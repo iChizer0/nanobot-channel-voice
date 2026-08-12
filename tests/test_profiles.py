@@ -80,3 +80,17 @@ def test_dialect_interrupt_pairing():
             assert p.interrupt == "truncate", key
         else:
             assert p.interrupt == "cancel", key
+
+
+def test_backend_literal_stays_in_sync_with_profiles():
+    """``VoiceConfig.backend``'s Literal and this table are hand-kept twins (a
+    Literal's arms must be static for the type checker, so the schema cannot
+    derive them from PROFILES): a profile added without extending the Literal is
+    rejected at parse though the backend works, and a Literal entry without a
+    profile KeyErrors at channel start."""
+    from typing import get_args
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    literal = set(get_args(VoiceConfig.model_fields["backend"].annotation))
+    assert literal == {"local"} | set(PROFILES)

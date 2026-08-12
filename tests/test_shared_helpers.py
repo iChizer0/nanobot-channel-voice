@@ -15,7 +15,7 @@ from nanobot_channel_voice.aio import (
 )
 from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_to_wav_bytes, wav_duration_ms
 from nanobot_channel_voice.engines import EngineSpec, describe_build_error, missing_fields
-from nanobot_channel_voice.streamid import base_of, started_ns
+from nanobot_channel_voice.streamid import base_of, started_ns, unique_token
 
 # ---- streamid ---------------------------------------------------------------
 
@@ -36,6 +36,15 @@ def test_started_ns_accepts_full_id_and_bare_base():
     assert started_ns("no timestamps") is None
     assert started_ns(None) is None
     assert started_ns("") is None
+
+
+def test_unique_token_cannot_collide_within_a_clock_tick():
+    """``str(time.time_ns())`` alone collided inside one clock quantum (~1 us on
+    macOS), letting a dead turn/delegation share a live one's identity and its
+    staleness gate swallow the live reply; the sequence tail makes equality
+    collisions impossible in-process."""
+    minted = [unique_token() for _ in range(10_000)]
+    assert len(set(minted)) == len(minted)
 
 
 # ---- aio --------------------------------------------------------------------

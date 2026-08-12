@@ -149,7 +149,9 @@ def _config(args: argparse.Namespace) -> int:
 def _scrub_secrets(node: Any) -> int:
     """Drop every ``apiKey`` in place, returning how many held a value. Dropping (not
     masking) keeps the output import-safe: a mask pasted back would overwrite the real
-    key, while an absent key merges nothing."""
+    key, while an absent key merges nothing. The name scan is complete BY TEST:
+    test_cli_config pins every credential-shaped schema field to the ``api_key`` leaf,
+    so a new secret under another name fails there instead of exporting in cleartext."""
     omitted = 0
     if isinstance(node, dict):
         if node.pop("apiKey", None):

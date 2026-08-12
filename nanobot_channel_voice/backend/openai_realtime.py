@@ -261,13 +261,12 @@ class RealtimeBackend(TurnEventMixin):
     async def barge_in(self, played_ms: int) -> None:
         try:
             if self._profile.interrupt == "cancel":
-                # Beta: no truncate event and no auto-cancel, so WE must stop the response
-                # or the model keeps generating (and billing) audio nobody will hear.
+                # Beta: WE must stop the response (see InterruptKind) or the model keeps
+                # generating (and billing) audio nobody will hear.
                 await self._cancel_active()
                 return
-            # GA: server-VAD already auto-cancelled (interrupt_response), so send ONLY
-            # truncate: a second response.cancel would race. With interruptResponse off
-            # there is no auto-cancel, so WE must cancel.
+            # GA (see InterruptKind): truncate only — a second response.cancel would race
+            # the server's auto-cancel, unless interruptResponse is off (no auto-cancel).
             if not self._rt.interrupt_response:
                 await self._cancel_active()
             else:
@@ -743,7 +742,7 @@ class RealtimeBackend(TurnEventMixin):
             args = self._fn_args.get(cid, "")
         self._log.debug("tool call ready: {}({})", name, args)
         self._metrics.call_dispatched(cid, self._sink.epoch)
-        await self._emit(ToolCall(call_id=cid, name=name, arguments=args, epoch=self._sink.epoch))
+        await self._emit(ToolCall(call_id=cid, name=name, arguments=args))
 
     async def _on_response_done(self, evt: dict) -> None:
         resp = evt.get("response") or {}

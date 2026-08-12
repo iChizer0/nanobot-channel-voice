@@ -117,14 +117,12 @@ class ToolStarted:
 class ToolCall:
     """CLOUD ONLY. The brain requests the shell EXECUTE a tool and return the
     result via ``backend.submit_tool_result(call_id, output)`` (``call_id`` echoed
-    verbatim). ``epoch`` is the sink epoch at dispatch, for staleness METRICS
-    only: the backend's cancelled-response bookkeeping is what keeps a result
+    verbatim). The backend's cancelled-response bookkeeping is what keeps a result
     completing after a barge-in from resurrecting the turn."""
 
     call_id: str
     name: str
     arguments: str  # JSON string; passed straight to ToolRegistry.execute (it coerces)
-    epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,13 +168,9 @@ class VoiceBackend(Protocol):
 
     async def barge_in(self, played_ms: int) -> None:
         """CLOUD: stop the in-flight response after the shell flushed the sink,
-        per ``profile.interrupt``. GA sends ``conversation.item.truncate`` to
-        align model memory with what the user heard; server-VAD auto-cancel
-        (``interrupt_response``, default on) handles the response itself, and a
-        second ``response.cancel`` would race — sent only when
-        ``realtime.interruptResponse`` is off. Beta dialects have neither
-        truncate nor auto-cancel: explicit ``response.cancel`` only. ``local``:
-        no-op (never called)."""
+        per ``profile.interrupt`` — the truncate-vs-cancel semantics live on
+        :data:`profiles.InterruptKind`, the one narration. ``local``: no-op
+        (never called)."""
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         """CLOUD: ``conversation.item.create(function_call_output)`` now; then

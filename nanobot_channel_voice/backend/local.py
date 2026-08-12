@@ -34,7 +34,7 @@ from nanobot_channel_voice.chunker import SentenceChunker
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.echo_reject import SelfEchoFilter, words_of
 from nanobot_channel_voice.metrics import VoiceMetrics
-from nanobot_channel_voice.streamid import base_of, started_ns
+from nanobot_channel_voice.streamid import base_of, started_ns, unique_token
 from nanobot_channel_voice.tts.base import TtsAdapter, is_wav
 from nanobot_channel_voice.vad import Endpointer, Vad, resolve_preroll_ms
 from nanobot_channel_voice.vad.adaptive import AdaptiveHangover
@@ -903,7 +903,7 @@ class LocalBackend(TurnEventMixin):
         self._chunker.flush()          # discard any partial chunk from a prior turn
         self._echo.reset()             # forget the old reply's words (AFTER is_self_echo)
         await self._set_turn(VoiceState.THINKING)
-        self._cur_turn = _Turn(str(time.time_ns()))
+        self._cur_turn = _Turn(unique_token())
         self._heard_prefix = ""        # heard accounting restarts with the new turn
         await self._publish_text(
             f"{text}\n\n{marker}" if marker else text, self._cur_turn.token

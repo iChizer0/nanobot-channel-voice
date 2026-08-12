@@ -63,3 +63,29 @@ def test_config_reports_an_invalid_section(tmp_path, capsys):
     path = _write(tmp_path, {"vad": {"engine": "nope"}})
     assert main(["config", "--config", path]) == 2
     assert "does not validate" in capsys.readouterr().err
+
+
+def test_every_credential_shaped_field_has_the_api_key_leaf():
+    """``_scrub_secrets`` drops by the literal leaf ``apiKey``; this pin walks the
+    whole schema so the first credential field with a DIFFERENT leaf (a bearer
+    token, an auth header) fails HERE instead of exporting in cleartext from a
+    command the docs advertise as secret-safe."""
+    from nanobot_channel_voice.config import VoiceConfig
+
+    def walk(model, prefix=""):
+        for name, info in model.model_fields.items():
+            ann = info.annotation
+            for nested in (ann, *getattr(ann, "__args__", ())):
+                if isinstance(nested, type) and hasattr(nested, "model_fields"):
+                    yield from walk(nested, f"{prefix}{name}.")
+            yield f"{prefix}{name}"
+
+    credential_words = {"key", "token", "secret", "password", "credential", "bearer", "auth"}
+    suspicious = [
+        path
+        for path in walk(VoiceConfig)
+        # whole segments, so tokens_path (a vocab FILE) does not trip the net
+        if credential_words & set(path.rsplit(".", 1)[-1].split("_"))
+    ]
+    assert suspicious, "the walker went blind: it must at least see the apiKey fields"
+    assert all(path.rsplit(".", 1)[-1] == "api_key" for path in suspicious), suspicious

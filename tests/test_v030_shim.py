@@ -42,46 +42,39 @@ def test_runtime_shim_reexports_the_channel():
     assert VoiceChannel.name == "voice"  # load_channel_class checks this match
 
 
-def test_setup_spec_exposes_the_webui_fields():
+def test_setup_spec_is_import_only():
+    """The WebUI surface is ONE write-only paste box; the full rationale lives on
+    the manifest's SETUP_SPEC comment, which this pin protects."""
     plugin = _load("voice_shim_manifest", _SHIM / "manifest.py").PLUGIN
     spec = plugin.setup
     assert spec is not None
-    # Exact ORDERED list: dict order is the WebUI display order (backend first:
-    # it is the one "primary" field, then the cloud credential block it selects).
-    assert list(spec.fields) == [
-        "backend",
-        "realtime.apiKey",
-        "realtime.model",
-        "realtime.voice",
-        "realtime.baseUrl",
-        "audio.captureDevice",
-        "audio.playbackDevice",
-        "audio.sampleRate",
-        "vad.engine",
-        "aec",
-        "logTranscripts",
-        "importJson",
-        "allowFrom",
-    ]
-    # Core's generic WebUI labels a field by its LAST dotted segment only; a
-    # duplicate leaf renders indistinguishable fields (this spec once showed
-    # three "Api Key"s and two "Provider"s). Keep leaves unique.
-    leaves = [name.rsplit(".", 1)[-1] for name in spec.fields]
-    assert len(leaves) == len(set(leaves))
+    assert list(spec.fields) == ["importJson"]
     # importJson is secret-kind although it's not a credential: the paste may CONTAIN
     # credentials, and secret is the one kind core never echoes back to a browser.
-    assert spec.secrets == frozenset({"realtime.apiKey", "importJson"})
+    assert spec.secrets == frozenset({"importJson"})
     # No required fields: the validator is authoritative, and a bare section
     # must not read as needs_setup (tier-0 needs nothing).
     assert spec.required == ()
-    # Core's toggle path materializes setup defaults into config.json and its
-    # fallback for lists is [] = deny-everyone; the schema default is ["*"].
-    assert spec.fields["allowFrom"].default == ["*"]
-    assert spec.fields["allowFrom"].writable is False
     public = spec.to_public_dict("voice")
-    keys = [f["key"] for f in public["fields"]]
-    assert "channels.voice.backend" in keys
-    assert "channels.voice.allowFrom" not in keys  # read-only: snapshot, not a form field
+    assert [f["key"] for f in public["fields"]] == ["channels.voice.importJson"]
+
+
+def test_enable_toggle_materialization_stays_allow_everyone():
+    """The deny-everyone hazard the SETUP_SPEC comment describes: an undeclared
+    allowFrom must stay unmaterialized by core's toggle, leaving the schema
+    default ["*"] to govern is_allowed."""
+    from nanobot.channels.contracts import channel_default_config
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    plugin = _load("voice_shim_manifest", _SHIM / "manifest.py").PLUGIN
+    materialized = channel_default_config(plugin)
+    # The toggle writes only what the spec declares (+ enabled); the paste box's
+    # '' filler is stripped again by the config layer at parse time.
+    assert set(materialized) == {"enabled", "importJson"}
+    cfg = VoiceConfig.model_validate({**materialized, "enabled": True})
+    assert cfg.allow_from == ["*"]
+    assert cfg.import_json is None
 
 
 def test_setup_validator_reports_plugin_schema_errors():
@@ -100,10 +93,10 @@ def _check_ids(payload):
     return {c["id"]: c for c in payload["checks"]}
 
 
-def test_setup_validator_nudges_keys_dropped_from_the_form(monkeypatch):
-    """tts.apiKey / stt.serve.* are config-file surface (their leaves would render
-    ambiguous WebUI labels), so the validator must carry the guidance instead,
-    as non-blocking 'skipped' notes naming the file keys."""
+def test_setup_validator_nudges_config_file_keys(monkeypatch):
+    """Every key is config-file surface (the form is one paste box), so the
+    validator carries the credential guidance as non-blocking 'skipped' notes
+    naming the file keys."""
     from nanobot.channels.contracts import ChannelValidationContext
 
     manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
@@ -125,38 +118,62 @@ def test_setup_validator_nudges_keys_dropped_from_the_form(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
     assert "tts_key" not in _check_ids(manifest._validate({"enabled": True}, ctx))
 
-    # cloud backend without a key -> realtime nudge, silenced by key or env
+    # cloud backend without a key -> realtime nudge; a real key silences it, and the
+    # env-export alternative is offered only where an OpenAI key would work
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     out = manifest._validate({"backend": "xai"}, ctx)
     assert _check_ids(out)["realtime_key"]["status"] == "skipped"
+    assert "OPENAI_API_KEY" not in _check_ids(out)["realtime_key"]["message"]
+    assert "OPENAI_API_KEY" in _check_ids(
+        manifest._validate({"backend": "openai"}, ctx)
+    )["realtime_key"]["message"]
     assert "tts_key" not in _check_ids(out)  # tts is local-backend-only guidance
     assert "realtime_key" not in _check_ids(
         manifest._validate({"backend": "xai", "realtime": {"apiKey": "k"}}, ctx)
     )
     assert out["can_enable"] is True  # notes never gate Check-and-enable
 
+    # the env fallback is NOT silence for a non-OpenAI backend: start() would send
+    # the OpenAI key to a provider that rejects it, and the one row must say so
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    out = manifest._validate({"backend": "xai"}, ctx)
+    message = _check_ids(out)["realtime_key"]["message"]
+    assert "OPENAI_API_KEY" in message and "reject" in message
+    assert "realtime_key" not in _check_ids(manifest._validate({"backend": "openai"}, ctx))
+    assert "realtime_key" not in _check_ids(
+        manifest._validate({"backend": "xai", "realtime": {"apiKey": "k"}}, ctx)
+    )
+
 
 def test_setup_validator_is_backend_aware(monkeypatch):
-    """The renderer shows ONE static field list for both modes, so the validator
-    is the only conditional surface: it must say which fields the chosen backend
-    ignores and what the local pipeline resolved to."""
+    """The form is one paste box whatever the backend, so the validator rows are
+    the only surface that can say which keys the chosen backend ignores and what
+    the section resolved to (backend, engines, devices)."""
     from nanobot.channels.contracts import ChannelValidationContext
 
     manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
     ctx = ChannelValidationContext()
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")  # silence the key nudges
 
-    # local: the pipeline check names the resolved engine trio + the file home
+    # local: the schema row names the backend, the pipeline check the resolved
+    # engine trio + the file home, the devices row the PCMs + the export command
     out = manifest._validate({"enabled": True}, ctx)
+    assert "backend='local'" in _check_ids(out)["schema"]["message"]
     pipeline = _check_ids(out)["pipeline"]
     assert pipeline["status"] == "pass"
     for expected in ("vad.engine='energy'", "stt.provider='nanobot'", "config.json"):
         assert expected in pipeline["message"]
     assert "realtime_unused" not in _check_ids(out)
     assert "local_unused" not in _check_ids(out)
+    devices = _check_ids(manifest._validate({"audio": {"captureDevice": "plug:mic"}}, ctx))
+    assert "plug:mic" in devices["manual_review"]["message"]
+    assert "nanobot-voice config" in devices["manual_review"]["message"]
 
-    # local + a cloud credential -> flagged as ignored (a misplaced edit)
+    # local + ANY non-default realtime.* value -> flagged as ignored (a misplaced
+    # edit); default-compared, so non-credential knobs are covered too
     out = manifest._validate({"realtime": {"model": "gpt-realtime"}}, ctx)
+    assert _check_ids(out)["realtime_unused"]["status"] == "skipped"
+    out = manifest._validate({"realtime": {"toolMode": "supervisor"}}, ctx)
     assert _check_ids(out)["realtime_unused"]["status"] == "skipped"
 
     # local + an engine that cannot build -> the pipeline check degrades to warn
@@ -167,10 +184,15 @@ def test_setup_validator_is_backend_aware(monkeypatch):
     assert "vad.firered.modelPath" in pipeline["message"]
     assert out["can_enable"] is True  # warn stays non-blocking
 
-    # cloud: no pipeline chatter, but a configured local block is flagged unused
+    # cloud: no pipeline chatter, but any configured local-only block is flagged
+    # unused, the row NAMING the touched blocks
     out = manifest._validate({"backend": "openai", "stt": {"provider": "whisper"}}, ctx)
+    assert "backend='openai'" in _check_ids(out)["schema"]["message"]
     assert "pipeline" not in _check_ids(out)
     assert _check_ids(out)["local_unused"]["status"] == "skipped"
+    assert "stt" in _check_ids(out)["local_unused"]["message"]
+    out = manifest._validate({"backend": "openai", "prologue": {"enabled": True}}, ctx)
+    assert "prologue" in _check_ids(out)["local_unused"]["message"]
     assert "local_unused" not in _check_ids(manifest._validate({"backend": "openai"}, ctx))
 
     # azure is the one profile with no default endpoint
@@ -227,3 +249,9 @@ def test_setup_validator_stays_within_the_rendered_check_budget(monkeypatch):
     )
     assert len(local_worst["checks"]) <= 6
     assert len(cloud_worst["checks"]) <= 6
+    # the env-fed non-OpenAI key variant REPLACES the no-key row, never adds one
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    cloud_env_worst = manifest._validate(
+        {"backend": "azure", "stt": {"provider": "whisper"}, "importJson": "{}"}, ctx
+    )
+    assert len(cloud_env_worst["checks"]) <= 6

@@ -69,7 +69,7 @@ The default stack (ALSA, energy VAD, OpenAI-compatible TTS) needs no extras. Eac
 
 ## Get started
 
-Run `nanobot webui`, open **Settings -> Channels -> Voice**, fill the form or paste a complete config into its **Import Json** box, and **Check and enable** - see [Example Configs](docs/EXAMPLE_CONFIGS.md) for various copy-pasteable setups and troubleshooting. Every key - default, range, per-field note - is documented inline in the schema, see [config.py](nanobot_channel_voice/config.py).
+Run `nanobot webui`, open **Settings -> Channels -> Voice**, paste your config into the **Import Json** box - the whole form; a partial paste patches just those keys over the current section - and **Check and enable** - see [Example Configs](docs/EXAMPLE_CONFIGS.md) for various copy-pasteable setups and troubleshooting. `nanobot-voice config` prints the current section back, paste-ready (API keys withheld unless `--secrets`). Every key - default, range, per-field note - is documented inline in the schema, see [config.py](nanobot_channel_voice/config.py).
 
 ## License
 

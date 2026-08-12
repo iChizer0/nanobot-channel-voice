@@ -38,7 +38,7 @@ from nanobot_channel_voice.config import (
 )
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
-from nanobot_channel_voice.streamid import started_ns
+from nanobot_channel_voice.streamid import started_ns, unique_token
 from nanobot_channel_voice.stt import SttAdapter, make_stt, write_temp_wav
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
@@ -206,7 +206,7 @@ class _DelegationCollector:
         # the collector, so an older base is a stopped turn's queued deltas racing the
         # tombstone swap. An unrecognized id format accepts everything.
         self._created_ns = time.time_ns()
-        self.token = str(self._created_ns)  # non-streaming identity, see _DELEGATION_META
+        self.token = unique_token()  # non-streaming identity, see _DELEGATION_META
 
     def accepts_stream(self, stream_id: str | None) -> bool:
         ns = started_ns(stream_id)

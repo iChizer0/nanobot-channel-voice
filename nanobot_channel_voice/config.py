@@ -94,17 +94,16 @@ class _VoiceBase(Base):
     @model_validator(mode="before")
     @classmethod
     def _fold_alias_twins(cls, data: Any) -> Any:
-        """Core's WebUI writers spell keys camelCase LITERALLY, never case-folding against
-        what a hand-written config already uses, so any WebUI write leaves a snake_case
-        config carrying BOTH spellings of a field, which ``forbid`` would reject wholesale;
-        fold the twins instead. Which wins depends on which writer plausibly produced the
-        camelCase twin:
+        """The camelCase writers never case-fold against what a hand-written config
+        already uses, so a snake_case config can end up carrying BOTH spellings of a
+        field, which ``forbid`` would reject wholesale; fold the twins instead. Which
+        wins depends on which writer plausibly produced the camelCase twin:
 
-        - the settings form saves the SUBMITTED value under the camelCase key: a
-          fresh edit, so camelCase wins (also pydantic's own alias priority);
-        - the enable/disable toggle merges the manifest DEFAULTS in as camelCase
-          siblings ('' for unset strings/secrets): filler, so a camelCase twin that
-          is empty-ish or exactly the field default loses to hand-written data.
+        - a consumed ``importJson`` paste is expanded under canonical camelCase keys:
+          a fresh edit, so camelCase wins (also pydantic's own alias priority);
+        - an empty-ish or exactly-default camelCase twin is FILLER (core's writers
+          materialize declared-field defaults as camelCase siblings, '' for unset
+          strings/secrets): it loses to hand-written data.
 
         Equal twins fold silently; a decided conflict warns (spellings only; either
         side may hold a secret) so a shadowed edit is never silently ignored."""
@@ -645,11 +644,12 @@ class VoiceConfig(_VoiceBase):
     agent_timeout_s: float | None = Field(default=120.0, gt=0)
     timeout_phrase: str = "Sorry, I'm having trouble answering that. Please try again."
 
-    # WebUI full-surface escape hatch (the manifest's secret-kind "importJson" box): the
-    # WHOLE channels.voice section as one pasted JSON object, deep-merged over the section
-    # at parse time (paste wins) and expanded into real config.json keys at channel start
-    # by consume_import_json(), which deletes the blob. A TRANSPORT, never a durable second
-    # copy; secret-kind means core never echoes it back to a browser.
+    # The WebUI's paste box (see the shim manifest's SETUP_SPEC comment for why it is
+    # the ONLY field): the WHOLE channels.voice section as one JSON object, deep-merged
+    # over the section at parse time (paste wins, partial pastes patch) and expanded
+    # into real config.json keys at channel start by consume_import_json(), which
+    # deletes the blob. A TRANSPORT, never a durable second copy; secret-kind, so core
+    # never echoes it back to a browser.
     import_json: str | None = None
 
     # LOCAL backend: operator text appended to the voice runtime-context block that rides
