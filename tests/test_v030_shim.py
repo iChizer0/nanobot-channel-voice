@@ -52,11 +52,15 @@ def test_setup_spec_is_import_only():
     # importJson is secret-kind although it's not a credential: the paste may CONTAIN
     # credentials, and secret is the one kind core never echoes back to a browser.
     assert spec.secrets == frozenset({"importJson"})
-    # No required fields: the validator is authoritative, and a bare section
-    # must not read as needs_setup (tier-0 needs nothing).
-    assert spec.required == ()
+    # "required" shapes the RENDERER only (one required field => it IS the primary
+    # form and the Advanced section, which repeats optional fields, is gone): core
+    # adds no gating with a custom validator and _validate never reports missing,
+    # so a bare section still enables with pure defaults (pinned in the validator
+    # tests below via can_enable).
+    assert spec.simple_required_fields == ("importJson",)
     public = spec.to_public_dict("voice")
     assert [f["key"] for f in public["fields"]] == ["channels.voice.importJson"]
+    assert public["fields"][0]["required"] is True
 
 
 def test_enable_toggle_materialization_stays_allow_everyone():
@@ -145,7 +149,7 @@ def test_setup_validator_nudges_config_file_keys(monkeypatch):
     )
 
 
-def test_setup_validator_is_backend_aware(monkeypatch):
+def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     """The form is one paste box whatever the backend, so the validator rows are
     the only surface that can say which keys the chosen backend ignores and what
     the section resolved to (backend, engines, devices)."""
@@ -159,6 +163,7 @@ def test_setup_validator_is_backend_aware(monkeypatch):
     # engine trio + the file home, the devices row the PCMs + the export command
     out = manifest._validate({"enabled": True}, ctx)
     assert "backend='local'" in _check_ids(out)["schema"]["message"]
+    assert out["can_enable"] is True  # the required-marked paste box never gates
     pipeline = _check_ids(out)["pipeline"]
     assert pipeline["status"] == "pass"
     for expected in ("vad.engine='energy'", "stt.provider='nanobot'", "config.json"):
@@ -183,6 +188,16 @@ def test_setup_validator_is_backend_aware(monkeypatch):
     assert "fall back" in pipeline["message"]
     assert "vad.firered.modelPath" in pipeline["message"]
     assert out["can_enable"] is True  # warn stays non-blocking
+
+    # an unfetched weights key warns with the exact fetch remedy: the WebUI's
+    # weights "status" row. Downloading itself stays a deliberate CLI act
+    # (`nanobot-voice fetch/sync`): progress and Ctrl-C live in the terminal,
+    # which no channel-start hook could offer.
+    monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(tmp_path / "empty-store"))
+    section = {"vad": {"engine": "firered", "firered": {"weights": "vad/firered/onnx"}}}
+    message = _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]
+    assert "not fetched" in message
+    assert "nanobot-voice fetch vad/firered/onnx" in message
 
     # cloud: no pipeline chatter, but any configured local-only block is flagged
     # unused, the row NAMING the touched blocks

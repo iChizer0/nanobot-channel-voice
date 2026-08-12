@@ -11,7 +11,7 @@ own channel packages and removes them with this dist. The implementation stays i
 
 from typing import Any
 
-from nanobot.channels._manifest import field
+from nanobot.channels._manifest import field, required
 from nanobot.channels.contracts import (
     ChannelSetupSpec,
     ChannelValidationContext,
@@ -240,9 +240,18 @@ SETUP_SPEC = ChannelSetupSpec(
     fields={
         "importJson": field("secret"),
     },
-    # Every knob has a working default and _validate is authoritative; a "backend
-    # is required" check would only make a valid bare section read as needs_setup.
-    required=(),
+    # "required" shapes the RENDERER, it does not gate: with a required field the
+    # panel's primary form is exactly that field and the collapsed "Advanced"
+    # section (which repeats every OPTIONAL field, i.e. the same box twice under
+    # required=()) disappears. Verified against core: with a custom validator the
+    # validate endpoint returns _validate's payload verbatim (no required-field
+    # checks are added), the configure/enable endpoint saves-then-enables without
+    # consulting it, and _validate always reports missing=[] — so a bare section
+    # still enables with pure defaults, exactly as before. Side effect, accepted:
+    # feature.configured now means "a paste is pending" instead of mirroring
+    # enabled, which only delays the optional "Check only" button until a first
+    # check has run.
+    required=(required("importJson"),),
     validator=_validate,
 )
 

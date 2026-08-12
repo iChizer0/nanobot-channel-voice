@@ -422,3 +422,4 @@ def test_cli_env_index_default(store, tmp_path, monkeypatch, capsys):
     )
     assert cli_main(["list"]) == 0
     assert "stt/m/onnx" in capsys.readouterr().out
+
