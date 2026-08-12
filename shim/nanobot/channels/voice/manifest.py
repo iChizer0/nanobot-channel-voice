@@ -48,12 +48,15 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
     )
     if cfg.import_json:
         # The paste already passed the schema above (it is merged before validation);
-        # this row says what happens to it, since the box itself is write-only.
+        # this row says what happens to it, since the box itself is write-only. The
+        # export counterpart rides here too: it answers itself exactly when someone
+        # is pasting ("how do I get this back out").
         checks.append(
             check(
                 "import", "Config import", "pass",
                 "importJson parses; it is merged over channels.voice (paste wins) and "
-                "expanded into the real config.json keys when the channel starts.",
+                "expanded into the real config.json keys when the channel starts. "
+                "`nanobot-voice config` prints the section back, paste-ready.",
             )
         )
 
@@ -165,8 +168,7 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
         check(
             "manual_review", "Audio devices", "skipped",
             f"audio.captureDevice='{cfg.audio.capture_device}', audio.playbackDevice="
-            f"'{cfg.audio.playback_device}': probed when the channel starts. "
-            "`nanobot-voice config` prints the whole section back, paste-ready.",
+            f"'{cfg.audio.playback_device}': probed when the channel starts.",
         )
     )
     return status_from_checks("voice", checks, [])

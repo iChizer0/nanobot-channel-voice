@@ -172,7 +172,6 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     assert "local_unused" not in _check_ids(out)
     devices = _check_ids(manifest._validate({"audio": {"captureDevice": "plug:mic"}}, ctx))
     assert "plug:mic" in devices["manual_review"]["message"]
-    assert "nanobot-voice config" in devices["manual_review"]["message"]
 
     # local + ANY non-default realtime.* value -> flagged as ignored (a misplaced
     # edit); default-compared, so non-credential knobs are covered too
@@ -236,6 +235,8 @@ def test_setup_validator_lints_the_import_paste(monkeypatch):
     out = manifest._validate({"enabled": True, "importJson": paste}, ctx)
     assert _check_ids(out)["import"]["status"] == "pass"
     assert "expanded" in _check_ids(out)["import"]["message"]
+    # the export counterpart rides the import row: shown exactly when pasting
+    assert "nanobot-voice config" in _check_ids(out)["import"]["message"]
     assert "import" not in _check_ids(manifest._validate({"enabled": True}, ctx))
 
     bad = manifest._validate({"importJson": "{not json"}, ctx)
