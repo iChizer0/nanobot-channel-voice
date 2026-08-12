@@ -21,11 +21,9 @@ _TOKEN_SEQ = itertools.count()
 
 
 def unique_token() -> str:
-    """Mint a process-unique opaque token (the plugin's turn/delegation identities,
-    compared by equality only). Wall-clock ns alone is NOT unique: two mints inside
-    one clock quantum (~1 us on macOS) share a timestamp, and an identity collision
-    lets a dead turn's staleness gate swallow a live turn's reply. The sequence tail
-    removes that possibility."""
+    """Process-unique opaque token (turn/delegation identity, equality-compared).
+    Bare time_ns collides inside one clock quantum (~1 us on macOS), letting a dead
+    turn's staleness gate swallow a live reply; the sequence tail prevents that."""
     return f"{time.time_ns()}-{next(_TOKEN_SEQ)}"
 
 

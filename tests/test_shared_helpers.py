@@ -39,10 +39,8 @@ def test_started_ns_accepts_full_id_and_bare_base():
 
 
 def test_unique_token_cannot_collide_within_a_clock_tick():
-    """``str(time.time_ns())`` alone collided inside one clock quantum (~1 us on
-    macOS), letting a dead turn/delegation share a live one's identity and its
-    staleness gate swallow the live reply; the sequence tail makes equality
-    collisions impossible in-process."""
+    """Bare str(time.time_ns()) collided inside one clock quantum (an observed
+    test flake); identity tokens must never be equal."""
     minted = [unique_token() for _ in range(10_000)]
     assert len(set(minted)) == len(minted)
 

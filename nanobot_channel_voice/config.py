@@ -94,19 +94,17 @@ class _VoiceBase(Base):
     @model_validator(mode="before")
     @classmethod
     def _fold_alias_twins(cls, data: Any) -> Any:
-        """The camelCase writers never case-fold against what a hand-written config
-        already uses, so a snake_case config can end up carrying BOTH spellings of a
-        field, which ``forbid`` would reject wholesale; fold the twins instead. Which
-        wins depends on which writer plausibly produced the camelCase twin:
+        """A camelCase writer never case-folds against what a hand-written config
+        already uses, so a snake_case config can carry BOTH spellings of a field,
+        which ``forbid`` would reject wholesale; fold the twins instead:
 
-        - a consumed ``importJson`` paste is expanded under canonical camelCase keys:
-          a fresh edit, so camelCase wins (also pydantic's own alias priority);
-        - an empty-ish or exactly-default camelCase twin is FILLER (core's writers
-          materialize declared-field defaults as camelCase siblings, '' for unset
-          strings/secrets): it loses to hand-written data.
+        - a consumed ``importJson`` paste expands under canonical camelCase keys: a
+          fresh edit, so camelCase wins (also pydantic's own alias priority);
+        - an empty-ish or exactly-default camelCase twin is filler ('' materialized
+          for unset strings/secrets): it loses to hand-written data.
 
-        Equal twins fold silently; a decided conflict warns (spellings only; either
-        side may hold a secret) so a shadowed edit is never silently ignored."""
+        Equal twins fold silently; a decided conflict warns with spellings only
+        (either side may hold a secret)."""
         if not isinstance(data, dict):
             return data
         twins = [
@@ -644,12 +642,10 @@ class VoiceConfig(_VoiceBase):
     agent_timeout_s: float | None = Field(default=120.0, gt=0)
     timeout_phrase: str = "Sorry, I'm having trouble answering that. Please try again."
 
-    # The WebUI's paste box (see the shim manifest's SETUP_SPEC comment for why it is
-    # the ONLY field): the WHOLE channels.voice section as one JSON object, deep-merged
-    # over the section at parse time (paste wins, partial pastes patch) and expanded
-    # into real config.json keys at channel start by consume_import_json(), which
-    # deletes the blob. A TRANSPORT, never a durable second copy; secret-kind, so core
-    # never echoes it back to a browser.
+    # The WebUI's paste box (the manifest's only field; rationale on its SETUP_SPEC):
+    # the WHOLE channels.voice section as one JSON object, deep-merged at parse time
+    # (paste wins) and expanded into real config.json keys at channel start by
+    # consume_import_json(), which deletes the blob — a transport, never a stored copy.
     import_json: str | None = None
 
     # LOCAL backend: operator text appended to the voice runtime-context block that rides

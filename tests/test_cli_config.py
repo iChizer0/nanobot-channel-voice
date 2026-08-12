@@ -66,10 +66,8 @@ def test_config_reports_an_invalid_section(tmp_path, capsys):
 
 
 def test_every_credential_shaped_field_has_the_api_key_leaf():
-    """``_scrub_secrets`` drops by the literal leaf ``apiKey``; this pin walks the
-    whole schema so the first credential field with a DIFFERENT leaf (a bearer
-    token, an auth header) fails HERE instead of exporting in cleartext from a
-    command the docs advertise as secret-safe."""
+    """``_scrub_secrets`` drops by the literal leaf ``apiKey``: a credential field
+    under any OTHER leaf must fail here instead of exporting in cleartext."""
     from nanobot_channel_voice.config import VoiceConfig
 
     def walk(model, prefix=""):

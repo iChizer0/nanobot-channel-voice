@@ -83,11 +83,9 @@ def test_dialect_interrupt_pairing():
 
 
 def test_backend_literal_stays_in_sync_with_profiles():
-    """``VoiceConfig.backend``'s Literal and this table are hand-kept twins (a
-    Literal's arms must be static for the type checker, so the schema cannot
-    derive them from PROFILES): a profile added without extending the Literal is
-    rejected at parse though the backend works, and a Literal entry without a
-    profile KeyErrors at channel start."""
+    """The backend Literal and PROFILES are hand-kept twins (Literal arms must be
+    static for the type checker): a profile without a Literal entry is rejected at
+    parse; a Literal entry without a profile KeyErrors at start."""
     from typing import get_args
 
     from nanobot_channel_voice.config import VoiceConfig

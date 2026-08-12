@@ -52,11 +52,8 @@ def test_setup_spec_is_import_only():
     # importJson is secret-kind although it's not a credential: the paste may CONTAIN
     # credentials, and secret is the one kind core never echoes back to a browser.
     assert spec.secrets == frozenset({"importJson"})
-    # "required" shapes the RENDERER only (one required field => it IS the primary
-    # form and the Advanced section, which repeats optional fields, is gone): core
-    # adds no gating with a custom validator and _validate never reports missing,
-    # so a bare section still enables with pure defaults (pinned in the validator
-    # tests below via can_enable).
+    # Renderer-shaping only (one box, no Advanced duplicate): core adds no gating
+    # with a custom validator; bare-enable is pinned below via can_enable.
     assert spec.simple_required_fields == ("importJson",)
     public = spec.to_public_dict("voice")
     assert [f["key"] for f in public["fields"]] == ["channels.voice.importJson"]
@@ -188,10 +185,8 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     assert "vad.firered.modelPath" in pipeline["message"]
     assert out["can_enable"] is True  # warn stays non-blocking
 
-    # an unfetched weights key warns with the exact fetch remedy: the WebUI's
-    # weights "status" row. Downloading itself stays a deliberate CLI act
-    # (`nanobot-voice fetch/sync`): progress and Ctrl-C live in the terminal,
-    # which no channel-start hook could offer.
+    # an unfetched weights key warns with the exact fetch remedy; downloading
+    # stays a deliberate CLI act (terminal progress + Ctrl-C)
     monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(tmp_path / "empty-store"))
     section = {"vad": {"engine": "firered", "firered": {"weights": "vad/firered/onnx"}}}
     message = _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]

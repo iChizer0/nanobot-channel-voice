@@ -20,15 +20,11 @@ from nanobot.channels.plugin import ChannelPlugin
 
 
 def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dict[str, Any]:
-    """WebUI setup validation: run the plugin's OWN pydantic schema over the merged
-    section, then explain what it resolved to. The form is one write-only Import
-    Json box, so these rows are the WebUI's ONLY read surface: they must name the
-    chosen backend, what it uses and ignores, and where the keys live. Core
-    renders at most 6 checks; each branch stays within that. Lazy imports: the
-    manifest must remain importable with no plugin dependencies loaded.
-    Non-schema checks never "fail": every knob has a working default and a fail
-    would block saving the paste itself.
-    """
+    """Run the plugin schema over the merged section, then explain what it resolved
+    to: the form is one write-only paste box, so these rows are the WebUI's only
+    read surface. Core renders at most 6 checks; each branch stays within that.
+    Lazy imports keep the manifest importable with no plugin deps. Non-schema
+    checks never "fail": a fail would block saving the paste itself."""
     from nanobot.channels.validation import check, status_from_checks
 
     checks: list[dict[str, Any]] = []
@@ -47,10 +43,8 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
         )
     )
     if cfg.import_json:
-        # The paste already passed the schema above (it is merged before validation);
-        # this row says what happens to it, since the box itself is write-only. The
-        # export counterpart rides here too: it answers itself exactly when someone
-        # is pasting ("how do I get this back out").
+        # Merged before validation, so it already passed the schema; the row says
+        # what happens next, naming the export counterpart while someone pastes.
         checks.append(
             check(
                 "import", "Config import", "pass",
@@ -65,9 +59,8 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
         from nanobot_channel_voice.config import RealtimeConfig
 
         checks.append(_pipeline_check(cfg, check))
-        # The realtime.* keys configure the cloud dialect family only; ANY
-        # non-default value under backend='local' is almost certainly a
-        # misplaced edit (default-compare, so no hand-kept field list to drift).
+        # Default-compare (no hand-kept field list to drift): any non-default
+        # realtime.* under backend='local' is almost certainly a misplaced edit.
         if rt != RealtimeConfig():
             checks.append(
                 check(
@@ -76,9 +69,8 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
                     "configure the cloud backends only.",
                 )
             )
-        # The tts_key note stays "skipped": the channel starts without a key
-        # (local TTS servers and system TTS need none), and it names the
-        # config-file remedies a paste or hand edit would apply.
+        # "skipped", not "fail": the channel starts keyless (local/system TTS
+        # need none); the message names the config-file remedies.
         if (
             cfg.tts.enabled
             and cfg.tts.provider == "openai"
@@ -93,10 +85,9 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
                 )
             )
     else:
-        # Same slot, three states: no key anywhere -> nudge to set one; only the env
-        # fallback on a non-OpenAI backend -> start() WILL send the OpenAI key to a
-        # provider that rejects it (resolve_openai_key's documented sharp edge), say
-        # so; a real realtime.apiKey -> silent. At most one row, whatever the state.
+        # One slot, three states: env-fallback-on-non-OpenAI warns (start() WILL
+        # send that key and the provider rejects it), no-key nudges, a real key
+        # is silent.
         if not rt.api_key and cfg.backend != "openai" and resolve_openai_key(None):
             checks.append(
                 check(
@@ -218,41 +209,26 @@ def _pipeline_check(cfg: Any, check: Any) -> dict[str, Any]:
 
 
 SETUP_SPEC = ChannelSetupSpec(
-    # The WebUI surface is ONE field: the WHOLE channels.voice section pasted as JSON
-    # (bare or still file-wrapped). The plugin schema lints it, deep-merges it over the
-    # section (paste wins, partial pastes patch), and start() expands it into real
-    # config.json keys, deleting the blob. secret kind though not a credential: core
-    # never echoes a secret back to a browser (a paste may CONTAIN keys) and an
-    # untouched empty box saves nothing. Write-only; the read/export surface is
-    # `nanobot-voice config` (apiKeys scrubbed unless --secrets) plus _validate's
-    # rows, which name the resolved backend, engines and devices.
-    #
-    # Individual form fields are deliberately NOT declared: core labels a field by
-    # its LAST dotted segment (colliding leaves like stt/tts "Provider" would render
-    # indistinguishably), core's toggle/save materializes every declared field's
-    # default into the section as a camelCase sibling ('' for unset strings), and
-    # every non-secret value is echoed to each browser session. One paste box keeps
-    # the section hand-owned and the surface write-only.
-    #
-    # allowFrom is NOT declared either, on purpose: undeclared means the toggle
-    # materializes nothing for it, and VoiceChannel always parses the section into
-    # VoiceConfig, whose ["*"] default governs BaseChannel.is_allowed. (Declared
-    # without a default it would materialize core's list filler [] = deny-everyone,
-    # which voice, having no pairing flow, cannot recover from.)
+    # The whole surface is ONE field: the channels.voice section pasted as JSON (bare
+    # or file-wrapped). The schema lints it, deep-merges it (paste wins, partial
+    # pastes patch), and start() expands it into real config.json keys, deleting the
+    # blob. secret kind: core never echoes secrets to a browser, and a paste may
+    # contain keys. Export is `nanobot-voice config` plus _validate's rows.
+    # No other fields, deliberately: core labels by LAST dotted segment (stt/tts
+    # "Provider" would collide), materializes every declared field's default into
+    # the section on toggle/save, and echoes every non-secret value to the browser.
+    # allowFrom stays undeclared too: nothing materializes it, so the schema default
+    # ["*"] governs is_allowed (declared without a default, core's [] list filler
+    # would mean deny-everyone, unrecoverable without a pairing flow).
     fields={
         "importJson": field("secret"),
     },
-    # "required" shapes the RENDERER, it does not gate: with a required field the
-    # panel's primary form is exactly that field and the collapsed "Advanced"
-    # section (which repeats every OPTIONAL field, i.e. the same box twice under
-    # required=()) disappears. Verified against core: with a custom validator the
-    # validate endpoint returns _validate's payload verbatim (no required-field
-    # checks are added), the configure/enable endpoint saves-then-enables without
-    # consulting it, and _validate always reports missing=[] — so a bare section
-    # still enables with pure defaults, exactly as before. Side effect, accepted:
-    # feature.configured now means "a paste is pending" instead of mirroring
-    # enabled, which only delays the optional "Check only" button until a first
-    # check has run.
+    # Shapes the RENDERER only: one required field is the whole primary form, and
+    # the "Advanced" section (which repeats every optional field — the same box
+    # twice under required=()) disappears. It does NOT gate: with a custom
+    # validator core adds no required-field checks, enable never consults it, and
+    # _validate always reports missing=[], so a bare section still enables with
+    # pure defaults (side effect: feature.configured now means "paste pending").
     required=(required("importJson"),),
     validator=_validate,
 )
