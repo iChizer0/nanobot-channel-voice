@@ -579,6 +579,20 @@ class BargeInConfig(_VoiceBase):
             "はい", "うん", "ええ", "そう",
         ]
     )
+    # Stop commands: a transcript made ENTIRELY of these phrases (backchannel words and
+    # politeness fillers may ride along) aimed at a live reply kills it and is CONSUMED —
+    # nothing is published, silence is the acknowledgment. Mixed utterances ("stop, use
+    # Tokyo instead") still publish as normal interruptions, and a cold stop with nothing
+    # live forwards to the agent. Empty list = off. See rd DESIGN-stop-commands.md.
+    stop_phrases: list[str] = Field(
+        default=[
+            "stop", "stop it", "shut up", "be quiet", "quiet", "enough",
+            "that's enough", "cancel", "never mind", "nevermind", "forget it",
+            "wait", "hold on", "hang on",
+            "停", "停止", "别说了", "闭嘴", "安静", "够了", "算了", "等等", "等一下",
+            "ストップ", "止めて", "やめて", "黙って", "もういい", "待って", "ちょっと待って",
+        ]
+    )
 
 
 class VoiceConfig(_VoiceBase):

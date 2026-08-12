@@ -16,6 +16,7 @@ from nanobot_channel_voice.backend import openai_realtime as rt
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
     Error,
+    InputTranscript,
     OutputAudio,
     StateHint,
     ToolCall,
@@ -325,3 +326,155 @@ def test_session_update_payload_shapes(key):
         assert session["output_audio_format"] == PROFILES[key].output_format
     if key == "glm":
         assert session["beta_fields"] == {"chat_mode": "audio"}  # session_extras merged
+
+
+# ---- stop-command consume (transcript-gated; DESIGN-stop-commands.md P1) ----
+
+
+def make_stop_backend(cfg: VoiceConfig | None = None):
+    backend = rt.RealtimeBackend(
+        cfg or VoiceConfig.model_validate(
+            {"realtime": {"inputTranscriptionModel": "whisper-1"}}
+        ),
+        sink=AudioSink(NullPlayback(), mode="stream"),
+        profile=PROFILES["openai"],
+    )
+    sent: list[dict] = []
+
+    async def _send(frame):
+        sent.append(frame)
+
+    backend._send = _send
+    events: list = []
+
+    async def on_event(e):
+        events.append(e)
+
+    backend._on_event = on_event
+    return backend, sent, events
+
+
+def _created(rid: str) -> dict:
+    return {"type": "response.created", "response": {"id": rid}}
+
+
+def _stop_t(text: str = "stop") -> dict:
+    return {"type": "conversation.item.input_audio_transcription.completed",
+            "transcript": text}
+
+
+def test_stop_transcript_cancels_the_live_ack_response():
+    async def _case():
+        b, sent, events = make_stop_backend()
+        await b._handle_event(_created("r1"))  # the ack response is already live
+        epoch = b._sink.epoch
+        await b._handle_event(_stop_t())
+        assert {"type": "response.cancel"} in sent
+        assert "r1" in b._cancelled_responses
+        assert b._sink.epoch > epoch  # queued ack audio flushed
+        assert b._turn is VoiceState.IDLE
+        assert b._metrics.counters.get("barge_in_stop") == 1
+        assert any(isinstance(e, InputTranscript) for e in events)  # still logged
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_stop_transcript_before_the_response_suppresses_it_at_birth():
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        b._turn = VoiceState.SPEAKING  # reply audible when the user spoke
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert b._onset_interrupting
+        await b._handle_event(_stop_t())  # no response yet: window armed
+        assert b._turn is VoiceState.IDLE
+        await b._handle_event(_created("r2"))  # the ack arrives late...
+        assert {"type": "response.cancel"} in sent  # ...and dies at birth
+        assert "r2" in b._cancelled_responses
+        assert b._turn is VoiceState.IDLE  # never THINKING
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_mixed_transcript_is_not_consumed():
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        b._turn = VoiceState.SPEAKING
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event(_stop_t("stop using celsius"))
+        assert sent == []
+        assert "barge_in_stop" not in b._metrics.counters
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_cold_stop_is_forwarded_not_consumed():
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})  # IDLE onset
+        await b._handle_event(_stop_t())
+        assert sent == []  # nothing live, no grace: the model may answer contextually
+        await b._handle_event(_created("r3"))
+        assert b._turn is VoiceState.THINKING  # the response lives
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_grace_consumes_the_double_tap():
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        b._turn = VoiceState.SPEAKING
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event(_created("r1"))
+        await b._handle_event(_stop_t())  # consumed: r1 cancelled
+        await b._handle_event(
+            {"type": "response.done", "response": {"id": "r1", "status": "cancelled"}}
+        )
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})  # cold onset
+        await b._handle_event(_stop_t())  # double-tap, inside the grace
+        assert b._metrics.counters.get("barge_in_stop") == 2
+        await b._handle_event(_created("r2"))  # its response dies at birth
+        assert "r2" in b._cancelled_responses
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_new_speech_clears_the_suppress_window():
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        b._turn = VoiceState.SPEAKING
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event(_stop_t())  # no active: window armed
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})  # new intent
+        await b._handle_event(_created("r9"))
+        assert sent == []  # not suppressed
+        assert b._turn is VoiceState.THINKING
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_without_transcription_model_the_matcher_is_inert():
+    async def _case():
+        b, sent, _ = make_stop_backend(VoiceConfig())
+        assert b._stop_match is None
+        await b._handle_event(_created("r1"))
+        await b._handle_event(_stop_t())
+        assert sent == []
+        assert "r1" not in b._cancelled_responses
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_cloud_instructions_always_carry_the_stop_rule():
+    from nanobot_channel_voice.channel import _STOP_RULE, _cloud_instructions
+
+    for sup, tools in ((False, False), (False, True), (True, True)):
+        assert _STOP_RULE in _cloud_instructions(None, supervisor=sup, has_tools=tools)
+    assert _STOP_RULE in _cloud_instructions("custom persona", supervisor=False,
+                                             has_tools=False)

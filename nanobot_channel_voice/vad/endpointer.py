@@ -83,6 +83,7 @@ class Endpointer:
         self._frames = 0
         self._active = 0  # speech-FLAGGED frames only
         self._eager = None
+        self._eager_active: int | None = None
         self._consult = None
         self._consult_active = None
         self._pretrigger.clear()
@@ -97,6 +98,30 @@ class Endpointer:
     @property
     def in_speech(self) -> bool:
         return self._in_speech
+
+    @property
+    def silence_run_ms(self) -> int:
+        """Trailing silence inside the OPEN utterance (0 whenever a speech frame
+        lands); meaningful only while ``in_speech``."""
+        return self._silence_run * self._frame_ms
+
+    @property
+    def active_ms(self) -> int:
+        """Speech-flagged audio accumulated by the open utterance (pauses excluded)."""
+        return self._active * self._frame_ms
+
+    @property
+    def last_speech_ms(self) -> int:
+        """Offset of the most recent speech flag from the confirming run's first frame.
+        Frame-domain like ``silence_run_ms``, so capture bursts/lag cannot skew the
+        pause-probe's leak attribution the way a wall clock would."""
+        return (self._frames - self._silence_run) * self._frame_ms
+
+    def eager_still_current(self) -> bool:
+        """No speech was flagged since the eager snapshot, so an (empty) eager decode
+        still describes the whole utterance — the release-side mirror of the consult
+        tier's ``_consult_active`` staleness pin."""
+        return self._eager_active is not None and self._active == self._eager_active
 
     @property
     def speech_run(self) -> int:
@@ -181,6 +206,7 @@ class Endpointer:
             and self._eager_frames < self._hangover_frames
         ):
             self._eager = bytes(self._buf)
+            self._eager_active = self._active  # eager_still_current staleness pin
 
         # Same once-per-final-run property as the eager mark. _consult_active pins the
         # snapshot to THIS pause: any resumed speech bumps _active, so a verdict landing

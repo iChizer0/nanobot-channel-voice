@@ -107,7 +107,7 @@ def test_stt_serve_requires_an_ondevice_engine():
 
 
 def test_transcripts_stay_out_of_logs_by_default():
-    from nanobot_channel_voice.backend.local import loggable_text
+    from nanobot_channel_voice.backend.common import loggable_text
 
     assert VoiceConfig().log_transcripts is False
     assert loggable_text("open the pod bay doors", False) == "<5 words>"

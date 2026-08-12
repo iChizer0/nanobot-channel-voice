@@ -31,6 +31,12 @@ from loguru import logger
 from nanobot_channel_voice.aio import Throttle, put_drop_oldest, wait_for_stall
 from nanobot_channel_voice.config import VoiceConfig, resolve_openai_key
 from nanobot_channel_voice.metrics import VoiceMetrics
+from nanobot_channel_voice.phrases import (
+    FILLER_WORDS,
+    PhraseLexicon,
+    PhraseMatcher,
+    tokens_of,
+)
 
 from .audio_sink import AudioSink
 from .base import (
@@ -46,10 +52,18 @@ from .base import (
     UserSpeechStarted,
     VoiceState,
 )
-from .common import TurnEventMixin
+from .common import TurnEventMixin, loggable_text
 from .profiles import RealtimeProfile
 
 _SEND_Q_MAX = 64  # ~1.3s of 20ms frames; drop-oldest past this
+
+# Stop-command consume (transcript-gated; the cloud half of rd DESIGN-stop-commands.md).
+# Grace mirrors local's _KILL_GRACE_S: a second bare stop right after a consumed one is a
+# double-tap, not a new turn. The suppress window covers transcripts that land BEFORE the
+# server creates the response answering them — that response is cancelled at creation;
+# new user speech ends the window (whatever follows answers the NEW utterance).
+_STOP_GRACE_S = 3.0
+_STOP_SUPPRESS_S = 2.0
 _BACKOFF = (0.5, 1.0, 2.0)
 # A session this long counts as healthy and resets the backoff budget: separates "the
 # endpoint recycles long sessions" (Qwen turn caps) from "it rejects us", which alone
@@ -185,6 +199,21 @@ class RealtimeBackend(TurnEventMixin):
         self._turn = VoiceState.IDLE
         # Barge-in latency clock: set at server-VAD onset, consumed by the next barge-in.
         self._speech_started_at: float | None = None
+        # Stop-command consume: active only with input transcription on — without
+        # transcripts the matcher is None and the persona rule is the only (soft) cover.
+        self._log_transcripts = config.log_transcripts
+        self._stop_match = (
+            PhraseMatcher(
+                PhraseLexicon(config.barge_in.stop_phrases),
+                PhraseLexicon(config.barge_in.ack_phrases),
+                extra=FILLER_WORDS,
+            )
+            if config.barge_in.stop_phrases and self._rt.input_transcription_model
+            else None
+        )
+        # The stop targeting latch and its clocks live in _reset_turn_state: the local
+        # onset latch's cloud twin, per LATEST onset (the transcript event carries no
+        # item->onset mapping to be more precise with).
         self._log = logger.bind(component="voice")  # before _reset_turn_state: it logs
         self._reset_turn_state()
 
@@ -220,6 +249,12 @@ class RealtimeBackend(TurnEventMixin):
         self._call_to_response: dict[str, str] = {}
         self._fn_names: dict[str, str] = {}
         self._fn_args: dict[str, str] = {}
+        # Stop-consume state is session-scoped: a suppress window or onset latch carried
+        # across a reconnect would cancel the NEW session's first response at birth (a
+        # dropped socket can reconnect well inside the 2 s window).
+        self._onset_interrupting = False
+        self._last_stop_consume = float("-inf")
+        self._stop_suppress_until = 0.0
 
     @property
     def metrics(self) -> VoiceMetrics:
@@ -324,6 +359,30 @@ class RealtimeBackend(TurnEventMixin):
         with suppress(Exception):
             await self._send({"type": "response.cancel"})
         self._note_cancelled(rid)
+
+    async def _consume_stop(self, text: str) -> None:
+        """A pure stop command (transcript-gated): the response answering it dies unspoken
+        — cancelled now if live, at birth via the suppress window if not — and queued ack
+        audio is flushed. Deliberately NO conversation.item.truncate: the tracked audio
+        item may still be the PREVIOUS reply's (the ack often has no item yet), and
+        truncating a fully-heard item corrupts the model's memory of it."""
+        self._metrics.count("barge_in_stop")
+        self._log.info(
+            "stop command consumed (cloud): '{}'",
+            loggable_text(text, self._log_transcripts, 40),
+        )
+        self._last_stop_consume = time.monotonic()
+        self._cancel_drain()
+        rid = self._active_response_id
+        if rid is not None and rid not in self._cancelled_responses:
+            await self._cancel_active()
+        else:
+            # Nothing live to cancel (or only a corpse awaiting its done): the response
+            # answering THIS stop is still unborn — arm the at-birth suppression.
+            self._stop_suppress_until = time.monotonic() + _STOP_SUPPRESS_S
+        await self._sink.flush()
+        if self._turn is not VoiceState.IDLE:
+            await self._set_turn(VoiceState.IDLE)
 
     def _clamp_tool_output(self, output: str) -> str:
         """Clamp an oversized tool output to protect the realtime context window; the
@@ -585,6 +644,13 @@ class RealtimeBackend(TurnEventMixin):
             self._cancel_drain()
             self._arm_watchdog()  # recover if the server never turns this into a response
             self._speech_started_at = time.monotonic() * 1000.0
+            # Stop targeting latch, read BEFORE the CAPTURING transition overwrites it.
+            # New speech also ends any pending created-response suppression: whatever
+            # response follows answers the NEW utterance, not a consumed stop.
+            self._onset_interrupting = self._turn in (
+                VoiceState.THINKING, VoiceState.SPEAKING,
+            )
+            self._stop_suppress_until = 0.0
             await self._set_turn(VoiceState.CAPTURING)
             await self._emit(UserSpeechStarted())
         elif t == "input_audio_buffer.speech_stopped":
@@ -594,8 +660,15 @@ class RealtimeBackend(TurnEventMixin):
             self._metrics.turn_anchor()
             self._progress_t = time.monotonic()  # end of speech IS turn progress
         elif t == "response.created":
-            self._cancel_drain()
             rid = (evt.get("response") or {}).get("id")
+            if time.monotonic() < self._stop_suppress_until:
+                # The response answering a consumed stop: kill it at birth, before any
+                # audio exists, and stay out of THINKING — silence is the acknowledgment.
+                self._stop_suppress_until = 0.0
+                self._active_response_id = rid
+                await self._cancel_active()
+                return
+            self._cancel_drain()
             self._active_response_id = rid
             if rid:
                 self._response_had_tools.setdefault(rid, False)
@@ -629,6 +702,16 @@ class RealtimeBackend(TurnEventMixin):
             text = evt.get("transcript", "")
             if text:
                 await self._emit(InputTranscript(text))
+                if (
+                    self._stop_match is not None
+                    and (
+                        self._onset_interrupting
+                        or self._active_response_id is not None
+                        or time.monotonic() - self._last_stop_consume <= _STOP_GRACE_S
+                    )
+                    and self._stop_match.pure(tokens_of(text))
+                ):
+                    await self._consume_stop(text)
         elif t == "error":
             await self._on_error(evt)
 

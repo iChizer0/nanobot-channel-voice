@@ -84,14 +84,22 @@ def _build(**cfg_over) -> _Harness:
     return harness
 
 
-def _utt(*, preempted: bool = False, marker: str | None = None) -> _PendingUtterance:
+def _utt(
+    *,
+    preempted: bool = False,
+    heard: str | None = None,
+    onset_interrupting: bool = False,
+    onset_at: float = 0.0,
+) -> _PendingUtterance:
     return _PendingUtterance(
         pcm=b"\x00" * 3200,
         eager=None,
         closed_by_silence=True,
         closed_at=0.0,
         preempted=preempted,
-        marker=marker,
+        heard=heard,
+        onset_interrupting=onset_interrupting,
+        onset_at=onset_at,
     )
 
 
@@ -113,11 +121,13 @@ def test_self_echo_while_speaking_is_dropped_not_published():
 
 def test_interrupt_through_echo_when_enough_fresh_words():
     """A real soft-duplex barge-in is user+leak blended; containment calls it
-    echo, so the fresh-word override is the only thing that lets it through."""
+    echo, so the fresh-word override is the only thing that lets it through.
+    (Fresh CONTENT words: a fresh stop command instead consumes, see
+    test_stop_commands.py.)"""
     h = _build()
     h.backend._turn = VoiceState.SPEAKING
     h.backend._echo.note_spoken("the capital of france is paris")
-    h.transcript = "the capital of france is paris wait stop"
+    h.transcript = "the capital of france is paris turn the lamp off"
     _run(h.backend._on_utterance(_utt()))
     assert h.interrupts == 1
     assert h.published and h.published[0][0].startswith("the capital")
@@ -252,9 +262,10 @@ def test_interrupt_kills_the_old_token_but_not_a_superseded_one():
         await h.backend._on_utterance(_utt(preempted=True))
         assert not h.backend.is_dead_turn(first)
         # A genuine interrupt kills the CURRENT token, before any await can race it.
+        # (Content words: a bare stop command would consume via the stop rung instead.)
         _, second = h.published[1]
         h.backend._turn = VoiceState.THINKING
-        h.transcript = "no wait"
+        h.transcript = "no not tokyo"
         await h.backend._on_utterance(_utt())
         assert h.backend.is_dead_turn(second)
         assert not h.backend.is_dead_turn(first)
@@ -413,6 +424,12 @@ def _finished_task(text: str):
     return asyncio.run(_make())
 
 
+def _arm_eager(b, task) -> None:
+    """The callback only trusts the CURRENT candidate's own decode."""
+    b._eager_task = task
+    b._eager_valid = True
+
+
 def test_aec_warmup_holds_the_eager_confirm():
     h = _build()
     b = h.backend
@@ -420,7 +437,9 @@ def test_aec_warmup_holds_the_eager_confirm():
     b._duck_onset = 1.0
     b._endpointer._in_speech = True
     b._aec = _StubAec(ref_ms=500.0)  # converging: too little reference processed
-    b._eager_confirm_cb(_finished_task("brand new words entirely"))
+    task = _finished_task("brand new words entirely")
+    _arm_eager(b, task)
+    b._eager_confirm_cb(task)
     assert b._early_confirm is False
     assert b._metrics.counters.get("barge_in_warmup_hold") == 1
 
@@ -432,6 +451,25 @@ def test_after_enough_reference_audio_the_eager_confirm_fires():
     b._duck_onset = 1.0
     b._endpointer._in_speech = True
     b._aec = _StubAec(ref_ms=5000.0)  # converged: plenty of reference processed
-    b._eager_confirm_cb(_finished_task("brand new words entirely"))
+    task = _finished_task("brand new words entirely")
+    _arm_eager(b, task)
+    b._eager_confirm_cb(task)
     assert b._early_confirm is True
     assert b._metrics.counters.get("barge_in_eager_confirm") == 1
+
+
+def test_stale_eager_task_cannot_judge_the_live_candidate():
+    """A dropped/superseded candidate's decode must neither confirm nor acquit the
+    utterance that is open NOW: its audio belongs to a different candidate."""
+    h = _build()
+    b = h.backend
+    b._turn = VoiceState.SPEAKING
+    b._duck_onset = 1.0
+    b._endpointer._in_speech = True
+    b._aec = _StubAec(ref_ms=5000.0)
+    task = _finished_task("brand new words entirely")
+    _arm_eager(b, task)
+    b._eager_valid = False  # what _drop_candidate / a skip leaves behind
+    b._eager_confirm_cb(task)
+    assert b._early_confirm is False
+    assert b._early_release is None

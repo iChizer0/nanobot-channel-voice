@@ -19,7 +19,7 @@ from nanobot_channel_voice.weights import WeightsError, apply_weights
 
 __all__ = [
     "Vad", "Endpointer", "EnergyVad", "WebRtcVad",
-    "make_vad", "make_turn_analyzer", "resolve_preroll_ms",
+    "flag_lag_ms", "make_vad", "make_turn_analyzer", "resolve_preroll_ms",
 ]
 
 # Onset lag = time from true speech onset to the first speech-flagged frame, the only
@@ -30,19 +30,24 @@ _MODEL_RISE_MARGIN_MS = 80  # sigmoid rise to threshold + safety
 _FIRERED_FRAME_MS = 10      # the model's own frame period (vad.firered.smoothFrames unit)
 
 
-def resolve_preroll_ms(cfg: VadConfig, frame_ms: int) -> int:
-    """The configured pre-roll, floored at the VAD's algorithmic onset lag, so a large
-    ``vad.firered.smoothFrames`` (or an under-set ``prerollMs``) cannot clip the first
-    word."""
+def flag_lag_ms(cfg: VadConfig, frame_ms: int) -> int:
+    """Algorithmic decision lag between the acoustic edge and the flag following it
+    (fbank window + smoothing settle + rise margin). Bounds both edges: pre-roll
+    recovers the onset side, the pause-probe's leak-death window covers release."""
     if cfg.engine == "firered":
-        flag_lag = (
+        return (
             _FBANK_WARMUP_MS
             + (cfg.firered.smooth_frames - 1) * _FIRERED_FRAME_MS
             + _MODEL_RISE_MARGIN_MS
         )
-    else:
-        flag_lag = 2 * frame_ms + 40  # energy/webrtc: ~instant per-frame decision + margin
-    return max(cfg.preroll_ms, flag_lag)
+    return 2 * frame_ms + 40  # energy/webrtc: ~instant per-frame decision + margin
+
+
+def resolve_preroll_ms(cfg: VadConfig, frame_ms: int) -> int:
+    """The configured pre-roll, floored at the VAD's algorithmic onset lag, so a large
+    ``vad.firered.smoothFrames`` (or an under-set ``prerollMs``) cannot clip the first
+    word."""
+    return max(cfg.preroll_ms, flag_lag_ms(cfg, frame_ms))
 
 
 def _build_webrtc(cfg: VadConfig, sample_rate: int, frame_ms: int) -> Vad:

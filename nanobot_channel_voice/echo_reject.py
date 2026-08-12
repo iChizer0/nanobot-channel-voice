@@ -10,16 +10,12 @@ Token-set containment, stdlib only; tuned for word-based languages.
 
 from __future__ import annotations
 
-import re
 import time
 from collections import deque
 
-_WORD_RE = re.compile(r"\w+", re.UNICODE)
+from nanobot_channel_voice.phrases import words_of
 
-
-def words_of(text: str) -> set[str]:
-    """The filter's comparison alphabet: lower-cased word tokens."""
-    return set(_WORD_RE.findall(text.lower()))
+__all__ = ["SelfEchoFilter", "words_of"]
 
 
 class SelfEchoFilter:

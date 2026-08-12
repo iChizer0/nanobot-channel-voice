@@ -55,6 +55,15 @@ _DIRECT_RULES = (
     "\"Let me check.\" (never implying success or failure) then call it."
 )
 
+# Silence-is-the-ack, model-side half: the enforcement is the client's transcript-gated
+# response.cancel (backend._consume_stop), but that needs input transcription enabled and
+# can lose a race to a very fast ack — this line keeps the un-cancellable head short and
+# covers providers whose transcription events never arrive. Appended in EVERY mode.
+_STOP_RULE = (
+    "If the user only tells you to stop, be quiet, or wait, do not answer — "
+    "produce no speech at all."
+)
+
 # Supervisor tool mode (Responder-Thinker): the realtime model owns the conversational
 # surface, delegating reasoning/tool work to nanobot; the filler masks the round-trip.
 _SUPERVISOR_RULES = (
@@ -137,7 +146,9 @@ def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: boo
     (contract). ONE derivation, so a ``realtime.persona`` override can restyle the voice
     but never delete the delegation contract or the filler preamble."""
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
-    return "\n\n".join(part for part in (persona or _DEFAULT_PERSONA, rules) if part)
+    return "\n\n".join(
+        part for part in (persona or _DEFAULT_PERSONA, rules, _STOP_RULE) if part
+    )
 
 
 def _voice_context_blocks(

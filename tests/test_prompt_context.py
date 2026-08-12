@@ -17,6 +17,7 @@ from nanobot_channel_voice.backend.local import TURN_META
 from nanobot_channel_voice.channel import (
     _DEFAULT_PERSONA,
     _DIRECT_RULES,
+    _STOP_RULE,
     _SUPERVISOR_RULES,
     VoiceChannel,
     _cloud_instructions,
@@ -35,14 +36,17 @@ class _FakeTts:
 
 def test_default_persona_carries_the_mode_rules():
     direct = _cloud_instructions(None, supervisor=False, has_tools=True)
-    assert direct == f"{_DEFAULT_PERSONA}\n\n{_DIRECT_RULES}"
+    assert direct == f"{_DEFAULT_PERSONA}\n\n{_DIRECT_RULES}\n\n{_STOP_RULE}"
     supervisor = _cloud_instructions(None, supervisor=True, has_tools=True)
-    assert supervisor == f"{_DEFAULT_PERSONA}\n\n{_SUPERVISOR_RULES}"
+    assert supervisor == f"{_DEFAULT_PERSONA}\n\n{_SUPERVISOR_RULES}\n\n{_STOP_RULE}"
 
 
 def test_persona_only_session_gets_no_tool_rules():
     # No tools declared => no round-trip to mask, so the filler preamble is dead text.
-    assert _cloud_instructions(None, supervisor=False, has_tools=False) == _DEFAULT_PERSONA
+    # The stop rule is mode-independent: silence-is-the-ack holds even tool-less.
+    assert _cloud_instructions(None, supervisor=False, has_tools=False) == (
+        f"{_DEFAULT_PERSONA}\n\n{_STOP_RULE}"
+    )
 
 
 def test_persona_override_replaces_style_but_never_the_contract():

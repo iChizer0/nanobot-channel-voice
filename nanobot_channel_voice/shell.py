@@ -41,7 +41,7 @@ from .backend.base import (
     VoiceBackend,
     VoiceState,
 )
-from .backend.local import loggable_text
+from .backend.common import loggable_text
 
 # (name, arguments_json) -> tool result (str or JSON-encodable). Cloud tool seam.
 ExecToolFn = Callable[[str, str], Awaitable[Any]]

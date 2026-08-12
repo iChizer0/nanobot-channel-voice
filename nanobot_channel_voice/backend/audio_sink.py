@@ -228,6 +228,12 @@ class AudioSink:
             return _DUCK_STREAM_LEAD_MS
         return _STREAM_LEAD_MS
 
+    def lead_ms(self) -> float:
+        """The write-ahead the device may still play after a pause/kill: the sink owns
+        pacing policy, so consumers deriving playout physics (the leak-death probe
+        window) ask here instead of copying the constants."""
+        return self._lead_ms()
+
     def backlog_ms(self) -> int:
         """Estimated ms of accepted-but-not-yet-audible audio: queued items plus the
         written-but-unplayed lead. Over-counts the in-flight item by up to one lead
