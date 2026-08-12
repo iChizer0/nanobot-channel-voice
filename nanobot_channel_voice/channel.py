@@ -695,16 +695,27 @@ class VoiceChannel(BaseChannel):
     async def _warmup(self) -> None:
         """Warm each on-device adapter once, then (``perf.calibrate``) measure the WARM
         steady state to derive this device's pacing knobs. Failures are logged and ignored
-        (both are optimizations, never gates)."""
-        for target in (self._stt, self._tts_adapter):
-            if target is None:
-                continue
-            try:
-                await target.warmup()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                self.logger.debug("voice warmup failed for {}: {}", type(target).__name__, exc)
+        (both are optimizations, never gates). Capture is already live, so hop-cost
+        accounting is held across each saturating burst — and ONLY the bursts:
+        ``_calibrate``'s wait-for-IDLE is live conversation and must stay accounted."""
+        local = self._local()
+        if local is not None:
+            local.hold_hop_accounting(True)
+        try:
+            for target in (self._stt, self._tts_adapter):
+                if target is None:
+                    continue
+                try:
+                    await target.warmup()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.debug(
+                        "voice warmup failed for {}: {}", type(target).__name__, exc
+                    )
+        finally:
+            if local is not None:
+                local.hold_hop_accounting(False)
         if self.config.perf.calibrate:
             await self._calibrate()
 
@@ -724,6 +735,7 @@ class VoiceChannel(BaseChannel):
             await asyncio.sleep(1.0)
         stt_ms: float | None = None
         tts_rtf: float | None = None
+        local.hold_hop_accounting(True)  # probes only: the IDLE wait above stays accounted
         try:
             if self._stt is not None:
                 t0 = time.monotonic()
@@ -750,6 +762,8 @@ class VoiceChannel(BaseChannel):
         except Exception as exc:  # noqa: BLE001
             self.logger.debug("voice calibration failed: {}", exc)
             return
+        finally:
+            local.hold_hop_accounting(False)
         local.apply_calibration(
             stt_cost_ms=stt_ms,
             tts_rtf=tts_rtf,

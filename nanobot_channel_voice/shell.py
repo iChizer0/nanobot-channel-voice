@@ -222,6 +222,11 @@ class VoiceShell:
                 try:
                     if await self._capture.flush():
                         self._metrics.count("capture_gate_flush")
+                    # The pipe is empty now; a local backend's capture-debt accounting
+                    # must not keep describing the backlog this just discarded.
+                    note = getattr(self._backend, "note_capture_flush", None)
+                    if note is not None:
+                        note()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - flush is hardening, not load-bearing

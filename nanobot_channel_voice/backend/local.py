@@ -65,6 +65,13 @@ _BACKLOG_POLL_S = 0.25
 # Measured in accepted reference audio, not wall time: silence teaches the filter nothing.
 _AEC_WARMUP_REF_MS = 3000.0
 
+# Capture debt = wall time the frame hop has overrun its budget and not yet paid back by
+# draining the pipe faster than real time; response latency grows by exactly this much.
+# Warn well below the ~2 s ALSA pipe. A pump-idle arrival gap (mic gate, capture restart)
+# means the pipe was flushed, so debt resets instead of reading as lag.
+_CAPTURE_DEBT_WARN_MS = 500.0
+_PUMP_GAP_RESET_MS = 1000.0
+
 
 def _swallow_result(task: asyncio.Task) -> None:
     """Retrieve an abandoned speculative decode's outcome, so it never logs 'exception was never
@@ -357,9 +364,31 @@ class LocalBackend(TurnEventMixin):
         # cannot: a barge-in DURING THINKING never learned the cancelled turn's base, so its
         # late deltas would garble the new turn.
         self._reject_started_before_ns = 0
-        self._vad_ms_ema = 0.0  # per-frame VAD cost vs the real-time frame budget
+        # Frame-hop accounting: compute (inside the hop lock) vs overhead (executor
+        # dispatch, lock wait, loop resume) EMAs attribute a slow hop to the engine or to
+        # contention; capture debt is the resulting real backlog, and gates the warning.
+        self._hop_compute_ema = 0.0
+        self._hop_overhead_ema = 0.0
+        self._capture_debt_ms = 0.0
+        self._debt_episode = False  # currently in a warned lag episode (metric edge)
+        self._last_push_end = 0.0
+        self._probe_hold = False  # warmup/calibration probes: drop their hop samples
         self._warn_throttle = Throttle()
         self._log = logger.bind(component="voice")
+
+    def hold_hop_accounting(self, active: bool) -> None:
+        """Warmup/calibration probes deliberately saturate the device while capture is
+        already live; their hop samples would indict the steady state, so drop them.
+        Release also discards debt from around the burst: its backlog drains in
+        milliseconds once the box idles, so carrying it would only seed a false warning."""
+        self._probe_hold = active
+        if not active:
+            self._capture_debt_ms = 0.0
+
+    def note_capture_flush(self) -> None:
+        """The shell flushed the capture source (mic-gate reopen): the pipe's backlog
+        was physically discarded, and the debt that described it goes with it."""
+        self._capture_debt_ms = 0.0
 
     def apply_calibration(
         self,
@@ -441,10 +470,13 @@ class LocalBackend(TurnEventMixin):
         # Off-loop so heavy VAD/streaming STT can't stall delta/TTS handling or the sink. Frames
         # are awaited one at a time, so the endpointer/stream is never entered concurrently.
         if self._threaded_hop:
-            utterance = await asyncio.to_thread(self._push_frame_sync, pcm, prev_speech)
+            utterance, compute_ms = await asyncio.to_thread(
+                self._push_frame_sync, pcm, prev_speech
+            )
         else:
             utterance = self._push_with_model_close(pcm)  # light path: loop-side, no lock
-        self._track_vad_cost((time.monotonic() - t0) * 1000.0)
+            compute_ms = (time.monotonic() - t0) * 1000.0
+        self._track_hop_cost(t0, compute_ms)
         if self._turn_analyzer is not None:
             snap = self._endpointer.take_consult()
             if snap is not None:
@@ -632,11 +664,15 @@ class LocalBackend(TurnEventMixin):
             "complete" if complete else "incomplete", int(ms),
         )
 
-    def _push_frame_sync(self, pcm: bytes, prev_speech: bool) -> bytes | None:
+    def _push_frame_sync(self, pcm: bytes, prev_speech: bool) -> tuple[bytes | None, float]:
         """One frame through the endpointer AND (when streaming) the STT stream, in a single
         off-loop hop. At onset a FRESH handle is started and the pre-roll ring replayed into it,
-        mirroring the endpointer's own pre-trigger; a rejected blip's handle is just dropped."""
+        mirroring the endpointer's own pre-trigger; a rejected blip's handle is just dropped.
+
+        Returns ``(utterance, compute_ms)``: the clock starts after the hop lock, so the
+        caller can split engine cost from dispatch/contention overhead."""
         with self._hop_lock:
+            t0 = time.monotonic()
             if self._aec is not None:
                 # Subtract our own playback BEFORE the endpointer/STT hear the frame, so echo
                 # never becomes "speech".
@@ -677,7 +713,7 @@ class LocalBackend(TurnEventMixin):
                     self._stt_live = None  # blip rejected by the min filter: abandon its stream
                 elif not prev_speech:
                     self._recent.append(pcm)  # idle: keep pre-onset context warm
-            return utterance
+            return utterance, (time.monotonic() - t0) * 1000.0
 
     def _queue_utterance(self, pending: _PendingUtterance) -> None:
         if self._adaptive is not None:
@@ -749,6 +785,8 @@ class LocalBackend(TurnEventMixin):
         # The dropped utterance's speculation dies with it: a still-valid eager
         # task would hand the PRE-GAP transcript to the next utterance's close.
         self._eager_valid = False
+        # The restart re-opens the device: whatever backlog the debt described is gone.
+        self._capture_debt_ms = 0.0
         if self._duck_onset is not None:
             self._release_duck("gap")
         await self._orphan_if_confirmed("gap")
@@ -1519,21 +1557,49 @@ class LocalBackend(TurnEventMixin):
                     await self._set_turn(VoiceState.IDLE)
                 self._metrics.turn_end()
 
-    def _track_vad_cost(self, push_ms: float) -> None:
-        """Track per-frame VAD cost; warn (throttled) when it nears the frame budget.
+    def _track_hop_cost(self, t0: float, compute_ms: float) -> None:
+        """Per-frame hop accounting; warn (throttled) only when capture actually lags.
 
-        Slow inference never clips audio (the pipe buffers in order): it grows latency as the
-        loop falls behind. The fix is a faster path (RKNN/NPU or a lighter VAD), not more
-        pre-roll, hence a warning, not compensation."""
-        self._vad_ms_ema = 0.9 * self._vad_ms_ema + 0.1 * push_ms
-        budget = self._cfg.audio.frame_ms
-        if self._vad_ms_ema <= 0.8 * budget:
+        Slow frames never clip audio (the pipe buffers in order): they grow response latency
+        by the accumulated capture debt, warned on once it is audible. The compute/overhead
+        split names the culprit: compute near the budget is the engine stack itself; overhead
+        dominating is dispatch/contention (bulk STT/TTS stealing cores), which no VAD or NPU
+        change fixes."""
+        now = time.monotonic()
+        gap_ms = (t0 - self._last_push_end) * 1000.0
+        self._last_push_end = now
+        if self._probe_hold:
+            return  # probes saturate the box on purpose; their samples indict nothing
+        total_ms = (now - t0) * 1000.0
+        budget = float(self._cfg.audio.frame_ms)
+        overhead_ms = max(0.0, total_ms - compute_ms)
+        self._hop_compute_ema = 0.9 * self._hop_compute_ema + 0.1 * compute_ms
+        self._hop_overhead_ema = 0.9 * self._hop_overhead_ema + 0.1 * overhead_ms
+        self._metrics.observe("hop_compute_ms", compute_ms)
+        self._metrics.observe("hop_overhead_ms", overhead_ms)
+        if gap_ms > _PUMP_GAP_RESET_MS:
+            self._capture_debt_ms = 0.0
+        self._capture_debt_ms = max(0.0, self._capture_debt_ms + total_ms - budget)
+        if self._capture_debt_ms == 0.0:
+            self._debt_episode = False  # fully drained: the next crossing is a new episode
+        if self._capture_debt_ms < _CAPTURE_DEBT_WARN_MS:
             return
+        if not self._debt_episode:
+            self._debt_episode = True
+            self._metrics.count("capture_behind")  # once per lag episode, never throttled
         if not self._warn_throttle.ready():
             return
+        if not self._threaded_hop:
+            # Light path: compute and total share one clock, so the split cannot
+            # attribute; name both suspects.
+            hint = "the VAD/STT stack or concurrent inference is over the frame budget"
+        elif self._hop_compute_ema > 0.8 * budget:
+            hint = "the VAD/AEC/streaming-STT stack is too slow for this device; use lighter engines"
+        else:
+            hint = "concurrent bulk inference is starving the frame path, not the VAD itself"
         self._log.warning(
-            "frame hop (VAD/AEC/streaming STT) ~{:.0f} ms/frame is near the {} ms "
-            "real-time budget; capture may fall behind (response latency grows). "
-            "Use the RKNN/NPU models or lighter VAD/STT engines.",
-            self._vad_ms_ema, budget,
+            "capture is ~{:.0f} ms behind real time (frame hop ~{:.1f} ms compute + "
+            "~{:.1f} ms scheduling/contention vs the {:.0f} ms budget): {}",
+            self._capture_debt_ms, self._hop_compute_ema, self._hop_overhead_ema, budget,
+            hint,
         )

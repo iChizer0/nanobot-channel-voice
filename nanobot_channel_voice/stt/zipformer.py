@@ -142,6 +142,9 @@ class ZipformerOnDeviceStt(SttAdapter):
         kw = dict(
             core_mask=z.core_mask, target=z.target, device_id=z.device_id,
             providers=z.execution_providers, provider_options=z.provider_options,
+            # Shared by the frame hop's chunk decode AND batch transcribe(); the frame
+            # budget wins (sherpa-onnx ships this model single-threaded too).
+            intra_op_threads=1,
         )
         with ExitStack() as models:  # any failure below releases every loaded model
             encoder, decoder, joiner = (

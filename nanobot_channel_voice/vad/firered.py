@@ -57,6 +57,7 @@ class FireRedVad(Vad):
             self._model = models.enter_context(OnDeviceModel(
                 model_path, core_mask=core_mask, target=target, device_id=device_id,
                 providers=providers, provider_options=provider_options,
+                intra_op_threads=1,  # runs per frame inside the hop: never fan out
             ))
             self._front = FbankCmvn(cmvn_path)
             self._threshold = threshold

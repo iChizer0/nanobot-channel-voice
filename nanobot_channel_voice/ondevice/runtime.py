@@ -17,6 +17,7 @@ which warns and falls back to a cloud/system backend.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -98,15 +99,21 @@ class OnDeviceModel:
             kwargs: dict[str, Any] = {"providers": providers or ["CPUExecutionProvider"]}
             if provider_options is not None:
                 kwargs["provider_options"] = provider_options
-            if intra_op_threads is not None:
-                # Callers off the latency-critical frame path cap their pool so a
-                # burst inference cannot saturate every core under the VAD/STT hop
-                # (ORT's default intra-op pool is the machine's core count).
-                opts = onnxruntime.SessionOptions()
-                opts.intra_op_num_threads = intra_op_threads
-                opts.inter_op_num_threads = 1
-                opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-                kwargs["sess_options"] = opts
+            opts = onnxruntime.SessionOptions()
+            if intra_op_threads is None:
+                # Bulk decode/synthesis: leave one core free so the capture pump and
+                # frame hop keep running under a burst (ORT's default pool is every
+                # core, spinning while idle). Count the cgroup/taskset budget, not the
+                # machine, where the OS can tell them apart.
+                affinity = getattr(os, "sched_getaffinity", None)
+                cores = len(affinity(0)) if affinity is not None else (os.cpu_count() or 1)
+                intra_op_threads = max(1, cores - 1)
+            opts.intra_op_num_threads = intra_op_threads  # frame-path callers pass 1
+            opts.inter_op_num_threads = 1
+            opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+            opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+            kwargs["sess_options"] = opts
             self._sess = onnxruntime.InferenceSession(path, **kwargs)
         else:
             raise ValueError(f"unsupported model type (need .rknn / .onnx): {path}")
