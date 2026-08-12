@@ -1,0 +1,509 @@
+# Example Configurations
+
+Complete `~/.nanobot/config.json` files for common deployments, ready to copy and adjust, plus the setup that precedes them.
+
+## Foundation
+
+API keys resolve per service, config first, then environment: transcription through core's provider entry (`GROQ_API_KEY` in the examples), TTS and realtime from `tts.apiKey` / `realtime.apiKey` falling back to `OPENAI_API_KEY` - for *every* provider, so set keys explicitly when mixing vendors.
+
+Speak, the agent transcribes, thinks, and replies through your speaker. The default is half-duplex: the mic is muted while the bot speaks, so wait for it to finish. To interrupt mid-reply, pick an open-mic mode and just start talking, note that without echo cancellation your voice has to acoustically out-compete the bot before the VAD even triggers.
+
+Long tool calls are masked by an agent-spoken status line, with opt-in canned filler (`prologue.enabled`) as the fallback. If the configured TTS cannot be built the channel degrades to `espeak-ng` with a warning rather than going silent, a robotic voice is your cue to read the log.
+
+## Pick audio devices
+
+Capture and playback stay on ALSA's `default` device until the config says otherwise - fine on a desktop. On a board, or whenever anything else needs the sound card too, pick devices and share them by name. List what ALSA sees, then record three seconds and play it back, substituting your own card and device numbers:
+
+```sh
+arecord -l && aplay -l
+arecord -D plughw:1,0 -f S16_LE -r 16000 -c 1 -d 3 /tmp/mic-test.wav
+aplay   -D plughw:0,0 /tmp/mic-test.wav
+```
+
+The `plughw:` opens the device exclusively, which is fine for a test but locks everything else out. For real use share them with `dsnoop` (capture) and `dmix` (playback) under names of your own - redefining ALSA's stock `dsnoop`/`dmix` is a config error. A minimal `/etc/asound.conf`, with the mic on card 1 and the speaker on card 0:
+
+```
+pcm.mic     { type dsnoop; ipc_key 2048; slave { pcm "hw:1,0"; rate 48000; } }
+pcm.speaker { type dmix;   ipc_key 2049; slave { pcm "hw:0,0"; rate 48000; } }
+```
+
+Retest with `-D plug:mic` and `-D plug:speaker` - exactly what the channel runs - then put those two names in the config as `captureDevice` and `playbackDevice`. The `plug:` wrapper converts rate and format in software, so 16 kHz mono capture works whatever the hardware's native rate. The examples below assume these two names, substitute `default` or your own.
+
+## Cloud and LAN
+
+The local pipeline against APIs: metered cloud services, or any server of yours speaking the same open protocols - identical config shape, different endpoints.
+
+### Quick start (half-duplex)
+
+The smallest useful config: Groq Whisper STT, OpenAI TTS, energy VAD, mic muted while the bot speaks. No extras needed.
+
+```json
+{
+  "transcription": {
+    "enabled": true,
+    "provider": "groq",
+    "language": "en"
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "tts": {
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "audioFormat": "wav",
+        "apiKey": "sk-..."
+      }
+    }
+  }
+}
+```
+
+### Open-mic barge-in with software AEC
+
+The same cloud engines, but you can talk over the bot: software echo cancellation (`[aec]` extra) plus raw-PCM TTS, which enables gapless playback, dynamic ducking, and the AEC reference signal in one move. The `[webrtc]` extra improves the VAD, which matters more once the mic stays open.
+
+```json
+{
+  "transcription": {
+    "enabled": true,
+    "provider": "groq",
+    "language": "en"
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "aec": "webrtc",
+      "duckDb": -12,
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "vad": { "engine": "webrtc" },
+      "tts": {
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "audioFormat": "pcm",
+        "apiKey": "sk-..."
+      }
+    }
+  }
+}
+```
+
+If your device or OS already cancels echo, set `"aec": "hardware"` instead and drop the `[aec]` extra; without either, `"aec": "soft"` still allows barge-in but reacts later, since your voice must out-compete the playback acoustically.
+
+### LAN servers, no cloud
+
+STT and TTS on machines you control: any OpenAI-compatible Whisper server for transcription and an OpenAI-compatible `/audio/speech` server (Kokoro-FastAPI here) for synthesis. Only the `[aec]` extra is needed, for the open mic. Core's `transcription` section only picks the provider and model; the endpoint and key live on a provider entry, and core resolves transcription only through its fixed provider registry (`groq`, `openai`, `siliconflow`, ... - the generic `custom` slot is chat-only), so repoint the `openai` entry at your server and give it any non-empty `apiKey`, which core requires to consider transcription configured. If you also chat through real OpenAI, borrow another OpenAI-shaped registry slot (`siliconflow`) instead of hijacking its entry. `tts.language` declares what the server's voice speaks, since the channel cannot know. `audioFormat: "pcm"` buys gapless playback, dynamic ducking, and the software-AEC reference; if the server emits PCM at a rate other than 24 kHz, set `tts.pcmSampleRate` to match or playback is pitch-shifted.
+
+```json
+{
+  "transcription": {
+    "enabled": true,
+    "provider": "openai",
+    "model": "Systran/faster-whisper-base",
+    "language": "en"
+  },
+  "providers": {
+    "openai": {
+      "apiKey": "unused",
+      "apiBase": "http://192.168.1.10:8000/v1"
+    }
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "aec": "webrtc",
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "tts": {
+        "provider": "openai_compat",
+        "apiBase": "http://192.168.1.10:8880/v1",
+        "model": "kokoro",
+        "voice": "af_bella",
+        "audioFormat": "pcm",
+        "language": "en"
+      }
+    }
+  }
+}
+```
+
+## On-device
+
+Every engine in-process (`[ondevice]` extra), no servers and no network: `.onnx` runs on CPU or Jetson GPU, `.rknn` on Rockchip NPUs, interchangeable per engine since the file extension picks the runtime. Weights are never bundled: name every file yourself or let the `nanobot-voice` CLI provision them from an index, so an engine block names one store key (`weights`) instead of a path per file. The [nanobot-channel-voice-models](https://huggingface.co/spaces/iChizer0/nanobot-channel-voice-models) currently serves only RKNN builds for RV1126B - hence the placeholder URL for the ONNX examples - and the package itself ships no entries and redistributes no weights, only the mechanism.
+
+```sh
+export NANOBOT_VOICE_INDEX=https://example.com/voice-weights.json   # ONNX examples
+nanobot-voice sync                                                  # fetch every weights key the config names, sha256-verified
+```
+
+### CPU
+
+SenseVoice STT (fast CTC, zh/yue/en/ja/ko) and Supertonic-3 TTS (31 languages, no zh), both ONNX on CPU.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "stt": {
+        "provider": "sensevoice",
+        "sensevoice": { "weights": "stt/sensevoice-small/onnx", "language": "en" }
+      },
+      "tts": {
+        "provider": "supertonic",
+        "supertonic": { "weights": "tts/supertonic-3/onnx", "language": "en" }
+      }
+    }
+  }
+}
+```
+
+Swap `stt.provider` to `"whisper"` (with a `stt.whisper` block) for broader language coverage at more CPU, or to `"zipformer"` for streaming decodes and mid-sentence barge-in confirmation. For noisy rooms add `"vad": { "engine": "firered", "firered": { "weights": "vad/firered/onnx" } }`.
+
+### Rockchip NPU
+
+The same shape with `.rknn` artifacts on the NPU (`[ondevice,rknn]` extras on the board): Whisper STT, MMS TTS, and FireRed VAD, all three from the default RV1126B index, so plain `nanobot-voice sync` provisions them, CLI may prompt for confirmation on fetch since we respect the licenses.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "vad": {
+        "engine": "firered",
+        "firered": { "weights": "vad/firered/rknn.rv1126b" }
+      },
+      "stt": {
+        "provider": "whisper",
+        "whisper": { "weights": "stt/whisper-base/rknn.rv1126b", "language": "en" }
+      },
+      "tts": {
+        "provider": "mms",
+        "mms": { "weights": "tts/mms-eng/rknn.rv1126b" }
+      }
+    }
+  }
+}
+```
+
+On a multi-core NPU, e.g., RK3588, swap in that board's own `rknn.rk3588` keys and pin each engine to its own NPU core (`"coreMask": "0_1"` on Whisper, `"2"` on the VAD and TTS) so a long decode never starves the VAD. If language detection on the quantized model gets flaky, add `"languageMinConfidence": 0.6` to the whisper block.
+
+#### Wiring it by hand, without an index
+
+For converted-it-yourself models or an air-gapped box, name every artifact directly. Explicit `*Path` fields always win over a `weights` key, and the two styles mix freely per engine, so drop these blocks in place of the ones above. `chunkLength` and `maxLength` must match the exported models; the Whisper and MMS exports follow Rockchip's `rknn_model_zoo` demos, and you convert `.onnx` to `.rknn` on a PC with `rknn-toolkit2`.
+
+```json
+"vad": {
+  "engine": "firered",
+  "firered": {
+    "modelPath": "model/fireredvad_stream_vad_with_cache.rknn",
+    "cmvnPath": "model/cmvn.ark"
+  }
+},
+"stt": {
+  "provider": "whisper",
+  "whisper": {
+    "encoderPath": "model/whisper_encoder_base_20s.rknn",
+    "decoderPath": "model/whisper_decoder_base_20s.rknn",
+    "vocabPath": "model/multilingual.tiktoken",
+    "melFiltersPath": "model/mel_80_filters.txt",
+    "language": "en",
+    "chunkLength": 20
+  }
+},
+"tts": {
+  "provider": "mms",
+  "mms": {
+    "encoderPath": "model/mms_tts_eng_encoder_200.rknn",
+    "decoderPath": "model/mms_tts_eng_decoder_200.rknn",
+    "maxLength": 200
+  }
+}
+```
+
+### NVIDIA Jetson (GPU via TensorRT)
+
+The same shape as [CPU](#cpu) but accelerated on the GPU: install a JetPack-matched `onnxruntime-gpu` wheel (from the Jetson Zoo, not PyPI) and add execution providers to each engine block. The first load builds and caches TensorRT engines, so it is slow once.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "stt": {
+        "provider": "whisper",
+        "whisper": {
+          "weights": "stt/whisper-base/onnx",
+          "language": "en",
+          "executionProviders": ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
+          "providerOptions": [{ "trt_engine_cache_enable": true, "trt_engine_cache_path": "trt-cache" }, {}, {}]
+        }
+      },
+      "tts": {
+        "provider": "supertonic",
+        "supertonic": {
+          "weights": "tts/supertonic-3/onnx",
+          "language": "en",
+          "executionProviders": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+          "providerOptions": [{}, {}]
+        }
+      }
+    }
+  }
+}
+```
+
+### Japanese assistant
+
+On-device Whisper detecting between Japanese and English, MMS-TTS speaking Japanese (`[ondevice,japanese]` extras). The `mms-tts-jpn` export brings its own `vocab.json` via the weights entry; because a supplied vocabulary carries no language label, `tts.language` declares it, and the agent is told to reply in Japanese through the runtime-context block. The `context` line is the voice-only seam for extra guidance.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "context": "Prefer short, conversational sentences.",
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "stt": {
+        "provider": "whisper",
+        "whisper": {
+          "weights": "stt/whisper-base/onnx",
+          "language": "ja",
+          "languages": ["ja", "en"],
+          "languageMinConfidence": 0.5
+        }
+      },
+      "tts": {
+        "provider": "mms",
+        "language": "ja",
+        "mms": { "weights": "tts/mms-jpn/onnx", "textFrontend": "japanese" }
+      }
+    }
+  }
+}
+```
+
+### STT serving core too
+
+One loaded model transcribing for everything (`[ondevice]` extra): the voice pipeline uses SenseVoice directly, and `stt.serve` exposes the same adapter as a local OpenAI-compatible endpoint that core's `transcription` consumers (WebUI dictation, chat-channel voice notes) call back into. Core reaches it through its `openai` provider entry repointed at the loopback endpoint (if you also chat through real OpenAI, borrow another OpenAI-shaped registry slot such as `siliconflow` instead), whose `apiKey` must match `stt.serve.apiKey`, since the serve endpoint checks the bearer token core sends.
+
+```json
+{
+  "transcription": {
+    "enabled": true,
+    "provider": "openai",
+    "model": "sensevoice-small"
+  },
+  "providers": {
+    "openai": {
+      "apiKey": "shared-secret",
+      "apiBase": "http://127.0.0.1:8035/v1"
+    }
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "stt": {
+        "provider": "sensevoice",
+        "sensevoice": { "weights": "stt/sensevoice-small/onnx" },
+        "serve": { "enabled": true, "port": 8035, "apiKey": "shared-secret" }
+      },
+      "tts": {
+        "provider": "supertonic",
+        "supertonic": { "weights": "tts/supertonic-3/onnx", "language": "en" }
+      }
+    }
+  }
+}
+```
+
+Note the direction: the voice channel itself keeps `stt.provider: "sensevoice"` (pointing it at `"nanobot"` while serving would be circular, and startup rejects it).
+
+## Turn-taking and barge-in
+
+Drop-in tuning for any local-backend example above. `vad.turn` layers Smart Turn v3, an audio-native end-of-turn model (`[ondevice]` extra, 16 kHz capture, one ~25-60 ms inference per pause), over the silence endpointer: a COMPLETE verdict closes the turn ~300 ms before `hangoverMs`, INCOMPLETE waits the silence out - the hangover becomes an upper bound rather than the decision, so raising it for hesitant speakers stops costing every turn. `hangoverMinMs` composes with it: each hangover starts there (snappy) and grows toward `hangoverMs` only on evidence a real pause was cut short. On the open-mic side, `bargeIn.mode: "pause"` halts playback outright during the confirm window instead of ducking it to `duckDb`, resuming exactly where it stopped on a false alarm.
+
+### Open mic with Smart Turn
+
+The open-mic cloud example with the tuning applied (`[aec,webrtc,ondevice]` extras): a hangover generous enough for hesitant speakers, made affordable by the turn model; the adaptive floor; pause instead of duck while an interruption is confirmed.
+
+```json
+{
+  "transcription": {
+    "enabled": true,
+    "provider": "groq",
+    "language": "en"
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "aec": "webrtc",
+      "bargeIn": { "mode": "pause" },
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker",
+        "sampleRate": 16000
+      },
+      "vad": {
+        "engine": "webrtc",
+        "hangoverMs": 1200,
+        "hangoverMinMs": 400,
+        "turn": { "engine": "smartturn", "modelPath": "model/smart-turn-v3.2-cpu.onnx" }
+      },
+      "tts": {
+        "provider": "openai",
+        "model": "gpt-4o-mini-tts",
+        "voice": "alloy",
+        "audioFormat": "pcm",
+        "apiKey": "sk-..."
+      }
+    }
+  }
+}
+```
+
+The turn model is an on-device engine like any other: the file extension picks the runtime, so a `.rknn` conversion (`rknn-toolkit2`, same as the other models) serves it from the NPU, with `"coreMask"` pinning it to its own core on a multi-core board, and a `weights` key works once an index serves one - `nanobot-voice sync` finds it there like in every other engine block and provisions it. A missing or unfetched model degrades loudly to silence-only endpointing, never a crash.
+
+## Realtime
+
+Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback and routes the model's tool calls through nanobot's guarded `ToolRegistry` under `nanobot gateway`. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.
+
+### Minimal
+
+Default gated barge-in: you interrupt after the bot finishes a phrase.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "backend": "openai",
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker"
+      },
+      "realtime": {
+        "model": "gpt-realtime",
+        "voice": "marin",
+        "apiKey": "sk-..."
+      }
+    }
+  }
+}
+```
+
+Other providers change `backend` and the `realtime` block only. For Qwen (Alibaba DashScope), tool calling needs the `qwen3.5` model (the `qwen3` default is persona-only), and outside mainland China you add your workspace's international `realtime.baseUrl` from the DashScope console:
+
+```json
+"backend": "qwen",
+"realtime": { "model": "qwen3.5-omni-flash-realtime", "apiKey": "sk-dashscope-..." }
+```
+
+Set the key explicitly rather than via `OPENAI_API_KEY`, which is the fallback for every provider.
+
+### Supervisor with open-mic barge-in
+
+The robust-tools variant: the realtime model owns the conversation but delegates every reasoning and tool step to nanobot's full agent loop (`realtime.toolMode: "supervisor"`), with the software AEC (`[aec]` extra) keeping the mic open so you can cut it off mid-reply. `delegationTimeoutS` budgets the agent's tool work; `inputTranscriptionModel` turns on user-side transcripts.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "backend": "openai",
+      "aec": "webrtc",
+      "audio": {
+        "captureDevice": "plug:mic",
+        "playbackDevice": "plug:speaker"
+      },
+      "realtime": {
+        "model": "gpt-realtime",
+        "voice": "marin",
+        "apiKey": "sk-...",
+        "toolMode": "supervisor",
+        "bargeIn": "aec",
+        "delegationTimeoutS": 120,
+        "inputTranscriptionModel": "whisper-1",
+        "persona": "You are a calm, dry-witted assistant. Keep answers under three sentences unless asked to elaborate."
+      }
+    }
+  }
+}
+```
+
+With hardware or OS echo cancellation, replace `"aec": "webrtc"` with `"realtime": { "aecAvailable": true, ... }` and drop the `[aec]` extra. The persona replaces style only; never mention tools in it.
+
+## Headless
+
+### No audio hardware
+
+For CI, containers, or protocol work: the `null` backend captures nothing and discards playback, while the rest of the pipeline runs normally. `logTranscripts` is acceptable here because nothing sensitive is spoken.
+
+```json
+{
+  "transcription": {
+    "enabled": true,
+    "provider": "groq",
+    "language": "en"
+  },
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "logTranscripts": true,
+      "audio": { "backend": "null" },
+      "tts": { "provider": "system" }
+    }
+  }
+}
+```
+
+## Troubleshooting
+
+- Channel missing from `nanobot channels status`: an editable core resolves channels through its source checkout, where no plugin manifest lands; reinstall core as a wheel (editable stays fine for this plugin).
+- Startup error naming a config key: typos in `channels.voice` are startup errors by design; the message names the offending key.
+- `arecord`/`aplay` errors or a busy device: another process holds the raw device; switch to the `dsnoop`/`dmix` setup above and check nothing opens `hw:` directly.
+- Robotic voice: the configured TTS failed to build and the channel degraded to espeak-ng; the log names the cause.
+- Bot answers but stays silent on some replies: look for "cannot voice" warnings - the agent replied in a language the on-device TTS cannot speak, and the unvoiceable text was dropped rather than played as noise. Configure a TTS for that language or constrain the agent (`tts.language`, top-level `context`).
+- First reply after startup is slow: model warmup runs once in the background after start; later turns are unaffected.
+- "no API key for realtime provider": set `realtime.apiKey`, or `OPENAI_API_KEY` - remembering it is the fallback for every provider.
+- "has no default endpoint": you picked `azure` (or a custom deployment) without `realtime.baseUrl`.
+- "cloud open-mic needs echo cancellation": `realtime.bargeIn: "aec"` needs `aec: "webrtc"`, `aec: "hardware"`, or `realtime.aecAvailable: true`; otherwise fall back to `"gated"`.
+- An "install the extra" hint despite `[realtime]` being installed: check for a stale `websockets` older than 13; the extra requires `websockets>=13`.
+- The bot cuts itself off every turn on a cloud backend: your hardware does not actually cancel echo; unset `realtime.aecAvailable` and use `aec: "webrtc"` or `"gated"` instead.

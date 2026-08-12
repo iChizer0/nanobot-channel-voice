@@ -1,0 +1,102 @@
+[project]
+name = "nanobot-channel-voice"
+version = "0.1.0"
+description = "Voice (ASR/STT + TTS) channel for nanobot — talk to your agent over ALSA audio"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["nanobot", "voice", "speech", "asr", "stt", "tts", "vad", "realtime", "onnx", "rknn"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    # >= 0.3.0 discovers channels as nanobot.channels subpackages via a manifest
+    # (the force-include below), not the entry-point group 0.3.0 removed and warns
+    # about — this plugin targets the package contract only.
+    "nanobot-ai>=0.3.0",
+    "httpx>=0.24",  # openai/openai_compat TTS client (the default provider)
+]
+
+# Optional engine upgrades; the default stack (ALSA arecord/aplay + energy VAD +
+# OpenAI-compatible TTS) needs none of these.
+[project.optional-dependencies]
+webrtc = ["webrtcvad-wheels>=2.0.10"]   # higher-quality VAD (drop-in behind the VAD interface)
+pyalsa = ["pyalsaaudio>=0.10.0"]        # in-process libasound backend (audio.backend="pyalsa")
+# Everything on-device, over local ONNX/RKNN models supplied by path (never bundled):
+# STT whisper/sensevoice/zipformer, TTS mms/supertonic, VAD firered, end-of-turn
+# smartturn. onnxruntime is the CPU path; kaldi-native-fbank is the front-end
+# sensevoice/zipformer/firered share; the NPU (.rknn) path additionally needs [rknn].
+# Jetson: install a JetPack-matched `onnxruntime-gpu` wheel (Jetson Zoo, not PyPI)
+# and set executionProviders to the TensorRT/CUDA EPs — same .onnx, no re-export.
+ondevice = ["numpy>=1.23", "onnxruntime>=1.16", "kaldi-native-fbank>=1.15"]
+# Rockchip NPU runtime for .rknn artifacts, on top of [ondevice]:
+# `pip install 'nanobot-channel-voice[ondevice,rknn]'` on the board. PyPI has only
+# manylinux aarch64 cp37-cp312 wheels (no sdist), so the requirement is marker-scoped:
+# unscoped it fails universal resolvers (uv lock) and any x86/macOS/py3.13 install;
+# scoped, the extra is a clean no-op off-board (the .onnx CPU path needs nothing here),
+# and py3.13 boards need Rockchip's vendor wheel until cp313 ships. rknn-toolkit2
+# (the PC-side .onnx -> .rknn converter) is deliberately NOT a dependency: conversion
+# happens off-board.
+rknn = [
+    "rknn-toolkit-lite2>=2.3; platform_machine == 'aarch64' and sys_platform == 'linux' and python_version < '3.13'",
+]
+# Software echo cancellation (aec="webrtc"): WebRTC AEC3 via the maintained
+# livekit.rtc AudioProcessingModule binding — full-duplex barge-in without hardware
+# AEC, with our own synthesized playback as the reference signal. The wheel bundles
+# libwebrtc (large) and is imported only when configured.
+aec = ["livekit>=1.0"]
+# e2e speech-to-speech over the OpenAI Realtime API dialects (backend="openai"/...),
+# cloud-only and lazily imported. >=13 for the websockets.asyncio client: a 12.x
+# install fails the import with a misleading "install the extra" hint.
+realtime = ["websockets>=13"]
+# OpenTelemetry export of tool-call outcomes (telemetry.enabled); voice latency
+# stays in-process in VoiceMetrics. API only — TracerProvider/exporter wiring is
+# the host app's job, so this never fights its configuration — and lazily imported.
+otel = ["opentelemetry-api>=1.20"]
+# MMS-TTS text frontends for non-Latin languages (tts.mms.textFrontend): uroman
+# romanizes any script, japanese adds kanji-aware readings (pyopenjtalk -> uroman).
+# Lazily imported; if configured but missing, the provider degrades to system TTS.
+uroman = ["uroman>=1.3"]
+japanese = ["pyopenjtalk>=0.3", "uroman>=1.3"]
+
+[project.scripts]
+# On-device weights management + effective-config export; runs with no optional
+# extra installed (the weights commands are stdlib-only).
+nanobot-voice = "nanobot_channel_voice.cli:main"
+
+[dependency-groups]
+# The suite is hermetic by default — no audio hardware, model files, or network;
+# real-model regression tests skip unless reference exports are present.
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nanobot_channel_voice"]
+# nanobot >= 0.3.0 discovers channels as subpackages of nanobot.channels; shipping
+# the dependency-free manifest shim into that namespace is the ONLY registration
+# path. Only the leaf directory is included, so nanobot's own package files are
+# never overwritten. Core resolves through nanobot.channels' OWN directory, so an
+# editable CORE never sees the shim; an editable install of THIS dist is fine
+# (hatchling applies force-include there too).
+[tool.hatch.build.targets.wheel.force-include]
+"shim/nanobot/channels/voice" = "nanobot/channels/voice"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
