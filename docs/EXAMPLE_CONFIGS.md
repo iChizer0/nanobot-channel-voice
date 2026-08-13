@@ -401,6 +401,28 @@ The open-mic cloud example with the tuning applied (`[aec,webrtc,ondevice]` extr
 
 The turn model is an on-device engine like any other: the file extension picks the runtime, so a `.rknn` conversion (`rknn-toolkit2`, same as the other models) serves it from the NPU, with `"coreMask"` pinning it to its own core on a multi-core board, and a `weights` key works once an index serves one - `nanobot-voice sync` finds it there like in every other engine block and provisions it. A missing or unfetched model degrades loudly to silence-only endpointing, never a crash.
 
+### Debugging false barge-in by ear
+
+When the logs show `false barge-in (empty)` / `(echo)` / `(probe)` streaks and you want to know *what the pipeline actually heard*, turn on the audio dump:
+
+```json
+{
+  "channels": {
+    "voice": {
+      "debug": { "dumpAudio": true }
+    }
+  }
+}
+```
+
+Every endpointed capture segment is then written under `~/.local/share/nanobot-voice/dumps/<session>/` (override with `debug.dumpDir`) as `utt-<seq>-<HHMMSS>-<verdict>.wav`, the verdict matching the log line that judged it: `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `interrupt`, `publish`. With `aec: "webrtc"` each segment gets a `.raw.wav` twin holding the same span *before* cancellation. Reading the pair:
+
+- TTS clearly audible in the **post-AEC** file (`.wav`) -> the canceller is not converging (check `audio.playoutDelayMs`, give it a few seconds of clean playback to adapt, or the device is looping audio somewhere AEC3 can't model).
+- TTS audible only in the **`.raw.wav`** twin, post-AEC quiet -> AEC is doing its job; the trigger is something else (VAD floor, room noise, a real voice).
+- Real room sound in both -> not an echo problem at all: tune the VAD (`vad.firered.minVolume`, `bargeIn.duckStartFrames`) instead of the canceller.
+
+Segments are recordings of the room - leave `dumpAudio` off outside debugging sessions. Disk use is capped (`debug.dumpMaxMb`, default 200): old sessions are pruned at startup and the oldest segments of a long session are deleted first.
+
 ## Realtime
 
 Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback and routes the model's tool calls through nanobot's guarded `ToolRegistry` under `nanobot gateway`. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.
@@ -507,3 +529,4 @@ For CI, containers, or protocol work: the `null` backend captures nothing and di
 - "cloud open-mic needs echo cancellation": `realtime.bargeIn: "aec"` needs `aec: "webrtc"`, `aec: "hardware"`, or `realtime.aecAvailable: true`; otherwise fall back to `"gated"`.
 - An "install the extra" hint despite `[realtime]` being installed: check for a stale `websockets` older than 13; the extra requires `websockets>=13`.
 - The bot cuts itself off every turn on a cloud backend: your hardware does not actually cancel echo; unset `realtime.aecAvailable` and use `aec: "webrtc"` or `"gated"` instead.
+- Frequent `false barge-in (...)` log lines and you can't tell leak from real sound: set `debug.dumpAudio: true` and listen to the verdict-named segments (see "Debugging false barge-in by ear" above).

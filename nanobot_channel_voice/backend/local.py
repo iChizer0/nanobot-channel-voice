@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 
 from loguru import logger
 
@@ -32,6 +33,7 @@ from nanobot_channel_voice.aio import (
 from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_rms, pcm_to_wav_bytes, wav_duration_ms
 from nanobot_channel_voice.chunker import SentenceChunker
 from nanobot_channel_voice.config import VoiceConfig
+from nanobot_channel_voice.dump import AudioDumper, default_dump_root
 from nanobot_channel_voice.echo_reject import SelfEchoFilter
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.phrases import (
@@ -174,6 +176,7 @@ class _PendingUtterance:
     closed_by_silence: bool
     closed_at: float
     silence_ms: int = 0  # trailing silence the close consumed (Endpointer.closed_silence_ms)
+    raw: bytes | None = None  # pre-AEC span of pcm, for the audio dump (None = no AEC/dump)
     learn_ms: float | None = None  # adaptive-hangover candidate bound to THIS utterance
     eager_always_valid: bool = False
     # Early-confirm state, bound AT CLOSE: as instance-global latches a DIFFERENT queued
@@ -494,6 +497,37 @@ class LocalBackend(TurnEventMixin):
         self._probe_hold = False  # warmup/calibration probes: drop their hop samples
         self._warn_throttle = Throttle()
         self._log = logger.bind(component="voice")
+        # Audio dump (debug.dumpAudio): every endpointed segment leaves as a
+        # verdict-named WAV for by-ear false-barge-in triage. A setup failure costs
+        # the diagnostics, never the session.
+        self._dumper: AudioDumper | None = None
+        if config.debug.dump_audio:
+            try:
+                root = (
+                    Path(config.debug.dump_dir).expanduser()
+                    if config.debug.dump_dir
+                    else default_dump_root()
+                )
+                self._dumper = AudioDumper(
+                    root,
+                    config.audio.sample_rate,
+                    config.debug.dump_max_mb * 1024 * 1024,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("audio dump disabled ({})", exc)
+        self._endpointer.keep_rejected = self._dumper is not None
+        # Rolling pre-AEC mirror of capture for the .raw.wav twins, sized to one
+        # whole segment (pre-roll + confirm + max utterance). A segment is always
+        # the stream's trailing bytes, so its twin is a tail slice; without AEC the
+        # segment already IS the raw audio and no ring is kept.
+        self._dump_raw: deque[bytes] | None = None
+        if self._dumper is not None and aec is not None:
+            self._dump_raw = deque(
+                maxlen=config.vad.start_frames
+                + resolve_preroll_ms(config.vad, frame_ms) // frame_ms
+                + config.vad.max_utterance_ms // frame_ms
+                + 2
+            )
 
     def hold_hop_accounting(self, active: bool) -> None:
         """Warmup/calibration probes deliberately saturate the device while capture is
@@ -711,9 +745,11 @@ class LocalBackend(TurnEventMixin):
                         heard=heard,
                         onset_interrupting=self._onset_interrupting,
                         onset_at=self._onset_at,
+                        raw=self._raw_tail(len(utterance)),
                     )
                 )
             elif prev_speech and not self._endpointer.in_speech:
+                self._dump_blip()
                 self._release_duck("blip")  # rejected by the min filter mid-candidate
                 await self._orphan_if_confirmed("blip")
             return
@@ -735,6 +771,7 @@ class LocalBackend(TurnEventMixin):
                 self._metrics.count("stt_eager_start")
         elif prev_speech and not self._endpointer.in_speech and utterance is None:
             self._eager_valid = False  # blip rejected by the min filter; speculation is moot
+            self._dump_blip()
             self._release_duck("blip")
             await self._orphan_if_confirmed("blip")
         if utterance is not None:
@@ -763,8 +800,35 @@ class LocalBackend(TurnEventMixin):
                     heard=heard,
                     onset_interrupting=self._onset_interrupting,
                     onset_at=self._onset_at,
+                    raw=self._raw_tail(len(utterance)),
                 )
             )
+
+    def _raw_tail(self, nbytes: int) -> bytes | None:
+        """The last ``nbytes`` of pre-AEC capture: a segment's raw twin. Valid because
+        a segment is contiguous trailing audio and callers run between frame pushes
+        (or under the hop lock), so the ring cannot advance mid-slice."""
+        if self._dump_raw is None or nbytes <= 0:
+            return None
+        frames: list[bytes] = []
+        total = 0
+        for frame in reversed(self._dump_raw):
+            frames.append(frame)
+            total += len(frame)
+            if total >= nbytes:
+                break
+        data = b"".join(reversed(frames))
+        return data[-nbytes:] if len(data) > nbytes else data
+
+    def _dump_blip(self) -> None:
+        """A min-filter reject may still have engaged the duck: keep it audible.
+        No-op unless the endpointer parked one this frame (probe/gap drops reset
+        the slot first)."""
+        if self._dumper is None:
+            return
+        pcm, self._endpointer.last_rejected = self._endpointer.last_rejected, None
+        if pcm:
+            self._dumper.submit("blip", pcm, self._raw_tail(len(pcm)))
 
     def _candidate_contested(self) -> bool:
         """A duck/pause candidate is live and no confirm has claimed it. ``in_speech``
@@ -843,9 +907,14 @@ class LocalBackend(TurnEventMixin):
         with self._hop_lock:
             t0 = time.monotonic()
             if self._aec is not None:
+                raw = pcm
                 # Subtract our own playback BEFORE the endpointer/STT hear the frame, so echo
                 # never becomes "speech".
                 pcm = self._aec.process(pcm)
+                if self._dump_raw is not None:
+                    # process() floors to whole 10 ms blocks: mirror only what the
+                    # pipeline heard, or later raw twins slice misaligned.
+                    self._dump_raw.append(raw if len(raw) == len(pcm) else raw[: len(pcm)])
             utterance = self._push_with_model_close(pcm)
             if utterance is not None:
                 # Closed: the ring's pre-onset context belongs to THIS utterance, not to a fast
@@ -910,14 +979,18 @@ class LocalBackend(TurnEventMixin):
     async def _utterance_worker(self) -> None:
         while True:
             pending = await self._utt_queue.get()
+            verdict = "error"
             try:
-                await self._on_utterance(pending)
+                verdict = await self._on_utterance(pending)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one bad utterance must not kill the worker
                 self._log.warning("utterance processing failed: {}", exc)
             finally:
                 self._utt_queue.task_done()
+            if self._dumper is not None:
+                # Post-verdict, so the filename carries the ladder's outcome.
+                self._dumper.submit(verdict, pending.pcm, pending.raw)
 
     async def barge_in(self, played_ms: int) -> None:
         return  # cloud-only
@@ -947,19 +1020,32 @@ class LocalBackend(TurnEventMixin):
         """The capture stream broke (device restart). The endpointer's clock is frame-counted:
         with no frames flowing, an open utterance silently bridges the outage and merges two
         sentences into one, so drop it, with its STT stream handle and any speculative duck."""
+        snap: bytes | None = None
+        raw: bytes | None = None
+
         def _reset() -> None:
+            nonlocal snap, raw
             with self._hop_lock:
                 if self._endpointer.in_speech:
                     self._log.warning("capture gap mid-utterance; dropping the open utterance")
                     self._metrics.count("capture_gap_drop")
+                    if self._dumper is not None:
+                        snap = self._endpointer.open_pcm()
+                        raw = self._raw_tail(len(snap)) if snap else None
                 self._stt_live = None
                 self._endpointer.reset()
                 self._recent.clear()
+                if self._dump_raw is not None:
+                    # Pre-gap audio no longer abuts the stream; never splice it
+                    # into a later segment's raw twin.
+                    self._dump_raw.clear()
 
         if self._threaded_hop:
             await asyncio.to_thread(_reset)
         else:
             _reset()
+        if snap is not None and self._dumper is not None:
+            self._dumper.submit("gap", snap, raw)
         # The dropped utterance's speculation dies with it: a still-valid eager
         # task would hand the PRE-GAP transcript to the next utterance's close.
         self._eager_valid = False
@@ -995,10 +1081,15 @@ class LocalBackend(TurnEventMixin):
             if engine is not None:
                 with suppress(Exception):
                     engine.release()
+        if self._dumper is not None:
+            await asyncio.to_thread(self._dumper.close)
 
     # ---- input: capture -> STT -> publish (bus) --------------------------
 
-    async def _on_utterance(self, pending: _PendingUtterance) -> None:
+    async def _on_utterance(self, pending: _PendingUtterance) -> str:
+        """Run the verdict ladder over one closed utterance. Returns the verdict token
+        (``empty``/``echo``/``stop``/``ack``/``interrupt``/``publish``) - the audio
+        dump names the segment's file with it."""
         pcm = pending.pcm
         interrupting = self._turn in (VoiceState.THINKING, VoiceState.SPEAKING)
         preempted, heard = pending.preempted, pending.heard
@@ -1028,7 +1119,7 @@ class LocalBackend(TurnEventMixin):
                 await self._orphaned_confirm("empty")
             elif self._turn is VoiceState.CAPTURING:
                 await self._set_turn(VoiceState.IDLE)  # no drain, no hangover
-            return
+            return "empty"
 
         # A transcript that is mostly the bot's own words is self-echo: drop it WHATEVER the
         # turn state or duplex mode. The trailing echo closes its VAD hangover (~600 ms) after
@@ -1055,7 +1146,7 @@ class LocalBackend(TurnEventMixin):
                     " ".join(fresh_seq), heard,
                     interrupting=interrupting, preempted=preempted,
                 )
-                return
+                return "stop"
             if (interrupting or preempted) and (
                 len(fresh) >= self._min_fresh_words
                 or self._stop_match.present(fresh_seq)
@@ -1079,7 +1170,7 @@ class LocalBackend(TurnEventMixin):
                     # The trailing echo's vad_start put us in CAPTURING; without this settle the
                     # session sits there until the user speaks.
                     await self._set_turn(VoiceState.IDLE)
-                return
+                return "echo"
 
         # Stop command aimed at a live reply: kill it and CONSUME the utterance — publishing
         # "stop" would make the agent answer it ("okay, stopping"), the exact reply the user
@@ -1097,7 +1188,7 @@ class LocalBackend(TurnEventMixin):
             await self._consume_stop(
                 text, heard, interrupting=interrupting, preempted=preempted
             )
-            return
+            return "stop"
 
         # Backchannel ("okay", "uh-huh") while the bot works/speaks: keep the reply. A wrong
         # call costs only ~a second of duck, hence a lexicon, not a classifier.
@@ -1112,7 +1203,7 @@ class LocalBackend(TurnEventMixin):
             self._release_duck("ack")
             if preempted:
                 await self._orphaned_confirm("ack")
-            return
+            return "ack"
 
         # Anchor at the TRUE end of speech, only for ACCEPTED utterances (a rejected echo/empty
         # must not corrupt a live turn's clock): back-date past STT time and queue wait to the
@@ -1138,7 +1229,7 @@ class LocalBackend(TurnEventMixin):
             "utterance: '{}' (stt {} ms, interrupt={})",
             loggable_text(text, self._cfg.log_transcripts, 80), stt_ms, interrupting,
         )
-        _, heard = await self._kill_live_reply(
+        killed, heard = await self._kill_live_reply(
             interrupting=interrupting, preempted=preempted, heard=heard
         )
         # After a preempted turn the sink can still be ducked from a candidate raised during the
@@ -1161,6 +1252,7 @@ class LocalBackend(TurnEventMixin):
         await self._publish_text("\n\n".join(parts), self._cur_turn.token)
         self._arm_prologue()
         self._arm_timeout()
+        return "interrupt" if killed else "publish"
 
     async def _do_interrupt(self) -> str | None:
         """Cancel-then-send barge-in: invalidate the dead turn, stop audio, /stop.
@@ -1352,8 +1444,16 @@ class LocalBackend(TurnEventMixin):
         state and the pre-onset ring, whose context belonged to the dropped candidate (the
         same rule as the close/capture-gap drops) — then the pause releases and
         re-engagement holds off briefly."""
+        snap: bytes | None = None
+        raw: bytes | None = None
+
         def _reset() -> None:
+            nonlocal snap, raw
             with self._hop_lock:
+                if self._dumper is not None:
+                    # Last moment this audio exists: snapshot the leak evidence.
+                    snap = self._endpointer.open_pcm()
+                    raw = self._raw_tail(len(snap)) if snap else None
                 self._stt_live = None
                 self._endpointer.reset()
                 self._recent.clear()
@@ -1362,6 +1462,8 @@ class LocalBackend(TurnEventMixin):
             await asyncio.to_thread(_reset)
         else:
             _reset()
+        if snap is not None and self._dumper is not None:
+            self._dumper.submit(reason, snap, raw)
         self._eager_valid = False
         self._probe_holdoff_until = time.monotonic() + _ENGAGE_HOLDOFF_S
         self._release_duck(reason)

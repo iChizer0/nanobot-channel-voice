@@ -543,6 +543,24 @@ class TelemetryConfig(_VoiceBase):
     capture_content: bool = False
 
 
+class DebugConfig(_VoiceBase):
+    """Diagnostics (local backend). ``dumpAudio`` writes every endpointed capture
+    segment as a WAV named by the pipeline's verdict (``publish``/``interrupt``/
+    ``empty``/``echo``/``ack``/``stop``/``blip``/``probe``/``gap``), so a false
+    barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the
+    same span pre-cancellation (TTS audible there but not in the post-AEC file = the
+    canceller works and the trigger is acoustic). Segments are recordings of the
+    operator's room: leave this off outside debugging sessions."""
+
+    dump_audio: bool = False
+    # Root for the per-session dump directories. None => the weights-store
+    # convention: $XDG_DATA_HOME|~/.local/share/nanobot-voice/dumps.
+    dump_dir: str | None = None
+    # Best-effort disk cap over the root: older sessions are pruned first, then the
+    # live session's oldest segments, so the most recent evidence survives.
+    dump_max_mb: int = Field(default=200, ge=1)
+
+
 class BargeInConfig(_VoiceBase):
     """Confirm-stage policy for the local open-mic modes (duck-then-confirm). The duck depth
     itself is the top-level ``duckDb``.
@@ -679,6 +697,7 @@ class VoiceConfig(_VoiceBase):
     perf: PerfConfig = Field(default_factory=PerfConfig)
     realtime: RealtimeConfig = Field(default_factory=RealtimeConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    debug: DebugConfig = Field(default_factory=DebugConfig)
 
     @model_validator(mode="before")
     @classmethod

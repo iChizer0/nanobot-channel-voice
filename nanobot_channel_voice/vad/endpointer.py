@@ -73,6 +73,10 @@ class Endpointer:
         # normal bar. Written from the loop, read per-frame (possibly on the hop
         # thread): GIL-atomic int/None, no lock needed.
         self.start_frames_override: int | None = None
+        # Audio-dump support: with keep_rejected set, a min-filter reject parks its
+        # audio in last_rejected instead of vanishing; the caller consumes the slot.
+        self.keep_rejected = False
+        self.last_rejected: bytes | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -87,6 +91,7 @@ class Endpointer:
         self._consult = None
         self._consult_active = None
         self._pretrigger.clear()
+        self.last_rejected = None
         self._vad.reset()
 
     def set_hangover_ms(self, ms: int) -> None:
@@ -129,6 +134,11 @@ class Endpointer:
         candidate dies. Meaningful only while ``in_speech`` is False (it freezes at
         onset): the duck-on-suspicion hook reads it to react a few frames early."""
         return self._speech_run
+
+    def open_pcm(self) -> bytes | None:
+        """Snapshot of the OPEN utterance (pre-roll included), None when idle: what
+        a probe/gap drop is about to discard."""
+        return bytes(self._buf) if self._in_speech else None
 
     def take_eager(self) -> bytes | None:
         """Consume the snapshot taken at the eager mark, if any since the last call.
@@ -233,5 +243,7 @@ class Endpointer:
             # (mirrors the s2s reference's active_speech_samples).
             long_enough = self._active >= self._min_frames
             self.reset()
+            if not long_enough and self.keep_rejected:
+                self.last_rejected = utterance  # after reset(), which clears the slot
             return utterance if long_enough else None
         return None
