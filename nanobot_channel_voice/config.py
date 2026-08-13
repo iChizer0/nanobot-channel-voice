@@ -332,7 +332,9 @@ class WhisperSttConfig(OnDeviceRuntime):
     # take the top candidate. Raise on a quantized (.rknn int8) model, where a 99-way logit
     # comparison degrades faster than greedy decoding does.
     language_min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    chunk_length: int = Field(default=20, ge=1)  # seconds; MUST match the exported model
+    # Seconds; MUST match the exported model. A decode window, not a cap: longer audio
+    # is decoded in window-sized pieces (stt/base.py transcribe_chunked).
+    chunk_length: int = Field(default=20, ge=1)
 
 
 class SttServeConfig(_VoiceBase):

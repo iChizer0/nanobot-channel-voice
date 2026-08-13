@@ -213,7 +213,7 @@ On a multi-core NPU, e.g., RK3588, swap in that board's own `rknn.rk3588` keys a
 
 #### Wiring it by hand, without an index
 
-For converted-it-yourself models or an air-gapped box, name every artifact directly. Explicit `*Path` fields always win over a `weights` key, and the two styles mix freely per engine, so drop these blocks in place of the ones above. `chunkLength` and `maxLength` must match the exported models; the Whisper and MMS exports follow Rockchip's `rknn_model_zoo` demos, and you convert `.onnx` to `.rknn` on a PC with `rknn-toolkit2`.
+For converted-it-yourself models or an air-gapped box, name every artifact directly. Explicit `*Path` fields always win over a `weights` key, and the two styles mix freely per engine, so drop these blocks in place of the ones above. `chunkLength` and `maxLength` must match the exported models; the Whisper and MMS exports follow Rockchip's `rknn_model_zoo` demos, and you convert `.onnx` to `.rknn` on a PC with `rknn-toolkit2`. `chunkLength` is a decode window, not a cap: audio longer than it (a `vad.maxUtteranceMs`-sized utterance, a WebUI dictation through `stt.serve`) is decoded in window-sized pieces cut at the quietest gap and joined, so there is no need to re-export a longer window for long speech.
 
 ```json
 "vad": {

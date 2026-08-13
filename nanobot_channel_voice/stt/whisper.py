@@ -102,6 +102,7 @@ class WhisperOnDeviceStt(SttAdapter):
             self._blocked[self._suppressed_ids] = True
         # Encoder time dim; from_config prefers the export's own when it declares one.
         self._max_frames = max_frames or chunk_length * 100
+        self.max_decode_ms = self._max_frames * 10  # mel hop = 10 ms at 16 kHz
         self._log = logger.bind(component="stt-whisper")
 
     @classmethod
@@ -214,7 +215,7 @@ class WhisperOnDeviceStt(SttAdapter):
             if mel.shape[1] > self._max_frames:
                 self._log.warning(
                     "utterance ({:.1f}s) exceeds the {:.0f}s encoder window; tail dropped "
-                    "-- lower vad.maxUtteranceMs or re-export with a longer chunkLength",
+                    "-- long audio belongs on transcribe_chunked",
                     mel.shape[1] * HOP_LENGTH / SAMPLE_RATE,
                     self._max_frames * HOP_LENGTH / SAMPLE_RATE,
                 )

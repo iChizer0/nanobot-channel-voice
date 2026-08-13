@@ -11,10 +11,10 @@ from loguru import logger
 
 from nanobot_channel_voice.config import SttConfig
 from nanobot_channel_voice.engines import EngineSpec, describe_build_error, missing_fields
-from nanobot_channel_voice.stt.base import SttAdapter, write_temp_wav
+from nanobot_channel_voice.stt.base import SttAdapter, transcribe_chunked, write_temp_wav
 from nanobot_channel_voice.weights import WeightsError, apply_weights
 
-__all__ = ["SttAdapter", "make_stt", "write_temp_wav"]
+__all__ = ["SttAdapter", "make_stt", "transcribe_chunked", "write_temp_wav"]
 
 
 def _build_whisper(cfg: SttConfig) -> SttAdapter:

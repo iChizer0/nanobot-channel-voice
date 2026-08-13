@@ -28,7 +28,7 @@ from contextlib import suppress
 from loguru import logger
 
 from nanobot_channel_voice.config import SttServeConfig
-from nanobot_channel_voice.stt.base import SttAdapter
+from nanobot_channel_voice.stt.base import SttAdapter, transcribe_chunked
 
 _ROUTE = ("POST", "/v1/audio/transcriptions")
 _HEADER_TIMEOUT_S = 10.0
@@ -133,7 +133,9 @@ class SttHttpServer:
                 audio, filename = _multipart_file(headers.get("content-type", ""), body)
                 pcm, rate = await self._ingest(audio, filename)
                 async with self._lock:
-                    text = await self._adapter.transcribe(pcm, rate)
+                    # Chunked: uploads (WebUI dictation runs to 120 s, the ingest cap to
+                    # 300 s) routinely outrun a fixed decode window.
+                    text = await transcribe_chunked(self._adapter, pcm, rate)
                 payload = json.dumps({"text": text}, ensure_ascii=False).encode()
                 self._respond(writer, 200, "OK", payload)
             except _HttpError as exc:

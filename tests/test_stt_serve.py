@@ -21,6 +21,8 @@ from nanobot_channel_voice.stt.serve import SttHttpServer
 class FakeAdapter:
     """Records calls; detects overlapping decodes (the singleton must serialize)."""
 
+    max_decode_ms: int | None = None
+
     def __init__(self, text: str = "hello world"):
         self.text = text
         self.calls: list[tuple[int, int]] = []
@@ -260,6 +262,21 @@ def test_long_wav_is_truncated_at_the_decode_ceiling():
         assert adapter.calls == [(serve_mod._MAX_DECODE_S * rate * 2, rate)]
 
     run(_with_server(case))
+
+
+def test_upload_past_the_adapter_window_decodes_in_pieces():
+    pytest.importorskip("numpy")
+    adapter = FakeAdapter(text="hi")
+    adapter.max_decode_ms = 100
+
+    async def case(server, adapter):
+        resp = await _post(server, files=_files(wav_bytes(frames=6400)))  # 400 ms
+        assert resp.status_code == 200
+        assert resp.json() == {"text": "hi hi hi hi"}
+        assert [n for n, _ in adapter.calls] == [3200] * 4  # lossless, window-sized
+        assert not adapter.overlapped  # pieces decode sequentially, under the lock
+
+    run(_with_server(case, adapter=adapter))
 
 
 def test_multipart_payload_survives_crlf_and_near_boundary_bytes():

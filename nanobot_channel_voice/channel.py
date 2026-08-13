@@ -39,7 +39,7 @@ from nanobot_channel_voice.config import (
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
 from nanobot_channel_voice.streamid import started_ns, unique_token
-from nanobot_channel_voice.stt import SttAdapter, make_stt, write_temp_wav
+from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, write_temp_wav
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
 from nanobot_channel_voice.vad import make_turn_analyzer, make_vad
@@ -406,17 +406,15 @@ class VoiceChannel(BaseChannel):
         self.logger.info("voice channel stopped")
 
     def _build_local(self) -> tuple[VoiceShell, str, list]:
-        if (
-            self.config.stt.provider == "whisper"
-            and self.config.vad.max_utterance_ms > self.config.stt.whisper.chunk_length * 1000
-        ):
-            # Not fatal (each truncated utterance warns), but the defaults (30 s cap vs a
-            # 20 s encoder window) guarantee it, so say so once at startup.
-            self.logger.warning(
-                "vad.maxUtteranceMs ({}) exceeds whisper's {}s encoder window; "
-                "max-length utterances will lose their tail; lower "
-                "vad.maxUtteranceMs or re-export with a longer chunkLength",
-                self.config.vad.max_utterance_ms, self.config.stt.whisper.chunk_length,
+        # The adapter's window, not config: a whisper export may override chunkLength.
+        window = None if self._stt is None else self._stt.max_decode_ms
+        if window is not None and self.config.vad.max_utterance_ms > window:
+            # The whisper defaults land here (30 s cap vs a 20 s export); harmless —
+            # long captures decode in pieces — but say once where the seams come from.
+            self.logger.info(
+                "stt decode window ({:.0f}s) is under vad.maxUtteranceMs ({}); longer "
+                "utterances are decoded in window-sized pieces cut at the quietest gap",
+                window / 1000, self.config.vad.max_utterance_ms,
             )
         if self.config.stt.provider == "zipformer" and self.config.audio.sample_rate != 16000:
             # The streaming path feeds raw capture frames to the model unresampled (only
@@ -808,7 +806,9 @@ class VoiceChannel(BaseChannel):
 
     async def _transcribe_pcm(self, pcm: bytes) -> str:
         if self._stt is not None:
-            return await self._stt.transcribe(pcm, self.config.audio.sample_rate)
+            # Chunked: vad.maxUtteranceMs may exceed the adapter's decode window (the
+            # defaults do for whisper: 30 s cap vs a 20 s export).
+            return await transcribe_chunked(self._stt, pcm, self.config.audio.sample_rate)
         # No on-device STT: hand a WAV to nanobot's transcription layer (cloud, or a local
         # Whisper server). Off the loop: a ~1 MB mkstemp+wave write and its unlink can
         # stall an SD-card SBC for tens of ms, and capture, VAD and sink pacing share it.

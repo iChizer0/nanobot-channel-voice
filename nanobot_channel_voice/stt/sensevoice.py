@@ -104,6 +104,10 @@ def ctc_greedy(ids) -> list[int]:
 
 
 class SenseVoiceOnDeviceStt(SttAdapter):
+    # Not an export bound (T is dynamic): SAN-M attention activations grow O(T^2) and
+    # the training audio is short-form, so past ~30 s memory and accuracy both slide.
+    max_decode_ms = 30_000
+
     def __init__(
         self,
         *,

@@ -32,6 +32,21 @@ def make_adapter(script: list[int], vocab: dict[str, str]) -> w.WhisperOnDeviceS
     )
 
 
+def test_decode_window_follows_the_export():
+    vocab = {"50257": "<|endoftext|>"}
+    assert make_adapter([50257], vocab).max_decode_ms == 20_000  # chunkLength fallback
+    adapter = w.WhisperOnDeviceStt(
+        encoder=None,
+        decoder=_ScriptedDecoder([50257]),
+        vocab=vocab,
+        mel_filters=np.zeros((1, 1), dtype=np.float32),
+        lang_token=50259,
+        chunk_length=20,
+        max_frames=3000,
+    )
+    assert adapter.max_decode_ms == 30_000  # the export's own window wins
+
+
 def test_specials_and_timestamps_never_reach_transcript():
     """Regression: non-timestamp specials (50258-50363) passed the old
     EOT/timestamp-only filter, so a greedy <|nospeech|> pick on noise
