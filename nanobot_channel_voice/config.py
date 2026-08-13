@@ -281,14 +281,18 @@ class VadConfig(_VoiceBase):
 
 class SenseVoiceSttConfig(OnDeviceRuntime):
     """On-device SenseVoice-Small (``stt.provider="sensevoice"``): non-autoregressive CTC,
-    one model for zh/yue/en/ja/ko, ~5-15x faster than Whisper on CPU. Use the sherpa-onnx
-    export: its ONNX metadata carries the whole front-end contract (CMVN/LFR/language ids),
-    so only the model and ``tokens.txt`` are supplied by path. int8 recommended (faster AND
-    smaller for ASR; REPORT-asr-tts-model-survey.md section 6.1)."""
+    one model for zh/yue/en/ja/ko, ~5-15x faster than Whisper on CPU. Consumes the
+    ORIGINAL FunASR export — the dynamic `.onnx` (CPU; int8 recommended, faster AND
+    smaller for ASR: REPORT-asr-tts-model-survey.md section 6.1) or the static
+    mask-input `.rknn` port (NPU, fp16 — int8 collapses this model) — plus the
+    exporter's ``frontend.json`` sidecar and ``tokens.txt``."""
 
     model_path: str | None = None
     tokens_path: str | None = None
-    language: str = "auto"  # auto/zh/en/ja/ko/yue, validated against the model metadata
+    # CMVN/LFR stats, language/itn id tables (FunASR runtime constants, in no model
+    # artifact), feats_len (.rknn window); auto-resolved from the weights store.
+    frontend_path: str | None = None
+    language: str = "auto"  # auto/zh/en/ja/ko/yue, validated against the sidecar
     use_itn: bool = True    # inverse text normalization: numbers/punctuation written out
 
 

@@ -56,6 +56,10 @@ def _load_rknn(path: str, *, core_mask: str, target: str | None, device_id: str 
         if rknn.init_runtime(core_mask=_core_mask(RKNNLite, core_mask)) != 0:
             rknn.release()
             raise RuntimeError(f"failed to init RKNNLite runtime for: {path}")
+        # Drop lite2's copy of the whole model file — dead weight once init_runtime has
+        # loaded the NPU (487 MB for SenseVoice); getattr: absent on the full toolkit.
+        if getattr(rknn, "rknn_data", None) is not None:
+            rknn.rknn_data = None
         return rknn
 
     from rknn.api import RKNN

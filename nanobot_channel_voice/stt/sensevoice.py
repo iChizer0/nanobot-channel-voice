@@ -1,26 +1,35 @@
-"""On-device SenseVoice-Small ASR (ONNX), the sherpa-onnx export.
+"""On-device SenseVoice-Small ASR over the ORIGINAL FunASR export (ONNX / RKNN).
 
 Non-autoregressive CTC (one encoder pass, greedy per-frame argmax): ~5-15x faster than
 Whisper on CPU and immune to hallucination loops (REPORT-asr-tts-model-survey.md 2.2);
 one model covers zh / yue / en / ja / ko plus emotion/event tags.
 
-I/O contract, verified against the pinned artifact
-(``sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17``, 2026-07-29): inputs
-``x [N,T,560]`` float32 (80-mel fbank x LFR window 7) plus per-row int32 ``x_length``,
-``language``, ``text_norm``; output ``logits [N,T,25055]`` (CTC over the SentencePiece
-vocab). The whole FRONT-END CONTRACT rides in the ONNX metadata (``neg_mean`` /
-``inv_stddev`` 560-dim CMVN, ``lfr_window_size/shift``, the language / itn ids,
-``normalize_samples=0`` = int16-scale waveform), so there is no side-file to mismatch;
-``.rknn`` exports have no metadata surface and are rejected. The model prepends its 4
-query embeddings INSIDE the graph, so this side supplies only real audio frames;
-``tokens.txt`` is ``<token> <id>``, columns reversed vs the Whisper vocab files.
+Both artifacts are converted from the upstream weights by the project's exporter, which
+writes a ``frontend.json`` sidecar (560-dim CMVN, LFR window/shift, the language / itn
+id tables — FunASR runtime constants living in NO model artifact — and the .rknn's
+``feats_len``) plus a ``<token> <id>`` ``tokens.txt`` (columns reversed vs the Whisper
+vocab files). Dispatch is on the file extension:
+
+- ``.onnx`` — the official dynamic export (upstream ``export_meta.py``): inputs
+  ``speech [N,T,560]`` float32 (80-mel fbank x LFR window 7, int16-scale waveform)
+  plus int32 ``speech_lengths`` / ``language`` / ``textnorm``; outputs
+  ``ctc_logits [N,4+T,25055]`` + ``encoder_out_lens``.
+- ``.rknn`` — the static mask-input port: ``speech [1,L,560]`` zero-padded to the
+  export window, a multiplicative ``mask [1,1,1,L+4]`` (1 = 4 query + valid frames),
+  ``language``, ``textnorm``; ``ctc_logits [1,L+4,25055]`` decoded over frames
+  ``0..4+n_valid`` (the padded tail's logits are meaningless).
+
+The model prepends its 4 query embeddings INSIDE the graph (those frames yield the
+rich-transcription tags), so this side supplies only real audio frames.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from contextlib import ExitStack
+from pathlib import Path
 
 import numpy as np
 from loguru import logger
@@ -58,9 +67,15 @@ def _apply_lfr(feats: np.ndarray, m: int, n: int) -> np.ndarray:
 
 class _Frontend:
     """FunASR's WavFrontend: fbank (hamming, 25/10 ms, int16-scale waveform) + LFR +
-    CMVN, the CMVN stats taken from the model metadata."""
+    CMVN, the CMVN stats taken from the frontend.json sidecar."""
 
     def __init__(self, neg_mean: np.ndarray, inv_stddev: np.ndarray, lfr_m: int, lfr_n: int):
+        dim = _NUM_MEL_BINS * lfr_m
+        if neg_mean.size != dim or inv_stddev.size != dim:
+            raise RuntimeError(
+                f"SenseVoice CMVN stats must be {dim}-dim (80 mel x LFR {lfr_m}), "
+                f"got {neg_mean.size}/{inv_stddev.size}"
+            )
         import kaldi_native_fbank as knf  # lazy: [ondevice] extra
 
         self._knf = knf
@@ -104,8 +119,8 @@ def ctc_greedy(ids) -> list[int]:
 
 
 class SenseVoiceOnDeviceStt(SttAdapter):
-    # Not an export bound (T is dynamic): SAN-M attention activations grow O(T^2) and
-    # the training audio is short-form, so past ~30 s memory and accuracy both slide.
+    # Dynamic-.onnx policy bound (O(T^2) SAN-M activations, short-form training audio:
+    # past ~30 s memory and accuracy slide); a static .rknn window tightens it per instance.
     max_decode_ms = 30_000
 
     def __init__(
@@ -116,54 +131,73 @@ class SenseVoiceOnDeviceStt(SttAdapter):
         frontend: _Frontend,
         language_id: int,
         text_norm_id: int,
+        feats_len: int | None = None,
     ):
         self._model = model
         self._tokens = tokens
         self._frontend = frontend
         self._language_id = language_id
         self._text_norm_id = text_norm_id
+        # None = dynamic-length .onnx; an int = the static .rknn window (frames).
+        self._feats_len = feats_len
+        if feats_len is not None:
+            # One frame = lfr_n fbank hops of 10 ms.
+            self.max_decode_ms = min(self.max_decode_ms, feats_len * frontend._lfr_n * 10)
         self.last_tags = ""  # stripped rich-transcription tags, for observers
         self._log = logger.bind(component="stt-sensevoice")
+
+    @staticmethod
+    def _load_sidecar(path: str) -> tuple[_Frontend, dict[str, int], dict[str, int], int | None]:
+        """``frontend.json`` -> (front end, language ids, textnorm ids, feats_len)."""
+        try:
+            side = json.loads(Path(path).read_text())
+            frontend = _Frontend(
+                np.fromiter((float(v) for v in side["neg_mean"].split(",")), np.float32),
+                np.fromiter((float(v) for v in side["inv_stddev"].split(",")), np.float32),
+                lfr_m=int(side.get("lfr_window_size", 7)),
+                lfr_n=int(side.get("lfr_window_shift", 6)),
+            )
+            langs = {str(k).lower(): int(v) for k, v in side["languages"].items()}
+            norms = {
+                "withitn": int(side["textnorm"]["withitn"]),
+                "woitn": int(side["textnorm"]["woitn"]),
+            }
+            feats_len = int(side["feats_len"]) if "feats_len" in side else None
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"bad SenseVoice frontend sidecar {path}: {exc!r}") from exc
+        return frontend, langs, norms, feats_len
 
     @classmethod
     def from_config(cls, cfg: SenseVoiceSttConfig) -> SenseVoiceOnDeviceStt:
         sv = cfg
+        # Sidecar first: a bad pairing must fail BEFORE the expensive model load.
+        frontend, langs, norms, feats_len = cls._load_sidecar(sv.frontend_path)  # type: ignore[arg-type]
+        if sv.language.lower() not in langs:
+            raise RuntimeError(
+                f"SenseVoice language '{sv.language}' not in the model (has: {', '.join(sorted(langs))})"
+            )
+        if not str(sv.model_path).endswith(".rknn"):
+            feats_len = None  # the window is .rknn-only; the .onnx graph is dynamic
+        elif feats_len is None:
+            raise RuntimeError(f"SenseVoice .rknn sidecar {sv.frontend_path} lacks feats_len")
         with ExitStack() as models:  # any failure below releases the loaded model
             model = models.enter_context(OnDeviceModel(
                 sv.model_path,  # type: ignore[arg-type]
                 core_mask=sv.core_mask, target=sv.target, device_id=sv.device_id,
                 providers=sv.execution_providers, provider_options=sv.provider_options,
             ))
-            md = model.metadata()
-            if "neg_mean" not in md or "inv_stddev" not in md:
-                raise RuntimeError(
-                    "SenseVoice model carries no front-end metadata (neg_mean/inv_stddev); "
-                    "use the sherpa-onnx .onnx export (.rknn is not supported yet)"
-                )
-            lang_key = f"lang_{sv.language.lower()}"
-            if lang_key not in md:
-                known = sorted(k.removeprefix("lang_") for k in md if k.startswith("lang_"))
-                raise RuntimeError(
-                    f"SenseVoice language '{sv.language}' not in the model (has: {', '.join(known)})"
-                )
-            neg_mean = np.fromiter(
-                (float(v) for v in md["neg_mean"].split(",")), dtype=np.float32
-            )
-            inv_stddev = np.fromiter(
-                (float(v) for v in md["inv_stddev"].split(",")), dtype=np.float32
-            )
-            frontend = _Frontend(
-                neg_mean, inv_stddev,
-                lfr_m=int(md.get("lfr_window_size", 7)),
-                lfr_n=int(md.get("lfr_window_shift", 6)),
-            )
             adapter = cls(
                 model=model,
                 tokens=read_token_table(sv.tokens_path),  # type: ignore[arg-type]
                 frontend=frontend,
-                language_id=int(md[lang_key]),
-                text_norm_id=int(md["with_itn" if sv.use_itn else "without_itn"]),
+                language_id=langs[sv.language.lower()],
+                text_norm_id=norms["withitn" if sv.use_itn else "woitn"],
+                feats_len=feats_len,
             )
+            # Contract probe doubling as warmup: a stale artifact (sherpa input names,
+            # wrong feats_len) raises here, where the registry degrades loudly — via
+            # _decode, not _transcribe_sync, whose blanket except would swallow it.
+            adapter._decode(adapter._frontend.compute(np.zeros(SAMPLE_RATE, dtype=np.float32)))
             models.pop_all()  # success: the adapter owns the model now
             return adapter
 
@@ -175,26 +209,54 @@ class SenseVoiceOnDeviceStt(SttAdapter):
             return ""
         return await asyncio.to_thread(self._transcribe_sync, pcm, sample_rate)
 
-    async def warmup(self) -> None:
-        await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
-
     def _transcribe_sync(self, pcm: bytes, sample_rate: int) -> str:
         try:
-            # normalize_samples=0 in the export: the model wants int16-SCALE values.
+            # FunASR's WavFrontend feeds kaldi fbank int16-SCALE values.
             audio = pcm_to_float_mono(pcm, sample_rate, SAMPLE_RATE) * 32768.0
             feats = self._frontend.compute(audio)
             if feats.shape[0] == 0:
                 return ""
-            logits = self._model.run([
-                ("x", feats[None, ...]),
-                ("x_length", np.array([feats.shape[0]], dtype=np.int32)),
-                ("language", np.array([self._language_id], dtype=np.int32)),
-                ("text_norm", np.array([self._text_norm_id], dtype=np.int32)),
-            ])[0]
-            ids = ctc_greedy(np.asarray(logits)[0].argmax(axis=-1))
-            text = "".join(self._tokens.get(i, "") for i in ids)
+            text = "".join(self._tokens.get(i, "") for i in self._decode(feats))
             self.last_tags = "".join(_TAG_RE.findall(text))
             return _TAG_RE.sub("", text).replace("▁", " ").strip()
         except Exception as exc:  # noqa: BLE001 - never let STT crash the capture loop
             self._log.warning("on-device SenseVoice STT failed: {}", exc)
             return ""
+
+    def _decode(self, feats: np.ndarray) -> list[int]:
+        return self._decode_dynamic(feats) if self._feats_len is None else self._decode_static(feats)
+
+    def _decode_dynamic(self, feats: np.ndarray) -> list[int]:
+        """The .onnx contract (official FunASR export): dynamic T, lengths by value."""
+        logits = self._model.run([
+            ("speech", feats[None, ...]),
+            ("speech_lengths", np.array([feats.shape[0]], dtype=np.int32)),
+            ("language", np.array([self._language_id], dtype=np.int32)),
+            ("textnorm", np.array([self._text_norm_id], dtype=np.int32)),
+        ])[0]
+        return ctc_greedy(np.asarray(logits)[0].argmax(axis=-1))
+
+    def _decode_static(self, feats: np.ndarray) -> list[int]:
+        """The .rknn static contract: zero-pad to the export window, multiplicative
+        mask over the 4 query + valid frames, decode only those frames (the padded
+        tail's logits are meaningless)."""
+        window = self._feats_len
+        assert window is not None
+        n_valid = feats.shape[0]
+        if n_valid > window:  # direct callers only: transcribe_chunked cuts to the window
+            self._log.warning(
+                "utterance has {} feature frames, over the {}-frame export window; "
+                "truncating the tail", n_valid, window,
+            )
+            n_valid = window
+        speech = np.zeros((1, window, feats.shape[1]), dtype=np.float32)
+        speech[0, :n_valid] = feats[:n_valid]
+        mask = np.zeros((1, 1, 1, window + 4), dtype=np.float32)
+        mask[0, 0, 0, : 4 + n_valid] = 1.0
+        logits = self._model.run([
+            ("speech", speech),
+            ("mask", mask),
+            ("language", np.array([self._language_id], dtype=np.int32)),
+            ("textnorm", np.array([self._text_norm_id], dtype=np.int32)),
+        ])[0]
+        return ctc_greedy(np.asarray(logits)[0, : 4 + n_valid].argmax(axis=-1))

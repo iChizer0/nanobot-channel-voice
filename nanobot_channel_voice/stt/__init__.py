@@ -50,6 +50,7 @@ ENGINES: dict[str, EngineSpec] = {
         required=(
             ("sensevoice.model_path", "sensevoice.modelPath"),
             ("sensevoice.tokens_path", "sensevoice.tokensPath"),
+            ("sensevoice.frontend_path", "sensevoice.frontendPath"),
         ),
         build=_build_sensevoice,
         modules=("numpy", "kaldi_native_fbank"),

@@ -28,6 +28,21 @@ _REF_MEL = (
     / "_whisper_features.py"
 )
 _WAV = _REF / "whisper" / "model" / "test_en.wav"
+# The RKNN v3.2 port only runs where rknnlite does (the board); the second
+# candidate is the workspace model store's copy.
+_MODEL_RKNN_CANDIDATES = (
+    _REF / "smartturn" / "rknn.rv1126b" / "model.rknn",
+    Path(__file__).resolve().parents[2]
+    / "nanobot-channel-voice-test" / "models" / "vad" / "smartturn" / "rknn.rv1126b" / "model.rknn",
+)
+_MODEL_RKNN = next(
+    (p for p in _MODEL_RKNN_CANDIDATES if p.is_file()), _MODEL_RKNN_CANDIDATES[0]
+)
+_WAV_RKNN_CANDIDATES = (
+    _REF / "silero-vad" / "tests" / "data" / "test.wav",  # 60 s, 16 kHz
+    _WAV,
+)
+_WAV_RKNN = next((p for p in _WAV_RKNN_CANDIDATES if p.is_file()), _WAV_RKNN_CANDIDATES[0])
 
 FRAME_MS = 20
 FRAME = b"\x01\x00" * 320  # 20 ms @ 16 kHz
@@ -213,6 +228,39 @@ def test_real_model_scores_speech_deterministically():
     assert analyzer is not None, "real model failed to build"
     try:
         with wave.open(str(_WAV), "rb") as w:
+            assert w.getframerate() == 16000
+            pcm = w.readframes(w.getnframes())
+
+        analyzer.assess(pcm)
+        p_full = analyzer.last_probability
+        analyzer.assess(pcm)
+        assert analyzer.last_probability == p_full
+        assert 0.0 <= p_full <= 1.0
+
+        # Cutting the clip mid-speech must not score MORE complete than the
+        # finished sentence.
+        analyzer.assess(pcm[: int(len(pcm) * 0.55) // 2 * 2])
+        p_cut = analyzer.last_probability
+        assert 0.0 <= p_cut <= 1.0
+        assert p_cut <= p_full
+    finally:
+        analyzer.release()
+
+
+def test_real_rknn_model_scores_speech_deterministically():
+    """The fixed-shape RKNN v3.2 port on the NPU: same behavioral contract as the
+    ONNX real-model test above. Board-only (rknnlite)."""
+    pytest.importorskip("numpy")
+    pytest.importorskip("rknnlite.api", reason="RKNN Lite runtime only exists on the board")
+    if not (_MODEL_RKNN.is_file() and _WAV_RKNN.is_file()):
+        pytest.skip("smart-turn .rknn / test wav not present")
+    cfg = VadConfig.model_validate({
+        "turn": {"engine": "smartturn", "modelPath": str(_MODEL_RKNN)},
+    })
+    analyzer = make_turn_analyzer(cfg, 16000, FRAME_MS)
+    assert analyzer is not None, "RKNN model failed to build"
+    try:
+        with wave.open(str(_WAV_RKNN), "rb") as w:
             assert w.getframerate() == 16000
             pcm = w.readframes(w.getnframes())
 

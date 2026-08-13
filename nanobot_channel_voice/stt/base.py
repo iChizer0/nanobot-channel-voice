@@ -184,7 +184,7 @@ def pcm_to_float_mono(pcm: bytes, src_rate: int, dst_rate: int):
 
 
 def read_token_table(path: str) -> dict[int, str]:
-    """Parse a sherpa ``<token> <id>`` tokens file into ``{id: token}``."""
+    """Parse a sherpa-style ``<token> <id>`` tokens file into ``{id: token}``."""
     tokens: dict[int, str] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:

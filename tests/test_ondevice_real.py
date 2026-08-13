@@ -30,6 +30,20 @@ _SILERO_CANDIDATES = (
     _REF / "pipecat" / "src" / "pipecat" / "audio" / "vad" / "data" / "silero_vad.onnx",  # v6.0
 )
 _SILERO = next((p for p in _SILERO_CANDIDATES if p.is_file()), _SILERO_CANDIDATES[0])
+# The RKNN v6 port only runs where rknnlite does (the board); the second
+# candidate is the workspace model store's copy.
+_SILERO_RKNN_CANDIDATES = (
+    _SILERO_DIR / "rknn.rv1126b" / "model.rknn",
+    Path(__file__).resolve().parents[2]
+    / "nanobot-channel-voice-test" / "models" / "vad" / "silero" / "rknn.rv1126b" / "model.rknn",
+)
+_SILERO_RKNN = next((p for p in _SILERO_RKNN_CANDIDATES if p.is_file()), _SILERO_RKNN_CANDIDATES[0])
+# A 16 kHz speech wav: the upstream silero-vad repo's own test clip, else whisper's.
+_SILERO_WAV_CANDIDATES = (
+    _REF / "silero-vad" / "tests" / "data" / "test.wav",
+    _WHISPER / "test_en.wav",
+)
+_SILERO_WAV = next((p for p in _SILERO_WAV_CANDIDATES if p.is_file()), _SILERO_WAV_CANDIDATES[0])
 
 pytestmark = pytest.mark.skipif(
     not _REF.is_dir(), reason=f"reference models not present at {_REF}"
@@ -195,6 +209,35 @@ def test_silero_single_rate_export_flags_speech():
     assert any(flags)
 
 
+def test_silero_rknn_real_model_flags_speech_and_not_silence():
+    """The fixed-shape RKNN v6 port on the NPU: same adapter contract as the ONNX
+    exports, so the same speech/silence proof. Board-only (rknnlite)."""
+    pytest.importorskip("rknnlite.api", reason="RKNN Lite runtime only exists on the board")
+    _need(_SILERO_RKNN, _SILERO_WAV)
+    from nanobot_channel_voice.config import VadConfig
+    from nanobot_channel_voice.vad import make_vad
+    from nanobot_channel_voice.vad.silero import SileroVad
+
+    vad = make_vad(VadConfig.model_validate({
+        "engine": "silero", "silero": {"modelPath": str(_SILERO_RKNN)},
+    }), 16000, 20)
+    assert isinstance(vad, SileroVad)
+
+    silence_flags = [vad.is_speech(b"\x00\x00" * 320) for _ in range(50)]
+    assert not any(silence_flags)
+
+    vad.reset()
+    with wave.open(str(_SILERO_WAV), "rb") as w:
+        assert w.getframerate() == 16000, _SILERO_WAV  # the port is 16 kHz only
+        pcm = w.readframes(w.getnframes())
+    frames = [pcm[i:i + 640] for i in range(0, min(len(pcm), 640 * 1500), 640)]
+    flags = [vad.is_speech(f) for f in frames]
+    vad.release()
+    assert any(flags)
+    longest = max((len(list(g)) for k, g in itertools.groupby(flags) if k), default=0)
+    assert longest >= 10  # >= 200 ms of continuous speech
+
+
 def test_firered_min_volume_gates_quiet_speech():
     _need(_FIRERED / "fireredvad_stream_vad_with_cache.onnx",
           _WHISPER / "test_en.wav")
@@ -226,3 +269,50 @@ def test_firered_min_volume_gates_quiet_speech():
     flags_gated = [gated.is_speech(f) for f in frames]
     gated.release()
     assert not any(flags_gated)  # AND'd loudness gate wins
+
+
+# The RKNN SenseVoice-Small port + its frontend.json/tokens.txt sidecars; the
+# second candidate is the workspace model store's copy. Board-only (rknnlite).
+_SENSEVOICE_RKNN_CANDIDATES = (
+    _REF / "sensevoice" / "rknn.rv1126b",
+    Path(__file__).resolve().parents[2]
+    / "nanobot-channel-voice-test" / "models" / "stt" / "sensevoice-small" / "rknn.rv1126b",
+)
+_SENSEVOICE_RKNN = next(
+    (p for p in _SENSEVOICE_RKNN_CANDIDATES if p.is_dir()), _SENSEVOICE_RKNN_CANDIDATES[0]
+)
+_SENSEVOICE_WAV_CANDIDATES = (
+    _REF / "sensevoice" / "en.wav",  # the upstream en.mp3 example, as 16 kHz wav
+    _WHISPER / "test_en.wav",
+)
+_SENSEVOICE_WAV = next(
+    (p for p in _SENSEVOICE_WAV_CANDIDATES if p.is_file()), _SENSEVOICE_WAV_CANDIDATES[0]
+)
+
+
+def test_sensevoice_rknn_real_transcription():
+    pytest.importorskip("rknnlite.api", reason="RKNN Lite runtime only exists on the board")
+    d = _SENSEVOICE_RKNN
+    _need(d / "model.rknn", d / "frontend.json", d / "tokens.txt", _SENSEVOICE_WAV)
+    from nanobot_channel_voice.config import SttConfig
+    from nanobot_channel_voice.stt import make_stt
+    from nanobot_channel_voice.stt.sensevoice import SenseVoiceOnDeviceStt
+
+    stt = make_stt(SttConfig.model_validate({
+        "provider": "sensevoice",
+        "sensevoice": {
+            "modelPath": str(d / "model.rknn"),
+            "tokensPath": str(d / "tokens.txt"),
+            "frontendPath": str(d / "frontend.json"),
+            "language": "auto",
+        },
+    }))
+    assert isinstance(stt, SenseVoiceOnDeviceStt)  # no silent delegate fallback
+    with wave.open(str(_SENSEVOICE_WAV), "rb") as w:
+        assert w.getframerate() == 16000
+        pcm = w.readframes(w.getnframes())
+    text = asyncio.run(stt.transcribe(pcm, 16000))
+    stt.release()
+    assert isinstance(text, str) and len(text.strip()) > 0
+    assert any(c.isalpha() for c in text)
+    assert stt.last_tags.startswith("<|")  # rich-transcription tags surfaced
