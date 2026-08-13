@@ -197,6 +197,33 @@ class FireRedVadConfig(OnDeviceRuntime):
     min_volume: float = Field(default=0.0, ge=0.0, lt=1.0)
 
 
+class SileroVadConfig(OnDeviceRuntime):
+    """On-device Silero VAD (``vad.engine="silero"``; v6 recommended, the VAD
+    Pipecat/LiveKit ship — v5 has the same I/O). Raw waveform in — no fbank/CMVN side
+    file — one decision per 32 ms window. The combined upstream export
+    (``silero_vad.onnx``) runs at 8 or 16 kHz; a fixed-shape port (``.rknn``) must
+    take ``input[1, context+window]`` + ``state[2,1,128]`` and return
+    ``(output, stateN)``."""
+
+    model_path: str | None = None   # ".onnx" (CPU/TensorRT EP) or ".rknn" (NPU)
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)   # speech enters at/above this
+    # Hysteresis exit: speech ends only when the probability falls BELOW this (upstream
+    # VADIterator behavior; stops mid-word flicker). None = threshold - 0.15.
+    neg_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Same AND'd loudness gate as vad.firered.minVolume (0..1 normalized RMS; 0 = off).
+    min_volume: float = Field(default=0.0, ge=0.0, lt=1.0)
+
+    @model_validator(mode="after")
+    def _hysteresis_ordered(self) -> SileroVadConfig:
+        if self.neg_threshold is not None and self.neg_threshold >= self.threshold:
+            raise ValueError(
+                f"vad.silero.negThreshold ({self.neg_threshold}) must be below "
+                f"vad.silero.threshold ({self.threshold}); it is the exit side of the "
+                "hysteresis pair"
+            )
+        return self
+
+
 class TurnConfig(OnDeviceRuntime):
     """Audio-native end-of-turn model layered over the endpointer
     (``vad.turn.engine="smartturn"`` = Smart Turn v3 over ONNX/RKNN, ``[ondevice]``
@@ -218,10 +245,12 @@ class TurnConfig(OnDeviceRuntime):
 class VadConfig(_VoiceBase):
     """Voice-activity detection / utterance endpointing. ``engine`` picks the per-frame
     detector; the endpointing knobs apply to all of them. ``energy`` is zero-dep;
-    ``webrtc`` is spectral (``[webrtc]`` extra); ``firered`` is on-device neural over
-    RKNN/ONNX (``[ondevice]`` extra, own block), best for noisy mics."""
+    ``webrtc`` is spectral (``[webrtc]`` extra); ``firered`` and ``silero`` are
+    on-device neural over RKNN/ONNX (``[ondevice]`` extra, own blocks): firered has
+    the fewest false alarms in noise, silero the better recall, a 3x cheaper decision
+    cadence (32 ms vs 10 ms), and no side files."""
 
-    engine: Literal["energy", "webrtc", "firered"] = "energy"
+    engine: Literal["energy", "webrtc", "firered", "silero"] = "energy"
     start_frames: int = Field(default=5, ge=1)      # consecutive speech frames to open an utterance
     preroll_ms: int = Field(default=300, ge=0)      # audio kept before onset so a slow VAD doesn't clip word 1
     hangover_ms: int = Field(default=600, ge=100)   # trailing silence that ends an utterance
@@ -236,6 +265,7 @@ class VadConfig(_VoiceBase):
     energy_threshold: float = Field(default=0.0, ge=0.0, lt=1.0)
     aggressiveness: int = Field(default=2, ge=0, le=3)    # webrtc only
     firered: FireRedVadConfig = Field(default_factory=FireRedVadConfig)
+    silero: SileroVadConfig = Field(default_factory=SileroVadConfig)
     turn: TurnConfig = Field(default_factory=TurnConfig)
 
     @model_validator(mode="after")
@@ -727,7 +757,11 @@ class VoiceConfig(_VoiceBase):
         """An EXPLICITLY configured neural VAD must run at the configured capture rate: statically
         knowable, and the runtime alternative is a silent downgrade to the energy fallback."""
         rate = self.audio.sample_rate
-        supported = {"firered": (16000,), "webrtc": (8000, 16000, 32000, 48000)}.get(self.vad.engine)
+        supported = {
+            "firered": (16000,),
+            "silero": (8000, 16000),
+            "webrtc": (8000, 16000, 32000, 48000),
+        }.get(self.vad.engine)
         if supported is not None and rate not in supported:
             raise ValueError(
                 f"vad.engine='{self.vad.engine}' cannot run at audio.sampleRate={rate} "

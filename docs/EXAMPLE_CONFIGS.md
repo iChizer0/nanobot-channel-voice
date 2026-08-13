@@ -176,7 +176,7 @@ SenseVoice STT (fast CTC, zh/yue/en/ja/ko) and Supertonic-3 TTS (31 languages, n
 }
 ```
 
-Swap `stt.provider` to `"whisper"` (with a `stt.whisper` block) for broader language coverage at more CPU, or to `"zipformer"` for streaming decodes and mid-sentence barge-in confirmation. For noisy rooms add `"vad": { "engine": "firered", "firered": { "weights": "vad/firered/onnx" } }`.
+Swap `stt.provider` to `"whisper"` (with a `stt.whisper` block) for broader language coverage at more CPU, or to `"zipformer"` for streaming decodes and mid-sentence barge-in confirmation. For noisy rooms add `"vad": { "engine": "firered", "firered": { "weights": "vad/firered/onnx" } }` — the fewest false triggers from background noise, and a false trigger is a spurious duck once the mic is open. The alternative is Silero VAD, `"vad": { "engine": "silero", "silero": { "modelPath": "model/silero_vad.onnx" } }`.
 
 ### Rockchip NPU
 

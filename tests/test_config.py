@@ -10,6 +10,7 @@ from nanobot_channel_voice.config import (
     MmsTtsConfig,
     OnDeviceRuntime,
     SenseVoiceSttConfig,
+    SileroVadConfig,
     SttConfig,
     SupertonicTtsConfig,
     TtsConfig,
@@ -86,7 +87,7 @@ def test_runtime_knobs_live_on_engine_blocks_only():
     # do not carry them at all (the old flat copies were silently per-engine).
     engine_blocks = (
         WhisperSttConfig, SenseVoiceSttConfig, ZipformerSttConfig,
-        MmsTtsConfig, SupertonicTtsConfig, FireRedVadConfig,
+        MmsTtsConfig, SupertonicTtsConfig, FireRedVadConfig, SileroVadConfig,
     )
     for block in engine_blocks:
         assert issubclass(block, OnDeviceRuntime)
@@ -141,10 +142,25 @@ def test_vad_engine_rate_mismatch_is_rejected_at_parse_time():
         VoiceConfig.model_validate(
             {"vad": {"engine": "webrtc"}, "audio": {"sampleRate": 44100}}
         )
+    with pytest.raises(ValidationError, match="cannot run at"):
+        VoiceConfig.model_validate(
+            {"vad": {"engine": "silero"}, "audio": {"sampleRate": 48000}}
+        )
     # The energy engine runs anywhere; the neural engines at their rates.
     VoiceConfig.model_validate({"vad": {"engine": "energy"}, "audio": {"sampleRate": 44100}})
     VoiceConfig.model_validate({"vad": {"engine": "firered"}, "audio": {"sampleRate": 16000}})
     VoiceConfig.model_validate({"vad": {"engine": "webrtc"}, "audio": {"sampleRate": 48000}})
+    VoiceConfig.model_validate({"vad": {"engine": "silero"}, "audio": {"sampleRate": 16000}})
+    VoiceConfig.model_validate({"vad": {"engine": "silero"}, "audio": {"sampleRate": 8000}})
+
+
+def test_silero_hysteresis_pair_is_ordered_at_parse_time():
+    with pytest.raises(ValidationError, match="negThreshold"):
+        SileroVadConfig.model_validate({"threshold": 0.5, "negThreshold": 0.5})
+    assert SileroVadConfig.model_validate(
+        {"threshold": 0.5, "negThreshold": 0.35}
+    ).neg_threshold == 0.35
+    assert SileroVadConfig().neg_threshold is None  # derived at build: threshold - 0.15
 
 
 def test_mp3_audio_format_is_rejected_at_parse_time():

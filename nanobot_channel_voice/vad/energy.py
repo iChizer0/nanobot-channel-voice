@@ -12,8 +12,8 @@ from nanobot_channel_voice.vad.base import Vad
 class EnergyVad(Vad):
     """With ``fixed_threshold == 0`` it tracks the background level and flags speech
     when a frame is a few times louder than the floor: good enough for a quiet,
-    close-mic, single-speaker setup; use ``webrtc``/``firered`` for noisy rooms. A
-    positive ``fixed_threshold`` (normalized 0..1) makes it static."""
+    close-mic, single-speaker setup; use ``webrtc``/``firered``/``silero`` for noisy
+    rooms. A positive ``fixed_threshold`` (normalized 0..1) makes it static."""
 
     _MIN_THRESHOLD = 0.01   # absolute floor so true silence never trips speech
     _SPEECH_MULT = 3.0      # a frame must be this many x the noise floor

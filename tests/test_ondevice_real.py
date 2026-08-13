@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import itertools
 import os
 import wave
 from pathlib import Path
@@ -23,6 +24,12 @@ _REF = Path(os.environ.get(
 _MMS = _REF / "mms_tts" / "model"
 _WHISPER = _REF / "whisper" / "model"
 _FIRERED = _REF / "vad" / "FireRedVAD" / "pretrained_models" / "onnx_models"
+_SILERO_DIR = _REF / "vad" / "silero"
+_SILERO_CANDIDATES = (
+    _SILERO_DIR / "silero_vad_v6.onnx",  # v6.2.1 via download_model.sh
+    _REF / "pipecat" / "src" / "pipecat" / "audio" / "vad" / "data" / "silero_vad.onnx",  # v6.0
+)
+_SILERO = next((p for p in _SILERO_CANDIDATES if p.is_file()), _SILERO_CANDIDATES[0])
 
 pytestmark = pytest.mark.skipif(
     not _REF.is_dir(), reason=f"reference models not present at {_REF}"
@@ -118,6 +125,74 @@ def test_firered_real_model_and_degrade_path():
         },
     }), 16000, 20)
     assert isinstance(bad, EnergyVad)
+
+
+def test_silero_real_model_flags_speech_and_not_silence():
+    _need(_SILERO, _WHISPER / "test_en.wav")
+    from nanobot_channel_voice.config import VadConfig
+    from nanobot_channel_voice.vad import make_vad
+    from nanobot_channel_voice.vad.silero import SileroVad
+
+    vad = make_vad(VadConfig.model_validate({
+        "engine": "silero",
+        "silero": {"modelPath": str(_SILERO)},
+    }), 16000, 20)
+    assert isinstance(vad, SileroVad)
+
+    silence_flags = [vad.is_speech(b"\x00\x00" * 320) for _ in range(50)]
+    assert not any(silence_flags)
+
+    vad.reset()
+    with wave.open(str(_WHISPER / "test_en.wav"), "rb") as w:
+        pcm = w.readframes(w.getnframes())
+    frames = [pcm[i:i + 640] for i in range(0, min(len(pcm), 640 * 150), 640)]
+    flags = [vad.is_speech(f) for f in frames]
+    vad.release()
+    assert any(flags)
+    # An utterance is a contiguous run, not isolated blips: the hysteresis pair
+    # must hold through word-internal dips at this frame granularity.
+    longest = max((len(list(g)) for k, g in itertools.groupby(flags) if k), default=0)
+    assert longest >= 10  # >= 200 ms of continuous speech in a ~2 s utterance
+
+
+def test_silero_real_model_construction_paths():
+    _need(_SILERO)
+    from nanobot_channel_voice.config import VadConfig
+    from nanobot_channel_voice.vad import make_vad
+    from nanobot_channel_voice.vad.energy import EnergyVad
+    from nanobot_channel_voice.vad.silero import SileroVad
+
+    # The combined export declares sr, so the SAME artifact runs at 8 kHz.
+    at_8k = make_vad(VadConfig.model_validate({
+        "engine": "silero", "silero": {"modelPath": str(_SILERO)},
+    }), 8000, 20)
+    assert isinstance(at_8k, SileroVad)
+    assert at_8k.is_speech(b"\x00\x00" * 160) is False  # a 20 ms 8 kHz silence frame
+    at_8k.release()
+
+    bad = make_vad(VadConfig.model_validate({
+        "engine": "silero", "silero": {"modelPath": "/nonexistent/silero_vad.onnx"},
+    }), 16000, 20)
+    assert isinstance(bad, EnergyVad)
+
+
+def test_silero_single_rate_export_flags_speech():
+    # The 16k-only v6 export: flattened graph, the shape a TensorRT/RKNN port starts from.
+    model = _SILERO_DIR / "silero_vad_16k_op15.onnx"
+    _need(model, _WHISPER / "test_en.wav")
+    from nanobot_channel_voice.config import VadConfig
+    from nanobot_channel_voice.vad import make_vad
+    from nanobot_channel_voice.vad.silero import SileroVad
+
+    vad = make_vad(VadConfig.model_validate({
+        "engine": "silero", "silero": {"modelPath": str(model)},
+    }), 16000, 20)
+    assert isinstance(vad, SileroVad)
+    with wave.open(str(_WHISPER / "test_en.wav"), "rb") as w:
+        pcm = w.readframes(w.getnframes())
+    flags = [vad.is_speech(pcm[i:i + 640]) for i in range(0, min(len(pcm), 640 * 150), 640)]
+    vad.release()
+    assert any(flags)
 
 
 def test_firered_min_volume_gates_quiet_speech():

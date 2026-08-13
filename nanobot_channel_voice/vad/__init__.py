@@ -1,9 +1,9 @@
 """VAD backend selection.
 
 ``make_vad`` picks a per-frame detector by ``vad.engine``: ``energy`` (zero-dep default),
-``webrtc`` (``[webrtc]`` extra), or ``firered`` (neural DFSMN over ONNX/RKNN,
-``[ondevice]`` extra), via the declarative engine table the STT/TTS registries also use
-(:mod:`..engines`)."""
+``webrtc`` (``[webrtc]`` extra), ``firered`` (neural DFSMN over ONNX/RKNN, ``[ondevice]``
+extra), or ``silero`` (Silero VAD over ONNX/RKNN, same extra), via the declarative
+engine table the STT/TTS registries also use (:mod:`..engines`)."""
 
 from __future__ import annotations
 
@@ -28,11 +28,12 @@ __all__ = [
 _FBANK_WARMUP_MS = 25       # analysis window before the first fbank frame
 _MODEL_RISE_MARGIN_MS = 80  # sigmoid rise to threshold + safety
 _FIRERED_FRAME_MS = 10      # the model's own frame period (vad.firered.smoothFrames unit)
+_SILERO_WINDOW_MS = 32      # decision period: 512 samples @ 16 kHz (256 @ 8 kHz)
 
 
 def flag_lag_ms(cfg: VadConfig, frame_ms: int) -> int:
     """Algorithmic decision lag between the acoustic edge and the flag following it
-    (fbank window + smoothing settle + rise margin). Bounds both edges: pre-roll
+    (analysis window + smoothing settle + rise margin). Bounds both edges: pre-roll
     recovers the onset side, the pause-probe's leak-death window covers release."""
     if cfg.engine == "firered":
         return (
@@ -40,6 +41,9 @@ def flag_lag_ms(cfg: VadConfig, frame_ms: int) -> int:
             + (cfg.firered.smooth_frames - 1) * _FIRERED_FRAME_MS
             + _MODEL_RISE_MARGIN_MS
         )
+    if cfg.engine == "silero":
+        # Window fill before the first decision sees the onset + rise to threshold.
+        return 2 * _SILERO_WINDOW_MS + _MODEL_RISE_MARGIN_MS
     return 2 * frame_ms + 40  # energy/webrtc: ~instant per-frame decision + margin
 
 
@@ -60,6 +64,12 @@ def _build_firered(cfg: VadConfig, sample_rate: int, frame_ms: int) -> Vad:
     return FireRedVad.from_config(cfg.firered, sample_rate)
 
 
+def _build_silero(cfg: VadConfig, sample_rate: int, frame_ms: int) -> Vad:
+    from nanobot_channel_voice.vad.silero import SileroVad
+
+    return SileroVad.from_config(cfg.silero, sample_rate)
+
+
 ENGINES: dict[str, EngineSpec] = {
     "webrtc": EngineSpec(build=_build_webrtc, modules=("webrtcvad",)),
     "firered": EngineSpec(
@@ -68,6 +78,11 @@ ENGINES: dict[str, EngineSpec] = {
             ("firered.cmvn_path", "firered.cmvnPath"),
         ),
         build=_build_firered,
+        modules=("numpy",),
+    ),
+    "silero": EngineSpec(
+        required=(("silero.model_path", "silero.modelPath"),),
+        build=_build_silero,
         modules=("numpy",),
     ),
 }
