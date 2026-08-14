@@ -425,6 +425,27 @@ Segments are recordings of the room - leave `dumpAudio` off outside debugging se
 
 For latency questions rather than by-ear ones, `debug.metricsIntervalS` (e.g. `30`) logs the in-process metrics snapshot - latency percentiles (`stt_ms`, `tts_synth_ms`, `ttfa_ms`, ...) and counters - as one JSON line on that cadence, so distributions are readable while you reproduce instead of only in the session-end summary.
 
+### Filler while the agent works
+
+Long waits (tool calls, slow reasoning) are masked in two layers. The voice context already asks the agent to speak one short status sentence before slow tools - a contextual "let me check the calendar" beats any canned phrase, and the backend detects it (`agent_prologue`) and defers the canned filler behind it. The fallback is opt-in canned filler:
+
+```json
+{
+  "channels": {
+    "voice": {
+      "prologue": {
+        "enabled": true,
+        "afterMs": 2000,
+        "intervalMs": 8000,
+        "phrases": ["One moment.", "Still working on it.", "This is taking a bit longer - hang on."]
+      }
+    }
+  }
+}
+```
+
+`phrases` is an escalation script: each wait consumes it **in order from the top**, repeating the last phrase every `intervalMs` until the reply arrives, so later entries can acknowledge a longer wait. Phrases are synthesized once with the session's own voice at warmup (local engines only; a cloud TTS is never billed at startup and pays lazily on first use) and cached. Fillers are killed by barge-in like any reply audio, never play over the user's speech, and don't count toward the latency metrics. When the agent spoke its own status line at a tool boundary, that line counts as the script's opener: the first canned filler waits a full `intervalMs` and continues from the second phrase. Keep phrases short: in half-duplex the mic is gated while one plays.
+
 ## Realtime
 
 Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback and routes the model's tool calls through nanobot's guarded `ToolRegistry` under `nanobot gateway`. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.

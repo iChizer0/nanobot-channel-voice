@@ -335,11 +335,8 @@ class RealtimeBackend(TurnEventMixin):
             self._record_barge_in()
 
     def _record_barge_in(self) -> None:
-        # The shell routes EVERY onset here (it cannot gate: state is already
-        # CAPTURING by then), so record only onsets that interrupted a live turn —
-        # _onset_interrupting is latched at speech_started for exactly this reading.
-        # A quiet-session onset would sample the empty-sink flush (~2 ms) and swamp
-        # the distribution. The stamp clears either way: it must not go stale.
+        # The shell routes EVERY onset here; only one that interrupted a live turn
+        # (_onset_interrupting) is a barge-in sample. The stamp clears either way.
         stamp, self._speech_started_at = self._speech_started_at, None
         if stamp is None or not self._onset_interrupting:
             return
@@ -518,9 +515,8 @@ class RealtimeBackend(TurnEventMixin):
         self._cancel_watchdog()
         self._cancel_drain()
         self._reset_turn_state(reason="session_lost")
-        # The metrics turn timeline dies too: an anchor (or continuation latch)
-        # surviving the outage would measure the reconnected session's first audio
-        # against a turn that no longer exists.
+        # An anchor surviving the outage would measure the reconnected session's
+        # first audio against a turn that no longer exists.
         self._metrics.turn_end()
         # Reset the coarse state too: the shell's half-duplex mic gate keys on SPEAKING, so
         # dropping while SPEAKING would wedge forever (mic gated -> no audio to the server

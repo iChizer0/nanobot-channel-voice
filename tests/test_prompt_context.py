@@ -83,6 +83,11 @@ def test_block_is_wrapped_and_names_the_engine_language():
     assert normalize_runtime_context_blocks([block]) == [block]
 
 
+def test_context_nudges_pre_tool_narration():
+    [block] = _voice_context_blocks(_FakeTts("en"))
+    assert "tools that may take more than a moment" in block.content
+
+
 def test_unrestricted_engine_claims_no_language():
     # openai/openai_compat (and a custom-vocab MMS) speak an unknown set: the format
     # half still applies, but inventing a language would be worse than staying quiet.

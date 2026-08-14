@@ -601,11 +601,8 @@ class DebugConfig(_VoiceBase):
     # live session's oldest segments, so the most recent evidence survives.
     dump_max_mb: int = Field(default=200, ge=1)
     # Log the in-process metrics snapshot (latency percentiles + counters, one JSON
-    # line) every this many seconds while the session runs. None = only the
-    # session-end summary line: the distributions exist either way, this makes them
-    # readable DURING a debugging session instead of after it. Floor of 1 s: each
-    # snapshot sorts the sample rings on the event loop, so sub-second cadence would
-    # make the debug reporter itself the stall it exists to find.
+    # line) every this many seconds; None = only the session-end summary. Floored at
+    # 1 s: each snapshot sorts the sample rings on the event loop.
     metrics_interval_s: float | None = Field(default=None, ge=1.0)
 
 

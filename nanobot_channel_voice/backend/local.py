@@ -229,10 +229,8 @@ class _Turn:
         self.base: str | None = None  # learned from the first delta's stream id
         self.last_activity = self.published_at  # any delta/segment end pushes this
         self.audible_at: float | None = None  # first audio frame emitted (adaptive hangover)
-        # A resuming stream end passed: the next delta is the first post-tool token and
-        # re-anchors the metrics clock (turn_continuation), keeping tool time out of
-        # ttfa_ms. The tool run itself is invisible to the channel, so that delta is
-        # the earliest observable resume edge.
+        # A resuming stream end passed: the next delta (the earliest observable resume
+        # edge) re-anchors the metrics clock so tool time never lands in ttfa_ms.
         self.continuation_pending = False
 
     @classmethod
@@ -379,9 +377,8 @@ class LocalBackend(TurnEventMixin):
         # overruns and leave the VAD deaf to barge-ins.
         self._utt_queue: asyncio.Queue[_PendingUtterance] = asyncio.Queue(maxsize=4)
         self._utt_task: asyncio.Task | None = None
-        # Capture-segment id: one per judged segment (utterance, blip, gap, probe),
-        # shared by the summary log line and the dump filename so a WAV maps to its
-        # log record exactly (the dumper's own write order can trail capture order).
+        # Capture-segment id, shared by the summary log line and the dump filename:
+        # the dumper's own write order can trail capture order.
         self._seg_seq = 0
         self._chunker = SentenceChunker(
             config.chunker.min_chars, config.chunker.max_chars, config.chunker.min_chars_first
@@ -495,8 +492,9 @@ class LocalBackend(TurnEventMixin):
         # Raw-PCM output follows the SINK's mode (the channel derived it from the TTS adapter),
         # so we can never emit pcm into a blob sink or vice versa.
         self._pcm_out = sink.stream_mode
-        self._fillers: dict[str, bytes] = {}  # phrase -> audio; lazy, session-scoped
-        self._filler_i = 0
+        # Phrase -> audio; session-scoped. Filled by prewarm_fillers() at channel
+        # warmup (probe_ok engines only) and lazily on first use otherwise.
+        self._fillers: dict[str, bytes] = {}
         # Stream identity is "<turn-base>:<segment>", the base stable across a turn. The live
         # base rides the _Turn; the barged-out base stays here so a DEAD turn's late deltas keep
         # dropping after the turn object is gone.
@@ -1009,8 +1007,7 @@ class LocalBackend(TurnEventMixin):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one bad utterance must not kill the worker
-                # Id included: the "error"-verdict WAV/manifest record has no utt #N
-                # summary line, so this is its only log-side correlation.
+                # The id is the "error"-verdict dump's only log-side correlation.
                 self._log.warning("utterance #{} processing failed: {}", pending.seg_id, exc)
             finally:
                 self._utt_queue.task_done()
@@ -1138,12 +1135,10 @@ class LocalBackend(TurnEventMixin):
             interrupting = False
 
         def _summary(verdict: str) -> str:
-            """One line per judged utterance — the whole record the ladder's earlier
-            fragments used to spread over five: id (matches the dump filename), verdict,
+            """One line per judged utterance: id (matches the dump filename), verdict,
             durations, close shape, STT cost/path, VAD confidence, head loudness (1 s
-            cap: triage metadata bounded for the numpy-less fallback, which loops on
-            the event loop; a quiet empty right after a reply is our own playback
-            tail, a loud one is real speech the model failed on). Also stamps
+            cap: the numpy-less fallback loops on the event loop; quiet = our own
+            playback tail, loud = real speech the model failed on). Also stamps
             ``pending.meta`` for the dump manifest."""
             dur_ms = int(pcm_ms(len(pcm), self._cfg.audio.sample_rate))
             rms = pcm_rms(pcm[: self._cfg.audio.sample_rate * 2])
@@ -1775,8 +1770,7 @@ class LocalBackend(TurnEventMixin):
                 else:
                     audio = await self._tts.synthesize(text)
                 synth_ms = (time.monotonic() - t0) * 1000.0
-                # Every chunk, not just the first: steady-state TTS speed (thermal
-                # throttling, NPU contention) is otherwise invisible until it gaps.
+                # Every chunk: steady-state TTS drift is otherwise invisible until it gaps.
                 self._metrics.observe("tts_synth_ms", synth_ms)
                 if epoch != self._sink.epoch:  # barged in during synthesis
                     continue
@@ -1857,17 +1851,23 @@ class LocalBackend(TurnEventMixin):
 
     # ---- prologue (filler while the agent works) -------------------------
 
-    def _arm_prologue(self, initial_ms: int | None = None) -> None:
+    def _arm_prologue(self, initial_ms: int | None = None, start_step: int = 0) -> None:
         """Arm the filler timer for the turn just published (cancels any prior).
 
-        ``initial_ms`` overrides the first delay: the tool-boundary re-arm passes ``intervalMs``
-        when the agent just spoke its own status line, so the canned filler doesn't pile on top
-        of it."""
+        ``initial_ms`` overrides the first delay and ``start_step`` opens the script
+        mid-way: the tool-boundary re-arm passes ``intervalMs`` + step 1 when the agent
+        just spoke its own status line — that line WAS the script's opener, so the
+        canned filler neither piles on top of it nor de-escalates back to phrase 0."""
         self._cancel_prologue()
-        if self._closing or self._tts is None or not self._cfg.prologue.enabled:
+        if (
+            self._closing
+            or self._tts is None
+            or not self._cfg.prologue.enabled
+            or not self._cfg.prologue.phrases
+        ):
             return
         self._cur_turn.prologue_task = asyncio.create_task(
-            self._prologue_watch(self._sink.epoch, initial_ms)
+            self._prologue_watch(self._sink.epoch, initial_ms, start_step)
         )
 
     def _cancel_prologue(self) -> None:
@@ -1916,10 +1916,8 @@ class LocalBackend(TurnEventMixin):
             await self._do_interrupt()  # watermark + /stop the stuck run
             if self._closing or self._cur_turn is not turn:
                 return  # a verdict published a successor during the interrupt's awaits
-            # Only after the successor guard: a verdict landing during the interrupt's
-            # awaits re-anchored the timeline for ITS turn, and releasing here would
-            # wipe that fresh anchor. With no successor, release the dead turn's anchor
-            # so the recovery notice's first chunk is not a ~timeout-sized TTFA sample.
+            # After the successor guard, or this would wipe a successor's fresh anchor;
+            # released so the recovery notice is not a ~timeout-sized TTFA sample.
             self._metrics.turn_end()
             await self.speak_final(self._cfg.timeout_phrase)  # then drain -> IDLE
         except asyncio.CancelledError:
@@ -1965,7 +1963,10 @@ class LocalBackend(TurnEventMixin):
                     if self._closing or epoch != self._sink.epoch:
                         return
                 await self._set_turn(VoiceState.THINKING)  # tools running; mic back open
-            self._arm_prologue(self._cfg.prologue.interval_ms if spoke else None)
+            self._arm_prologue(
+                initial_ms=self._cfg.prologue.interval_ms if spoke else None,
+                start_step=1 if spoke else 0,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a dead watcher must not wedge the mic
@@ -1974,19 +1975,27 @@ class LocalBackend(TurnEventMixin):
                 with suppress(Exception):
                     await self._set_turn(VoiceState.THINKING)
 
-    async def _prologue_watch(self, epoch: int, initial_ms: int | None = None) -> None:
+    async def _prologue_watch(
+        self, epoch: int, initial_ms: int | None = None, start_step: int = 0
+    ) -> None:
         """After ``afterMs`` of THINKING with no reply, speak a neutral filler, then keep the
         wait alive every ``intervalMs``. Cancelled by the first delta / speak_final / barge-in /
-        drain; the epoch guard covers the rest."""
+        drain; the epoch guard covers the rest.
+
+        Phrases are an escalation script: consumed in order per wait, the last one
+        repeating. A SKIPPED filler (user mid-utterance, state moved) does not advance
+        the script: nothing was said."""
         try:
             cfg = self._cfg.prologue
             await asyncio.sleep((cfg.after_ms if initial_ms is None else initial_ms) / 1000)
+            step = start_step
             while (
                 not self._closing
                 and self._turn is VoiceState.THINKING
                 and epoch == self._sink.epoch
             ):
-                await self._play_filler(epoch)
+                if await self._play_filler(epoch, step):
+                    step += 1
                 await asyncio.sleep(cfg.interval_ms / 1000)
         except asyncio.CancelledError:
             raise
@@ -1997,27 +2006,59 @@ class LocalBackend(TurnEventMixin):
                 with suppress(Exception):
                     await self._set_turn(VoiceState.THINKING)
 
-    async def _play_filler(self, epoch: int) -> None:
-        phrases = self._cfg.prologue.phrases
-        if not phrases:
-            return
-        text = phrases[self._filler_i % len(phrases)]
-        self._filler_i += 1
+    async def _synth_filler(self, text: str) -> bytes:
+        """Synthesize-and-cache one filler phrase (~150 ms at MMS RTF 0.15 for a short
+        one). A transient failure is never cached as permanent silence."""
         audio = self._fillers.get(text)
         if audio is None:
-            # One synth per phrase per session (~150 ms at MMS RTF 0.15 for a short one), paid
-            # while nothing else is synthesizing.
             audio = await (
                 self._tts.synthesize_pcm(text) if self._pcm_out else self._tts.synthesize(text)
             )
-            if audio:  # never cache a transient failure as permanent silence
+            if audio:
                 self._fillers[text] = audio
-        if not audio or self._turn is not VoiceState.THINKING or epoch != self._sink.epoch:
+        return audio
+
+    async def prewarm_fillers(self) -> None:
+        """Pre-synthesize the prologue phrases (channel warmup) so filler #1 never pays
+        synthesis inside the wait it masks. ``probe_ok`` gates it like the calibrate
+        probe: a cloud TTS must never bill at startup (its phrases stay lazy)."""
+        if (
+            self._tts is None
+            or not self._cfg.prologue.enabled
+            or not getattr(self._tts, "probe_ok", True)
+        ):
             return
+        # An escalation script is short; a pathological list must not burn startup
+        # synth (the tail stays lazy). Capped, and abandoned the moment a real turn
+        # starts: adapters tolerate overlapped synthesis (RKNN serializes, ORT runs
+        # concurrently) but the contention would inflate the first reply's TTFA.
+        for text in self._cfg.prologue.phrases[:8]:
+            if self._closing or self._turn is not VoiceState.IDLE:
+                return
+            try:
+                audio = await self._synth_filler(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - warmup is an optimization, never a gate
+                self._log.debug("filler prewarm failed for '{}': {}", text, exc)
+                return
+            if not audio:
+                return  # adapters degrade to b"" — a broken one fails every phrase
+
+    async def _play_filler(self, epoch: int, step: int) -> bool:
+        """Speak escalation-script phrase ``step`` (clamped to the last). Returns whether
+        the phrase was emitted, so a skip does not advance the script."""
+        phrases = self._cfg.prologue.phrases
+        if not phrases:
+            return False
+        text = phrases[min(step, len(phrases) - 1)]
+        audio = await self._synth_filler(text)
+        if not audio or self._turn is not VoiceState.THINKING or epoch != self._sink.epoch:
+            return False
         if self._endpointer.in_speech:
             # A filler now would flip to SPEAKING and gate the half-duplex mic, punching a hole
             # in the very speech the wait yields to.
-            return
+            return False
         self._metrics.count("prologue_filler")
         # Our own filler must not read back as user speech: half-duplex gates the mic via
         # SPEAKING; soft-duplex needs the echo filter to know the words.
@@ -2026,15 +2067,17 @@ class LocalBackend(TurnEventMixin):
             audio = await asyncio.to_thread(_scale_wav, audio, self._duck_gain)
         await self._set_turn(VoiceState.SPEAKING)
         await self._emit(self._audio_event(epoch, audio))
+        # Emitted: every path from here returns True.
         if not await self._settle(epoch):  # audibly complete before reopening the mic
-            return
+            return True
         if self._turn is VoiceState.SPEAKING:
             if not self._full_duplex:
                 # Tail guard: let device latency/reverb settle, or the filler re-triggers the VAD.
                 await asyncio.sleep(self._cfg.playback_hangover_ms / 1000)
                 if self._closing or epoch != self._sink.epoch:
-                    return
+                    return True
             await self._set_turn(VoiceState.THINKING)  # still waiting; mic back open
+        return True
 
     async def _drain_watch(self, epoch: int) -> None:
         """Return to IDLE once the reply finishes playing (and a hangover).

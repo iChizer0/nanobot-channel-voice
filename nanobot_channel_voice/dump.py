@@ -146,9 +146,8 @@ class AudioDumper:
             "dumped segment #{} {} ({} ms, rms {:.3f}{}) -> {}",
             seq, verdict, dur_ms, rms, ", +raw" if raw else "", path,
         )
-        # Writer stamps second so identity keys can never be clobbered by meta;
-        # default=str keeps a future non-JSON meta value from silently costing
-        # the whole record.
+        # Writer stamps spread second so meta can never clobber identity keys;
+        # default=str so a non-JSON meta value costs a field, not the record.
         record = {
             **(meta or {}),
             "id": seq, "verdict": verdict, "file": path.name,
@@ -196,9 +195,8 @@ class AudioDumper:
             if total <= self._max_bytes:
                 break
             try:
-                # Delete only what the dumper wrote; a user file parked in the dir
-                # survives (and keeps the dir alive), matching the "anything else
-                # in the tree is a user's saved sample" contract.
+                # Delete only what the dumper wrote: a user file parked in the dir
+                # survives, and keeps the dir alive.
                 for f in path.glob("*.wav"):
                     f.unlink(missing_ok=True)
                 (path / "manifest.jsonl").unlink(missing_ok=True)

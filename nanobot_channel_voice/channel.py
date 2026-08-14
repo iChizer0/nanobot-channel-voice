@@ -154,8 +154,8 @@ def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: boo
 def _voice_context_blocks(
     tts: TtsAdapter | None, extra: str | None = None
 ) -> list[RuntimeContextBlock]:
-    """The local backend's turn context: what the agent must know to be SPEAKABLE, plus
-    the operator's voice-scoped ``context`` lines.
+    """The local backend's turn context: what the agent must know to be SPEAKABLE, the
+    pre-tool narration nudge, plus the operator's voice-scoped ``context`` lines.
 
     Core's format-hint ladder has no ``voice`` branch, so without this the agent writes
     for a screen and answers in whatever language the user spoke; markdown the chunker
@@ -172,6 +172,10 @@ def _voice_context_blocks(
             "Write plain conversational prose. Markdown, headings, tables, code blocks, "
             "URLs and emoji are stripped before speaking, so they are heard as nothing "
             "or as mangled words.",
+            # The backend detects this spoken status line (agent_prologue) and defers
+            # the canned filler behind it.
+            "Before using tools that may take more than a moment, first say one short "
+            "sentence about what you are doing, then proceed.",
         ]
         lang = getattr(tts, "spoken_language", None)
         if lang:
@@ -734,6 +738,8 @@ class VoiceChannel(BaseChannel):
                     self.logger.debug(
                         "voice warmup failed for {}: {}", type(target).__name__, exc
                     )
+            if local is not None:
+                await local.prewarm_fillers()  # gated internally on probe_ok + IDLE
         finally:
             if local is not None:
                 local.hold_hop_accounting(False)
@@ -794,10 +800,8 @@ class VoiceChannel(BaseChannel):
         )
 
     async def _metrics_reporter(self, interval_s: float) -> None:
-        """``debug.metricsIntervalS``: the live snapshot as one JSON line per interval,
-        so the distributions are readable while a session is being debugged, not only
-        in the session-end summary. Single-line by construction: no transcript content,
-        and compact separators."""
+        """``debug.metricsIntervalS``: the live snapshot as one JSON line per interval
+        (no transcript content), so distributions are readable during a repro."""
         while True:
             await asyncio.sleep(interval_s)
             if self._metrics.has_data:
