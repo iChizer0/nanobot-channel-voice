@@ -136,6 +136,30 @@ def test_pause_freezes_the_playout_clocks():
     asyncio.run(scenario())
 
 
+def test_pause_release_splices_the_span_out_of_the_clock():
+    """A released pause must not read as elapsed playout: without the clock splice
+    starved_ms/played_ms count the silence until the next write re-anchors."""
+    async def scenario():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        sink.configure_pause(True)
+        await sink.start()
+        try:
+            sink.enqueue(_pcm_item(sink, ms=400))
+            await asyncio.sleep(0.05)
+            sink.pause(True)
+            await asyncio.sleep(0.02)  # writer at the gate
+            played_at_pause = sink.played_ms()
+            await asyncio.sleep(0.2)
+            sink.pause(False)
+            assert sink.starved_ms() == 0.0  # the pause was deliberate silence
+            assert sink.played_ms() <= played_at_pause + 20
+            await asyncio.wait_for(sink.wait_idle(), 3.0)
+        finally:
+            await sink.stop()
+
+    asyncio.run(scenario())
+
+
 def test_pause_is_a_noop_in_blob_mode():
     sink = AudioSink(NullPlayback(), mode="blob")
     sink.pause(True)

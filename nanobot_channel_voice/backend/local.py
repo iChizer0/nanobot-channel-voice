@@ -61,12 +61,20 @@ InterruptFn = Callable[[], Awaitable[None]]
 # non-streamed analogue of the stream-id watermark (a final ``send`` carries no stream id).
 TURN_META = "_voice_turn"
 
-# Synthesis-ahead cap for the TTS worker (stream mode): the sink paces the DEVICE (240/120 ms
-# lead) but nothing paces SYNTHESIS, so a fast adapter renders a whole reply that a barge-in
-# then flushes — wasted NPU/CPU cycles and cloud billing. 4 s dwarfs any sane
-# tts_first_chunk_ms, so the gate can never starve playback into an audible gap.
-_SYNTH_BACKLOG_MS = 4000.0
-_BACKLOG_POLL_S = 0.25
+# JIT synthesis (stream mode): a call starts once the unplayed runway drains to its
+# predicted cost (per-char EMA x SAFETY + MARGIN) and shrinks to what the runway can pay
+# for when that deadline is already infeasible; the ahead cap bounds what a barge-in can
+# flush. MARGIN absorbs scheduling jitter and estimator slack.
+_SYNTH_AHEAD_CAP_S = 4.0
+_SYNTH_LEAD_SAFETY = 2.0
+_SYNTH_LEAD_MARGIN_S = 0.4
+_JIT_POLL_CAP_S = 0.25  # wait granularity: pause freeze / barge-in / fresh text re-check
+# Cost EMA: slow samples lift it instantly (undershoot gaps audibly, overshoot merely
+# synthesizes early); samples clamped against one-off outliers (cloud retry ladders),
+# floored against near-instant adapters.
+_MPC_ALPHA = 0.3
+_MPC_MIN = 1e-3
+_GAP_COUNT_MIN_MS = 20.0  # dry spells under this are inaudible
 
 # AEC3 needs a few seconds of double-talk-free REFERENCE AUDIO to converge; until then its
 # residual can transcribe as "fresh words", so the early-confirm shortcuts hold back — the
@@ -327,6 +335,28 @@ def _scale_wav(wav_bytes: bytes, gain: float) -> bytes:
         return wav_bytes
 
 
+_CUT_SENT = set(".!?…。！？")
+_CUT_CLAUSE = set(",;:，、；：")
+
+
+def _cut_index(text: str, budget: int, floor: int) -> int:
+    """Cut for an over-budget chunk: last sentence end in [floor, budget), else clause
+    punctuation, else space, else the hard budget — TTS front-ends terminate fragments
+    (Supertonic appends '.'), so a bad seam gets sentence-final prosody."""
+    window = min(len(text), budget)
+    for punct in (_CUT_SENT, _CUT_CLAUSE):
+        for i in range(window - 1, floor - 1, -1):
+            # ASCII punct binds to a following alnum ("3.14", "1,234"); CJK stands alone.
+            if text[i] in punct and (
+                ord(text[i]) >= 0x2E80 or i + 1 >= len(text) or not text[i + 1].isalnum()
+            ):
+                return i + 1
+    space = text.rfind(" ", floor, window)
+    if space > 0:
+        return space + 1
+    return window
+
+
 class LocalBackend(TurnEventMixin):
     def __init__(
         self,
@@ -527,6 +557,9 @@ class LocalBackend(TurnEventMixin):
         self._tts_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
         self._tts_task: asyncio.Task | None = None
         self._drain_task: asyncio.Task | None = None
+        # Per-char synth cost (ms) EMA for the JIT schedule; the serial worker's first
+        # chunk seeds it before the turn's first deadline decision.
+        self._synth_mpc: float | None = None
 
         self._turn = VoiceState.IDLE
         self._on_event: OnEvent | None = None
@@ -1790,105 +1823,228 @@ class LocalBackend(TurnEventMixin):
 
     async def _tts_worker(self) -> None:
         while True:
+            # Pre-block snapshot: streamed enqueues set segment_spoke, so post-get it is
+            # already on; the prior value separates a mid-segment text stall from
+            # idle/tool waits.
+            spoke = self._cur_turn.segment_spoke
+            wait_epoch = self._sink.epoch
+            wait_t0 = time.monotonic()
             epoch, text = await self._tts_queue.get()
             try:
                 if self._tts is None or epoch != self._sink.epoch:
                     continue  # tts off, or barged in before synthesis
+                wait_ms = (time.monotonic() - wait_t0) * 1000.0
+                if (
+                    spoke
+                    and epoch == wait_epoch
+                    and self._pcm_out
+                    and wait_ms >= _GAP_COUNT_MIN_MS
+                    and self._sink.starved_ms() > 0.0
+                ):
+                    self._metrics.observe("tts_text_wait_ms", wait_ms)
                 if self._pcm_out and not self._cur_turn.tts_first_pending:
-                    # Backlog gate: hold synthesis while plenty of audio is queued/unplayed. A
-                    # verdict resolves a paused sink and a barge-in flush bumps the epoch, so
-                    # this always releases.
-                    if self._sink.backlog_ms() > _SYNTH_BACKLOG_MS:
-                        self._metrics.count("tts_backlog_gated")
-                        while (
-                            epoch == self._sink.epoch
-                            and self._sink.backlog_ms() > _SYNTH_BACKLOG_MS
-                        ):
-                            await asyncio.sleep(_BACKLOG_POLL_S)
-                        if epoch != self._sink.epoch:
-                            continue  # barged in while gated
-                    # TTS is BEHIND: coalesce same-epoch chunks into one call, fewer calls and
-                    # prosody seams on high-RTF adapters. Never for the first chunk (it would
-                    # fight the first-chunk floor). No await between the epoch check and this
-                    # drain, so every drained item shares the head's (current) epoch.
-                    while (
-                        len(text) < self._cfg.chunker.max_chars
-                        and not self._tts_queue.empty()
-                    ):
-                        nxt_epoch, nxt = self._tts_queue.get_nowait()
-                        self._tts_queue.task_done()
-                        if nxt_epoch != epoch:  # defensive; unreachable today
-                            self._tts_queue.put_nowait((nxt_epoch, nxt))
-                            break
-                        # >= U+2E80 is CJK and up: those scripts take no space.
-                        sep = "" if (text[-1].isspace() or ord(text[-1]) >= 0x2E80) else " "
-                        text = f"{text}{sep}{nxt}"
-                        self._metrics.count("tts_coalesced")
-                t0 = time.monotonic()
-                if self._pcm_out:
-                    audio = await self._tts.synthesize_pcm(text)
+                    await self._jit_pipeline(epoch, text)
                 else:
-                    audio = await self._tts.synthesize(text)
-                synth_ms = (time.monotonic() - t0) * 1000.0
-                # Every chunk: steady-state TTS drift is otherwise invisible until it gaps.
-                self._metrics.observe("tts_synth_ms", synth_ms)
-                if epoch != self._sink.epoch:  # barged in during synthesis
-                    continue
-                if not audio:
-                    continue
-                was_first = self._cur_turn.tts_first_pending
-                if was_first:
-                    self._cur_turn.tts_first_pending = False
-                    self._cur_turn.audible_at = time.monotonic()
-                    self._metrics.observe("tts_first_chunk_ms", synth_ms)
-                elif self._sink.starved():
-                    # Synthesis lost the race against playback (audible mid-reply gap): the
-                    # chunk floors are too small for this TTS speed.
-                    self._metrics.count("tts_gap")
-                if self._pcm_out:
-                    # A turn's first chunk keeps only 20 ms of lead silence (the rest is pure
-                    # TTFA); later chunks keep 120 ms, so inter-sentence pauses stay natural.
-                    audio = trim_lead_silence(
-                        audio, self._tts.output_rate, cap_ms=20.0 if was_first else 120.0
-                    )
-                if self._duck_gain < 1.0 and not self._pcm_out:
-                    # Blob fallback: no mid-chunk gain control, so bake the static duck in.
-                    audio = await asyncio.to_thread(_scale_wav, audio, self._duck_gain)
-                self._metrics.turn_first_audio()  # latched: TTFA on the turn's first frame
-                dur_ms = self._audio_ms(audio)
-                self._log.debug(
-                    "tts: {} chars -> {:.0f} ms audio in {:.0f} ms (rtf {:.2f})",
-                    len(text), dur_ms, synth_ms,
-                    synth_ms / dur_ms if dur_ms > 0 else 0.0,
-                )
-                if self._pcm_out:
-                    # Heard-up-to span, appended in sink FIFO order.
-                    gen = self._sink.stream_generation
-                    if self._spoken_spans and gen != self._spans_gen:
-                        # The spans' stream was EOF'd and replaced since they were anchored (a
-                        # cancelled tool-boundary settle: its fold never ran, and the tail rang
-                        # out in full). Fold them as heard: against a stale base the mapping
-                        # garbles.
-                        spoken = " ".join(t for t, _ in self._spoken_spans).strip()
-                        self._heard_prefix = f"{self._heard_prefix} {spoken}".strip()
-                        self._spoken_spans.clear()
-                    if not self._spoken_spans:
-                        # Segment start: anchor at the CURRENT played position; the stream may
-                        # already have played a filler's audio.
-                        self._spans_base_ms = float(self._sink.played_ms())
-                        self._spans_gen = gen
-                    self._spoken_spans.append((text, dur_ms))
-                # Fed HERE, not at chunker feed: the eviction window runs from when the words
-                # stop being AUDIBLE, hence backlog + this chunk's playtime. Earlier, and a long
-                # reply's tail ages out mid-playback and reads back as user speech.
-                self._echo.note_spoken(text, hold_ms=self._sink.backlog_ms() + dur_ms)
-                await self._emit(self._audio_event(epoch, audio))
+                    # Turn's first chunk (pure TTFA) and blob mode: as-is, unscheduled.
+                    await self._synth_and_emit(epoch, text)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - never let one chunk kill the worker
                 self._log.warning("tts error: {}", exc)
             finally:
                 self._tts_queue.task_done()
+
+    def _coalesce_into(self, epoch: int, pending: list[str]) -> None:
+        """Drain same-epoch queued chunks into the candidate up to max_chars (checked
+        before append). Drained items are task_done'd here; the rest keep their own,
+        so queue.join() accounting stays exact. No-op once the epoch died: draining
+        then would re-queue a successor turn's chunks out of order."""
+        if epoch != self._sink.epoch:
+            return
+        while (
+            sum(map(len, pending)) < self._cfg.chunker.max_chars
+            and not self._tts_queue.empty()
+        ):
+            nxt_epoch, nxt = self._tts_queue.get_nowait()
+            self._tts_queue.task_done()
+            if nxt_epoch != epoch:  # defensive; the entry guard makes this unreachable
+                self._tts_queue.put_nowait((nxt_epoch, nxt))
+                break
+            pending.append(nxt)
+            self._metrics.count("tts_coalesced")
+
+    def _take_piece(self, pending: list[str], budget: int) -> str:
+        """Whole chunks greedily up to *budget*, CJK-aware separator between them;
+        the head is cut inside only when it alone exceeds the budget (those seams
+        cost prosody: counted), and never below the first-chunk floor."""
+        head = pending[0]
+        if len(head) > budget:
+            cut = _cut_index(head, budget, self._cfg.chunker.min_chars_first)
+            piece, rest = head[:cut].strip(), head[cut:].strip()
+            if rest:
+                pending[0] = rest
+                self._metrics.count("tts_piece_split")
+                return piece
+            pending.pop(0)  # the cut only shed whitespace: the whole head went
+            return piece
+        parts = [pending.pop(0)]
+        size = len(parts[0])
+        while pending and size + len(pending[0]) <= budget:
+            nxt = pending.pop(0)
+            last = parts[-1]
+            # >= U+2E80 is CJK and up: those scripts take no space.
+            parts.append("" if (last[-1].isspace() or ord(last[-1]) >= 0x2E80) else " ")
+            parts.append(nxt)
+            size += len(nxt)
+        return "".join(parts)
+
+    def _runway_ms(self) -> float:
+        """Unplayed audio ahead of the listener, CONTINUOUS: backlog_ms over-counts
+        the in-flight sink item until its write returns (a step signal the deadline
+        math cannot run on), so prefer the span ledger against played_ms. A filler
+        tail preceding the spans' anchor under-counts — synthesis merely starts
+        early. Falls back to backlog_ms between segments (no spans)."""
+        if self._spoken_spans and self._spans_gen == self._sink.stream_generation:
+            rem = (
+                self._spans_base_ms
+                + sum(dur for _, dur in self._spoken_spans)
+                - self._sink.played_ms()
+            )
+            return max(0.0, rem)
+        return float(self._sink.backlog_ms())
+
+    async def _jit_pipeline(self, epoch: int, head: str) -> None:
+        """Deadline-scheduled synthesis of one queue item plus coalesced successors.
+
+        The remainder is carried HERE, never re-queued (re-queueing would reorder it
+        behind fresh arrivals); the head item's task_done stays with the caller until
+        every piece is emitted, so _settle's queue.join() covers the remainder. A
+        verdict resolves a paused (frozen-backlog) sink and a barge-in flush bumps
+        the epoch, so the wait always releases."""
+        pending = [head]
+        while pending:
+            if epoch != self._sink.epoch:
+                return  # barged in: the remainder dies with the turn
+            self._coalesce_into(epoch, pending)
+            mpc = self._synth_mpc
+            if mpc is None:
+                # Unseeded: no basis to schedule; whole candidate, as the old worker.
+                budget = sum(map(len, pending))
+            else:
+                mpc = max(mpc, _MPC_MIN)
+                floor = self._cfg.chunker.min_chars_first
+                # The ahead cap folded into WANT keeps the wait threshold and the
+                # post-wait budget consistent (release size == cut size).
+                cap_chars = int(
+                    (_SYNTH_AHEAD_CAP_S - _SYNTH_LEAD_MARGIN_S)
+                    / _SYNTH_LEAD_SAFETY * 1000.0 / mpc
+                )
+                wait_t0 = time.monotonic()
+                while True:
+                    want = min(
+                        sum(map(len, pending)),
+                        self._cfg.chunker.max_chars,
+                        max(cap_chars, floor),
+                    )
+                    need_s = want * mpc / 1000.0 * _SYNTH_LEAD_SAFETY + _SYNTH_LEAD_MARGIN_S
+                    surplus = self._runway_ms() / 1000.0 - need_s
+                    if surplus <= 0.0 or epoch != self._sink.epoch:
+                        break
+                    # Floored sleep (no ~ms churn at the threshold), capped for prompt
+                    # pause/epoch/fresh-text re-checks.
+                    await asyncio.sleep(min(max(surplus, 0.02), _JIT_POLL_CAP_S))
+                    self._coalesce_into(epoch, pending)
+                if epoch != self._sink.epoch:
+                    return
+                waited_ms = (time.monotonic() - wait_t0) * 1000.0
+                if waited_ms >= 1.0:
+                    self._metrics.observe("tts_jit_wait_ms", waited_ms)
+                runway_s = self._runway_ms() / 1000.0
+                budget_s = max(runway_s - _SYNTH_LEAD_MARGIN_S, 0.0) / _SYNTH_LEAD_SAFETY
+                # Floor first, then candidate size: short text is never inflated.
+                budget = min(want, max(floor, int(budget_s * 1000.0 / mpc)))
+            piece = self._take_piece(pending, budget)
+            if not await self._synth_and_emit(epoch, piece):
+                return
+
+    async def _synth_and_emit(self, epoch: int, text: str) -> bool:
+        """Shared synthesis tail of both worker paths (cost EMA, trim, spans, echo,
+        metrics). False only when the epoch died during synthesis (the caller drops
+        its remainder); empty audio returns True — the rest may still speak."""
+        t0 = time.monotonic()
+        if self._pcm_out:
+            audio = await self._tts.synthesize_pcm(text)
+        else:
+            audio = await self._tts.synthesize(text)
+        synth_ms = (time.monotonic() - t0) * 1000.0
+        # Every chunk: steady-state TTS drift is otherwise invisible until it gaps.
+        self._metrics.observe("tts_synth_ms", synth_ms)
+        if audio and text:
+            # EMA before the epoch check: a barged-in call is still a valid speed sample.
+            obs = synth_ms / len(text)
+            ema = self._synth_mpc
+            if ema is None:
+                self._synth_mpc = obs
+            else:
+                obs = min(max(obs, ema / 4.0), ema * 4.0)
+                self._synth_mpc = max(obs, (1.0 - _MPC_ALPHA) * ema + _MPC_ALPHA * obs)
+        if epoch != self._sink.epoch:  # barged in during synthesis
+            return False
+        if not audio:
+            return True
+        was_first = self._cur_turn.tts_first_pending
+        if was_first:
+            self._cur_turn.tts_first_pending = False
+            self._cur_turn.audible_at = time.monotonic()
+            self._metrics.observe("tts_first_chunk_ms", synth_ms)
+        elif self._pcm_out:
+            # Synthesis lost the race: only a RUNNING stream gone dry counts — a
+            # drained tool-boundary stream is a deliberate pause, not a loss.
+            dry_ms = self._sink.starved_ms()
+            if dry_ms >= _GAP_COUNT_MIN_MS:
+                self._metrics.count("tts_gap")
+                self._metrics.observe("tts_gap_ms", dry_ms)
+        elif self._sink.starved():
+            self._metrics.count("tts_gap")  # blob mode: the queue ran idle
+        if self._pcm_out:
+            # A turn's first chunk keeps only 20 ms of lead silence (the rest is pure
+            # TTFA); later chunks keep 120 ms, so inter-sentence pauses stay natural.
+            audio = trim_lead_silence(
+                audio, self._tts.output_rate, cap_ms=20.0 if was_first else 120.0
+            )
+        if self._duck_gain < 1.0 and not self._pcm_out:
+            # Blob fallback: no mid-chunk gain control, so bake the static duck in.
+            audio = await asyncio.to_thread(_scale_wav, audio, self._duck_gain)
+        self._metrics.turn_first_audio()  # latched: TTFA on the turn's first frame
+        dur_ms = self._audio_ms(audio)
+        self._log.debug(
+            "tts: {} chars -> {:.0f} ms audio in {:.0f} ms (rtf {:.2f})",
+            len(text), dur_ms, synth_ms,
+            synth_ms / dur_ms if dur_ms > 0 else 0.0,
+        )
+        if self._pcm_out:
+            # Heard-up-to span, appended in sink FIFO order.
+            gen = self._sink.stream_generation
+            if self._spoken_spans and gen != self._spans_gen:
+                # The spans' stream was EOF'd and replaced since they were anchored (a
+                # cancelled tool-boundary settle: its fold never ran, and the tail rang
+                # out in full). Fold them as heard: against a stale base the mapping
+                # garbles.
+                spoken = " ".join(t for t, _ in self._spoken_spans).strip()
+                self._heard_prefix = f"{self._heard_prefix} {spoken}".strip()
+                self._spoken_spans.clear()
+            if not self._spoken_spans:
+                # Segment start: anchor at the CURRENT played position; the stream may
+                # already have played a filler's audio.
+                self._spans_base_ms = float(self._sink.played_ms())
+                self._spans_gen = gen
+            self._spoken_spans.append((text, dur_ms))
+        # Fed HERE, not at chunker feed: the eviction window runs from when the words
+        # stop being AUDIBLE, hence backlog + this chunk's playtime. Earlier, and a long
+        # reply's tail ages out mid-playback and reads back as user speech.
+        self._echo.note_spoken(text, hold_ms=self._sink.backlog_ms() + dur_ms)
+        await self._emit(self._audio_event(epoch, audio))
+        return True
 
     def _schedule_drain(self) -> None:
         # Reply complete: no filler, tool boundary, or stall watch can still apply to this turn.

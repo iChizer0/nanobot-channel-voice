@@ -176,6 +176,11 @@ class AudioSink:
                 self._pause_gate.clear()
                 self._paused_at = time.monotonic()
         else:
+            if self._paused_at is not None and self._stream is not None:
+                # Splice the paused span out of the stream clock, or every
+                # elapsed-based read (played_ms, backlog_ms, starved_ms) counts
+                # the silence as playout until the next write re-anchors.
+                self._stream_open_t += time.monotonic() - self._paused_at
             self._pause_gate.set()
             self._paused_at = None
 
@@ -271,6 +276,17 @@ class AudioSink:
             elapsed = (time.monotonic() - self._stream_open_t) * 1000.0
             return elapsed >= self._bytes / (2 * self._rate) * 1000.0
         return not self.busy
+
+    def starved_ms(self) -> float:
+        """How long the stream has been audibly dry; 0 when healthy, paused, between
+        streams, or blob. Read BEFORE the next write: ``_stream_write``'s starvation
+        re-anchor rebases the clock and erases the evidence."""
+        if self._mode != "stream" or self._stream is None or self._rate <= 0:
+            return 0.0
+        if not self._pause_gate.is_set():
+            return 0.0
+        elapsed = (self._clock_now() - self._stream_open_t) * 1000.0
+        return max(0.0, elapsed - self._bytes / (2 * self._rate) * 1000.0)
 
     async def start(self) -> None:
         if self._worker is None:
