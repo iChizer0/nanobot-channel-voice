@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from importlib.metadata import version as _dist_version
 from pathlib import Path
 
 from loguru import logger
@@ -261,6 +262,53 @@ class _Turn:
         self.segment_spoke = False
         self.chunk_await = self.tts_first_pending = self.await_first_token = False
         self.continuation_pending = False
+
+
+def _dump_session_header(config: VoiceConfig, frame_ms: int) -> dict:
+    """First manifest record: the tuning-relevant config in effect, so records from
+    different threshold experiments stay attributable. Curated - active VAD engine
+    only, no model paths/runtime knobs; ``neg_threshold`` stays as configured (null
+    = engine-default hysteresis)."""
+    vad = config.vad
+    detector: dict = {"engine": vad.engine}
+    if vad.engine == "energy":
+        detector["threshold"] = vad.energy_threshold  # 0 = adaptive noise floor
+    elif vad.engine == "webrtc":
+        detector["aggressiveness"] = vad.aggressiveness
+    elif vad.engine == "firered":
+        detector.update(
+            threshold=vad.firered.threshold,
+            smooth_frames=vad.firered.smooth_frames,
+            min_volume=vad.firered.min_volume,
+        )
+    elif vad.engine == "silero":
+        detector.update(
+            threshold=vad.silero.threshold,
+            neg_threshold=vad.silero.neg_threshold,
+            min_volume=vad.silero.min_volume,
+        )
+    header = {
+        "wall": round(time.time(), 3),
+        "sample_rate": config.audio.sample_rate,
+        "frame_ms": frame_ms,
+        "vad": detector,
+        "start_frames": vad.start_frames,
+        "preroll_ms": resolve_preroll_ms(vad, frame_ms),
+        "hangover_ms": vad.hangover_ms,
+        "min_utterance_ms": vad.min_utterance_ms,
+        "max_utterance_ms": vad.max_utterance_ms,
+    }
+    if vad.hangover_min_ms is not None:
+        header["hangover_min_ms"] = vad.hangover_min_ms
+    if vad.turn.engine != "none":
+        header["turn"] = {
+            "engine": vad.turn.engine,
+            "threshold": vad.turn.threshold,
+            "consult_ms": vad.turn.consult_ms,
+        }
+    with suppress(Exception):  # uninstalled source tree: only the version is lost
+        header["version"] = _dist_version("nanobot-channel-voice")
+    return header
 
 
 def _scale_wav(wav_bytes: bytes, gain: float) -> bytes:
@@ -529,6 +577,7 @@ class LocalBackend(TurnEventMixin):
                     root,
                     config.audio.sample_rate,
                     config.debug.dump_max_mb * 1024 * 1024,
+                    header=_dump_session_header(config, frame_ms),
                 )
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("audio dump disabled ({})", exc)
@@ -839,17 +888,28 @@ class LocalBackend(TurnEventMixin):
         return data[-nbytes:] if len(data) > nbytes else data
 
     def _dump_blip(self) -> None:
-        """A min-filter reject may still have engaged the duck: keep it audible.
-        No-op unless the endpointer parked one this frame (probe/gap drops reset
-        the slot first)."""
+        """Dump a min-filter reject; no-op unless the endpointer parked one this
+        frame (probe/gap drops clear the slot first). A reject IS a close and no
+        push has run since, so the ``closed_*`` snapshot - the false-trigger
+        evidence the VAD threshold is tuned on - is this blip's own."""
         if self._dumper is None:
             return
-        pcm, self._endpointer.last_rejected = self._endpointer.last_rejected, None
-        if pcm:
-            self._dumper.submit(
-                "blip", pcm, self._raw_tail(len(pcm)),
-                seq=self._next_seg(), meta={"wall": round(time.time(), 3)},
-            )
+        ep = self._endpointer
+        pcm, ep.last_rejected = ep.last_rejected, None
+        if not pcm:
+            return
+        meta = {
+            "wall": round(time.time(), 3),
+            "active_ms": ep.closed_active_ms,
+            "close": ep.closed_reason,
+            "silence_ms": ep.closed_silence_ms,
+        }
+        if ep.closed_prob_mean is not None:
+            meta["prob_mean"] = round(ep.closed_prob_mean, 3)
+            meta["prob_peak"] = round(ep.closed_prob_peak, 3)
+        self._dumper.submit(
+            "blip", pcm, self._raw_tail(len(pcm)), seq=self._next_seg(), meta=meta,
+        )
 
     def _candidate_contested(self) -> bool:
         """A duck/pause candidate is live and no confirm has claimed it. ``in_speech``

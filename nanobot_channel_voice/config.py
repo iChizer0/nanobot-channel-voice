@@ -590,8 +590,11 @@ class DebugConfig(_VoiceBase):
     ``empty``/``echo``/``ack``/``stop``/``blip``/``probe``/``gap``), so a false
     barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the
     same span pre-cancellation (TTS audible there but not in the post-AEC file = the
-    canceller works and the trigger is acoustic). Segments are recordings of the
-    operator's room: leave this off outside debugging sessions."""
+    canceller works and the trigger is acoustic). Each session directory also holds
+    ``manifest.jsonl`` (a config-header line, then one record per segment) and an
+    ``index.html`` viewer: serve the directory (``python -m http.server``) to browse,
+    filter and play the records. Segments are recordings of the operator's room:
+    leave this off outside debugging sessions."""
 
     dump_audio: bool = False
     # Root for the per-session dump directories. None => the weights-store

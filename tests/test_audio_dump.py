@@ -4,6 +4,7 @@ raw twin under software AEC), so false barge-ins can be diagnosed by ear."""
 from __future__ import annotations
 
 import asyncio
+import json
 import wave
 
 from nanobot_channel_voice.audio.null import NullPlayback
@@ -284,8 +285,6 @@ def test_debug_config_parses_camel_case():
 
 
 def test_manifest_records_backend_ids_and_meta(tmp_path):
-    import json
-
     d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
     d.submit("publish", b"\x01\x00" * 1600, seq=7, meta={"stt_ms": 42, "close": "silence"})
     d.submit("blip", b"\x02\x00" * 800, seq=8)
@@ -309,6 +308,56 @@ def test_prune_removes_manifest_bearing_sessions(tmp_path):
     stale.mkdir()
     (stale / "utt-0001-empty.wav").write_bytes(b"\x00" * 8192)
     (stale / "manifest.jsonl").write_text('{"id": 1}\n')
+    (stale / "index.html").write_text("<!doctype html>")
     d = AudioDumper(tmp_path, 16000, 4 * 1024)  # cap below the stale session's bytes
     d.close()
-    assert not stale.exists()  # manifest must not wedge the rmdir
+    assert not stale.exists()  # manifest/viewer must not wedge the rmdir
+
+
+def test_manifest_session_header_is_first_line(tmp_path):
+    d = AudioDumper(
+        tmp_path, 16000, 10 * 1024 * 1024,
+        header={"vad": {"engine": "silero", "threshold": 0.5}, "hangover_ms": 600},
+    )
+    d.submit("publish", b"\x01\x00" * 800, seq=1)
+    d.close()
+    recs = [
+        json.loads(line)
+        for line in (d.dir / "manifest.jsonl").read_text().splitlines()
+    ]
+    assert recs[0]["type"] == "session"
+    assert recs[0]["vad"]["threshold"] == 0.5 and recs[0]["hangover_ms"] == 600
+    assert recs[1]["id"] == 1 and "type" not in recs[1]
+
+
+def test_viewer_installed_per_session(tmp_path):
+    d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
+    d.close()  # writer thread installs the viewer at startup; close joins it
+    viewer = (d.dir / "index.html").read_text()
+    assert "manifest.jsonl" in viewer
+
+
+def test_blip_manifest_carries_close_snapshot(tmp_path):
+    async def _case():
+        # Same shape as test_blip_reject_is_dumped: 6 flagged frames (120 ms) under
+        # the 200 ms min -> reject; the record must carry the close snapshot the
+        # threshold is tuned on, not just the audio.
+        vad = _ScriptedVad([True] * 6 + [False] * 35)
+        h = _build(vad, tmp_path)
+        await _start(h.backend)
+        for _ in range(42):
+            await h.backend.push_audio(_FRAME)
+        await h.backend._utt_queue.join()
+        dump_dir = h.backend._dumper.dir
+        await h.backend.close()
+        return [
+            json.loads(line)
+            for line in (dump_dir / "manifest.jsonl").read_text().splitlines()
+        ]
+
+    recs = asyncio.run(_case())
+    assert recs[0]["type"] == "session" and recs[0]["vad"]["engine"] == "energy"
+    blip = next(r for r in recs if r.get("verdict") == "blip")
+    assert blip["active_ms"] == 120
+    assert blip["close"] == "silence" and blip["silence_ms"] == 600
+    assert "prob_mean" not in blip  # scripted VAD exposes no probability

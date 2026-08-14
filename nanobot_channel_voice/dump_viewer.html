@@ -1,0 +1,218 @@
+<!doctype html>
+<!-- Session viewer for debug.dumpAudio: copied into each dump session directory as
+     index.html. Self-contained (no CDN: dump sessions live on headless SBCs); reads
+     ./manifest.jsonl on every load, so it never needs a per-record refresh. Serve the
+     directory (python -m http.server) - browsers block fetch() from file:// pages. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>voice dump session</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1a2027; --muted: #67707c;
+    --line: #e2e6ea; --accent: #2563eb; --chip: #eef1f5; --chip-on: #dbe7ff;
+    --bad: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a; --panel: #1d2126; --ink: #e6e9ec; --muted: #98a1ab;
+      --line: #2c3238; --accent: #7aa2ff; --chip: #262c33; --chip-on: #2c3f63;
+      --bad: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.25rem; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1.05rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin-bottom: 1rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: .75rem 1rem; margin-bottom: 1rem;
+  }
+  .kv { display: flex; flex-wrap: wrap; gap: .35rem .5rem; }
+  .kv span {
+    background: var(--chip); border-radius: 4px; padding: .1rem .45rem;
+    white-space: nowrap;
+  }
+  .kv b { font-weight: 600; }
+  .chips { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+  .chip {
+    cursor: pointer; user-select: none; background: var(--chip); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 999px; padding: .15rem .7rem;
+  }
+  .chip.on { background: var(--chip-on); border-color: var(--accent); }
+  .chip small { color: var(--muted); }
+  button.plain {
+    cursor: pointer; background: var(--panel); color: var(--ink);
+    border: 1px solid var(--line); border-radius: 6px; padding: .2rem .7rem;
+    font: inherit; margin-left: auto;
+  }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--line);
+    white-space: nowrap; vertical-align: middle;
+  }
+  th { cursor: pointer; color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  th .dir { color: var(--accent); }
+  td.text { max-width: 26rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .verdict { border-radius: 4px; padding: .05rem .4rem; background: var(--chip); }
+  .verdict.publish, .verdict.interrupt, .verdict.stop, .verdict.ack { background: var(--chip-on); }
+  .verdict.blip, .verdict.empty, .verdict.echo, .verdict.error { color: var(--bad); }
+  audio { height: 28px; width: 15rem; vertical-align: middle; }
+  .rawlbl { color: var(--muted); margin: 0 .3rem 0 .8rem; }
+  .missing { color: var(--bad); }
+  .note { color: var(--muted); }
+  #err { color: var(--bad); white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>voice dump session</h1>
+<div class="sub" id="sub">loading…</div>
+<div class="card" id="session" hidden><div class="kv" id="sessionkv"></div></div>
+<div class="card"><div class="chips" id="chips"><button class="plain" id="reload">reload</button></div></div>
+<div class="card scroll"><table id="tbl"><thead></thead><tbody></tbody></table></div>
+<div id="err"></div>
+<script>
+"use strict";
+const COLS = [
+  { key: "id",        label: "id",      num: true },
+  { key: "verdict",   label: "verdict" },
+  { key: "wall",      label: "time",    num: true, fmt: r => r.wall ? new Date(r.wall * 1000).toLocaleTimeString() : "–" },
+  { key: "dur_ms",    label: "dur",     num: true, fmt: r => ms(r.dur_ms) },
+  { key: "active_ms", label: "active",  num: true, fmt: r => ms(r.active_ms) },
+  { key: "close",     label: "close",   fmt: r => r.close ? r.close + (r.silence_ms != null ? "+" + r.silence_ms + "ms" : "") : "–" },
+  { key: "prob_peak", label: "vad",     num: true, fmt: r => r.prob_mean != null ? r.prob_mean.toFixed(2) + "~" + r.prob_peak.toFixed(2) : "–" },
+  { key: "rms",       label: "rms",     num: true, fmt: r => r.rms != null ? r.rms.toFixed(3) : "–" },
+  { key: "stt_ms",    label: "stt",     num: true, fmt: r => r.stt_ms != null ? r.stt_ms + "ms/" + (r.stt || "?") : "–" },
+  { key: "text",      label: "text",    fmt: r => r.text ?? "" },
+];
+const state = { header: null, records: [], filter: new Set(), sortKey: "id", sortDir: 1 };
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ms = v => v != null ? v + "ms" : "–";
+
+async function load() {
+  const err = document.getElementById("err");
+  err.textContent = "";
+  if (location.protocol === "file:") {
+    document.getElementById("sub").textContent = "opened from file:// - the browser blocks reading manifest.jsonl.";
+    err.textContent = "Serve this directory instead:\n  python3 -m http.server -d " + decodeURIComponent(location.pathname).replace(/\/[^/]*$/, "") + "\nthen open http://localhost:8000/";
+    return;
+  }
+  let text;
+  try {
+    const resp = await fetch("./manifest.jsonl", { cache: "no-store" });
+    if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
+    text = await resp.text();
+  } catch (e) {
+    document.getElementById("sub").textContent = "could not read ./manifest.jsonl";
+    err.textContent = String(e);
+    return;
+  }
+  state.header = null;
+  state.records = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (rec.type === "session") state.header = rec;
+    else state.records.push(rec);
+  }
+  render();
+}
+
+function flat(obj, prefix) {
+  const out = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === "type") continue;
+    if (v !== null && typeof v === "object") out.push(...flat(v, prefix + k + "."));
+    else out.push([prefix + k, k === "wall" ? new Date(v * 1000).toLocaleString() : v]);
+  }
+  return out;
+}
+
+function render() {
+  const dir = decodeURIComponent(location.pathname).split("/").filter(Boolean).pop() || "";
+  document.title = "voice dump " + dir;
+  document.getElementById("sub").textContent =
+    dir + " - " + state.records.length + " segment" + (state.records.length === 1 ? "" : "s") +
+    " (rows outlive pruned audio; a dead player means the byte cap removed that WAV)";
+
+  const sess = document.getElementById("session");
+  if (state.header) {
+    sess.hidden = false;
+    document.getElementById("sessionkv").innerHTML = flat(state.header, "")
+      .map(([k, v]) => "<span><b>" + esc(k) + "</b>=" + esc(v ?? "default") + "</span>").join("");
+  } else sess.hidden = true;
+
+  const counts = {};
+  for (const r of state.records) counts[r.verdict] = (counts[r.verdict] || 0) + 1;
+  const chips = document.getElementById("chips");
+  chips.querySelectorAll(".chip").forEach(c => c.remove());
+  const reload = document.getElementById("reload");
+  for (const v of Object.keys(counts).sort()) {
+    const c = document.createElement("span");
+    c.className = "chip" + (state.filter.has(v) ? " on" : "");
+    c.innerHTML = esc(v) + " <small>" + counts[v] + "</small>";
+    c.onclick = () => { state.filter.has(v) ? state.filter.delete(v) : state.filter.add(v); render(); };
+    chips.insertBefore(c, reload);
+  }
+
+  const hasText = state.records.some(r => r.text != null);
+  const cols = COLS.filter(c => c.key !== "text" || hasText);
+  document.querySelector("#tbl thead").innerHTML = "<tr>" + cols.map(c =>
+    "<th data-key='" + c.key + "'>" + c.label +
+    (state.sortKey === c.key ? " <span class='dir'>" + (state.sortDir > 0 ? "▴" : "▾") + "</span>" : "") +
+    "</th>").join("") + "<th>audio</th></tr>";
+  document.querySelectorAll("#tbl th[data-key]").forEach(th => {
+    th.onclick = () => {
+      const k = th.dataset.key;
+      state.sortDir = state.sortKey === k ? -state.sortDir : 1;
+      state.sortKey = k;
+      render();
+    };
+  });
+
+  const shown = state.records.filter(r => !state.filter.size || state.filter.has(r.verdict));
+  const key = state.sortKey, dirn = state.sortDir;
+  shown.sort((a, b) => {
+    const x = a[key], y = b[key];
+    if (x == null) return 1;
+    if (y == null) return -1;
+    return (x < y ? -1 : x > y ? 1 : 0) * dirn;
+  });
+
+  document.querySelector("#tbl tbody").innerHTML = shown.map(r => {
+    const cells = cols.map(c => {
+      const val = c.fmt ? c.fmt(r) : r[c.key] ?? "–";
+      if (c.key === "verdict")
+        return "<td><span class='verdict " + esc(r.verdict) + "'>" + esc(val) + "</span></td>";
+      if (c.key === "text")
+        return "<td class='text' title='" + esc(val) + "'>" + esc(val) + "</td>";
+      return "<td class='" + (c.num ? "num" : "") + "'>" + esc(val) + "</td>";
+    }).join("");
+    let audio = "<td class='note'>no file</td>";
+    if (r.file) {
+      audio = "<td><audio controls preload='none' src='" + esc(r.file) + "'></audio>";
+      if (r.raw)
+        audio += "<span class='rawlbl'>raw</span><audio controls preload='none' src='" +
+                 esc(r.file.replace(/\.wav$/, ".raw.wav")) + "'></audio>";
+      audio += "</td>";
+    }
+    return "<tr>" + cells + audio + "</tr>";
+  }).join("");
+  document.querySelectorAll("#tbl audio").forEach(a => {
+    a.onerror = () => { a.outerHTML = "<span class='missing'>pruned</span>"; };
+  });
+}
+
+document.getElementById("reload").onclick = load;
+load();
+</script>
+</body>
+</html>

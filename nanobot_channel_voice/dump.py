@@ -12,7 +12,16 @@ probe/blip drop immediately).
 ``manifest.jsonl`` in the session directory gets one record per segment (id,
 verdict, duration, rms, plus whatever metadata the backend attached - close
 shape, STT cost, VAD confidence, capture-side wall stamp), so a dump directory
-is filtered with jq before anything is listened to.
+is filtered with jq before anything is listened to. Its first line is a
+``{"type": "session", ...}`` record of the config in effect, so threshold
+experiments stay attributable across sessions; readers skip lines bearing
+``type``. A record outlives its WAV (the byte cap deletes audio, never
+manifest lines), so ``file`` may name a pruned segment.
+
+``index.html`` (the packaged ``dump_viewer.html``) lands next to the manifest:
+serve the directory (``python -m http.server``) and the session is browsable -
+filterable record table, inline players. It re-reads the manifest per load, so
+it needs no per-record refresh and survives a crash.
 
 :meth:`submit` only enqueues (producers must never block on disk); one daemon
 writer thread does all file I/O, including the startup prune.
@@ -27,6 +36,7 @@ import threading
 import time
 import wave
 from contextlib import suppress
+from importlib import resources
 from pathlib import Path
 
 from loguru import logger
@@ -54,9 +64,13 @@ class AudioDumper:
     bounded queue, and a best-effort byte cap (older sessions pruned first, then
     the live session's oldest segments)."""
 
-    def __init__(self, root: Path, sample_rate: int, max_bytes: int):
+    def __init__(
+        self, root: Path, sample_rate: int, max_bytes: int,
+        *, header: dict | None = None,
+    ):
         self._rate = sample_rate
         self._max_bytes = max_bytes
+        self._header = header
         self._log = logger.bind(component="voice")
         self._root = root
         root.mkdir(parents=True, exist_ok=True)
@@ -113,6 +127,12 @@ class AudioDumper:
     # ---- writer thread -----------------------------------------------------
 
     def _writer(self) -> None:
+        if self._header is not None:  # first manifest line, ahead of any queued record
+            try:
+                self._append_manifest({"type": "session", **self._header})
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never kill audio
+                self._log.warning("audio dump session header failed: {}", exc)
+        self._install_viewer()
         self._prune_old_sessions()  # off-loop: an unlink storm must not stall start()
         try:
             while True:
@@ -153,10 +173,7 @@ class AudioDumper:
             "id": seq, "verdict": verdict, "file": path.name,
             "dur_ms": dur_ms, "rms": rms, "raw": raw is not None,
         }
-        if self._manifest is None:
-            self._manifest = open(self.dir / "manifest.jsonl", "a", encoding="utf-8")
-        self._manifest.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        self._manifest.flush()  # a crash must not cost the records that led to it
+        self._append_manifest(record)
         while self._written_bytes > self._max_bytes and len(self._written) > 1:
             old, size = self._written.pop(0)
             try:
@@ -164,6 +181,23 @@ class AudioDumper:
                 self._written_bytes -= size
             except OSError:
                 break  # best-effort; retried on the next write
+
+    def _append_manifest(self, record: dict) -> None:
+        if self._manifest is None:
+            self._manifest = open(self.dir / "manifest.jsonl", "a", encoding="utf-8")
+        self._manifest.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        self._manifest.flush()  # a crash must not cost the records that led to it
+
+    def _install_viewer(self) -> None:
+        """Copy the packaged viewer in as ``index.html``: serving the directory over
+        HTTP is then all the browsing setup there is."""
+        try:
+            html = (
+                resources.files("nanobot_channel_voice") / "dump_viewer.html"
+            ).read_bytes()
+            (self.dir / "index.html").write_bytes(html)
+        except Exception as exc:  # noqa: BLE001 - a missing viewer costs browsing, not audio
+            self._log.warning("audio dump viewer not installed: {}", exc)
 
     def _write_wav(self, path: Path, pcm: bytes) -> None:
         with wave.open(str(path), "wb") as wav:
@@ -200,6 +234,7 @@ class AudioDumper:
                 for f in path.glob("*.wav"):
                     f.unlink(missing_ok=True)
                 (path / "manifest.jsonl").unlink(missing_ok=True)
+                (path / "index.html").unlink(missing_ok=True)
                 with suppress(OSError):
                     path.rmdir()  # left standing if the user parked files inside
                 total -= size
