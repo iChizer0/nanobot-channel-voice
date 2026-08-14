@@ -49,9 +49,10 @@ class Endpointer:
         # Monotonic across utterances (NOT reset), so a verdict about one pause can
         # never authorize closing a different one.
         self._consult_gen = 0
-        # Why the last utterance closed; read right after push() returns one. A max-length
-        # close invalidates the eager snapshot and has no hangover lag to back-date.
-        self.closed_by_silence = True
+        # Why the last utterance closed ("silence" | "max" | "eou"); read right after
+        # push() returns one. A max close invalidates the eager snapshot and has no
+        # hangover lag to back-date; "eou" is the turn model's close_now().
+        self.closed_reason = "silence"
         # Did the FINAL silence run reach the eager mark before the close? A
         # close_now() firing earlier means a still-valid eager task belongs to an
         # EARLIER pause and must not stand in for the whole utterance.
@@ -60,6 +61,13 @@ class Endpointer:
         # back-dating: the full hangover on a silence close, less when close_now()
         # ended it, the interrupted run (usually ~0) at max-length.
         self.closed_silence_ms = 0
+        # Close-time snapshots of the utterance body, for the per-utterance summary:
+        # speech-flagged audio, and the VAD probability behind those flags (peak and
+        # mean; None on engines without one). Live counters die in reset(), so the
+        # snapshot is the only readable copy after a close.
+        self.closed_active_ms = 0
+        self.closed_prob_peak: float | None = None
+        self.closed_prob_mean: float | None = None
         self._min_frames = min_utterance_ms // frame_ms
         self._max_frames = max(1, max_utterance_ms // frame_ms)
         # Onset-confirmation frames PLUS pre-roll from before the VAD flagged speech,
@@ -86,6 +94,9 @@ class Endpointer:
         self._buf = bytearray()
         self._frames = 0
         self._active = 0  # speech-FLAGGED frames only
+        self._prob_peak: float | None = None
+        self._prob_sum = 0.0
+        self._prob_n = 0
         self._eager = None
         self._eager_active: int | None = None
         self._consult = None
@@ -171,14 +182,31 @@ class Endpointer:
             or self._active < self._min_frames
         ):
             return None
-        self.closed_by_silence = True
-        self.closed_silence_ms = self._silence_run * self._frame_ms
+        self._snap_close("eou")
         self.eager_covered = (
             not self._eager_frames or self._silence_run >= self._eager_frames
         )
         utterance = bytes(self._buf)
         self.reset()
         return utterance
+
+    def _snap_close(self, reason: str) -> None:
+        """Freeze the close-time snapshot fields; the caller resets right after."""
+        self.closed_reason = reason
+        self.closed_silence_ms = self._silence_run * self._frame_ms
+        self.closed_active_ms = self._active * self._frame_ms
+        self.closed_prob_peak = self._prob_peak
+        self.closed_prob_mean = (
+            self._prob_sum / self._prob_n if self._prob_n else None
+        )
+
+    def _note_prob(self) -> None:
+        p = self._vad.last_prob
+        if p is not None:
+            self._prob_n += 1
+            self._prob_sum += p
+            if self._prob_peak is None or p > self._prob_peak:
+                self._prob_peak = p
 
     def push(self, frame: bytes) -> bytes | None:
         if not frame:
@@ -189,6 +217,7 @@ class Endpointer:
             self._pretrigger.append(frame)
             if speech:
                 self._speech_run += 1
+                self._note_prob()  # the confirm run's flags belong to the utterance
                 start = self.start_frames_override or self._start_frames
                 if self._speech_run >= start:
                     self._in_speech = True
@@ -198,12 +227,15 @@ class Endpointer:
                     self._silence_run = 0
             else:
                 self._speech_run = 0
+                # A dead candidate's probabilities describe nothing that survives.
+                self._prob_peak, self._prob_sum, self._prob_n = None, 0.0, 0
             return None
 
         self._buf += frame
         self._frames += 1
         if speech:
             self._active += 1
+            self._note_prob()
         self._silence_run = 0 if speech else self._silence_run + 1
 
         # Once per silence run; every FINAL run passes through it before the hangover,
@@ -234,8 +266,9 @@ class Endpointer:
             self._consult_gen += 1
 
         if self._silence_run >= self._hangover_frames or self._frames >= self._max_frames:
-            self.closed_by_silence = self._silence_run >= self._hangover_frames
-            self.closed_silence_ms = self._silence_run * self._frame_ms
+            self._snap_close(
+                "silence" if self._silence_run >= self._hangover_frames else "max"
+            )
             self.eager_covered = True  # hangover > eager mark; max-length closes discard eager
             utterance = bytes(self._buf)
             # Only speech-flagged frames satisfy minUtteranceMs: neither hangover nor

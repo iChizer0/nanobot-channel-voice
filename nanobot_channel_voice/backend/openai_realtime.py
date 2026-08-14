@@ -197,8 +197,6 @@ class RealtimeBackend(TurnEventMixin):
         self._last_error: str | None = None
 
         self._turn = VoiceState.IDLE
-        # Barge-in latency clock: set at server-VAD onset, consumed by the next barge-in.
-        self._speech_started_at: float | None = None
         # Stop-command consume: active only with input transcription on — without
         # transcripts the matcher is None and the persona rule is the only (soft) cover.
         self._log_transcripts = config.log_transcripts
@@ -255,6 +253,12 @@ class RealtimeBackend(TurnEventMixin):
         self._onset_interrupting = False
         self._last_stop_consume = float("-inf")
         self._stop_suppress_until = 0.0
+        # Barge-in latency clock (monotonic ms): set at server-VAD onset, consumed by
+        # the next barge-in. Session-scoped, or a reconnect inherits a stale onset.
+        self._speech_started_at: float | None = None
+        # speech_started..speech_stopped: the only span in which uplink frames may
+        # feed the turn deadman (see the sender loop). Session-scoped.
+        self._user_speaking = False
 
     @property
     def metrics(self) -> VoiceMetrics:
@@ -331,13 +335,18 @@ class RealtimeBackend(TurnEventMixin):
             self._record_barge_in()
 
     def _record_barge_in(self) -> None:
-        if self._speech_started_at is None:
-            return  # no onset recorded (e.g. programmatic cancel) -> nothing to measure
+        # The shell routes EVERY onset here (it cannot gate: state is already
+        # CAPTURING by then), so record only onsets that interrupted a live turn —
+        # _onset_interrupting is latched at speech_started for exactly this reading.
+        # A quiet-session onset would sample the empty-sink flush (~2 ms) and swamp
+        # the distribution. The stamp clears either way: it must not go stale.
+        stamp, self._speech_started_at = self._speech_started_at, None
+        if stamp is None or not self._onset_interrupting:
+            return
         self._metrics.observe(
             f"barge_in_ms.{self._profile.interrupt}",
-            time.monotonic() * 1000.0 - self._speech_started_at,
+            time.monotonic() * 1000.0 - stamp,
         )
-        self._speech_started_at = None
 
     def _note_cancelled(self, rid: str) -> None:
         """Record a dead response so late deltas drop (the cloud analog of the local
@@ -381,6 +390,16 @@ class RealtimeBackend(TurnEventMixin):
             # answering THIS stop is still unborn — arm the at-birth suppression.
             self._stop_suppress_until = time.monotonic() + _STOP_SUPPRESS_S
         await self._sink.flush()
+        # The tracked item dies with the flush: played_ms() restarts at 0, so a LATER
+        # barge-in computing audio_end against the old base would truncate the
+        # partially-heard pre-stop item at 0 — wiping the model's memory of audio the
+        # user DID hear, the exact corruption skipping the truncate above avoids.
+        # Cleared, the next barge-in finds no item and sends nothing: the model
+        # over-remembers (the docstring's chosen direction) instead. An item announced
+        # after this point cannot re-arm the slot: the stop's cancel/suppress marks its
+        # response dead and _on_item_added drops non-live items.
+        self._audio_item_id = None
+        self._item_base_played = 0
         if self._turn is not VoiceState.IDLE:
             await self._set_turn(VoiceState.IDLE)
 
@@ -499,6 +518,10 @@ class RealtimeBackend(TurnEventMixin):
         self._cancel_watchdog()
         self._cancel_drain()
         self._reset_turn_state(reason="session_lost")
+        # The metrics turn timeline dies too: an anchor (or continuation latch)
+        # surviving the outage would measure the reconnected session's first audio
+        # against a turn that no longer exists.
+        self._metrics.turn_end()
         # Reset the coarse state too: the shell's half-duplex mic gate keys on SPEAKING, so
         # dropping while SPEAKING would wedge forever (mic gated -> no audio to the server
         # -> no speech_started to move off SPEAKING).
@@ -547,11 +570,15 @@ class RealtimeBackend(TurnEventMixin):
                     "type": "input_audio_buffer.append",
                     "audio": base64.b64encode(pcm).decode("ascii"),
                 })
-                if self._turn is VoiceState.CAPTURING:
+                if self._user_speaking and self._turn is VoiceState.CAPTURING:
                     # A monologue longer than turn_timeout_s emits no server events until
                     # speech_stopped, so the watchdog armed at speech_started would fire
-                    # mid-sentence. Only while CAPTURING: idle mic frames feeding the
-                    # deadman would keep a THINKING hang from ever recovering.
+                    # mid-sentence. Only while the user is AUDIBLY speaking: the silence
+                    # frames that keep flowing after speech_stopped (the state stays
+                    # CAPTURING until response.created) must not feed the deadman, or a
+                    # server that acks the speech and never answers wedges CAPTURING
+                    # forever — the exact hang the speech_started arming exists to catch.
+                    # Idle mic frames feeding it in THINKING would likewise mask a hang.
                     self._progress_t = time.monotonic()
             except asyncio.CancelledError:
                 raise
@@ -643,6 +670,7 @@ class RealtimeBackend(TurnEventMixin):
         elif t == "input_audio_buffer.speech_started":
             self._cancel_drain()
             self._arm_watchdog()  # recover if the server never turns this into a response
+            self._user_speaking = True
             self._speech_started_at = time.monotonic() * 1000.0
             # Stop targeting latch, read BEFORE the CAPTURING transition overwrites it.
             # New speech also ends any pending created-response suppression: whatever
@@ -658,6 +686,7 @@ class RealtimeBackend(TurnEventMixin):
             # number is measured from (end of user speech); absent without server_vad,
             # and then turn latency simply goes unrecorded.
             self._metrics.turn_anchor()
+            self._user_speaking = False  # uplink frames stop feeding the deadman here
             self._progress_t = time.monotonic()  # end of speech IS turn progress
         elif t == "response.created":
             rid = (evt.get("response") or {}).get("id")

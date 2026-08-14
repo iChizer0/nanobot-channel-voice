@@ -580,7 +580,7 @@ class TelemetryConfig(_VoiceBase):
 
 
 class DebugConfig(_VoiceBase):
-    """Diagnostics (local backend). ``dumpAudio`` writes every endpointed capture
+    """Diagnostics. ``dumpAudio`` (local backend) writes every endpointed capture
     segment as a WAV named by the pipeline's verdict (``publish``/``interrupt``/
     ``empty``/``echo``/``ack``/``stop``/``blip``/``probe``/``gap``), so a false
     barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the
@@ -595,6 +595,13 @@ class DebugConfig(_VoiceBase):
     # Best-effort disk cap over the root: older sessions are pruned first, then the
     # live session's oldest segments, so the most recent evidence survives.
     dump_max_mb: int = Field(default=200, ge=1)
+    # Log the in-process metrics snapshot (latency percentiles + counters, one JSON
+    # line) every this many seconds while the session runs. None = only the
+    # session-end summary line: the distributions exist either way, this makes them
+    # readable DURING a debugging session instead of after it. Floor of 1 s: each
+    # snapshot sorts the sample rings on the event loop, so sub-second cadence would
+    # make the debug reporter itself the stall it exists to find.
+    metrics_interval_s: float | None = Field(default=None, ge=1.0)
 
 
 class BargeInConfig(_VoiceBase):

@@ -99,6 +99,7 @@ class FireRedVad(Vad):
         self._window: deque[float] = deque()
         self._window_sum = 0.0
         self._last_speech = False
+        self.last_prob = None
 
     def _validate(self) -> None:
         """Prove the model's I/O contract once, at construction, on a zeroed frame, so
@@ -140,6 +141,7 @@ class FireRedVad(Vad):
                 return self._gated(self._last_speech, frame)
             for i in range(feats.shape[0]):
                 smoothed = self._smooth(self._infer_one(feats[i]))
+                self.last_prob = smoothed
                 self._last_speech = smoothed >= self._threshold
             return self._gated(self._last_speech, frame)
         except Exception as exc:  # noqa: BLE001 - never let VAD crash the capture loop

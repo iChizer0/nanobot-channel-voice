@@ -12,6 +12,11 @@ class Vad(abc.ABC):
     # run it off the event loop; False keeps the default path free of thread-hop overhead.
     heavy: bool = False
 
+    # Probability behind the latest is_speech() decision, for diagnostics (the
+    # Endpointer aggregates it per utterance). None on engines without one (webrtc,
+    # energy); may repeat across frames shorter than the model's decision window.
+    last_prob: float | None = None
+
     @abc.abstractmethod
     def is_speech(self, frame: bytes) -> bool: ...
 

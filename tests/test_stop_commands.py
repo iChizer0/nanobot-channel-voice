@@ -84,7 +84,7 @@ def _utt(
     return _PendingUtterance(
         pcm=b"\x00" * 3200,
         eager=None,
-        closed_by_silence=True,
+        closed_reason="silence",
         closed_at=0.0,
         preempted=preempted,
         heard=heard,

@@ -281,3 +281,34 @@ def test_debug_config_parses_camel_case():
     assert cfg.debug.dump_audio is True
     assert cfg.debug.dump_dir == "/tmp/x"
     assert cfg.debug.dump_max_mb == 10
+
+
+def test_manifest_records_backend_ids_and_meta(tmp_path):
+    import json
+
+    d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
+    d.submit("publish", b"\x01\x00" * 1600, seq=7, meta={"stt_ms": 42, "close": "silence"})
+    d.submit("blip", b"\x02\x00" * 800, seq=8)
+    d.close()
+    assert sorted(p.name for p in d.dir.glob("*.wav")) == [
+        "utt-0007-publish.wav", "utt-0008-blip.wav",
+    ]
+    recs = [
+        json.loads(line)
+        for line in (d.dir / "manifest.jsonl").read_text().splitlines()
+    ]
+    assert [r["id"] for r in recs] == [7, 8]
+    assert recs[0]["verdict"] == "publish" and recs[0]["file"] == "utt-0007-publish.wav"
+    assert recs[0]["dur_ms"] == 100 and recs[0]["raw"] is False
+    assert recs[0]["stt_ms"] == 42 and recs[0]["close"] == "silence"
+    assert recs[1]["verdict"] == "blip" and "stt_ms" not in recs[1]
+
+
+def test_prune_removes_manifest_bearing_sessions(tmp_path):
+    stale = tmp_path / "20200101-000000"
+    stale.mkdir()
+    (stale / "utt-0001-empty.wav").write_bytes(b"\x00" * 8192)
+    (stale / "manifest.jsonl").write_text('{"id": 1}\n')
+    d = AudioDumper(tmp_path, 16000, 4 * 1024)  # cap below the stale session's bytes
+    d.close()
+    assert not stale.exists()  # manifest must not wedge the rmdir

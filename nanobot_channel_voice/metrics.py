@@ -9,8 +9,10 @@ Methodology (sourced in ``REPORT-eval-methodology.md``):
 
 * **Anchor at end-of-speech**, not at an API call: the cloud anchor is
   ``input_audio_buffer.speech_stopped``, local uses ``turn_anchor(offset_ms=...)``
-  back-dated past the hangover. With neither, record NOTHING and count
-  ``ttfa_unanchored``: an un-anchored number looks comparable and isn't.
+  back-dated past the hangover. With no anchor, record NOTHING and count
+  ``ttfa_unanchored``: an un-anchored number looks comparable and isn't. The
+  counter also absorbs audio after a DELIBERATE release (``turn_end`` on agent
+  timeout / session loss): recovery speech is real audio outside any measured turn.
 * **Keep raw samples; never average or add percentiles** (the p99 of a pipeline
   is not the sum of its stages'), so quantiles are computed at read time.
 * **Refuse percentiles the sample size cannot support**: ``p90`` needs n >= 10,

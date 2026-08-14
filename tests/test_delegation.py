@@ -177,3 +177,19 @@ def test_first_token_recorded_once():
         assert m.snapshot()["latency_ms"]["delegation_first_token_ms"]["n"] == 1
 
     run(_case())
+
+
+def test_tool_boundary_does_not_latch_first_token():
+    async def _t():
+        m = VoiceMetrics()
+        c = _DelegationCollector(m)
+        # A tool-first delegation: the boundary arrives before any model token.
+        c.note_boundary()
+        assert "delegation_first_token_ms" not in m.snapshot()["latency_ms"]
+        c.add("the answer")  # the REAL first token latches
+        c.finish()
+        lat = m.snapshot()["latency_ms"]
+        assert lat["delegation_first_token_ms"]["n"] == 1
+        assert (await c.result()).strip() == "the answer"
+
+    asyncio.run(_t())

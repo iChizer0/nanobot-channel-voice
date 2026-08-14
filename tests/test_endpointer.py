@@ -10,10 +10,13 @@ FRAME_MS = 20
 
 
 class ScriptedVad(Vad):
-    def __init__(self, decisions: list[bool]):
+    def __init__(self, decisions: list[bool], probs: list[float] | None = None):
         self._decisions = list(decisions)
+        self._probs = list(probs) if probs is not None else None
 
     def is_speech(self, frame: bytes) -> bool:
+        if self._probs:
+            self.last_prob = self._probs.pop(0)
         return self._decisions.pop(0) if self._decisions else False
 
 
@@ -22,6 +25,7 @@ def frame(i: int) -> bytes:
 
 
 def make(decisions: list[bool], **kw) -> Endpointer:
+    probs = kw.pop("probs", None)
     defaults = dict(
         frame_ms=FRAME_MS,
         start_frames=3,
@@ -31,16 +35,16 @@ def make(decisions: list[bool], **kw) -> Endpointer:
         preroll_ms=40,         # 2 frames of pre-trigger context
     )
     defaults.update(kw)
-    return Endpointer(ScriptedVad(decisions), **defaults)
+    return Endpointer(ScriptedVad(decisions, probs), **defaults)
 
 
 def push_all(ep: Endpointer, n: int, start: int = 0):
-    """Push frames start..start+n-1; collect the (utterance, closed_by_silence) pairs emitted."""
+    """Push frames start..start+n-1; collect the (utterance, closed_reason) pairs emitted."""
     outs = []
     for i in range(n):
         out = ep.push(frame(start + i))
         if out is not None:
-            outs.append((out, ep.closed_by_silence))
+            outs.append((out, ep.closed_reason))
     return outs
 
 
@@ -59,8 +63,8 @@ def test_utterance_includes_preroll_and_closes_by_silence():
     ep = make([False, False, True, True, True] + [False] * 5)
     outs = push_all(ep, 10)
     assert len(outs) == 1
-    utterance, by_silence = outs[0]
-    assert by_silence is True
+    utterance, reason = outs[0]
+    assert reason == "silence"
     assert utterance == b"".join(frame(i) for i in range(10))
     assert not ep.in_speech
 
@@ -72,12 +76,12 @@ def test_min_utterance_gates_on_active_frames_not_padding():
     assert outs == []  # blip rejected: internal/trailing silence must not count
 
 
-def test_max_length_close_sets_closed_by_silence_false():
+def test_max_length_close_reports_max_reason():
     ep = make([True] * 60)
     outs = push_all(ep, 55)
     assert len(outs) == 1
-    _, by_silence = outs[0]
-    assert by_silence is False
+    _, reason = outs[0]
+    assert reason == "max"
 
 
 def test_eager_snapshot_taken_once_per_silence_run():
@@ -167,7 +171,7 @@ def test_close_now_ends_the_utterance_early():
     gen, _pcm = ep.take_consult()
     utterance = ep.close_now(gen)
     assert utterance == b"".join(frame(i) for i in range(7))
-    assert ep.closed_by_silence is True
+    assert ep.closed_reason == "eou"
     assert ep.closed_silence_ms == 40  # 2 silence frames, not the 100 ms hangover
     assert not ep.in_speech
 
@@ -272,3 +276,35 @@ def test_consult_snapshot_is_capped_to_the_model_window():
         ep.push(frame(i))
     _gen, pcm = ep.take_consult()
     assert len(pcm) == 8  # only the tail the model scores, not the whole buffer
+
+
+def test_close_snapshots_active_ms_and_probability_stats():
+    # Onset run 0.6/0.8/1.0, one in-speech speech frame 0.9, then hangover silence.
+    ep = make(
+        [True, True, True, True] + [False] * 5,
+        probs=[0.6, 0.8, 1.0, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1],
+    )
+    outs = push_all(ep, 9)
+    assert len(outs) == 1 and outs[0][1] == "silence"
+    assert ep.closed_active_ms == 4 * FRAME_MS
+    assert ep.closed_prob_peak == 1.0
+    assert ep.closed_prob_mean == (0.6 + 0.8 + 1.0 + 0.9) / 4
+
+
+def test_dead_candidate_probabilities_do_not_leak_into_the_next_utterance():
+    # A two-frame run dies (0.95s), then the real utterance runs at 0.5.
+    ep = make(
+        [True, True, False] + [True] * 4 + [False] * 5,
+        probs=[0.95, 0.95, 0.1] + [0.5] * 4 + [0.1] * 5,
+    )
+    outs = push_all(ep, 12)
+    assert len(outs) == 1
+    assert ep.closed_prob_peak == 0.5  # the dead run's 0.95 must not survive
+    assert ep.closed_prob_mean == 0.5
+
+
+def test_prob_stats_are_none_for_binary_vads():
+    ep = make([True, True, True] + [False] * 5)  # ScriptedVad without probs
+    outs = push_all(ep, 8)
+    assert len(outs) == 1
+    assert ep.closed_prob_peak is None and ep.closed_prob_mean is None

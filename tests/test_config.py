@@ -115,6 +115,24 @@ def test_transcripts_stay_out_of_logs_by_default():
     assert loggable_text("open the pod bay doors", True, 8) == "open the"
 
 
+def test_loggable_text_collapses_newlines_into_one_line():
+    from nanobot_channel_voice.backend.common import loggable_text
+
+    # STT/model text can carry newlines; a log record must stay one line.
+    assert loggable_text("line one\nline two\n\n\tline three", True) == (
+        "line one line two line three"
+    )
+    assert loggable_text("a\nb c", False) == "<3 words>"
+
+
+def test_debug_metrics_interval_parses_and_rejects_zero():
+    assert VoiceConfig().debug.metrics_interval_s is None
+    cfg = VoiceConfig.model_validate({"debug": {"metricsIntervalS": 30}})
+    assert cfg.debug.metrics_interval_s == 30.0
+    with pytest.raises(ValidationError):
+        VoiceConfig.model_validate({"debug": {"metricsIntervalS": 0}})
+
+
 def test_stt_serve_beyond_loopback_requires_a_key():
     """0.0.0.0 without auth hands the decoder (and the mic-adjacent surface)
     to the whole network; reject at parse time."""

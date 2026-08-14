@@ -188,10 +188,17 @@ def test_browser_style_compressed_audio_is_transcoded(tmp_path):
     src = tmp_path / "src.wav"
     src.write_bytes(wav_bytes(frames=4410, rate=22050))
     ogg = tmp_path / "mic.ogg"
-    subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", str(src), "-c:a", "libvorbis", str(ogg)],
-        check=True,
-    )
+    # The DECODE side under test doesn't care which encoder made the file; hosts
+    # ship ffmpeg with libvorbis, with only the built-in encoder, or with neither.
+    for codec_args in (["-c:a", "libvorbis"], ["-c:a", "vorbis", "-strict", "-2"]):
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(src), *codec_args, str(ogg)],
+            check=False,
+        )
+        if proc.returncode == 0:
+            break
+    else:
+        pytest.skip("host ffmpeg has no vorbis encoder")
 
     async def case(server, adapter):
         resp = await _post(server, files=_files(ogg.read_bytes(), "mic.ogg", "audio/ogg"))

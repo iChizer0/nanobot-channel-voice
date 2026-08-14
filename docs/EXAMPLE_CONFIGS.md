@@ -415,13 +415,15 @@ When the logs show `false barge-in (empty)` / `(echo)` / `(probe)` streaks and y
 }
 ```
 
-Every endpointed capture segment is then written under `~/.local/share/nanobot-voice/dumps/<session>/` (override with `debug.dumpDir`) as `utt-<seq>-<HHMMSS>-<verdict>.wav`, the verdict matching the log line that judged it: `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `interrupt`, `publish`. With `aec: "webrtc"` each segment gets a `.raw.wav` twin holding the same span *before* cancellation. Reading the pair:
+Every endpointed capture segment is then written under `~/.local/share/nanobot-voice/dumps/<session>/` (override with `debug.dumpDir`) as `utt-<id>-<verdict>.wav`, where `<id>` matches the `utt #N:` log line that judged it and the verdict is its outcome: `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `interrupt`, `publish`. A `manifest.jsonl` in the same directory carries one record per segment (id, verdict, duration, rms, close shape, STT cost/path, VAD confidence, capture-side wall stamp; the transcript only with `logTranscripts` on), so a big dump is filtered with `jq` before anything is listened to. With `aec: "webrtc"` each segment gets a `.raw.wav` twin holding the same span *before* cancellation. Reading the pair:
 
 - TTS clearly audible in the **post-AEC** file (`.wav`) -> the canceller is not converging (check `audio.playoutDelayMs`, give it a few seconds of clean playback to adapt, or the device is looping audio somewhere AEC3 can't model).
 - TTS audible only in the **`.raw.wav`** twin, post-AEC quiet -> AEC is doing its job; the trigger is something else (VAD floor, room noise, a real voice).
 - Real room sound in both -> not an echo problem at all: tune the VAD (`vad.firered.minVolume`, `bargeIn.duckStartFrames`) instead of the canceller.
 
 Segments are recordings of the room - leave `dumpAudio` off outside debugging sessions. Disk use is capped (`debug.dumpMaxMb`, default 200): old sessions are pruned at startup and the oldest segments of a long session are deleted first.
+
+For latency questions rather than by-ear ones, `debug.metricsIntervalS` (e.g. `30`) logs the in-process metrics snapshot - latency percentiles (`stt_ms`, `tts_synth_ms`, `ttfa_ms`, ...) and counters - as one JSON line on that cadence, so distributions are readable while you reproduce instead of only in the session-end summary.
 
 ## Realtime
 

@@ -236,6 +236,13 @@ class _DelegationCollector:
             self._mark_first_token()
             self._parts.append(delta)
 
+    def note_boundary(self) -> None:
+        """A tool-boundary segment break: separate the reply's parts WITHOUT latching
+        the first-token clock — the separator is channel-fabricated, not a model token,
+        and latching would under-report TTFT for exactly the tool-first delegations
+        supervisor mode exists for."""
+        self._parts.append("\n")
+
     def finish(self, fallback: str = "") -> None:
         text = "".join(self._parts).strip() or (fallback or "").strip()
         if not text:
@@ -300,6 +307,7 @@ class VoiceChannel(BaseChannel):
         # for cloud, where the provider both reasons and speaks under its own persona.
         self._voice_context: list[RuntimeContextBlock] = []
         self._warmup_task: asyncio.Task | None = None
+        self._metrics_task: asyncio.Task | None = None  # debug.metricsIntervalS reporter
         # Supervisor mode only: the in-flight ask_nanobot delegation whose reply the bus
         # glue collects. One slot, since a bus reply can't be correlated to a specific
         # concurrent delegation, so the lock serializes them.
@@ -402,6 +410,10 @@ class VoiceChannel(BaseChannel):
             return
         # Off the critical path: the first turn then pays no cold start (ORT/RKNN/TRT).
         self._warmup_task = asyncio.create_task(self._warmup())
+        if self.config.debug.metrics_interval_s:
+            self._metrics_task = asyncio.create_task(
+                self._metrics_reporter(self.config.debug.metrics_interval_s)
+            )
         await self._stop_event.wait()
         self.logger.info("voice channel stopped")
 
@@ -781,8 +793,26 @@ class VoiceChannel(BaseChannel):
             in getattr(self.config.chunker, "model_fields_set", set()),
         )
 
+    async def _metrics_reporter(self, interval_s: float) -> None:
+        """``debug.metricsIntervalS``: the live snapshot as one JSON line per interval,
+        so the distributions are readable while a session is being debugged, not only
+        in the session-end summary. Single-line by construction: no transcript content,
+        and compact separators."""
+        while True:
+            await asyncio.sleep(interval_s)
+            if self._metrics.has_data:
+                self.logger.info(
+                    "voice metrics: {}",
+                    json.dumps(
+                        self._metrics.snapshot(), ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+
     async def stop(self) -> None:
         self._running = False
+        await cancel_and_wait(self._metrics_task)
+        self._metrics_task = None
         await cancel_and_wait(self._warmup_task)
         self._warmup_task = None
         if self._stt_server is not None:
@@ -906,7 +936,7 @@ class VoiceChannel(BaseChannel):
                 return  # a stopped PREVIOUS turn's queued straggler, not our answer
             if stream_end:
                 if resuming:
-                    self._pending_delegation.add("\n")  # segment break, keep collecting
+                    self._pending_delegation.note_boundary()  # segment break, keep collecting
                 else:
                     self._pending_delegation.finish(fallback=delta or "")
             else:

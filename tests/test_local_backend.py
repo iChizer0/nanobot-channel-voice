@@ -94,7 +94,7 @@ def _utt(
     return _PendingUtterance(
         pcm=b"\x00" * 3200,
         eager=None,
-        closed_by_silence=True,
+        closed_reason="silence",
         closed_at=0.0,
         preempted=preempted,
         heard=heard,
@@ -473,3 +473,64 @@ def test_stale_eager_task_cannot_judge_the_live_candidate():
     b._eager_confirm_cb(task)
     assert b._early_confirm is False
     assert b._early_release is None
+
+
+# ---- metrics turn timeline (tool boundary + timeout) ------------------------
+
+def test_tool_boundary_reanchors_post_tool_audio_as_continuation():
+    async def _t():
+        h = _build()
+        b = h.backend
+        h.transcript = "what's the weather"
+        await b._on_utterance(_utt())  # publish -> THINKING, anchor armed
+        sid = "s:1000000000000000000:0"
+        await b.on_delta("One sec.", stream_id=sid)
+        b._metrics.turn_first_audio()  # the pre-tool status line's chunk
+        await b.on_stream_end(resuming=True, stream_id=sid)
+        assert b._cur_turn.continuation_pending is True
+        await b.on_delta("It is sunny out.", stream_id="s:1000000000000000000:1")
+        assert b._cur_turn.continuation_pending is False
+        b._metrics.turn_first_audio()  # first post-tool chunk
+        lat = b._metrics.snapshot()["latency_ms"]
+        assert lat["ttfa_ms"]["n"] == 1
+        assert lat["continuation_ms"]["n"] == 1
+
+    _run(_t())
+
+
+def test_tool_only_turn_keeps_tool_time_out_of_ttfa():
+    async def _t():
+        h = _build()
+        b = h.backend
+        h.transcript = "look this up"
+        await b._on_utterance(_utt())
+        sid = "s:1000000000000000000:0"
+        # The agent went straight to the tool call: no pre-tool delta, no audio.
+        await b.on_stream_end(resuming=True, stream_id=sid)
+        await b.on_delta("Found it.", stream_id="s:1000000000000000000:1")
+        b._metrics.turn_first_audio()  # the turn's FIRST audio, after the tool ran
+        lat = b._metrics.snapshot()["latency_ms"]
+        assert "ttfa_ms" not in lat  # the tool wait must not read as model latency
+        assert lat["continuation_ms"]["n"] == 1
+
+    _run(_t())
+
+
+def test_timeout_notice_audio_is_not_ttfa():
+    async def _t():
+        h = _build(agentTimeoutS=0.05)
+        b = h.backend
+        h.transcript = "hello there"
+        await b._on_utterance(_utt())  # publish arms the timeout deadman
+        for _ in range(80):  # let the watch fire (0.05 s stall budget)
+            await asyncio.sleep(0.01)
+            if b._metrics.counters.get("agent_turn_timeout"):
+                break
+        assert b._metrics.counters.get("agent_turn_timeout") == 1
+        assert h.interrupts == 1  # the stuck run was /stop-ped
+        b._metrics.turn_first_audio()  # the notice's first chunk
+        snap = b._metrics.snapshot()
+        assert "ttfa_ms" not in snap["latency_ms"]  # anchor was released
+        assert snap["counters"].get("ttfa_unanchored") == 1
+
+    _run(_t())

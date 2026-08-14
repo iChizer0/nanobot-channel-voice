@@ -1,24 +1,32 @@
 """Capture-segment WAV dumps for by-ear debugging (``debug.dumpAudio``).
 
-Each segment lands as ``utt-<seq>-<HHMMSS>-<verdict>.wav`` - the audio exactly as
-the VAD/STT judged it (post-AEC) - plus a ``.raw.wav`` twin of the same span
-straight off the mic when a software canceller is active, so a false barge-in can
-be attributed to AEC residual vs. real room sound by listening to the pair.
+Each segment lands as ``utt-<id>-<verdict>.wav`` - the audio exactly as the
+VAD/STT judged it (post-AEC) - plus a ``.raw.wav`` twin of the same span straight
+off the mic when a software canceller is active, so a false barge-in can be
+attributed to AEC residual vs. real room sound by listening to the pair. ``id``
+is the backend's capture-segment id, the same number the ``utt #N:`` summary log
+line carries, so a WAV maps to its log record exactly even though dump WRITE
+order can trail capture order (an utterance submits after its STT verdict, a
+probe/blip drop immediately).
+
+``manifest.jsonl`` in the session directory gets one record per segment (id,
+verdict, duration, rms, plus whatever metadata the backend attached - close
+shape, STT cost, VAD confidence, capture-side wall stamp), so a dump directory
+is filtered with jq before anything is listened to.
 
 :meth:`submit` only enqueues (producers must never block on disk); one daemon
-writer thread does all file I/O, including the startup prune. ``seq`` is dump
-order, which can trail capture order: an utterance submits after its STT verdict,
-a probe/blip drop immediately - the HHMMSS stamp (taken at submit) is the
-capture-side anchor.
+writer thread does all file I/O, including the startup prune.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
 import time
 import wave
+from contextlib import suppress
 from pathlib import Path
 
 from loguru import logger
@@ -27,6 +35,9 @@ from nanobot_channel_voice.aio import Throttle
 from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_rms
 
 _QUEUE_DEPTH = 16  # segments in flight; a 30 s max utterance is ~1 MB, so <=~16 MB held
+# Head span for the manifest/log rms (triage metadata, not an unbounded pass over a
+# max-length utterance), matching the backend summary line's cap.
+_RMS_HEAD_S = 1.0
 
 
 def default_dump_root() -> Path:
@@ -55,12 +66,13 @@ class AudioDumper:
             session = root / f"{stamp}-{os.getpid()}"
         session.mkdir(parents=True, exist_ok=True)
         self.dir = session
-        self._seq = 0
+        self._seq = 0  # fallback ids for seq-less submits; backend ids are authoritative
+        self._manifest = None  # opened by the writer thread on first record
         self._written: list[tuple[Path, int]] = []  # oldest first
         self._written_bytes = 0
-        self._queue: queue.Queue[tuple[str, str, bytes, bytes | None] | None] = (
-            queue.Queue(maxsize=_QUEUE_DEPTH)
-        )
+        self._queue: queue.Queue[
+            tuple[str, bytes, bytes | None, int | None, dict | None] | None
+        ] = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._drop_warn = Throttle()
         self._thread = threading.Thread(
             target=self._writer, name="voice-dump", daemon=True
@@ -70,12 +82,22 @@ class AudioDumper:
 
     # ---- producers (any thread) -------------------------------------------
 
-    def submit(self, verdict: str, pcm: bytes, raw: bytes | None = None) -> None:
-        """Queue one segment; never blocks. ``raw`` = the pre-AEC span of ``pcm``."""
+    def submit(
+        self,
+        verdict: str,
+        pcm: bytes,
+        raw: bytes | None = None,
+        *,
+        seq: int | None = None,
+        meta: dict | None = None,
+    ) -> None:
+        """Queue one segment; never blocks. ``raw`` = the pre-AEC span of ``pcm``;
+        ``seq`` = the backend's capture-segment id (filename + manifest identity);
+        ``meta`` = extra manifest fields the backend judged at close/verdict time."""
         if not pcm:
             return
         try:
-            self._queue.put_nowait((time.strftime("%H%M%S"), verdict, pcm, raw))
+            self._queue.put_nowait((verdict, pcm, raw, seq, meta))
         except queue.Full:
             if self._drop_warn.ready():
                 self._log.warning("audio dump backlogged; dropping a '{}' segment", verdict)
@@ -92,27 +114,50 @@ class AudioDumper:
 
     def _writer(self) -> None:
         self._prune_old_sessions()  # off-loop: an unlink storm must not stall start()
-        while True:
-            item = self._queue.get()
-            if item is None:
-                return
-            try:
-                self._write_one(*item)
-            except Exception as exc:  # noqa: BLE001 - diagnostics must never kill audio
-                self._log.warning("audio dump write failed: {}", exc)
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    return
+                try:
+                    self._write_one(*item)
+                except Exception as exc:  # noqa: BLE001 - diagnostics must never kill audio
+                    self._log.warning("audio dump write failed: {}", exc)
+        finally:
+            if self._manifest is not None:
+                with suppress(Exception):
+                    self._manifest.close()
 
-    def _write_one(self, stamp: str, verdict: str, pcm: bytes, raw: bytes | None) -> None:
-        self._seq += 1
-        stem = f"utt-{self._seq:04d}-{stamp}-{verdict}"
+    def _write_one(
+        self, verdict: str, pcm: bytes, raw: bytes | None,
+        seq: int | None, meta: dict | None,
+    ) -> None:
+        if seq is None:  # defensive: every production submit carries the backend id
+            self._seq += 1
+            seq = self._seq
+        stem = f"utt-{seq:04d}-{verdict}"
         path = self.dir / f"{stem}.wav"
         self._write_wav(path, pcm)
         if raw:
             self._write_wav(self.dir / f"{stem}.raw.wav", raw)
+        dur_ms = int(pcm_ms(len(pcm), self._rate))
+        rms = round(pcm_rms(pcm[: int(self._rate * _RMS_HEAD_S) * 2]), 3)
         self._log.info(
             "dumped segment #{} {} ({} ms, rms {:.3f}{}) -> {}",
-            self._seq, verdict, int(pcm_ms(len(pcm), self._rate)), pcm_rms(pcm),
-            ", +raw" if raw else "", path,
+            seq, verdict, dur_ms, rms, ", +raw" if raw else "", path,
         )
+        # Writer stamps second so identity keys can never be clobbered by meta;
+        # default=str keeps a future non-JSON meta value from silently costing
+        # the whole record.
+        record = {
+            **(meta or {}),
+            "id": seq, "verdict": verdict, "file": path.name,
+            "dur_ms": dur_ms, "rms": rms, "raw": raw is not None,
+        }
+        if self._manifest is None:
+            self._manifest = open(self.dir / "manifest.jsonl", "a", encoding="utf-8")
+        self._manifest.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        self._manifest.flush()  # a crash must not cost the records that led to it
         while self._written_bytes > self._max_bytes and len(self._written) > 1:
             old, size = self._written.pop(0)
             try:
@@ -151,9 +196,14 @@ class AudioDumper:
             if total <= self._max_bytes:
                 break
             try:
+                # Delete only what the dumper wrote; a user file parked in the dir
+                # survives (and keeps the dir alive), matching the "anything else
+                # in the tree is a user's saved sample" contract.
                 for f in path.glob("*.wav"):
                     f.unlink(missing_ok=True)
-                path.rmdir()
+                (path / "manifest.jsonl").unlink(missing_ok=True)
+                with suppress(OSError):
+                    path.rmdir()  # left standing if the user parked files inside
                 total -= size
                 self._log.info("audio dump: pruned old session {}", path.name)
             except OSError:

@@ -127,7 +127,7 @@ def test_publish_commits_and_retargets_the_endpointer():
     assert backend._endpointer._hangover_frames == 100 // 20  # starts at the floor
 
     pending = _PendingUtterance(
-        pcm=b"\x00" * 3200, eager=None, closed_by_silence=True,
+        pcm=b"\x00" * 3200, eager=None, closed_reason="silence",
         closed_at=0.0, silence_ms=100, learn_ms=350.0,
     )
     asyncio.run(backend._on_utterance(pending))

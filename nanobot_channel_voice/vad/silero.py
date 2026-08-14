@@ -109,6 +109,7 @@ class SileroVad(Vad):
         self._context = np.zeros(self._context_n, dtype=np.float32)
         self._pending = np.empty(0, dtype=np.float32)
         self._last_speech = False
+        self.last_prob = None
 
     def _validate(self) -> None:
         """Prove the model's I/O contract once, at construction, on a zeroed window, so
@@ -160,6 +161,7 @@ class SileroVad(Vad):
                     self._pending[: self._window], self._pending[self._window:],
                 )
                 prob = self._infer_one(window)
+                self.last_prob = prob
                 # Hysteresis (upstream VADIterator): between the thresholds the
                 # decision holds, so a mid-word dip never flickers the flag.
                 if prob >= self._threshold:

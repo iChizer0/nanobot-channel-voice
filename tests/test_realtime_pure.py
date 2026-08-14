@@ -478,3 +478,120 @@ def test_cloud_instructions_always_carry_the_stop_rule():
         assert _STOP_RULE in _cloud_instructions(None, supervisor=sup, has_tools=tools)
     assert _STOP_RULE in _cloud_instructions("custom persona", supervisor=False,
                                              has_tools=False)
+
+
+def test_barge_in_latency_records_only_real_interrupts():
+    async def _run():
+        backend, _ = make_backend()
+        sent: list[dict] = []
+
+        async def record(payload):
+            sent.append(payload)
+
+        backend._send = record
+        # Onset over a quiet session: nothing live, so nothing to measure.
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend.barge_in(0)
+        assert "barge_in_ms.truncate" not in backend._metrics.snapshot()["latency_ms"]
+        # Onset over a live response: one sample.
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend.barge_in(0)
+        lat = backend._metrics.snapshot()["latency_ms"]
+        assert lat["barge_in_ms.truncate"]["n"] == 1
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_session_lost_releases_the_metrics_anchor():
+    async def _run():
+        backend, _ = make_backend()
+        await backend._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await backend._on_session_lost()
+        backend._metrics.turn_first_audio()  # a reconnect-quirk response's first audio
+        snap = backend._metrics.snapshot()
+        assert "ttfa_ms" not in snap["latency_ms"]  # the outage must not be a sample
+        assert snap["counters"].get("ttfa_unanchored") == 1
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_consumed_stop_voids_the_truncate_target():
+    """The next utterance's barge-in must NOT truncate the partially-heard pre-stop
+    item at audio_end_ms=0 (the stop's flush restarted played_ms, voiding the base)."""
+
+    async def _run():
+        backend, _ = make_backend()
+        sent: list[dict] = []
+
+        async def record(payload):
+            sent.append(payload)
+
+        backend._send = record
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({
+            "type": "response.output_item.added",
+            "response_id": "r1",
+            "item": {"type": "message", "id": "item-1"},
+        })
+        backend._item_base_played = 3000  # user heard ~3 s before saying "stop"
+        await backend._consume_stop("stop")
+        assert backend._audio_item_id is None
+        # Next utterance: onset barge-in over the (now idle) session.
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend.barge_in(0)
+        assert not any(p["type"] == "conversation.item.truncate" for p in sent)
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_uplink_deadman_feed_stops_at_speech_stopped():
+    """Silence frames after speech_stopped must not feed the turn deadman: a server
+    that acks the speech and never creates a response has to be recoverable."""
+
+    async def _run():
+        backend, _ = make_backend()
+        assert backend._user_speaking is False
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert backend._user_speaking is True  # monologue frames may refresh
+        await backend._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        assert backend._user_speaking is False  # the sender gate goes cold here
+        # The watchdog armed at speech_started is still pending: with the feed cut,
+        # wait_for_stall now sees a frozen _progress_t and can fire after
+        # turn_timeout_s (not exercised in real time here).
+        assert backend._watchdog_task is not None and not backend._watchdog_task.done()
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_watchdog_recovers_a_capturing_wedge():
+    """speech_stopped acked, response never created: with the uplink feed gated off,
+    the watchdog armed at speech_started fires and settles the session to IDLE."""
+
+    async def _run():
+        cfg = VoiceConfig.model_validate({"realtime": {"turnTimeoutS": 0.05}})
+        backend = rt.RealtimeBackend(
+            cfg, sink=AudioSink(NullPlayback(), mode="stream"), profile=PROFILES["openai"],
+        )
+        events: list = []
+
+        async def on_event(e):
+            events.append(e)
+
+        backend._on_event = on_event
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        for _ in range(80):
+            await asyncio.sleep(0.01)
+            if any(isinstance(e, Error) for e in events):
+                break
+        timeouts = [e for e in events if isinstance(e, Error)]
+        assert timeouts and not timeouts[0].fatal and "timed out" in timeouts[0].message
+        assert hints(events)[-1] is VoiceState.IDLE
+        await backend.close()
+
+    asyncio.run(_run())

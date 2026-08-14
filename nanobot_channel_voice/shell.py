@@ -215,7 +215,8 @@ class VoiceShell:
                 # Gate-reopen edge: the gate is applied at READ time, but under lag
                 # frames captured while it was closed (the bot audible) can still be
                 # buffered: released now, they would reach the VAD as fresh speech
-                # and endpoint as unintelligible echo blobs (stt_empty every turn).
+                # and endpoint as unintelligible echo blobs (an empty verdict every
+                # turn).
                 # Realign with the wall clock: drop the in-hand frame (it predates or
                 # spans the edge) and the source's backlog with it.
                 was_gated = False

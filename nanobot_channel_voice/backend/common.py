@@ -9,8 +9,10 @@ from .base import OnEvent, StateHint, VoiceState
 def loggable_text(text: str, enabled: bool, cap: int = 80) -> str:
     """Transcript text for log lines, honoring ``voice.logTranscripts``. Off (the default)
     the line still fires, with a word count in place of content: user speech is personal
-    data and gateway logs get persisted."""
-    return text[:cap] if enabled else f"<{len(text.split())} words>"
+    data and gateway logs get persisted. Whitespace runs (newlines included) collapse to
+    one space: an embedded ``\\n`` would split the record and break line-oriented logs."""
+    words = text.split()
+    return " ".join(words)[:cap] if enabled else f"<{len(words)} words>"
 
 
 class TurnEventMixin:
