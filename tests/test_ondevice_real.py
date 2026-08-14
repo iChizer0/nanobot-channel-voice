@@ -316,3 +316,87 @@ def test_sensevoice_rknn_real_transcription():
     assert isinstance(text, str) and len(text.strip()) > 0
     assert any(c.isalpha() for c in text)
     assert stt.last_tags.startswith("<|")  # rich-transcription tags surfaced
+
+
+# The RKNN streaming Zipformer trio + its meta.json/tokens.txt sidecars; the
+# second candidate is the workspace model store's copy. Board-only (rknnlite).
+_ZIPFORMER_RKNN_CANDIDATES = (
+    _REF / "zipformer" / "rknn.rv1126b",
+    Path(__file__).resolve().parents[2]
+    / "nanobot-channel-voice-test" / "models" / "stt" / "zipformer-bilingual-zh-en"
+    / "rknn.rv1126b",
+)
+_ZIPFORMER_RKNN = next(
+    (p for p in _ZIPFORMER_RKNN_CANDIDATES if p.is_dir()), _ZIPFORMER_RKNN_CANDIDATES[0]
+)
+_ZIPFORMER_ONNX = (
+    _REF / "zipformer" / "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20"
+)
+_ZIPFORMER_WAV_CANDIDATES = (  # first: the sherpa export's bundled bilingual clip
+    _REF / "zipformer" / "0.wav",
+    _ZIPFORMER_ONNX / "test_wavs" / "0.wav",
+    _WHISPER / "test_en.wav",
+)
+_ZIPFORMER_WAV = next(
+    (p for p in _ZIPFORMER_WAV_CANDIDATES if p.is_file()), _ZIPFORMER_WAV_CANDIDATES[0]
+)
+
+
+def test_zipformer_onnx_real_streaming_matches_batch():
+    d = _ZIPFORMER_ONNX
+    enc, dec, join = (
+        d / f"{n}-epoch-99-avg-1.int8.onnx" for n in ("encoder", "decoder", "joiner")
+    )
+    _need(enc, dec, join, d / "tokens.txt", _ZIPFORMER_WAV)
+    from nanobot_channel_voice.config import SttConfig
+    from nanobot_channel_voice.stt import make_stt
+    from nanobot_channel_voice.stt.zipformer import ZipformerOnDeviceStt
+
+    stt = make_stt(SttConfig.model_validate({
+        "provider": "zipformer",
+        "zipformer": {
+            "encoderPath": str(enc), "decoderPath": str(dec),
+            "joinerPath": str(join), "tokensPath": str(d / "tokens.txt"),
+        },
+    }))
+    assert isinstance(stt, ZipformerOnDeviceStt)  # no silent delegate fallback
+    with wave.open(str(_ZIPFORMER_WAV), "rb") as w:
+        assert w.getframerate() == 16000
+        pcm = w.readframes(w.getnframes())
+    batch = asyncio.run(stt.transcribe(pcm, 16000))
+    stream = stt.stream_start()
+    for i in range(0, len(pcm), 640):  # 20 ms frames, the live capture size
+        stream.accept(pcm[i : i + 640])
+    streamed = stream.finish()
+    stt.release()
+    assert batch.strip() and any(c.isalpha() for c in batch)
+    assert streamed == batch  # the streaming path is transcript-identical to batch
+
+
+def test_zipformer_rknn_real_transcription():
+    pytest.importorskip("rknnlite.api", reason="RKNN Lite runtime only exists on the board")
+    d = _ZIPFORMER_RKNN
+    _need(d / "encoder.rknn", d / "decoder.rknn", d / "joiner.rknn",
+          d / "meta.json", d / "tokens.txt", _ZIPFORMER_WAV)
+    from nanobot_channel_voice.config import SttConfig
+    from nanobot_channel_voice.stt import make_stt
+    from nanobot_channel_voice.stt.zipformer import ZipformerOnDeviceStt
+
+    stt = make_stt(SttConfig.model_validate({
+        "provider": "zipformer",
+        "zipformer": {
+            "encoderPath": str(d / "encoder.rknn"),
+            "decoderPath": str(d / "decoder.rknn"),
+            "joinerPath": str(d / "joiner.rknn"),
+            "tokensPath": str(d / "tokens.txt"),
+            "metaPath": str(d / "meta.json"),
+        },
+    }))
+    assert isinstance(stt, ZipformerOnDeviceStt)  # no silent delegate fallback
+    with wave.open(str(_ZIPFORMER_WAV), "rb") as w:
+        assert w.getframerate() == 16000
+        pcm = w.readframes(w.getnframes())
+    text = asyncio.run(stt.transcribe(pcm, 16000))
+    stt.release()
+    assert isinstance(text, str) and len(text.strip()) > 0
+    assert any(c.isalpha() for c in text)  # True for CJK too: bilingual-safe

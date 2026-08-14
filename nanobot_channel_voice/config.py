@@ -300,14 +300,19 @@ class ZipformerSttConfig(OnDeviceRuntime):
     """On-device streaming Zipformer transducer (``stt.provider="zipformer"``).
 
     The STREAMING engine: audio is decoded during speech, so the transcript is ready
-    ~immediately at the endpoint. One model per language (pair); use a sherpa-onnx export:
-    chunk geometry and decoder context come from the model metadata. Requires 16 kHz
-    capture. int8 recommended."""
+    ~immediately at the endpoint. One model per language (pair). Use a sherpa-onnx
+    export (`.onnx` on CPU: chunk geometry and decoder context come from the model
+    metadata; int8 recommended) or the project's static `.rknn` trio port (NPU,
+    fp16), which additionally needs ``metaPath`` (the exporter's meta.json sidecar:
+    state specs in declared order, output order, per-state len increments, feedback
+    layout — an .rknn has no introspection surface). Requires 16 kHz capture."""
 
     encoder_path: str | None = None
     decoder_path: str | None = None
     joiner_path: str | None = None
     tokens_path: str | None = None
+    # .rknn only: the exporter's meta.json sidecar; auto-resolved from the weights store.
+    meta_path: str | None = None
 
 
 class WhisperSttConfig(OnDeviceRuntime):

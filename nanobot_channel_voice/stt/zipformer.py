@@ -2,8 +2,8 @@
 
 A ``streaming = True`` engine: frames are decoded DURING speech (one encoder chunk per
 320 ms of audio), so at the endpoint only the final tail remains and STT latency stops
-existing as a pipeline stage (DESIGN-local-latency-and-engines.md). One model per
-language pair; the bilingual zh-en artifact is the reference target.
+existing as a pipeline stage. One model per language pair; the bilingual zh-en
+artifact is the reference target.
 
 Verified against the pinned artifact
 (``sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20``, 2026-07-29):
@@ -17,18 +17,24 @@ Verified against the pinned artifact
 * ``tokens.txt`` is ``<token> <id>`` with ``<blk> 0``; BPE ``▁`` marks word starts,
   CJK tokens are bare chars.
 
-State plumbing is GENERIC: zero states come from the encoder's own ``input_specs`` and
+State plumbing is GENERIC: zero states come from the encoder's declared inputs and
 each ``new_X`` output feeds the next call's ``X`` input, so a re-export with different
-cache geometry still runs; ``.rknn`` has no introspection surface for that and is
-rejected. icefall front-end contract: fbank 80 (25/10 ms, dither 0) over waveform
-normalized to [-1, 1], NOT the int16 scale SenseVoice uses; the streaming path
-requires 16 kHz capture.
+cache geometry still runs. For `.rknn` (no introspection surface) that contract rides
+in the RKNN exporter's ``meta.json`` sidecar: state specs and output names IN DECLARED
+ORDER (RKNN is fed positionally), plus per-state ``cached_len`` increments — the
+rv1126b converter cannot emit the int64 ``new_cached_len_*`` assembly (toolkit 2.4.0
+SIGABRT), so the port drops those outputs and the host advances the len states itself.
+icefall front-end contract: fbank 80 (25/10 ms, dither 0) over waveform normalized to
+[-1, 1], NOT the int16 scale SenseVoice uses; the streaming path requires 16 kHz
+capture.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import ExitStack
+from pathlib import Path
 
 import numpy as np
 from loguru import logger
@@ -104,6 +110,10 @@ class ZipformerOnDeviceStt(SttAdapter):
         chunk_t: int,
         chunk_shift: int,
         context_size: int,
+        state_specs: list | None = None,
+        out_names: list | None = None,
+        state_increments: dict | None = None,
+        feedback_transpose: tuple | None = None,
     ):
         import kaldi_native_fbank as knf  # lazy: [ondevice] extra
 
@@ -123,22 +133,37 @@ class ZipformerOnDeviceStt(SttAdapter):
         self._chunk_t = chunk_t
         self._chunk_shift = chunk_shift
         self._context = context_size
-        # Encoder state contract, read from the model itself.
-        self._state_specs = [
+        # Encoder state contract: from the model itself (ONNX) or the sidecar (RKNN).
+        self._state_specs = state_specs or [
             (name, shape, typ) for name, shape, typ in encoder.input_specs() if name != "x"
         ]
-        self._out_names = encoder.output_names()
+        self._out_names = out_names or encoder.output_names()
+        self._increments = state_increments or {}
+        # .rknn: 4D caches return NCHW; the sidecar permutation restores the declared feed.
+        self._feedback_transpose = feedback_transpose
         if not self._state_specs or not self._out_names:
             raise RuntimeError(
-                "zipformer needs ONNX input/output introspection for its cache "
-                "state (.rknn is not supported yet)"
+                "zipformer needs the encoder cache contract: ONNX introspection or "
+                "the exporter's meta.json sidecar (stt.zipformer.metaPath)"
+            )
+        missing = [n for n, _, _ in self._state_specs
+                   if f"new_{n}" not in self._out_names and n not in self._increments]
+        if missing:
+            raise RuntimeError(
+                f"zipformer states with no feedback path (no new_* output, no "
+                f"sidecar increment): {missing} -- meta.json/encoder mismatch"
             )
         self._log = logger.bind(component="stt-zipformer")
-        self.stream_start()  # runs the decoder once: fails loading, not mid-utterance
+        # Contract probe doubling as warmup: one zero chunk (25 ms window + chunk_t
+        # 10 ms hops) through encoder+joiner, so a stale export or meta.json mismatch
+        # raises here — loud registry degrade, not _transcribe_sync's blanket except.
+        self.stream_start().accept(bytes(2 * (25 + 10 * self._chunk_t) * (SAMPLE_RATE // 1000)))
 
     @classmethod
     def from_config(cls, cfg: ZipformerSttConfig) -> ZipformerOnDeviceStt:
         z = cfg
+        # Sidecar first: a bad pairing must fail BEFORE the expensive model loads.
+        side = cls._load_sidecar(z.meta_path) if str(z.encoder_path).endswith(".rknn") else {}
         kw = dict(
             core_mask=z.core_mask, target=z.target, device_id=z.device_id,
             providers=z.execution_providers, provider_options=z.provider_options,
@@ -151,17 +176,47 @@ class ZipformerOnDeviceStt(SttAdapter):
                 models.enter_context(OnDeviceModel(path, **kw))  # type: ignore[arg-type]
                 for path in (z.encoder_path, z.decoder_path, z.joiner_path)
             )
-            md = encoder.metadata()
-            dmd = decoder.metadata()
+            if not side:
+                md, dmd = encoder.metadata(), decoder.metadata()
+                side = dict(
+                    chunk_t=int(md.get("T", 39)),
+                    chunk_shift=int(md.get("decode_chunk_len", 32)),
+                    context_size=int(dmd.get("context_size", 2)),
+                )
             adapter = cls(
                 encoder=encoder, decoder=decoder, joiner=joiner,
                 tokens=read_token_table(z.tokens_path),  # type: ignore[arg-type]
-                chunk_t=int(md.get("T", 39)),
-                chunk_shift=int(md.get("decode_chunk_len", 32)),
-                context_size=int(dmd.get("context_size", 2)),
+                **side,
             )
             models.pop_all()  # success: the adapter owns the models now
             return adapter
+
+    @staticmethod
+    def _load_sidecar(path: str | None) -> dict:
+        """The exporter's ``meta.json`` -> constructor kwargs: the encoder contract
+        an ``.rknn`` cannot introspect (see the module docstring)."""
+        if not path:
+            raise RuntimeError(
+                "zipformer .rknn needs stt.zipformer.metaPath (the exporter's meta.json sidecar)"
+            )
+        try:
+            side = json.loads(Path(path).read_text())
+            if side["encoder_inputs"][0][0] != "x":
+                raise ValueError("encoder_inputs must declare 'x' first (RKNN is fed positionally)")
+            return dict(
+                chunk_t=int(side.get("T", 39)),
+                chunk_shift=int(side.get("decode_chunk_len", 32)),
+                context_size=int(side.get("context_size", 2)),
+                state_specs=[(n, s, t) for n, s, t in side["encoder_inputs"] if n != "x"],
+                out_names=side["encoder_outputs"],
+                state_increments={k: int(v) for k, v in side["state_increments"].items()},
+                feedback_transpose=(
+                    tuple(side["state_feedback_transpose"])
+                    if "state_feedback_transpose" in side else None
+                ),
+            )
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"bad zipformer meta sidecar {path}: {exc!r}") from exc
 
     def stream_start(self) -> _ZipformerStream:
         return _ZipformerStream(self)
@@ -176,9 +231,6 @@ class ZipformerOnDeviceStt(SttAdapter):
         if not pcm:
             return ""
         return await asyncio.to_thread(self._transcribe_sync, pcm, sample_rate)
-
-    async def warmup(self) -> None:
-        await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
 
     def _transcribe_sync(self, pcm: bytes, sample_rate: int) -> str:
         try:
@@ -205,7 +257,17 @@ class ZipformerOnDeviceStt(SttAdapter):
             )
             named = dict(zip(self._out_names, outs, strict=True))
             for name in s.states:
-                s.states[name] = named[f"new_{name}"]
+                new = named.get(f"new_{name}")
+                if new is not None:
+                    if (
+                        self._feedback_transpose is not None
+                        and np.asarray(new).ndim == len(self._feedback_transpose)
+                    ):
+                        new = np.ascontiguousarray(np.transpose(new, self._feedback_transpose))
+                    s.states[name] = new
+                else:
+                    # .rknn drops the int64 new_cached_len_* outputs: advance host-side.
+                    s.states[name] = s.states[name] + self._increments[name]
             # Commit the cursor exactly here: shift 32 of the 39 frames (7 of right
             # context re-read). Earlier, a raising encoder would skip the chunk with
             # stale caches; later, a raising joiner would re-feed already-advanced ones.
