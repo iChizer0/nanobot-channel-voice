@@ -43,6 +43,7 @@ from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, 
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
 from nanobot_channel_voice.vad import make_turn_analyzer, make_vad
+from nanobot_channel_voice.wake import make_wake_detector
 
 _DEFAULT_PERSONA = (
     "You are a helpful, concise voice assistant. Keep replies short and conversational."
@@ -444,6 +445,9 @@ class VoiceChannel(BaseChannel):
         turn_analyzer = make_turn_analyzer(
             self.config.vad, self.config.audio.sample_rate, self.config.audio.frame_ms
         )
+        wake_detector = make_wake_detector(
+            self.config.wake, self.config.audio.sample_rate, self.config.audio.frame_ms
+        )
         tts = make_tts(self.config.tts)
         self._tts_adapter = tts
         self._voice_context = _voice_context_blocks(tts, self.config.context)
@@ -491,6 +495,7 @@ class VoiceChannel(BaseChannel):
             stt_stream=self._stt if streaming else None,
             aec=aec_stage,
             turn_analyzer=turn_analyzer,
+            wake_detector=wake_detector,
         )
         shell = VoiceShell(
             self.config,

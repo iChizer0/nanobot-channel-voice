@@ -68,7 +68,7 @@ class _ScriptTts(TtsAdapter):
 class EvalConversation:
     """One scripted conversation. Use as an async context manager."""
 
-    def __init__(self, **cfg_over):
+    def __init__(self, wake_detector=None, **cfg_over):
         cfg = VoiceConfig.model_validate({
             "aec": "soft",       # open mic: barge-in verdicts reachable while SPEAKING
             "duckDb": -12.0,
@@ -99,6 +99,7 @@ class EvalConversation:
         self.backend = LocalBackend(
             cfg, vad=self.vad, tts=_ScriptTts(), sink=self.sink,
             transcribe=transcribe, publish_text=publish, interrupt=interrupt,
+            wake_detector=wake_detector,
         )
 
     async def __aenter__(self) -> EvalConversation:

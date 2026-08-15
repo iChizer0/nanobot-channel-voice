@@ -47,6 +47,7 @@ from nanobot_channel_voice.streamid import base_of, started_ns, unique_token
 from nanobot_channel_voice.tts.base import TtsAdapter, is_wav
 from nanobot_channel_voice.vad import Endpointer, Vad, flag_lag_ms, resolve_preroll_ms
 from nanobot_channel_voice.vad.adaptive import AdaptiveHangover
+from nanobot_channel_voice.wake.phrase import WakePhrase
 
 from .audio_sink import AudioSink, scale_pcm, trim_lead_silence
 from .base import OnEvent, OutputAudio, ToolDef, VoiceState
@@ -130,6 +131,13 @@ _FALSE_WARN_WINDOW_S = 60.0
 _FALSE_WARN_N = 10
 _LEAK_REASONS = frozenset({"probe", "partial", "eager", "echo", "empty"})
 
+# A wake hit binds to the utterance whose VAD onset it follows within this window:
+# detection trails the phrase's END (chunk cadence + model rise) while the onset
+# precedes its START, so the window must cover a spoken phrase plus detector lag.
+# A hit that no onset consumes inside it goes stale instead of blessing whatever
+# utterance happens next.
+_WAKE_ATTACH_S = 2.5
+
 
 def _swallow_result(task: asyncio.Task) -> None:
     """Retrieve an abandoned speculative decode's outcome, so it never logs 'exception was never
@@ -147,6 +155,25 @@ def _interrupt_marker(heard: str | None) -> str | None:
         f'[note: you were interrupted mid-reply; the user heard only: "{heard}"]'
         if heard
         else "[note: you were interrupted before your reply was heard]"
+    )
+
+
+def _wake_note(heard: str | None) -> str:
+    """The pending note a wake-word kill leaves for the NEXT publish (the wake
+    itself publishes nothing) — same contract as a consumed stop's note."""
+    if heard:
+        return (
+            "[note: the user cut your reply short with the wake word; "
+            f'they heard only: "{heard}"; do not resume it unless asked]'
+        )
+    if heard == "":
+        return (
+            "[note: the user cut your reply short with the wake word "
+            "before hearing it; do not resume it unless asked]"
+        )
+    return (
+        "[note: the user cut your reply short with the wake word; "
+        "do not resume it unless asked]"
     )
 
 
@@ -207,6 +234,14 @@ class _PendingUtterance:
     # into a cold turn.
     onset_interrupting: bool = False
     onset_at: float = 0.0
+    # Wake-gate evidence bound at close: an acoustic/text-tier hit claimed this
+    # utterance; whether its onset fell while the bot was AUDIBLY speaking
+    # (strict mode gates only those; THINKING continuations stay free); and
+    # whether the attention window was open AT ONSET (judged then, never at the
+    # verdict — a later wake must not retroactively bless queued speech).
+    wake_hit: bool = False
+    onset_speaking: bool = False
+    onset_window_open: bool = False
 
 
 class _Turn:
@@ -314,6 +349,14 @@ def _dump_session_header(config: VoiceConfig, frame_ms: int) -> dict:
             "threshold": vad.turn.threshold,
             "consult_ms": vad.turn.consult_ms,
         }
+    if config.wake.mode != "off":
+        header["wake"] = {
+            "mode": config.wake.mode,
+            "engine": config.wake.engine,
+            "window_s": config.wake.window_s,
+        }
+        if config.wake.engine == "openwakeword":
+            header["wake"]["threshold"] = config.wake.openwakeword.threshold
     with suppress(Exception):  # uninstalled source tree: only the version is lost
         header["version"] = _dist_version("nanobot-channel-voice")
     return header
@@ -373,6 +416,7 @@ class LocalBackend(TurnEventMixin):
         stt_stream=None,  # a streaming=True SttAdapter, or None (batch STT)
         aec=None,  # an EchoCanceller front-end (aec="webrtc"), or None
         turn_analyzer=None,  # a SmartTurnAnalyzer, or None (silence-only endpointing)
+        wake_detector=None,  # a WakeDetector (acoustic tier), or None (text tier only)
     ):
         self._cfg = config
         self._tts = tts
@@ -488,10 +532,15 @@ class LocalBackend(TurnEventMixin):
         # Serializes the frame hop against loop-side resets.
         self._hop_lock = threading.Lock()
         # Does per-frame work thread at all? The LIGHT path (energy/webrtc VAD, batch STT, no
-        # AEC) pushes the endpointer on the loop, so its resets must run inline too, or the lock
-        # protects only one side of the race.
+        # AEC, no acoustic wake) pushes the endpointer on the loop, so its resets must run
+        # inline too, or the lock protects only one side of the race. An acoustic wake
+        # detector forces the threaded hop: its inference is heavy-class AND it is only fed
+        # inside _push_frame_sync.
         self._threaded_hop = (
-            self._vad_heavy or self._stt_stream is not None or self._aec is not None
+            self._vad_heavy
+            or self._stt_stream is not None
+            or self._aec is not None
+            or wake_detector is not None
         )
         # Backchannel ignore-list and stop-command lexicon (see _on_utterance's ladder).
         # Matchers precompute the merged vocabularies once: the per-call unions were
@@ -504,9 +553,43 @@ class LocalBackend(TurnEventMixin):
             self._stop_lex, self._ack_lex, extra=FILLER_WORDS
         )
         self._min_fresh_words = config.barge_in.min_words
+        # Wake-word gate (wake.mode != "off"): "gate" requires the wake phrase to
+        # START a conversation from cold (attention window shut), "strict"
+        # additionally to barge into a live reply — while SPEAKING, non-wake
+        # speech neither ducks nor confirms, so the public-space barge-in path
+        # collapses to hit-or-ignore. Two tiers feed one claim: the acoustic
+        # detector (frame hop) and the transcript prefix (partial poll / eager /
+        # endpoint verdict).
+        wake_phrase = WakePhrase(config.wake.phrases) if config.wake.mode != "off" else None
+        self._wake_phrase = wake_phrase if wake_phrase else None  # falsy = nothing matchable
+        self._wake_detector = wake_detector
+        wake_mode = config.wake.mode
+        if wake_mode != "off" and self._wake_phrase is None and wake_detector is None:
+            # Zero working tiers would gate every utterance FOREVER — a running,
+            # healthy-looking, permanently deaf channel. Config requires phrases,
+            # so only degenerate (unmatchable) phrase lists can land here.
+            logger.warning(
+                "voice: wake.mode='{}' has no working tier (no matchable phrases, "
+                "no acoustic detector); wake gating disabled",
+                wake_mode,
+            )
+            wake_mode = "off"
+        self._wake_mode = wake_mode
+        # For the acoustic-hit echo check: our own reply speaking the phrase
+        # ("just say hey nanobot") must not wake us through a weak/absent AEC.
+        self._wake_phrases_text = tuple(config.wake.phrases)
+        self._wake_window_s = config.wake.window_s
+        self._wake_until = 0.0  # attention deadline (monotonic); cold onsets past it are gated
+        # Last hit and its loop-side consumption watermark. Hop-thread writes,
+        # GIL-atomic, same cross-thread pattern as _early_confirm.
+        self._wake_hit_at = float("-inf")
+        self._wake_seen_at = float("-inf")
+        self._wake_claimed = False  # the hit is bound to the OPEN utterance; dies at close/reset
         # Stop-command targeting: turn state latched at VAD onset (see _PendingUtterance),
         # and the wall time of the last stop-consume kill for the double-tap grace.
         self._onset_interrupting = False
+        self._onset_speaking = False
+        self._onset_window_open = False
         self._onset_at = 0.0
         self._last_kill = float("-inf")
         # A consumed stop's heard-up-to note, appended to the NEXT publish.
@@ -729,6 +812,53 @@ class LocalBackend(TurnEventMixin):
             utterance = self._push_with_model_close(pcm)  # light path: loop-side, no lock
             compute_ms = (time.monotonic() - t0) * 1000.0
         self._track_hop_cost(t0, compute_ms)
+        if self._wake_mode != "off" and self._wake_hit_at > self._wake_seen_at:
+            # A hop-side wake hit (acoustic, or a strict-mode partial/eager text
+            # match). The loop is the single confirm authority: the hop only
+            # latches, so the echo/warmup suppressions below can veto before
+            # anything irreversible happens.
+            self._wake_seen_at = self._wake_hit_at
+            live = self._turn in (VoiceState.SPEAKING, VoiceState.THINKING)
+            if live and self._wake_hit_echoed():
+                # Our own reply says the phrase ("just say hey nanobot"): with
+                # weak or absent AEC the detector/STT hears it back. Not a user:
+                # no window, no kill, and the claim must not bless the trailing
+                # echo utterance.
+                self._wake_claimed = False
+                self._metrics.count("wake_echo_suppressed")
+                self._log.info("wake hit suppressed (own reply speaks the phrase)")
+            else:
+                self._touch_wake()
+                score = getattr(self._wake_detector, "last_score", None)
+                self._log.info(
+                    "wake hit{}", f" (score={score:.2f})" if score is not None else ""
+                )
+                if live and self._in_aec_warmup():
+                    # The residual can false-trigger while AEC3 converges: hold
+                    # the kill; the claim still rides to the endpoint verdict,
+                    # so a real wake interrupts there (delayed, not lost).
+                    self._metrics.count("wake_warmup_hold")
+                elif live and self._endpointer.in_speech:
+                    # Spoken over a live reply mid-utterance: a high-precision
+                    # interrupt (see the echo veto above), confirmed without
+                    # waiting for the min-words bar.
+                    self._early_confirm = True
+                elif live:
+                    # No utterance to bind the confirm to — the residual was too
+                    # loud-proof for the VAD but not the wake model, or the user
+                    # said only the bare phrase. Kill directly and settle: the
+                    # follow-up (if any) publishes cold inside the window the
+                    # hit just opened.
+                    killed, heard = await self._kill_live_reply(
+                        interrupting=True, preempted=False, heard=None
+                    )
+                    if killed:
+                        self._last_kill = time.monotonic()
+                        self._pending_note = _wake_note(heard)
+                    self._clear_duck()
+                    self._metrics.count("wake_kill")
+                    if self._turn is not VoiceState.IDLE:
+                        await self._set_turn(VoiceState.IDLE)
         if self._turn_analyzer is not None:
             snap = self._endpointer.take_consult()
             if snap is not None:
@@ -739,12 +869,24 @@ class LocalBackend(TurnEventMixin):
                     # stack (the gen guard would reject its verdict anyway).
                     self._metrics.count("eou_consult_skipped")
         if self._endpointer.in_speech and not prev_speech:
+            if (
+                self._wake_claimed
+                and time.monotonic() - self._wake_hit_at > _WAKE_ATTACH_S
+            ):
+                # A hit nothing followed (VAD missed the phrase's tail, or noise
+                # tripped the head) must not bless a later, unrelated utterance.
+                self._wake_claimed = False
             # Stop-command targeting is decided by the state NOW, at onset (see
             # _PendingUtterance.onset_interrupting).
             self._onset_at = time.monotonic()
             self._onset_interrupting = self._turn in (
                 VoiceState.THINKING, VoiceState.SPEAKING,
             )
+            self._onset_speaking = self._turn is VoiceState.SPEAKING
+            # Window openness is judged AT ONSET, not at the verdict: a wake
+            # arriving later must not retroactively bless bystander speech that
+            # was already in flight (or queued behind slow STT).
+            self._onset_window_open = self._onset_at < self._wake_until
             if self._adaptive is not None:
                 # CAPTURING here means a PREVIOUS utterance is still in its STT/queue window (a
                 # fresh onset sees IDLE): exactly the fast-resume the learner exists to catch.
@@ -897,6 +1039,9 @@ class LocalBackend(TurnEventMixin):
             heard=heard,
             onset_interrupting=self._onset_interrupting,
             onset_at=self._onset_at,
+            wake_hit=self._take_wake_claim(),
+            onset_speaking=self._onset_speaking,
+            onset_window_open=self._onset_window_open,
             raw=self._raw_tail(len(pcm)),
             active_ms=ep.closed_active_ms,
             prob_peak=ep.closed_prob_peak,
@@ -955,6 +1100,13 @@ class LocalBackend(TurnEventMixin):
             and not self._preempted
             and self._endpointer.in_speech
         )
+
+    def _take_wake_claim(self) -> bool:
+        """Consume the wake claim for the utterance closing RIGHT NOW: a hit can
+        only have fired during its own capture (the onset staleness check drops
+        older ones), so binding at close time is exact."""
+        claimed, self._wake_claimed = self._wake_claimed, False
+        return claimed
 
     def _take_confirm_latches(self) -> tuple[bool, str | None]:
         """Consume the early-confirm latches for the utterance closing RIGHT NOW: the confirm
@@ -1029,6 +1181,12 @@ class LocalBackend(TurnEventMixin):
                     # process() floors to whole 10 ms blocks: mirror only what the
                     # pipeline heard, or later raw twins slice misaligned.
                     self._dump_raw.append(raw if len(raw) == len(pcm) else raw[: len(pcm)])
+            if self._wake_detector is not None and self._wake_detector.push(pcm):
+                # Post-AEC, so a hit while the bot speaks is judged on the
+                # residual: the acoustic tier's whole point in strict mode.
+                self._wake_hit_at = time.monotonic()
+                self._wake_claimed = True
+                self._metrics.count("wake_hit")
             utterance = self._push_with_model_close(pcm)
             if utterance is not None:
                 # Closed: the ring's pre-onset context belongs to THIS utterance, not to a fast
@@ -1043,12 +1201,24 @@ class LocalBackend(TurnEventMixin):
                             self._stt_live.accept(frame)
                     if self._stt_live is not None:
                         self._stt_live.accept(pcm)
-                        if (
+                        poll_confirm = (
                             self._duck_onset is not None
                             and not self._preempted
                             and not self._early_confirm
                             and utterance is None
-                        ):
+                        )
+                        # Strict mode's text-tier unlock: until a claim exists no
+                        # candidate can even engage, so partials are scanned for
+                        # the wake prefix instead of fresh words.
+                        poll_wake = (
+                            self._wake_mode == "strict"
+                            and not self._wake_claimed
+                            and self._wake_phrase is not None
+                            and not self._preempted
+                            and utterance is None
+                            and self._turn is VoiceState.SPEAKING
+                        )
+                        if poll_confirm or poll_wake:
                             # Early confirm from streaming partials (_judge_fresh); zero
                             # fresh words across consecutive polls release early instead
                             # (consumed duck-mode-only, see the loop-side block).
@@ -1056,20 +1226,26 @@ class LocalBackend(TurnEventMixin):
                             if self._partial_countdown <= 0:
                                 self._partial_countdown = self._partial_every
                                 ptext = self._stt_live.partial()
-                                fresh = self._echo.fresh_words(ptext) - self._ack_words
-                                if self._judge_fresh(ptext, fresh) is None:
-                                    if fresh:
-                                        self._empty_polls = 0
-                                    else:
-                                        self._empty_polls += 1
-                                        onset = self._duck_onset
-                                        if (
-                                            self._empty_polls >= _RELEASE_POLLS
-                                            and onset is not None
-                                            and (time.monotonic() - onset) * 1000.0
-                                            >= _EARLY_RELEASE_MS
-                                        ):
-                                            self._early_release = "partial"
+                                if poll_wake and self._wake_phrase.leads(ptext):
+                                    # Latch only: the loop-side consumption is
+                                    # the confirm authority (echo/warmup vetoes).
+                                    self._wake_hit_at = time.monotonic()
+                                    self._wake_claimed = True
+                                elif poll_confirm:
+                                    fresh = self._echo.fresh_words(ptext) - self._ack_words
+                                    if self._judge_fresh(ptext, fresh) is None:
+                                        if fresh:
+                                            self._empty_polls = 0
+                                        else:
+                                            self._empty_polls += 1
+                                            onset = self._duck_onset
+                                            if (
+                                                self._empty_polls >= _RELEASE_POLLS
+                                                and onset is not None
+                                                and (time.monotonic() - onset) * 1000.0
+                                                >= _EARLY_RELEASE_MS
+                                            ):
+                                                self._early_release = "partial"
                 elif prev_speech and utterance is None:
                     self._stt_live = None  # blip rejected by the min filter: abandon its stream
                 elif not prev_speech:
@@ -1129,6 +1305,9 @@ class LocalBackend(TurnEventMixin):
                 if not self._endpointer.in_speech:
                     self._endpointer.reset()
                     self._recent.clear()
+                    # The wake claim deliberately survives: a hit over the
+                    # reply's tail must still bless the follow-up utterance
+                    # (the onset staleness check bounds it to _WAKE_ATTACH_S).
 
         if self._threaded_hop:
             await asyncio.to_thread(_reset)
@@ -1154,6 +1333,11 @@ class LocalBackend(TurnEventMixin):
                 self._stt_live = None
                 self._endpointer.reset()
                 self._recent.clear()
+                self._wake_claimed = False
+                if self._wake_detector is not None:
+                    # The stream is discontinuous: mel/embedding context spliced
+                    # across the gap would score garbage.
+                    self._wake_detector.reset()
                 if self._dump_raw is not None:
                     # Pre-gap audio no longer abuts the stream; never splice it
                     # into a later segment's raw twin.
@@ -1199,7 +1383,7 @@ class LocalBackend(TurnEventMixin):
                 await aclose()
         # An RKNN context is NOT freed by refcount-GC, so an in-process channel restart would
         # load a second copy and exhaust the NPU cores.
-        for engine in (self._tts, self._vad, self._turn_analyzer):
+        for engine in (self._tts, self._vad, self._turn_analyzer, self._wake_detector):
             if engine is not None:
                 with suppress(Exception):
                     engine.release()
@@ -1290,7 +1474,24 @@ class LocalBackend(TurnEventMixin):
             # single fresh STOP word is enough (the kill switch must survive the leak).
             fresh = self._echo.fresh_words(text) - self._ack_words
             fresh_seq = self._fresh_seq(text, fresh)
-            if (interrupting or preempted) and self._stop_match.pure(fresh_seq):
+            # Strict wake gating applies to the echo-rung overrides too: without
+            # it a bystander's "stop" through the playback leak would kill the
+            # reply (and the settle would open the attention window) — the exact
+            # bypass strict exists to close. Wake evidence (claim or a leading
+            # phrase in the transcript) unblocks.
+            wake_blocked = (
+                self._wake_mode == "strict"
+                and pending.onset_speaking
+                and not pending.wake_hit
+                and not (
+                    self._wake_phrase is not None and self._wake_phrase.leads(text)
+                )
+            )
+            if (
+                (interrupting or preempted)
+                and not wake_blocked
+                and self._stop_match.pure(fresh_seq)
+            ):
                 # The fresh remainder is pure command material: a stop said THROUGH the
                 # leak. Ordered, so multi-word phrases ("shut up") match here too.
                 self._log.info(
@@ -1302,7 +1503,7 @@ class LocalBackend(TurnEventMixin):
                     interrupting=interrupting, preempted=preempted,
                 )
                 return _summary("stop")
-            if (interrupting or preempted) and (
+            if (interrupting or preempted) and not wake_blocked and (
                 len(fresh) >= self._min_fresh_words
                 or self._stop_match.present(fresh_seq)
             ):
@@ -1322,6 +1523,45 @@ class LocalBackend(TurnEventMixin):
                     # session sits there until the user speaks.
                     await self._set_turn(VoiceState.IDLE)
                 return _summary("echo")
+
+        # Wake gate (wake.mode != "off"): a cold utterance without the wake
+        # phrase — or, in strict mode, an unwoken attempt over a live reply — is
+        # not addressed to us and is dropped WHOLE (content spoken at a gated
+        # device must not reach the agent). Sits above the stop rung on purpose:
+        # a bystander's "stop" is bystander speech; the engaged user's stop
+        # arrives inside the attention window (or wake-prefixed) and passes.
+        if self._wake_mode != "off":
+            gate, text = self._wake_verdict(pending, text)
+            if gate == "gated":
+                self._metrics.count("wake_gated")
+                if self._adaptive is not None:
+                    self._adaptive.drop_anchor()  # not a turn: nothing to resume from
+                self._release_duck("gated")
+                if preempted:
+                    await self._orphaned_confirm("gated")
+                elif self._turn is VoiceState.CAPTURING:
+                    await self._set_turn(VoiceState.IDLE)
+                return _summary("gated")
+            if gate == "wake":
+                # The bare wake phrase: attention, not content. Kill a live reply
+                # (the user called our name to get the floor), open the window,
+                # publish nothing — silence + a stopped reply is the earcon. The
+                # kill arms the same grace and pending note a consumed stop
+                # leaves: a follow-up bare "stop" must stay consumable, and the
+                # next turn's agent must know the reply was cut.
+                self._metrics.count("wake_only")
+                if self._adaptive is not None:
+                    self._adaptive.drop_anchor()
+                killed, heard = await self._kill_live_reply(
+                    interrupting=interrupting, preempted=preempted, heard=heard
+                )
+                if killed:
+                    self._last_kill = time.monotonic()
+                    self._pending_note = _wake_note(heard)
+                self._clear_duck()
+                if self._turn is not VoiceState.IDLE:
+                    await self._set_turn(VoiceState.IDLE)
+                return _summary("wake")
 
         # Stop command aimed at a live reply: kill it and CONSUME the utterance — publishing
         # "stop" would make the agent answer it ("okay, stopping"), the exact reply the user
@@ -1392,6 +1632,7 @@ class LocalBackend(TurnEventMixin):
             # describes the one killed by THIS utterance. Both may ride one publish.
             parts.append(self._pending_note)
             self._pending_note = None
+        self._touch_wake()  # an accepted turn keeps the conversation's attention
         await self._publish_text("\n\n".join(parts), self._cur_turn.token)
         self._arm_prologue()
         self._arm_timeout()
@@ -1459,6 +1700,60 @@ class LocalBackend(TurnEventMixin):
             break
         return " ".join(out).strip()
 
+    async def _set_turn(self, state: VoiceState) -> None:
+        # The attention window restarts when a conversation settles (reply
+        # drained, stop consumed): follow-ups stay wake-free for wake.windowS.
+        # Rejected-utterance settles (CAPTURING -> IDLE) deliberately don't
+        # touch it: a gated bystander must not hold the gate open.
+        if state is VoiceState.IDLE and self._turn in (
+            VoiceState.SPEAKING, VoiceState.THINKING,
+        ):
+            self._touch_wake()
+        await super()._set_turn(state)
+
+    def _touch_wake(self) -> None:
+        """(Re)open the attention window: cold starts inside it need no wake
+        phrase. No-op when gating is off or windowS is 0 (every cold start
+        gated)."""
+        if self._wake_mode != "off" and self._wake_window_s > 0:
+            self._wake_until = time.monotonic() + self._wake_window_s
+
+    def _wake_hit_echoed(self) -> bool:
+        """The configured wake phrase is fully contained in recently-spoken TTS:
+        a hit right now is (very likely) the bot hearing its own reply say the
+        phrase, not a user. Empty echo window -> nothing suppressed."""
+        return any(
+            p and not self._echo.fresh_words(p) for p in self._wake_phrases_text
+        )
+
+    def _wake_verdict(
+        self, pending: _PendingUtterance, text: str
+    ) -> tuple[str, str]:
+        """Judge one utterance against the wake gate. Returns ``(decision,
+        text)``: ``"pass"`` (any leading wake phrase stripped from the text),
+        ``"wake"`` (the bare phrase: attention only), or ``"gated"``."""
+        matched, stripped = (
+            self._wake_phrase.strip(text)
+            if self._wake_phrase is not None else (False, text)
+        )
+        if matched:
+            self._metrics.count("wake_text")
+        woke = pending.wake_hit or matched
+        window_open = pending.onset_window_open
+        required = (
+            # Strict gates barge-in on AUDIBLE replies only: a follow-up during
+            # THINKING is the user's own continuation, not a bystander.
+            (self._wake_mode == "strict" and pending.onset_speaking)
+            or (not pending.onset_interrupting and not window_open)
+        )
+        if required and not woke:
+            return "gated", text
+        if woke:
+            self._touch_wake()
+        if matched and not tokens_of(stripped):
+            return "wake", ""
+        return "pass", stripped if matched else text
+
     def _in_aec_warmup(self) -> bool:
         """AEC3 still converging (too little reference audio accepted): hold the
         early-confirm shortcuts (the endpoint verdict still decides)."""
@@ -1473,6 +1768,11 @@ class LocalBackend(TurnEventMixin):
             and self._turn is VoiceState.SPEAKING
             and self._sink.stream_mode
             and (self._duck_gain < 1.0 or self._duck_pause)
+            # Strict wake gating: unclaimed speech over a live reply is treated
+            # as not-for-us — it never ducks, so the reply plays through crowds
+            # unperturbed and the whole duck/acquit machinery stays cold until
+            # a wake hit claims the utterance.
+            and (self._wake_mode != "strict" or self._wake_claimed)
             # Post-acquittal holdoff: resumed playback re-leaks immediately; without this
             # the candidate loop flaps at ~1 Hz under weak/absent AEC.
             and time.monotonic() >= self._probe_holdoff_until
@@ -1525,11 +1825,25 @@ class LocalBackend(TurnEventMixin):
             return
         if (
             self._closing
-            or self._duck_onset is None
             or self._preempted
             or self._early_confirm
             or not self._endpointer.in_speech  # closed: the endpoint verdict owns it
         ):
+            return
+        if (
+            self._wake_mode == "strict"
+            and not self._wake_claimed
+            and self._wake_phrase is not None
+            and self._turn is VoiceState.SPEAKING
+        ):
+            # Batch analog of the strict partial scan: an unclaimed candidate
+            # takes no fresh-words verdict, only the wake-prefix unlock. Latch
+            # only — the loop-side consumption is the confirm authority.
+            if self._wake_phrase.leads(task.result() or ""):
+                self._wake_hit_at = time.monotonic()
+                self._wake_claimed = True
+            return
+        if self._duck_onset is None:
             return
         text = task.result() or ""
         fresh = self._echo.fresh_words(text) - self._ack_words
@@ -1600,6 +1914,7 @@ class LocalBackend(TurnEventMixin):
                 self._stt_live = None
                 self._endpointer.reset()
                 self._recent.clear()
+                self._wake_claimed = False
 
         if self._threaded_hop:
             await asyncio.to_thread(_reset)

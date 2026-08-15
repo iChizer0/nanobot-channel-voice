@@ -29,8 +29,11 @@ dependencies = [
 webrtc = ["webrtcvad-wheels>=2.0.10"]   # higher-quality VAD (drop-in behind the VAD interface)
 pyalsa = ["pyalsaaudio>=0.10.0"]        # in-process libasound backend (audio.backend="pyalsa")
 # Everything on-device, over local ONNX/RKNN models supplied by path (never bundled):
-# STT whisper/sensevoice/zipformer, TTS mms/supertonic, VAD firered, end-of-turn
-# smartturn. onnxruntime is the CPU path; kaldi-native-fbank is the front-end
+# STT whisper/sensevoice/zipformer, TTS mms/supertonic, VAD firered/silero, end-of-turn
+# smartturn, wake-word openwakeword (the MODEL FORMAT — the upstream `openwakeword`
+# package is deliberately not a dependency: we run its ONNX artifacts through our own
+# runtime, which is also what lets livekit-wakeword heads load through the same
+# adapter). onnxruntime is the CPU path; kaldi-native-fbank is the front-end
 # sensevoice/zipformer/firered share; the NPU (.rknn) path additionally needs [rknn].
 # Jetson: install a JetPack-matched `onnxruntime-gpu` wheel (Jetson Zoo, not PyPI)
 # and set executionProviders to the TensorRT/CUDA EPs — same .onnx, no re-export.

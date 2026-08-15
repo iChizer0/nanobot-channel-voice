@@ -587,7 +587,8 @@ class TelemetryConfig(_VoiceBase):
 class DebugConfig(_VoiceBase):
     """Diagnostics. ``dumpAudio`` (local backend) writes every endpointed capture
     segment as a WAV named by the pipeline's verdict (``publish``/``interrupt``/
-    ``empty``/``echo``/``ack``/``stop``/``blip``/``probe``/``gap``), so a false
+    ``empty``/``echo``/``ack``/``stop``/``gated``/``wake``/``blip``/``probe``/
+    ``gap``), so a false
     barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the
     same span pre-cancellation (TTS audible there but not in the post-AEC file = the
     canceller works and the trigger is acoustic). Each session directory also holds
@@ -661,6 +662,61 @@ class BargeInConfig(_VoiceBase):
     )
 
 
+class OpenWakeWordConfig(OnDeviceRuntime):
+    """openWakeWord-format acoustic wake word (``wake.engine="openwakeword"``,
+    ``[ondevice]`` extra; needs ``audio.sampleRate=16000``). Three ORIGINAL
+    upstream artifacts: ``melPath`` (melspectrogram.onnx) and ``embeddingPath``
+    (embedding_model.onnx) are shared by every phrase; ``modelPath`` is the
+    per-phrase classifier head. livekit-wakeword heads speak the same backbone
+    contract and load here too. NOTE: openWakeWord's official pretrained heads
+    are CC-BY-NC-SA (non-commercial); livekit-wakeword and self-trained heads
+    (either project's training pipeline) are unrestricted."""
+
+    mel_path: str | None = None        # melspectrogram.onnx (shared front end)
+    embedding_path: str | None = None  # embedding_model.onnx (Google speech_embedding re-export)
+    model_path: str | None = None      # the wake-phrase classifier head
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # sigmoid score at/above => hit
+    # Minimum spacing between hits: the phrase echoing in a hard room must not
+    # double-fire the gate.
+    refractory_s: float = Field(default=2.0, ge=0.0)
+
+
+class WakeConfig(_VoiceBase):
+    """Wake-word gate (LOCAL backend only; the cloud paths are ungated by design).
+
+    ``mode="gate"``: starting a conversation from cold requires the wake phrase;
+    once engaged, follow-ups and barge-in stay natural for ``windowS`` after each
+    turn. ``mode="strict"`` additionally requires the phrase to interrupt a live
+    reply — while the bot speaks, non-wake speech neither ducks nor stops it,
+    which is the robust posture for public/multi-speaker spaces (and what makes
+    barge-in SIMPLE there: a hit is the whole verdict). Detection is two-tier:
+    the transcript prefix (``phrases``, any language the STT covers) always
+    counts, and ``engine="openwakeword"`` adds an acoustic detector that hears
+    through the bot's own playback. A leading wake phrase is stripped from the
+    published text; an utterance that is ONLY the phrase publishes nothing and
+    just opens the attention window."""
+
+    mode: Literal["off", "gate", "strict"] = "off"
+    # The spoken wake phrases, matched at utterance START (hesitation fillers may
+    # precede). Also what the transcript tier strips from published turns.
+    phrases: list[str] = Field(default_factory=list)
+    # Attention window: seconds after a wake/turn during which cold starts need
+    # no wake phrase. 0 = every cold start needs the phrase.
+    window_s: float = Field(default=45.0, ge=0.0)
+    engine: Literal["text", "openwakeword"] = "text"
+    openwakeword: OpenWakeWordConfig = Field(default_factory=OpenWakeWordConfig)
+
+    @model_validator(mode="after")
+    def _phrases_required(self) -> WakeConfig:
+        if self.mode != "off" and not self.phrases:
+            raise ValueError(
+                f'wake.mode="{self.mode}" requires wake.phrases: the transcript tier '
+                "is the always-available fallback (the acoustic engine is "
+                "best-effort and may degrade), and phrases drive wake stripping"
+            )
+        return self
+
+
 class VoiceConfig(_VoiceBase):
     """Top-level ``channels.voice`` config.
 
@@ -711,6 +767,7 @@ class VoiceConfig(_VoiceBase):
     # TTS) can't change gain mid-chunk and bakes it in statically.
     duck_db: float = Field(default=-12.0, le=0.0)
     barge_in: BargeInConfig = Field(default_factory=BargeInConfig)
+    wake: WakeConfig = Field(default_factory=WakeConfig)
 
     # Tail after playback drains before re-listening (local only; the cloud drain has no hangover).
     playback_hangover_ms: int = Field(default=250, ge=0)

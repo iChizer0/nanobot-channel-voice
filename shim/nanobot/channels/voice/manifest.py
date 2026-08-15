@@ -170,11 +170,13 @@ def _pipeline_check(cfg: Any, check: Any) -> dict[str, Any]:
     home: the form carries no engine fields (import-only surface), so this row
     is where the selection becomes visible. Downgraded to "warn" when a selected
     engine would silently fall back at start."""
-    from nanobot_channel_voice import stt, tts, vad
+    from nanobot_channel_voice import stt, tts, vad, wake
     from nanobot_channel_voice.engines import preflight
 
     parts = [f"vad.engine='{cfg.vad.engine}'", f"stt.provider='{cfg.stt.provider}'"]
     parts.append(f"tts.provider='{cfg.tts.provider}'" if cfg.tts.enabled else "tts disabled")
+    if cfg.wake.mode != "off":
+        parts.append(f"wake.mode='{cfg.wake.mode}'")
     degraded = [
         f"{kind} '{engine}' would fall back ({reason})"
         for kind, engine, reason in (
@@ -194,6 +196,13 @@ def _pipeline_check(cfg: Any, check: Any) -> dict[str, Any]:
                 cfg.tts.provider,
                 preflight(cfg.tts, cfg.tts.provider, tts.ENGINES, prefix="tts.")
                 if cfg.tts.enabled
+                else None,
+            ),
+            (
+                "wake",
+                cfg.wake.engine,
+                preflight(cfg.wake, cfg.wake.engine, wake.ENGINES, prefix="wake.")
+                if cfg.wake.mode != "off"
                 else None,
             ),
         )

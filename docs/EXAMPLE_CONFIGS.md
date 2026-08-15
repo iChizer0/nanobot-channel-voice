@@ -401,6 +401,36 @@ The open-mic cloud example with the tuning applied (`[aec,webrtc,ondevice]` extr
 
 The turn model is an on-device engine like any other: the file extension picks the runtime, so a `.rknn` conversion (`rknn-toolkit2`, same as the other models) serves it from the NPU, with `"coreMask"` pinning it to its own core on a multi-core board, and a `weights` key works once an index serves one - `nanobot-voice sync` finds it there like in every other engine block and provisions it. A missing or unfetched model degrades loudly to silence-only endpointing, never a crash.
 
+### Wake word for public spaces
+
+`wake.mode` gates the pipeline behind a wake phrase (local backend only). `"gate"` requires the phrase to *start* a conversation from cold; once engaged, follow-ups and barge-in stay natural for `windowS` seconds after each turn. `"strict"` additionally requires it to interrupt a live reply: while the bot speaks, non-wake speech neither ducks nor stops playback — the whole duck-then-confirm machinery stays cold until a wake hit claims the utterance, which is both the robust posture for public/multi-speaker spaces and the *simple* barge-in path (a hit is the entire verdict). Detection is two-tier and both tiers feed the same gate: the transcript prefix (`phrases`, zero models, any language the STT covers — hesitation fillers may precede it, and the phrase is stripped from the published turn) always counts, and `engine: "openwakeword"` adds an acoustic detector (openWakeWord/livekit-wakeword-format ONNX, ~3.7 MB total, one decision per 80 ms, `[ondevice]` extra, 16 kHz capture) that hears through the bot's own playback — the bot never says its own wake phrase, so an acoustic hit mid-reply is a high-precision interrupt that confirms without the min-words bar. An utterance that is *only* the phrase publishes nothing: it kills a live reply, opens the attention window, and listens.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "aec": "webrtc",
+      "bargeIn": { "mode": "pause" },
+      "wake": {
+        "mode": "strict",
+        "phrases": ["hey jarvis"],
+        "windowS": 30,
+        "engine": "openwakeword",
+        "openwakeword": {
+          "melPath": "model/mel.onnx",
+          "embeddingPath": "model/embedding.onnx",
+          "modelPath": "model/hey_jarvis_v0.1.onnx",
+          "threshold": 0.5
+        }
+      }
+    }
+  }
+}
+```
+
+The acoustic engine is an on-device engine like any other: a `weights` key provisions all three files via `nanobot-voice sync`, `.rknn` conversions serve from the NPU, and a missing/unfetchable model degrades loudly to transcript-tier gating, never a crash. Notes: openWakeWord's official pretrained heads are **CC-BY-NC-SA (non-commercial)** — for commercial deployments train your own phrase head (openWakeWord's Colab or livekit-wakeword's one-command pipeline, both Apache-licensed toolchains) and point `modelPath` at it. `"strict"` with a *batch* STT and no acoustic engine detects the phrase only at the eager/endpoint decode, so interrupts confirm late — pair strict either with the acoustic engine or a streaming STT (`zipformer`). Gated utterances appear in the audio dump as `utt-<id>-gated.wav`, so a phrase that "doesn't work" is diagnosed by ear like any false barge-in.
+
 ### Debugging false barge-in by ear
 
 When the logs show `false barge-in (empty)` / `(echo)` / `(probe)` streaks and you want to know *what the pipeline actually heard*, turn on the audio dump:
@@ -415,7 +445,7 @@ When the logs show `false barge-in (empty)` / `(echo)` / `(probe)` streaks and y
 }
 ```
 
-Every endpointed capture segment is then written under `~/.local/share/nanobot-voice/dumps/<session>/` (override with `debug.dumpDir`) as `utt-<id>-<verdict>.wav`, where `<id>` matches the `utt #N:` log line that judged it and the verdict is its outcome: `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `interrupt`, `publish`. A `manifest.jsonl` in the same directory carries one record per segment (id, verdict, duration, rms, close shape, STT cost/path, VAD confidence, capture-side wall stamp; the transcript only with `logTranscripts` on), so a big dump is filtered with `jq` before anything is listened to. With `aec: "webrtc"` each segment gets a `.raw.wav` twin holding the same span *before* cancellation. Reading the pair:
+Every endpointed capture segment is then written under `~/.local/share/nanobot-voice/dumps/<session>/` (override with `debug.dumpDir`) as `utt-<id>-<verdict>.wav`, where `<id>` matches the `utt #N:` log line that judged it and the verdict is its outcome: `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `gated`, `wake`, `interrupt`, `publish`. A `manifest.jsonl` in the same directory carries one record per segment (id, verdict, duration, rms, close shape, STT cost/path, VAD confidence, capture-side wall stamp; the transcript only with `logTranscripts` on), so a big dump is filtered with `jq` before anything is listened to. With `aec: "webrtc"` each segment gets a `.raw.wav` twin holding the same span *before* cancellation. Reading the pair:
 
 - TTS clearly audible in the **post-AEC** file (`.wav`) -> the canceller is not converging (check `audio.playoutDelayMs`, give it a few seconds of clean playback to adapt, or the device is looping audio somewhere AEC3 can't model).
 - TTS audible only in the **`.raw.wav`** twin, post-AEC quiet -> AEC is doing its job; the trigger is something else (VAD floor, room noise, a real voice).
