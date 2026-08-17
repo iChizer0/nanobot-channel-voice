@@ -186,3 +186,24 @@ def test_prewarm_fills_the_cache_and_respects_probe_ok_and_enabled():
             await backend.close()
 
     asyncio.run(_t())
+
+
+def test_phrase_defaults_follow_the_tts_language():
+    from nanobot_channel_voice.backend.local import (
+        _PROLOGUE_BUILTINS,
+        _PROLOGUE_FALLBACK,
+        _prologue_phrases,
+    )
+
+    assert _prologue_phrases(None, "zh") == _PROLOGUE_BUILTINS["zh"]
+    assert _prologue_phrases(None, None) == _PROLOGUE_FALLBACK
+    assert _prologue_phrases(None, "ko") == _PROLOGUE_FALLBACK  # no builtin -> English
+    assert _prologue_phrases(["custom"], "zh") == ["custom"]    # explicit always wins
+    assert _prologue_phrases([], "zh") == []                    # explicit off
+
+
+def test_backend_resolves_builtins_when_phrases_omitted():
+    from nanobot_channel_voice.backend.local import _PROLOGUE_FALLBACK
+
+    b, _tts, _sink = _build()  # _FakeTts declares no spoken_language -> English builtins
+    assert b._prologue_phrases == _PROLOGUE_FALLBACK

@@ -479,6 +479,9 @@ class MatchaTtsConfig(OnDeviceRuntime):
     speaker_id: int = Field(default=0, ge=0)  # multi-speaker exports only; ignored otherwise
     noise_scale: float = Field(default=0.667, ge=0)  # upstream temperature default
     speed: float = Field(default=1.0, gt=0)          # >1 = faster (length_scale = 1/speed)
+    # Grad-TTS spectral denoiser on separate WAVEFORM (HiFi-GAN) vocoders, upstream's CLI
+    # default; 0 = off. Vocos and embedded-vocoder exports carry no bias and are skipped.
+    denoiser_strength: float = Field(default=0.00025, ge=0)
     # Per-piece text budget in codepoints; 0 = the defaults (120 for dynamic lexicon
     # models, 300 for dynamic espeak models, 80 for static espeak encoders, 40 for
     # static lexicon encoders). Longer chunks split at space/clause.
@@ -561,9 +564,9 @@ class PrologueConfig(_VoiceBase):
     enabled: bool = False
     after_ms: int = Field(default=2000, ge=0)        # THINKING silence before filler 1
     interval_ms: int = Field(default=8000, ge=1000)  # re-filler cadence during long waits
-    phrases: list[str] = Field(
-        default_factory=lambda: ["One moment.", "Still working on it."]
-    )
+    # Escalation script; None = built-ins matched to the TTS engine's language (an
+    # on-device engine speaks exactly one, and English through a zh lexicon is silence).
+    phrases: list[str] | None = None
 
 
 class RealtimeConfig(_VoiceBase):

@@ -146,6 +146,22 @@ def _swallow_result(task: asyncio.Task) -> None:
         task.exception()
 
 
+# prologue.phrases=None: built-ins keyed to the TTS engine's language — every on-device
+# engine speaks exactly one, and an unspeakable phrase synthesizes to silence.
+_PROLOGUE_BUILTINS = {
+    "zh": ["稍等。", "还在处理中。"],
+    "ja": ["少々お待ちください。", "まだ作業中です。"],
+    "de": ["Einen Moment.", "Ich arbeite noch daran."],
+}
+_PROLOGUE_FALLBACK = ["One moment.", "Still working on it."]
+
+
+def _prologue_phrases(configured: list[str] | None, language: str | None) -> list[str]:
+    if configured is not None:
+        return configured  # explicit always wins; [] = script off
+    return _PROLOGUE_BUILTINS.get(language or "", _PROLOGUE_FALLBACK)
+
+
 def _interrupt_marker(heard: str | None) -> str | None:
     """The heard-up-to note riding an interrupting utterance's publish. ``heard`` is the
     heard text ("" = cut before anything sounded), None = marker disabled/blob mode."""
@@ -420,6 +436,9 @@ class LocalBackend(TurnEventMixin):
     ):
         self._cfg = config
         self._tts = tts
+        self._prologue_phrases = _prologue_phrases(
+            config.prologue.phrases, getattr(tts, "spoken_language", None)
+        )
         self._sink = sink
         self._transcribe = transcribe
         self._publish_text = publish_text
@@ -2394,7 +2413,7 @@ class LocalBackend(TurnEventMixin):
             self._closing
             or self._tts is None
             or not self._cfg.prologue.enabled
-            or not self._cfg.prologue.phrases
+            or not self._prologue_phrases
         ):
             return
         self._cur_turn.prologue_task = asyncio.create_task(
@@ -2563,7 +2582,7 @@ class LocalBackend(TurnEventMixin):
         # synth (the tail stays lazy). Capped, and abandoned the moment a real turn
         # starts: adapters tolerate overlapped synthesis (RKNN serializes, ORT runs
         # concurrently) but the contention would inflate the first reply's TTFA.
-        for text in self._cfg.prologue.phrases[:8]:
+        for text in self._prologue_phrases[:8]:
             if self._closing or self._turn is not VoiceState.IDLE:
                 return
             try:
@@ -2574,12 +2593,16 @@ class LocalBackend(TurnEventMixin):
                 self._log.debug("filler prewarm failed for '{}': {}", text, exc)
                 return
             if not audio:
-                return  # adapters degrade to b"" — a broken one fails every phrase
+                self._log.warning(
+                    "voice: prologue filler '{}' synthesized to silence (phrase not "
+                    "speakable by this TTS engine?) — it will never play", text,
+                )
+                return
 
     async def _play_filler(self, epoch: int, step: int) -> bool:
         """Speak escalation-script phrase ``step`` (clamped to the last). Returns whether
         the phrase was emitted, so a skip does not advance the script."""
-        phrases = self._cfg.prologue.phrases
+        phrases = self._prologue_phrases
         if not phrases:
             return False
         text = phrases[min(step, len(phrases) - 1)]

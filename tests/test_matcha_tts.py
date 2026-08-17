@@ -14,12 +14,16 @@ from nanobot_channel_voice.tts.matcha import (  # noqa: E402
     EspeakFrontend,
     LexiconFrontend,
     MatchaTtsAdapter,
+    VocoderSpec,
     add_blank,
+    denoise,
+    denoiser_bias,
     fold_punct_aliases,
     istft,
     load_lexicon,
     official_token2id,
     read_tokens,
+    stft,
 )
 from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_zh  # noqa: E402
 
@@ -415,7 +419,9 @@ def test_matcha_split_host_bridge_tiles_decoder_and_edges_vocos(monkeypatch, tmp
     assert np.array_equal(
         decoder_inputs["mu_up"][:, :, 12:], decoder_inputs["mu_up"][:, :, :4]
     )
-    vocoder_inputs = dict(made[2].calls[0])
+    # calls[0] is the build-time mode/bias probe (zero mel); calls[-1] the synth.
+    assert not dict(made[2].calls[0])["mels"].any()
+    vocoder_inputs = dict(made[2].calls[-1])
     assert vocoder_inputs["mels"].shape == (1, 80, 16)
     tts.release()
 
@@ -454,6 +460,11 @@ def test_matcha_split_meta_sidecar_fills_unset_fields_only(monkeypatch, tmp_path
 
         def metadata(self):
             return {}
+
+        def run(self, inputs):  # only the build-time vocoder probe lands here
+            ((_, mel),) = inputs
+            t = mel.shape[2]
+            return [np.ones((1, 513, t), np.float32)] * 3
 
     monkeypatch.setattr(matcha, "OnDeviceModel", FakeModel)
     monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_a, **_k: str)
@@ -578,3 +589,176 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
     # The tail pads with the TABLE's pad id (zh "_" is 1, not 0 - id 0 is a real token).
     assert set(encoder_inputs["x"][0, 9:].tolist()) == {1}
     tts.release()
+
+
+# ---- denoiser and edge fades ------------------------------------------------
+
+
+def test_stft_round_trips_through_istft():
+    rng = np.random.default_rng(3)
+    sig = rng.standard_normal(5000).astype(np.float32) * 0.3
+    mag, cos, sin = stft(sig, n_fft=1024, hop_length=256, center=True)
+    assert mag.shape[0] == 513
+    out = istft(mag, cos, sin, n_fft=1024, hop_length=256, center=True)
+    n = min(out.size, sig.size)
+    assert np.allclose(out[:n], sig[:n], atol=1e-4)
+
+
+def test_denoise_preserves_length_and_a_huge_bias_silences():
+    rng = np.random.default_rng(4)
+    wav = rng.standard_normal(5000).astype(np.float32) * 0.2  # not a hop multiple
+    out = denoise(wav, np.zeros((513, 1), np.float32))
+    assert out.size == wav.size and np.allclose(out, wav, atol=1e-4)
+    silenced = denoise(wav, np.full((513, 1), 100.0, np.float32))
+    assert silenced.size == wav.size and np.abs(silenced).max() < 1e-6
+    tiny = np.ones(300, np.float32)
+    assert denoise(tiny, np.zeros((513, 1), np.float32)) is tiny  # too short to pad
+
+
+def test_denoiser_bias_probes_the_vocoder_at_its_own_geometry():
+    calls = []
+
+    class Voc:
+        shape = None  # dynamic graph
+
+        def input_shape(self, _name):
+            return self.shape
+
+        def run(self, inputs):
+            calls.append(inputs)
+            ((_, mel),) = inputs
+            return [np.full((1, mel.shape[2] * 256), 0.01, np.float32)]
+
+    spec = VocoderSpec(Voc(), "mels", None)
+    bias = denoiser_bias(spec, 0.00025)
+    ((name, mel),) = calls[0]
+    assert name == "mels" and mel.shape == (1, 80, 88) and not mel.any()
+    assert bias.shape == (513, 1) and (bias >= 0).all()
+
+    fixed = Voc()
+    fixed.shape = (1, 80, 800)  # RKNN-style fixed bucket: probed as-is, never 88
+    assert denoiser_bias(VocoderSpec(fixed, "mels", None), 0.00025) is not None
+    assert calls[-1][0][1].shape == (1, 80, 800)
+
+    # Vocos, strength 0, and a failing probe all disable rather than build or raise.
+    assert denoiser_bias(VocoderSpec(Voc(), "mels", {"n_fft": 1024}), 0.00025) is None
+    assert denoiser_bias(spec, 0.0) is None
+
+    class Broken:
+        def input_shape(self, _name):
+            return None
+
+        def run(self, inputs):
+            raise RuntimeError("bad graph")
+
+    assert denoiser_bias(VocoderSpec(Broken(), "mels", None), 0.00025) is None
+
+
+def test_edge_fade_ramps_piece_boundaries():
+    adapter = MatchaTtsAdapter.__new__(MatchaTtsAdapter)
+    adapter.output_rate = 22050
+    out = adapter._edge_fade(np.ones(2000, np.float32))
+    n = int(0.005 * 22050)
+    assert out[0] == 0.0 and out[-1] == 0.0
+    assert out[n : 2000 - n].min() == 1.0  # only the edges are touched
+    assert adapter._edge_fade(np.ones(1, np.float32))[0] == 1.0  # too short: untouched
+
+
+def _waveform_adapter(vocoder_model, bias):
+    class Acoustic:
+        def run(self, inputs):
+            return [np.zeros((1, 80, 8), np.float32)]
+
+    class Frontend:
+        def sentences(self, text):
+            return [[5, 6]]
+
+        def can_speak(self, ch):
+            return True
+
+    return MatchaTtsAdapter(
+        acoustic=Acoustic(), vocoder=VocoderSpec(vocoder_model, "mels", None),
+        frontend=Frontend(), official=False, length_input="x_length",
+        sample_rate=22050, pad_id=0, bos_id=None, eos_id=None, spk_input=None,
+        speaker_id=0, noise_scale=0.667, speed=1.0, max_len=300, language="en",
+        denoise_bias=bias,
+    )
+
+
+def test_waveform_vocoder_output_is_denoised_and_faded():
+    class Voc:
+        def run(self, inputs):
+            rng = np.random.default_rng(1)
+            return [rng.standard_normal((1, 4096)).astype(np.float32) * 0.1]
+
+    plain = _waveform_adapter(Voc(), None)._synthesize_piece("hi")
+    huge = np.full((513, 1), 10.0, np.float32)
+    denoised = _waveform_adapter(Voc(), huge)._synthesize_piece("hi")
+    assert plain.size == denoised.size == 4096
+    assert plain[0] == 0.0 and plain[-1] == 0.0  # edge fade applied
+    assert np.abs(denoised).max() < np.abs(plain).max() * 0.01
+
+
+def test_matcha_split_waveform_vocoder_is_probed_and_denoised(monkeypatch, tmp_path):
+    """A 1-output vocoder flips the split to waveform mode: factor from the probe,
+    denoiser bias from the same run, wav sliced to the real frames."""
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts import matcha
+
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text("_ 0\n^ 1\n$ 2\n 3\n. 4\nh 5\ni 6\n", encoding="utf-8")
+    made = []
+
+    class FakeModel:
+        def __init__(self, path, **_kw):
+            self.path = path
+            self.calls = []
+            made.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def release(self):
+            pass
+
+        def input_shape(self, _name):
+            return None
+
+        def metadata(self):
+            return {}
+
+        def run(self, inputs):
+            self.calls.append(inputs)
+            if self.path.endswith("encoder.rknn"):
+                return [np.zeros((1, 80, 200), np.float32), np.zeros((1, 1, 200), np.float32)]
+            if self.path.endswith("decoder.rknn"):
+                return [np.zeros((1, 80, 16), np.float32)]
+            rng = np.random.default_rng(2)
+            return [rng.standard_normal((1, 16 * 256)).astype(np.float32) * 0.05]
+
+    monkeypatch.setattr(matcha, "OnDeviceModel", FakeModel)
+    monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_args, **_kw: lambda _text: "hi")
+    base = {
+        "encoderPath": str(tmp_path / "encoder.rknn"),
+        "decoderPath": str(tmp_path / "decoder.rknn"),
+        "vocoderPath": str(tmp_path / "vocoder.rknn"),
+        "tokensPath": str(tokens),
+        "encoderLen": 200,
+        "melLen": 16,
+    }
+    tts = matcha.SplitMatchaTtsAdapter.from_config(MatchaTtsConfig.model_validate(base))
+    assert tts._stft is None and tts._voc_factor == 256
+    assert tts._denoise_bias is not None  # the default strength rides the probe
+    wav = tts._synthesize_piece("hi.")
+    assert wav.size == 11 * 256 and wav.dtype == np.float32
+    assert wav[0] == 0.0 and wav[-1] == 0.0  # faded like the dynamic path
+    tts.release()
+
+    off = matcha.SplitMatchaTtsAdapter.from_config(
+        MatchaTtsConfig.model_validate({**base, "denoiserStrength": 0})
+    )
+    assert off._denoise_bias is None
+    off.release()

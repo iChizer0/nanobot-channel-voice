@@ -129,6 +129,10 @@ def frame_ids(
     return ids
 
 
+def _hann(n_fft: int) -> np.ndarray:
+    return (0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(n_fft) / n_fft))).astype(np.float32)
+
+
 def istft(mag: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
           n_fft: int, hop_length: int, center: bool) -> np.ndarray:
     """Vocos (bins, frames) mag/cos/sin -> waveform; torch.istft-compatible."""
@@ -137,7 +141,7 @@ def istft(mag: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
     np.multiply(mag, cos, out=spec.real)
     np.multiply(mag, sin, out=spec.imag)
     frames = np.fft.irfft(spec, n=n_fft, axis=0).astype(np.float32)  # (n_fft, F)
-    win = (0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(n_fft) / n_fft))).astype(np.float32)
+    win = _hann(n_fft)
     frames *= win[:, None]
     n_frames = frames.shape[1]
     total = n_fft + hop_length * (n_frames - 1)
@@ -161,6 +165,18 @@ def istft(mag: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
             wsum[s : s + n_fft] += w2
     out /= np.maximum(wsum, 1e-11)
     return out[n_fft // 2 : -(n_fft // 2)] if center else out
+
+
+def stft(wav: np.ndarray, *, n_fft: int, hop_length: int, center: bool
+         ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Waveform -> (bins, frames) mag/cos/sin; the exact forward of :func:`istft`."""
+    if center:
+        wav = np.pad(wav, n_fft // 2, mode="reflect")
+    frames = np.lib.stride_tricks.sliding_window_view(wav, n_fft)[::hop_length].T
+    spec = np.fft.rfft(frames * _hann(n_fft)[:, None], axis=0)
+    mag = np.abs(spec).astype(np.float32)
+    safe = np.maximum(mag, 1e-12)
+    return mag, (spec.real / safe).astype(np.float32), (spec.imag / safe).astype(np.float32)
 
 
 def _is_latin(ch: str) -> bool:
@@ -293,6 +309,54 @@ class VocoderSpec(NamedTuple):
     stft: dict | None
 
 
+# Grad-TTS/WaveGlow denoiser: upstream's CLI subtracts the vocoder's zero-mel bias
+# spectrum from every HiFi-GAN output, but the ONNX export only clamps — without this
+# the export carries a constant hiss the demo doesn't. Vocos has no such bias, and an
+# embedded vocoder can't be probed alone, so neither is denoised.
+_DENOISE_STFT = {"n_fft": 1024, "hop_length": 256, "center": True}
+
+
+def _bias_from_wav(wav: np.ndarray, strength: float) -> np.ndarray | None:
+    """Strength-scaled bias magnitude (bins, 1) from a zero-mel probe waveform."""
+    if strength <= 0:
+        return None
+    try:
+        mag, _, _ = stft(wav, **_DENOISE_STFT)
+    except Exception as exc:  # noqa: BLE001 - an enhancement must not fail the build
+        logger.warning("voice: matcha denoiser disabled (bias probe failed: {})", exc)
+        return None
+    return mag[:, :1] * strength  # frame 0, as upstream
+
+
+def denoiser_bias(vocoder: VocoderSpec, strength: float) -> np.ndarray | None:
+    """Probe a waveform vocoder for its bias; None when denoising doesn't apply."""
+    if vocoder.stft is not None or strength <= 0:
+        return None
+    shape = vocoder.model.input_shape(vocoder.input_name)
+    frames = shape[2] if shape is not None and len(shape) == 3 else 88  # fixed graphs probe as-is
+    try:
+        wav = np.asarray(
+            vocoder.model.run([(vocoder.input_name, np.zeros((1, 80, frames), np.float32))])[0],
+            dtype=np.float32,
+        ).reshape(-1)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("voice: matcha denoiser disabled (bias probe failed: {})", exc)
+        return None
+    return _bias_from_wav(wav, strength)
+
+
+def denoise(wav: np.ndarray, bias: np.ndarray) -> np.ndarray:
+    """Subtract ``bias`` in the magnitude domain, keeping the phase and the length."""
+    hop = _DENOISE_STFT["hop_length"]
+    if wav.size <= _DENOISE_STFT["n_fft"] // 2:  # reflect pad needs len > n_fft/2
+        return wav
+    # pad to a hop multiple: the center-ISTFT round trip yields floor(n/hop)*hop samples
+    padded = np.pad(np.clip(wav, -1.0, 1.0), (0, -wav.size % hop))
+    mag, cos, sin = stft(padded, **_DENOISE_STFT)
+    out = istft(np.maximum(mag - bias, 0.0), cos, sin, **_DENOISE_STFT)
+    return out[: wav.size]
+
+
 def _espeak_frontend(
     cfg: MatchaTtsConfig, token2id: dict[str, int], default_voice: str = "en-us",
 ) -> tuple[EspeakFrontend, str]:
@@ -320,6 +384,15 @@ class _MatchaCommon:
     def _can_speak(self, ch: str) -> bool:
         return self._frontend.can_speak(ch)  # type: ignore[attr-defined]
 
+    def _edge_fade(self, wav: np.ndarray) -> np.ndarray:
+        # 5 ms cosine ramps: pieces butt-join against silence, and a non-zero edge clicks
+        n = min(int(0.005 * self.output_rate), wav.size // 2)  # type: ignore[attr-defined]
+        if n > 0:
+            ramp = (0.5 * (1.0 - np.cos(np.pi * np.arange(n) / n))).astype(np.float32)
+            wav[:n] *= ramp
+            wav[-n:] *= ramp[::-1]
+        return wav
+
 
 class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     _label = "Matcha"
@@ -343,10 +416,12 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         speed: float,
         max_len: int,
         language: str | None,
+        denoise_bias: np.ndarray | None,
     ):
         super().__init__()
         self._acoustic = acoustic
         self._vocoder = vocoder
+        self._denoise_bias = denoise_bias
         self._frontend = frontend
         self._official = official
         self._length_input = length_input
@@ -447,17 +522,17 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                     raise ValueError(
                         f"vocoder sample rate {voc_rate} != acoustic model {sample_rate}"
                     )
-                stft = None
+                stft_params = None
                 if len(model.output_names()) == 3:  # Vocos: mag/cos/sin STFT frames
                     if int(vmeta.get("normalized", "0")):
                         raise ValueError("normalized-STFT vocos exports are not supported")
-                    stft = {
+                    stft_params = {
                         "n_fft": int(vmeta.get("n_fft", "1024")),
                         "hop_length": int(vmeta.get("hop_length", "256")),
                         "center": bool(int(vmeta.get("center", "1"))),
                     }
                 specs = model.input_specs()
-                vocoder = VocoderSpec(model, specs[0][0] if specs else "mels", stft)
+                vocoder = VocoderSpec(model, specs[0][0] if specs else "mels", stft_params)
 
             adapter = cls(
                 acoustic=acoustic,
@@ -476,6 +551,9 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 max_len=cfg.max_len
                 or (120 if isinstance(frontend, LexiconFrontend) else 300),
                 language=language,
+                denoise_bias=(
+                    denoiser_bias(vocoder, cfg.denoiser_strength) if vocoder else None
+                ),
             )
             models.pop_all()  # success: the adapter owns the models now
             return adapter
@@ -508,22 +586,27 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         outs = self._acoustic.run(inputs)
 
         if self._vocoder is None:  # embedded vocoder: the graph already emitted wav
-            return np.asarray(outs[0], dtype=np.float32).reshape(-1)
+            return self._edge_fade(np.asarray(outs[0], dtype=np.float32).reshape(-1))
         mel = np.asarray(outs[0], dtype=np.float32)
         vouts = self._vocoder.model.run([(self._vocoder.input_name, mel)])
         if self._vocoder.stft is not None:
-            return istft(
+            return self._edge_fade(istft(
                 np.asarray(vouts[0])[0], np.asarray(vouts[1])[0],
                 np.asarray(vouts[2])[0], **self._vocoder.stft,
-            )
-        return np.asarray(vouts[0], dtype=np.float32).reshape(-1)
+            ))
+        wav = np.asarray(vouts[0], dtype=np.float32).reshape(-1)
+        if self._denoise_bias is not None:
+            wav = denoise(wav, self._denoise_bias)
+        return self._edge_fade(wav)
 
 
 class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     """Static three-graph icefall Matcha: the host bridges durations -> alignment ->
-    tiling -> denorm -> ISTFT between fixed buckets (RKNN cannot express them).
+    tiling -> denorm -> vocoding between fixed buckets (RKNN cannot express them).
     The decoder needs a PERIODIC tail - its attention has no time mask. Extension
-    picks the runtime, so an .onnx triple validates the split off-board."""
+    picks the runtime, so an .onnx triple validates the split off-board. The vocoder
+    is Vocos (3 outputs, host ISTFT) or a waveform HiFi-GAN (1 output, denoised),
+    classified by a build-time probe."""
 
     output_rate = _SAMPLE_RATE_DEFAULT
     _label = "Matcha-split"
@@ -543,7 +626,9 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         mel_len: int,
         mel_scale: float,
         mel_bias: float,
-        stft: dict,
+        stft: dict | None,               # None => single-output waveform vocoder
+        voc_factor: int,                 # waveform mode: samples per mel frame
+        denoise_bias: np.ndarray | None,
         noise_scale: float,
         speed: float,
         max_len: int,
@@ -561,6 +646,8 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         self._mel_scale = mel_scale
         self._mel_bias = mel_bias
         self._stft = stft
+        self._voc_factor = voc_factor
+        self._denoise_bias = denoise_bias
         self._noise_scale = noise_scale
         self._speed = speed
         self._max_len = max_len
@@ -636,14 +723,30 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                         f"matcha split: graph input {name} is {list(shape)}, "
                         f"configured geometry wants {list(want)}"
                     )
-            vmeta = vocoder.metadata()
-            if int(vmeta.get("normalized", "0")):
-                raise ValueError("normalized-STFT vocos exports are not supported")
-            stft = {
-                "n_fft": int(vmeta.get("n_fft", "1024")),
-                "hop_length": int(vmeta.get("hop_length", "256")),
-                "center": bool(int(vmeta.get("center", "1"))),
-            }
+            # One zero-mel probe classifies the vocoder without graph introspection
+            # (RKNN has none): 1 output = waveform (HiFi-GAN), 3 = Vocos. It also
+            # yields the upsample factor and the denoiser bias, and a graph that
+            # cannot run its own bucket fails HERE, not mid-conversation.
+            probe = vocoder.run([("mels", np.zeros((1, 80, mel_len), np.float32))])
+            stft_params, voc_factor, bias = None, 0, None
+            if len(probe) == 1:
+                wav = np.asarray(probe[0], dtype=np.float32).reshape(-1)
+                voc_factor, rem = divmod(wav.size, mel_len)
+                if voc_factor < 1 or rem:
+                    raise ValueError(
+                        f"matcha split: waveform vocoder emits {wav.size} samples for "
+                        f"a {mel_len}-frame mel (not an integer upsample factor)"
+                    )
+                bias = _bias_from_wav(wav, cfg.denoiser_strength)
+            else:
+                vmeta = vocoder.metadata()
+                if int(vmeta.get("normalized", "0")):
+                    raise ValueError("normalized-STFT vocos exports are not supported")
+                stft_params = {
+                    "n_fft": int(vmeta.get("n_fft", "1024")),
+                    "hop_length": int(vmeta.get("hop_length", "256")),
+                    "center": bool(int(vmeta.get("center", "1"))),
+                }
             adapter = cls(
                 encoder=encoder,
                 decoder=decoder,
@@ -657,7 +760,9 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 mel_len=mel_len,
                 mel_scale=mel_scale,
                 mel_bias=mel_bias,
-                stft=stft,
+                stft=stft_params,
+                voc_factor=voc_factor,
+                denoise_bias=bias,
                 noise_scale=cfg.noise_scale,
                 speed=cfg.speed,
                 max_len=cfg.max_len or (40 if language == "zh" else 80),
@@ -711,6 +816,12 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         )
         # edge-replicate: zero is a loud, valid log-mel value
         mel_in = self._edge_to_bucket(mel, self._mel_len)
+        if self._stft is None:  # waveform vocoder: bucket wav, keep the real frames
+            wav = np.asarray(self._vocoder.run([("mels", mel_in)])[0], dtype=np.float32)
+            wav = wav.reshape(-1)[: total * self._voc_factor]
+            if self._denoise_bias is not None:
+                wav = denoise(wav, self._denoise_bias)
+            return self._edge_fade(wav)
         mag, cos, sin = self._vocoder.run([("mels", mel_in)])
         n_fft, hop = self._stft["n_fft"], self._stft["hop_length"]
         # frames past total + n_fft/hop cannot touch a kept sample
@@ -721,7 +832,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             np.asarray(sin, dtype=np.float32)[0, :, :keep],
             **self._stft,
         )
-        return wav[: total * hop]
+        return self._edge_fade(wav[: total * hop])
 
     def _overflow_retry(self, text: str, reason: str) -> np.ndarray:
         if len(text.strip()) <= 1:

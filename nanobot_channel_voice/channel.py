@@ -52,8 +52,9 @@ _DEFAULT_PERSONA = (
 # Direct tool mode: the filler preamble is what the user hears across a tool round-trip;
 # without it the line goes dead. Appended only when tools are actually declared.
 _DIRECT_RULES = (
-    "Before calling a tool, say a brief neutral filler such as \"One moment.\" or "
-    "\"Let me check.\" (never implying success or failure) then call it."
+    "Before calling a tool, say a brief neutral filler in the user's language, such "
+    "as \"One moment.\" or \"Let me check.\" (never implying success or failure) "
+    "then call it."
 )
 
 # Silence-is-the-ack, model-side half: the enforcement is the client's transcript-gated
@@ -70,8 +71,9 @@ _STOP_RULE = (
 _SUPERVISOR_RULES = (
     "Handle greetings, small talk, and clarifying questions yourself. For ANYTHING "
     "that needs a fact you don't already know, an action, a lookup, or multi-step "
-    "work, you MUST delegate: FIRST say a brief neutral filler such as \"One "
-    "moment.\" or \"Let me check.\" (never implying success or failure), THEN call "
+    "work, you MUST delegate: FIRST say a brief neutral filler in the user's "
+    "language, such as \"One moment.\" or \"Let me check.\" (never implying "
+    "success or failure), THEN call "
     "the ask_nanobot tool with the user's request. When it returns, read the answer "
     "aloud naturally and concisely as if it were your own, never mention the tool "
     "or that you delegated."
@@ -176,7 +178,8 @@ def _voice_context_blocks(
             # The backend detects this spoken status line (agent_prologue) and defers
             # the canned filler behind it.
             "Before using tools that may take more than a moment, first say one short "
-            "sentence about what you are doing, then proceed.",
+            "sentence about what you are doing (never implying success or failure), "
+            "then proceed.",
         ]
         lang = getattr(tts, "spoken_language", None)
         if lang:

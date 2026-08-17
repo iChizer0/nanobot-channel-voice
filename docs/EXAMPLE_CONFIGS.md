@@ -187,7 +187,7 @@ pip install matcha-tts   # export-time only, never on the device
 curl -LO https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/matcha_ljspeech.ckpt
 curl -LO https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/generator_v1
 python -m matcha.onnx.export matcha_ljspeech.ckpt matcha_ljspeech_hifigan.onnx \
-  --n-timesteps 3 --vocoder-name hifigan_T2_v1 --vocoder-checkpoint-path generator_v1
+  --n-timesteps 5 --vocoder-name hifigan_T2_v1 --vocoder-checkpoint-path generator_v1
 ```
 
 ```json
@@ -197,7 +197,9 @@ python -m matcha.onnx.export matcha_ljspeech.ckpt matcha_ljspeech_hifigan.onnx \
 }
 ```
 
-`matcha_vctk.ckpt` exports the same way (vocoder `hifigan_univ_v1`) and adds 108 voices via `speakerId`. A mel-only export (no `--vocoder-name`) instead pairs with a `vocoderPath` graph — HiFi-GAN, or sherpa's `vocos-22khz-univ.onnx` (ISTFT runs host-side). English phonemizes through espeak-ng, resolved `espeakPath` → system binary → the `[espeak]` pip extra bundling libespeak-ng + data for boards without a package manager (GPL-3, opt-in); with none of the three the channel falls back to system TTS and says so. `speed` (>1 = faster) and `noiseScale` (flow temperature, default 0.667) tune delivery.
+`matcha_vctk.ckpt` exports the same way (vocoder `hifigan_univ_v1`) and adds 108 voices via `speakerId`. A mel-only export (no `--vocoder-name`) instead pairs with a `vocoderPath` graph — HiFi-GAN, or sherpa's `vocos-22khz-univ.onnx` (ISTFT runs host-side). English phonemizes through espeak-ng, resolved `espeakPath` → system binary → the `[espeak]` pip extra bundling libespeak-ng + data for boards without a package manager (GPL-3, opt-in); with none of the three the channel falls back to system TTS and says so.
+
+Timbre: `--n-timesteps` (ODE steps) is baked at export — 5 is the export default, upstream's demo runs 10, 3 audibly flattens prosody; only the small flow decoder scales with it. Upstream's CLI also denoises HiFi-GAN output but its ONNX export doesn't, so the plugin applies the same spectral denoiser host-side to separate waveform vocoders (`denoiserStrength`, default 0.00025, 0 = off) — an embedded vocoder can't be probed for its bias and keeps a faint hiss, making mel-only + `vocoderPath` the higher-fidelity route; Vocos has no such bias and needs none. `speed` (>1 = faster) and `noiseScale` (flow temperature, default 0.667; lower = cleaner but flatter, higher = breathier) tune delivery.
 
 The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata), and `matcha-icefall-zh-baker` is currently the only Chinese option (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically):
 
@@ -215,7 +217,7 @@ The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/s
 
 ### Matcha-TTS static split (icefall, NPU-ready)
 
-A static Matcha deployment uses a matched encoder/decoder/Vocos set — **not** a direct conversion of dynamic `model-steps-3.onnx`; the data-dependent duration regulator, noise, padding, and ISTFT stay in the adapter. Convert and validate the three artifacts together, never mixed across conversions.
+A static Matcha deployment uses a matched encoder/decoder/vocoder set — **not** a direct conversion of dynamic `model-steps-3.onnx`; the data-dependent duration regulator, noise, padding, and ISTFT stay in the adapter. The vocoder slot takes Vocos (host ISTFT) or a fixed-shape single-output HiFi-GAN (conv-only, NPU-friendlier, gets the spectral denoiser) — a build-time probe classifies the graph, no metadata needed. Convert and validate the artifacts together, never mixed across conversions.
 
 ```json
 "tts": {
@@ -529,7 +531,7 @@ Long waits (tool calls, slow reasoning) are masked in two layers. The voice cont
 }
 ```
 
-`phrases` is an escalation script: each wait consumes it **in order from the top**, repeating the last phrase every `intervalMs` until the reply arrives, so later entries can acknowledge a longer wait. Phrases are synthesized once with the session's own voice at warmup (local engines only; a cloud TTS is never billed at startup and pays lazily on first use) and cached. Fillers are killed by barge-in like any reply audio, never play over the user's speech, and don't count toward the latency metrics. When the agent spoke its own status line at a tool boundary, that line counts as the script's opener: the first canned filler waits a full `intervalMs` and continues from the second phrase. Keep phrases short: in half-duplex the mic is gated while one plays.
+`phrases` is an escalation script: each wait consumes it **in order from the top**, repeating the last phrase every `intervalMs` until the reply arrives, so later entries can acknowledge a longer wait. Omit it for built-in phrases matched to the TTS engine's language (en/zh/ja/de) — an on-device engine speaks exactly one language, and an unspeakable phrase synthesizes to silence (warned at warmup); an explicit list always wins, `[]` disables the script. Phrases are synthesized once with the session's own voice at warmup (local engines only; a cloud TTS is never billed at startup and pays lazily on first use) and cached. Fillers are killed by barge-in like any reply audio, never play over the user's speech, and don't count toward the latency metrics. When the agent spoke its own status line at a tool boundary, that line counts as the script's opener: the first canned filler waits a full `intervalMs` and continues from the second phrase. Keep phrases short: in half-duplex the mic is gated while one plays.
 
 ## Realtime
 
