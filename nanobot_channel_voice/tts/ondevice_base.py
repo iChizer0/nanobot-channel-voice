@@ -1,4 +1,4 @@
-"""Shared shell for the on-device numpy TTS engines (mms, supertonic).
+"""Shared shell for the on-device numpy TTS engines (mms, supertonic, matcha).
 
 Owns everything EXCEPT the model math: strip/empty guards, the ``to_thread`` hop off
 the event loop, the degrade-to-empty error policy ("never let one chunk kill the

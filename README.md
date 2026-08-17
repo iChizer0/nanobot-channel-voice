@@ -58,7 +58,7 @@ nanobot channels status
 
 The default stack (ALSA, energy VAD, OpenAI-compatible TTS) needs no extras. Each of these is lazily imported, so the plugin runs and degrades gracefully without them:
 
-- `[ondevice]` is every on-device engine over local ONNX models (CPU, via onnxruntime): STT `whisper`/`sensevoice`/`zipformer`, TTS `mms`/`supertonic`, VAD `firered`/`silero` (Silero VAD v6), end-of-turn `smartturn` (Smart Turn v3).
+- `[ondevice]` is every on-device engine over local ONNX models (CPU, via onnxruntime): STT `whisper`/`sensevoice`/`zipformer`, TTS `mms`/`supertonic`/`matcha`, VAD `firered`/`silero` (Silero VAD v6), end-of-turn `smartturn` (Smart Turn v3). Matcha's English front-end needs espeak-ng: the system package, or add `[espeak]` for a pip-bundled library on boards without a package manager.
 - `[rknn]` adds Rockchip's NPU runtime (`rknn-toolkit-lite2`) for `.rknn` artifacts, on top of `[ondevice]`. Requires aarch64 arch and Python <= 3.12, elsewhere it installs nothing, since `.onnx` is the non-board path.
 - `[realtime]` is the WebSocket client for the E2E cloud backends (`backend: "openai"` and its dialects).
 - `[aec]` is software echo cancellation (`aec: "webrtc"`, WebRTC AEC3), large wheel.

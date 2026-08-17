@@ -463,11 +463,24 @@ class VoiceChannel(BaseChannel):
         # hold suppresses the early-confirm shortcuts forever (reference_ms() never advances).
         aec_stage = None
         if self.config.aec == "webrtc":
-            if not pcm_capable:
+            # AEC3 frames the reference in 10 ms blocks, so the TTS rate must divide
+            # into them; 22050 (matcha) cannot, and push_reference would drop every
+            # block -> the exact reference-starved canceller described above.
+            tts_rate = getattr(tts, "output_rate", None) if pcm_capable else None
+            if tts_rate is None:
                 self.logger.warning(
-                    "aec='webrtc' needs a raw-PCM TTS for its reference signal (mms, "
-                    "supertonic, or openai/openai_compat with tts.audioFormat='pcm'); "
-                    "WAV-blob playback supplies none, falling back to soft-duplex"
+                    "aec='webrtc' needs a raw-PCM TTS for its reference signal, but "
+                    "tts.provider='{}' plays WAV blobs (its sink never feeds the "
+                    "reference tap); use an on-device raw-PCM engine or set "
+                    "tts.audioFormat='pcm', falling back to soft-duplex",
+                    self.config.tts.provider,
+                )
+            elif tts_rate % 100:
+                self.logger.warning(
+                    "aec='webrtc' cannot frame the {} Hz reference from "
+                    "tts.provider='{}' (rate must be divisible by 100); "
+                    "falling back to soft-duplex",
+                    tts_rate, self.config.tts.provider,
                 )
             else:
                 from nanobot_channel_voice.aec import make_echo_canceller

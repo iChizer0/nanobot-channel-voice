@@ -178,6 +178,43 @@ SenseVoice STT (fast CTC, zh/yue/en/ja/ko) and Supertonic-3 TTS (31 languages, n
 
 Swap `stt.provider` to `"whisper"` (with a `stt.whisper` block) for broader language coverage at more CPU, or to `"zipformer"` for streaming decodes and mid-sentence barge-in confirmation. For noisy rooms add `"vad": { "engine": "firered", "firered": { "weights": "vad/firered/onnx" } }` — the fewest false triggers from background noise, and a false trigger is a spurious duck once the mic is open. The alternative is Silero VAD, `"vad": { "engine": "silero", "silero": { "modelPath": "model/silero_vad.onnx" } }`.
 
+### Matcha-TTS (CPU)
+
+Matcha-TTS (`tts.provider="matcha"`) prefers the OFFICIAL export from [shivammehta25/Matcha-TTS](https://github.com/shivammehta25/Matcha-TTS) (MIT): export the released checkpoint once, with the HiFi-GAN vocoder embedded, and the engine needs exactly one file — the symbol table is fixed upstream, so there is no tokens file:
+
+```sh
+pip install matcha-tts   # export-time only, never on the device
+curl -LO https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/matcha_ljspeech.ckpt
+curl -LO https://github.com/shivammehta25/Matcha-TTS-checkpoints/releases/download/v1.0/generator_v1
+python -m matcha.onnx.export matcha_ljspeech.ckpt matcha_ljspeech_hifigan.onnx \
+  --n-timesteps 3 --vocoder-name hifigan_T2_v1 --vocoder-checkpoint-path generator_v1
+```
+
+```json
+"tts": {
+  "provider": "matcha",
+  "matcha": { "acousticModelPath": "model/matcha_ljspeech_hifigan.onnx" }
+}
+```
+
+`matcha_vctk.ckpt` exports the same way (vocoder `hifigan_univ_v1`) and adds a `speakerId` choice of 108 voices. A mel-only export (no `--vocoder-name`) instead pairs with a `vocoderPath` graph — a HiFi-GAN export, or sherpa's `vocos-22khz-univ.onnx` whose inverse STFT runs host-side. English phonemizes through espeak-ng, resolved in order: an explicit `espeakPath` binary → the system binary (`apt install espeak-ng`) → the `[espeak]` pip extra, whose wheel bundles libespeak-ng + its data for boards with no package manager at all (espeak-ng itself is GPL-3; the extra is opt-in). With none of the three the channel falls back to system TTS and says so. `speed` (>1 = faster) and `noiseScale` (the flow temperature, default 0.667) tune delivery.
+
+The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata), and `matcha-icefall-zh-baker` is currently the only Chinese option (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically):
+
+```json
+"tts": {
+  "provider": "matcha",
+  "matcha": {
+    "acousticModelPath": "model/matcha-icefall-zh-baker/model-steps-3.onnx",
+    "vocoderPath": "model/vocos-22khz-univ.onnx",
+    "tokensPath": "model/matcha-icefall-zh-baker/tokens.txt",
+    "lexiconPath": "model/matcha-icefall-zh-baker/lexicon.txt"
+  }
+}
+```
+
+ONNX/CPU only for now — the ODE decoder needs graph surgery (static split + periodic tiling) before it runs on an NPU.
+
 ### Rockchip NPU
 
 The same shape with `.rknn` artifacts on the NPU (`[ondevice,rknn]` extras on the board): Whisper STT, MMS TTS, and FireRed VAD, all three from the default RV1126B index, so plain `nanobot-voice sync` provisions them, CLI may prompt for confirmation on fetch since we respect the licenses.

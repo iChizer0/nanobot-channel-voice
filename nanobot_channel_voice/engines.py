@@ -57,6 +57,9 @@ _EXTRA_BY_MODULE = {
     # elsewhere the fix is a .onnx artifact, but naming the extra still points at the doc.
     "rknn": "rknn",
     "rknnlite": "rknn",
+    # matcha's espeak fallback library; usually surfaced pre-wrapped by tts/espeak.py,
+    # kept here so a bare import failure still names the extra.
+    "espeakng_loader": "espeak",
 }
 
 

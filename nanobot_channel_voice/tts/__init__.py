@@ -49,6 +49,12 @@ def _build_supertonic(cfg: TtsConfig) -> TtsAdapter:
     return SupertonicTtsAdapter.from_config(cfg.supertonic)
 
 
+def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
+    from nanobot_channel_voice.tts.matcha import MatchaTtsAdapter
+
+    return MatchaTtsAdapter.from_config(cfg.matcha)
+
+
 ENGINES: dict[str, EngineSpec] = {
     "openai": EngineSpec(build=_build_openai),
     "openai_compat": EngineSpec(build=_build_openai),
@@ -72,6 +78,13 @@ ENGINES: dict[str, EngineSpec] = {
             ("supertonic.voice_style_path", "supertonic.voiceStylePath"),
         ),
         build=_build_supertonic,
+        modules=("numpy",),
+    ),
+    "matcha": EngineSpec(
+        # Only the acoustic graph is universally required: an official embedded-vocoder
+        # export needs nothing else; from_config names what a given export still wants.
+        required=(("matcha.acoustic_model_path", "matcha.acousticModelPath"),),
+        build=_build_matcha,
         modules=("numpy",),
     ),
 }

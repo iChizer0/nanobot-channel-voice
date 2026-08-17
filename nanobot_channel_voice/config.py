@@ -450,16 +450,50 @@ class MmsTtsConfig(OnDeviceRuntime):
     speaking_rate: float = Field(default=1.0, gt=0)  # >1 = faster (shorter durations)
 
 
+class MatchaTtsConfig(OnDeviceRuntime):
+    """On-device Matcha-TTS (``tts.provider="matcha"``): the KTH flow-matching model
+    (github.com/shivammehta25/Matcha-TTS, MIT), 22.05 kHz out, ~18M params.
+
+    The preferred artifact is the OFFICIAL export - ``python -m matcha.onnx.export
+    <ckpt> model.onnx --vocoder-name hifigan_T2_v1 --vocoder-checkpoint-path
+    generator_v1`` - one graph with the vocoder embedded: only ``acousticModelPath``
+    is needed (the symbol table is fixed upstream; ``spks``-taking VCTK exports select
+    a voice with ``speakerId``). A mel-only export instead pairs with ``vocoderPath``
+    (a HiFi-GAN export, or Vocos whose ISTFT runs host-side). The icefall/sherpa-onnx
+    ``matcha-icefall-*`` releases are also consumed (front-end contract read from
+    their metadata): those need ``tokensPath``, zh-baker also ``lexiconPath`` (its
+    training data is non-commercial-use-only) - today's only zh option. English
+    phonemizes through espeak-ng: the system binary, or ``espeakPath`` for boards
+    without a package manager. ONNX only: the ODE decoder has no direct RKNN port."""
+
+    acoustic_model_path: str | None = None
+    vocoder_path: str | None = None         # only for mel-emitting exports
+    tokens_path: str | None = None          # icefall exports; official table is built in
+    lexicon_path: str | None = None         # lexicon-based (zh) models only
+    espeak_path: str | None = None          # explicit espeak-ng binary; None => $PATH
+    espeak_voice: str | None = None         # None => the model's own voice (en-us)
+    speaker_id: int = Field(default=0, ge=0)  # multi-speaker exports only; ignored otherwise
+    noise_scale: float = Field(default=0.667, ge=0)  # upstream temperature default
+    speed: float = Field(default=1.0, gt=0)          # >1 = faster (length_scale = 1/speed)
+    # Per-piece text budget in codepoints; 0 = the defaults (120 for lexicon models whose
+    # every char is a syllable, 300 for espeak ones). Longer chunks split at space/clause.
+    max_len: int = Field(default=0, ge=0)
+
+
 class TtsConfig(_VoiceBase):
     """Text-to-speech. The default provider speaks OpenAI-compatible ``/audio/speech`` over
     httpx, driving cloud OR any local server (Kokoro-FastAPI, piper-http, ...) by changing
-    ``apiBase``: local neural TTS with no decoder here. ``mms``/``supertonic`` are the
-    on-device ONNX/RKNN engines; ``system`` is the zero-dep espeak-ng/say fallback."""
+    ``apiBase``: local neural TTS with no decoder here. ``mms``/``supertonic``/``matcha``
+    are the on-device ONNX/RKNN engines; ``system`` is the zero-dep espeak-ng/say
+    fallback."""
 
     enabled: bool = True
-    provider: Literal["openai", "openai_compat", "system", "mms", "supertonic"] = "openai"
+    provider: Literal[
+        "openai", "openai_compat", "system", "mms", "supertonic", "matcha"
+    ] = "openai"
     mms: MmsTtsConfig = Field(default_factory=MmsTtsConfig)
     supertonic: SupertonicTtsConfig = Field(default_factory=SupertonicTtsConfig)
+    matcha: MatchaTtsConfig = Field(default_factory=MatchaTtsConfig)
     model: str = "gpt-4o-mini-tts"
     voice: str = "alloy"
     api_base: str | None = None    # e.g. http://localhost:8880/v1 for a local server

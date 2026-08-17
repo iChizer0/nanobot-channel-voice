@@ -139,6 +139,94 @@ def verbalize_numbers_en(text: str) -> str:
     return _RE_INT.sub(lambda m: _int_words(int(m.group())), text)
 
 
+# ---- Chinese number verbalization ------------------------------------------
+#
+# Same failure as English: the matcha zh lexicon voices 零..九 but has no "0".."9"
+# entries, so unverbalized digits are dropped as OOV: exactly the highest-value content.
+
+_ZH_DIGITS = "零一二三四五六七八九"
+_ZH_SMALL_UNITS = ("", "十", "百", "千")
+_ZH_GROUP_UNITS = ("", "万", "亿", "万亿")
+
+
+def _zh_four(n: int) -> str:
+    """0 < n < 10000 with the in-group 零 collapse (1005 -> 一千零五)."""
+    out = ""
+    zero_pending = False
+    for i in (3, 2, 1, 0):
+        d = n // 10**i % 10
+        if d == 0:
+            zero_pending = bool(out)
+        else:
+            if zero_pending:
+                out += "零"
+                zero_pending = False
+            out += _ZH_DIGITS[d] + _ZH_SMALL_UNITS[i]
+    return out
+
+
+def _zh_int(n: int) -> str:
+    if n == 0:
+        return "零"
+    if n >= 10**13:  # id/phone territory: read the digits out
+        return _zh_digit_words(str(n))
+    groups = []
+    while n:
+        groups.append(n % 10000)
+        n //= 10000
+    out = ""
+    for i in reversed(range(len(groups))):
+        g = groups[i]
+        if g == 0:
+            continue
+        if out and g < 1000:  # a skipped group or leading zeros: 100000001 -> 一亿零一
+            out += "零"
+        out += _zh_four(g) + _ZH_GROUP_UNITS[i]
+    if out.startswith("一十"):  # 12 -> 十二, but 112 keeps 一百一十二
+        out = out[1:]
+    return out
+
+
+def _zh_digit_words(digits: str) -> str:
+    return "".join(_ZH_DIGITS[int(d)] for d in digits)
+
+
+def _zh_number(number: str) -> str:
+    """"3" -> 三, "3.5" -> 三点五."""
+    head, _, frac = number.partition(".")
+    return _zh_int(int(head)) + (f"点{_zh_digit_words(frac)}" if frac else "")
+
+
+def _zh_time_words(m: re.Match) -> str:
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if minute == 0:
+        return f"{_zh_int(hour)}点"
+    pad = "零" if minute < 10 else ""
+    return f"{_zh_int(hour)}点{pad}{_zh_int(minute)}分"
+
+
+# The en patterns anchor on \b, but CJK codepoints are \w so there is NO boundary
+# between 是 and 3 and none of them would ever fire in real Chinese text; these use
+# digit lookarounds instead. Percent is decimal-aware and runs BEFORE decimal, or
+# "3.5%" would lose its integer part to the percent match.
+_RE_TIME_ZH = re.compile(r"(?<!\d)(\d{1,2})[:：]([0-5]\d)(?!\d)")
+_RE_GROUPED_ZH = re.compile(r"(?<!\d)\d{1,3}(?:,\d{3})+(?!\d)")
+_RE_PERCENT_ZH = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*[%％]")
+_RE_DECIMAL_ZH = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
+_RE_INT_ZH = re.compile(r"\d+")
+
+
+def verbalize_numbers_zh(text: str) -> str:
+    """Expand digits into Chinese words the matcha zh lexicon can actually speak."""
+    text = _RE_TIME_ZH.sub(_zh_time_words, text)
+    text = _RE_GROUPED_ZH.sub(lambda m: m.group().replace(",", ""), text)
+    text = _RE_PERCENT_ZH.sub(lambda m: f"百分之{_zh_number(m.group(1))}", text)
+    text = _RE_DECIMAL_ZH.sub(
+        lambda m: f"{_zh_int(int(m.group(1)))}点{_zh_digit_words(m.group(2))}", text
+    )
+    return _RE_INT_ZH.sub(lambda m: _zh_int(int(m.group())), text)
+
+
 _FRONTENDS = {
     "none": NoneFrontend,
     "uroman": UromanFrontend,
@@ -166,4 +254,5 @@ __all__ = [
     "JapaneseFrontend",
     "make_text_frontend",
     "verbalize_numbers_en",
+    "verbalize_numbers_zh",
 ]

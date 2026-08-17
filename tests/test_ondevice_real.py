@@ -22,6 +22,7 @@ _REF = Path(os.environ.get(
     "NANOBOT_VOICE_REF_DIR", Path(__file__).resolve().parents[2] / "reference"
 ))
 _MMS = _REF / "mms_tts" / "model"
+_MATCHA = _REF / "matcha_tts" / "model"  # model dirs + shared vocoder + official exports
 _WHISPER = _REF / "whisper" / "model"
 _FIRERED = _REF / "vad" / "FireRedVAD" / "pretrained_models" / "onnx_models"
 _SILERO_DIR = _REF / "vad" / "silero"
@@ -56,6 +57,15 @@ def _need(*paths: Path):
         pytest.skip(f"model files missing: {missing}")
 
 
+def _need_espeak():
+    import importlib.util
+    import shutil
+
+    if not (shutil.which("espeak-ng") or shutil.which("espeak")
+            or importlib.util.find_spec("espeakng_loader")):
+        pytest.skip("no espeak-ng binary and no espeakng-loader ([espeak] extra)")
+
+
 def test_mms_real_synthesis_wav_and_pcm():
     _need(_MMS / "mms_tts_eng_encoder_200.onnx", _MMS / "mms_tts_eng_decoder_200.onnx")
     from nanobot_channel_voice.config import TtsConfig
@@ -78,6 +88,82 @@ def test_mms_real_synthesis_wav_and_pcm():
 
     pcm = asyncio.run(tts.synthesize_pcm("Short check."))
     assert len(pcm) > 16000  # > 0.5 s of 16 kHz S16_LE
+
+
+def test_matcha_real_official_embedded_vocoder():
+    """The preferred artifact: python -m matcha.onnx.export with the vocoder embedded
+    (scales input, wav output, built-in symbol table - no side files at all)."""
+    model = _MATCHA / "matcha_ljspeech_hifigan.onnx"
+    _need(model)
+    _need_espeak()
+    from nanobot_channel_voice.config import TtsConfig
+    from nanobot_channel_voice.tts import make_tts
+
+    tts = make_tts(TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {"acousticModelPath": str(model)},
+    }))
+    assert type(tts).__name__ == "MatchaTtsAdapter"  # no silent fallback to system
+    assert tts.output_rate == 22050
+    assert tts.spoken_language == "en"
+
+    pcm = asyncio.run(tts.synthesize_pcm("The official matcha export speaks for itself."))
+    duration_s = len(pcm) / 2 / 22050
+    assert 1.0 < duration_s < 8.0, duration_s
+    tts.release()
+
+
+def test_matcha_real_zh_synthesis():
+    zh = _MATCHA / "matcha-icefall-zh-baker"
+    vocoder = _MATCHA / "vocos-22khz-univ.onnx"
+    _need(zh / "model-steps-3.onnx", zh / "tokens.txt", zh / "lexicon.txt", vocoder)
+    from nanobot_channel_voice.config import TtsConfig
+    from nanobot_channel_voice.tts import make_tts
+
+    tts = make_tts(TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {
+            "acousticModelPath": str(zh / "model-steps-3.onnx"),
+            "vocoderPath": str(vocoder),
+            "tokensPath": str(zh / "tokens.txt"),
+            "lexiconPath": str(zh / "lexicon.txt"),
+        },
+    }))
+    assert type(tts).__name__ == "MatchaTtsAdapter"  # no silent fallback to system
+    assert tts.output_rate == 22050
+    assert tts.spoken_language == "zh"
+
+    pcm = asyncio.run(tts.synthesize_pcm("你好，现在是7点45分。"))  # digits verbalize
+    duration_s = len(pcm) / 2 / 22050
+    assert 1.0 < duration_s < 10.0, duration_s
+    tts.release()
+
+
+def test_matcha_real_en_synthesis():
+    en = _MATCHA / "matcha-icefall-en_US-ljspeech"
+    vocoder = _MATCHA / "vocos-22khz-univ.onnx"
+    _need(en / "model-steps-3.onnx", en / "tokens.txt", vocoder)
+    _need_espeak()
+    from nanobot_channel_voice.config import TtsConfig
+    from nanobot_channel_voice.tts import make_tts
+
+    tts = make_tts(TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {
+            "acousticModelPath": str(en / "model-steps-3.onnx"),
+            "vocoderPath": str(vocoder),
+            "tokensPath": str(en / "tokens.txt"),
+        },
+    }))
+    assert type(tts).__name__ == "MatchaTtsAdapter"
+    assert tts.spoken_language == "en"
+
+    blob = asyncio.run(tts.synthesize("Hello from the matcha regression test."))
+    with wave.open(io.BytesIO(blob), "rb") as w:
+        duration_s = w.getnframes() / w.getframerate()
+        assert w.getframerate() == 22050
+    assert 0.5 < duration_s < 6.0, duration_s
+    tts.release()
 
 
 def test_whisper_real_transcription():

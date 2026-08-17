@@ -40,6 +40,29 @@ def test_wav_blob_tts_degrades_to_soft_without_building_a_canceller(monkeypatch)
     assert not backend._sink.stream_mode
 
 
+def test_unframeable_pcm_rate_degrades_to_soft(monkeypatch):
+    # 22050 Hz (matcha-class) cannot fill AEC3's 10 ms reference frames: rate % 100
+    # != 0 means push_reference would drop every block and reference_ms() would
+    # never advance, so NOT building the canceller is the correct degrade.
+    monkeypatch.setattr(
+        aec_mod, "make_echo_canceller",
+        lambda *a, **k: pytest.fail("built a canceller whose reference is always dropped"),
+    )
+    cfg = VoiceConfig.model_validate({
+        "aec": "webrtc",
+        "audio": {"backend": "null"},
+        "tts": {"provider": "openai", "audioFormat": "pcm", "apiKey": "k",
+                "pcmSampleRate": 22050},
+    })
+    ch = VoiceChannel(cfg, MessageBus())
+    ch._build_local()
+    backend = ch._backend
+    assert backend._aec is None
+    assert backend._open_mic
+    assert not backend._full_duplex
+    assert backend._sink.stream_mode  # streaming keeps working; only AEC degrades
+
+
 def test_pcm_tts_builds_and_taps_the_canceller(monkeypatch):
     stub = object()
     monkeypatch.setattr(aec_mod, "make_echo_canceller", lambda *a, **k: stub)
