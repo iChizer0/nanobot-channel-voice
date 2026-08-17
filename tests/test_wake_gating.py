@@ -278,7 +278,7 @@ def test_strict_thinking_continuation_stays_free():
     _run(_case())
 
 
-# ---- off mode stays untouched ----------------------------------------------
+# ---- off mode stays untouched -----------------------------------------------
 
 def test_mode_off_neither_gates_nor_strips():
     async def _case():

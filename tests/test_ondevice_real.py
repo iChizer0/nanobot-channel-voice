@@ -36,7 +36,7 @@ _SILERO = next((p for p in _SILERO_CANDIDATES if p.is_file()), _SILERO_CANDIDATE
 _SILERO_RKNN_CANDIDATES = (
     _SILERO_DIR / "rknn.rv1126b" / "model.rknn",
     Path(__file__).resolve().parents[2]
-    / "nanobot-channel-voice-test" / "models" / "vad" / "silero" / "rknn.rv1126b" / "model.rknn",
+    / "nanobot-channel-voice-test" / "models" / "vad" / "silero" / "v6" / "rknn.rv1126b" / "model.rknn",
 )
 _SILERO_RKNN = next((p for p in _SILERO_RKNN_CANDIDATES if p.is_file()), _SILERO_RKNN_CANDIDATES[0])
 # A 16 kHz speech wav: the upstream silero-vad repo's own test clip, else whisper's.
@@ -108,6 +108,38 @@ def test_matcha_real_official_embedded_vocoder():
     assert tts.spoken_language == "en"
 
     pcm = asyncio.run(tts.synthesize_pcm("The official matcha export speaks for itself."))
+    duration_s = len(pcm) / 2 / 22050
+    assert 1.0 < duration_s < 8.0, duration_s
+    tts.release()
+
+
+def test_matcha_real_static_split_onnx():
+    """The static split over its .onnx artifacts: same host glue the board runs."""
+    en = _MATCHA / "matcha-icefall-en_US-ljspeech"
+    _need(
+        _MATCHA / "matcha_encoder_200.onnx",
+        _MATCHA / "matcha_decoder_800.onnx",
+        _MATCHA / "vocos_800.onnx",
+        en / "tokens.txt",
+    )
+    _need_espeak()
+    from nanobot_channel_voice.config import TtsConfig
+    from nanobot_channel_voice.tts import make_tts
+
+    tts = make_tts(TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {
+            "encoderPath": str(_MATCHA / "matcha_encoder_200.onnx"),
+            "decoderPath": str(_MATCHA / "matcha_decoder_800.onnx"),
+            "vocoderPath": str(_MATCHA / "vocos_800.onnx"),
+            "tokensPath": str(en / "tokens.txt"),
+        },
+    }))
+    assert type(tts).__name__ == "SplitMatchaTtsAdapter"  # no silent fallback
+    assert tts.output_rate == 22050
+    assert tts.spoken_language == "en"
+
+    pcm = asyncio.run(tts.synthesize_pcm("The static split speaks through fixed buckets."))
     duration_s = len(pcm) / 2 / 22050
     assert 1.0 < duration_s < 8.0, duration_s
     tts.release()
@@ -362,7 +394,7 @@ def test_firered_min_volume_gates_quiet_speech():
 _SENSEVOICE_RKNN_CANDIDATES = (
     _REF / "sensevoice" / "rknn.rv1126b",
     Path(__file__).resolve().parents[2]
-    / "nanobot-channel-voice-test" / "models" / "stt" / "sensevoice-small" / "rknn.rv1126b",
+    / "nanobot-channel-voice-test" / "models" / "stt" / "sensevoice" / "small" / "rknn.rv1126b",
 )
 _SENSEVOICE_RKNN = next(
     (p for p in _SENSEVOICE_RKNN_CANDIDATES if p.is_dir()), _SENSEVOICE_RKNN_CANDIDATES[0]
@@ -409,8 +441,7 @@ def test_sensevoice_rknn_real_transcription():
 _ZIPFORMER_RKNN_CANDIDATES = (
     _REF / "zipformer" / "rknn.rv1126b",
     Path(__file__).resolve().parents[2]
-    / "nanobot-channel-voice-test" / "models" / "stt" / "zipformer-bilingual-zh-en"
-    / "rknn.rv1126b",
+    / "nanobot-channel-voice-test" / "models" / "stt" / "zipformer" / "zh-en" / "rknn.rv1126b",
 )
 _ZIPFORMER_RKNN = next(
     (p for p in _ZIPFORMER_RKNN_CANDIDATES if p.is_dir()), _ZIPFORMER_RKNN_CANDIDATES[0]

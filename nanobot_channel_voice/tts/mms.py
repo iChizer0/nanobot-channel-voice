@@ -196,27 +196,11 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
         )
         window = 2 * self._max_length
         if real_len > window:
-            # Predicted audio outruns the decoder's FIXED output window and would be
-            # clipped mid-word; the char budget bounds input, not duration, and duration
-            # is ~linear in text length, so splitting into halves fixes it.
-            stripped = text.strip()
-            if len(stripped) > 1:
-                mid = (len(stripped) + 1) // 2
-                left = stripped.rfind(" ", 1, mid)
-                right = stripped.find(" ", mid, len(stripped) - 1)
-                cands = [c for c in (left, right) if c > 0]
-                cut = (min(cands, key=lambda c: abs(c - mid)) + 1) if cands else mid
-                left = self._synthesize_piece(stripped[:cut].strip())
-                right = self._synthesize_piece(stripped[cut:].strip())
-                parts = [p for p in (left, right) if p.size]
-                if len(parts) == 2:
-                    gap = np.zeros(int(_JOIN_GAP_S * SAMPLE_RATE), dtype=np.float32)
-                    parts.insert(1, gap)
-                return (
-                    np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
-                )
+            # duration outruns the FIXED decoder window; the char budget bounds input only
+            if len(text.strip()) > 1:
+                return self._halve_and_retry(text)
             self._log.warning("MMS: single unsplittable piece exceeds the decoder window")
-            real_len = window
+            real_len = window  # crop: partial speech beats silence for one word
         waveform = self._decoder.run(
             [
                 ("attn", attn),

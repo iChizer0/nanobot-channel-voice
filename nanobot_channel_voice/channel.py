@@ -328,7 +328,7 @@ class VoiceChannel(BaseChannel):
     def default_config(cls) -> dict[str, Any]:
         return VoiceConfig().model_dump(by_alias=True)
 
-    # ---- lifecycle -------------------------------------------------------
+    # ---- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
         self._running = True
@@ -463,9 +463,8 @@ class VoiceChannel(BaseChannel):
         # hold suppresses the early-confirm shortcuts forever (reference_ms() never advances).
         aec_stage = None
         if self.config.aec == "webrtc":
-            # AEC3 frames the reference in 10 ms blocks, so the TTS rate must divide
-            # into them; 22050 (matcha) cannot, and push_reference would drop every
-            # block -> the exact reference-starved canceller described above.
+            # AEC3 frames 10 ms blocks: a rate % 100 != 0 (matcha's 22050) would drop
+            # every reference block -> the starved canceller described above
             tts_rate = getattr(tts, "output_rate", None) if pcm_capable else None
             if tts_rate is None:
                 self.logger.warning(
@@ -854,7 +853,7 @@ class VoiceChannel(BaseChannel):
         if self._stop_event is not None:
             self._stop_event.set()
 
-    # ---- input helpers ---------------------------------------------------
+    # ---- input helpers ------------------------------------------------------
 
     async def _transcribe_pcm(self, pcm: bytes) -> str:
         if self._stt is not None:
@@ -904,7 +903,7 @@ class VoiceChannel(BaseChannel):
             )
         )
 
-    # ---- output ----------------------------------------------------------
+    # ---- output -------------------------------------------------------------
 
     def _local(self) -> LocalBackend | None:
         """The backend when it's the local pipeline (bus glue speaks the reply), else None.

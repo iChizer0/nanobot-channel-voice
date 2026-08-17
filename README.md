@@ -71,6 +71,14 @@ The default stack (ALSA, energy VAD, OpenAI-compatible TTS) needs no extras. Eac
 
 Run `nanobot webui`, open **Settings -> Channels -> Voice**, paste your config into the **Import Json** box - the whole form; a partial paste patches just those keys over the current section - and **Check and enable** - see [Example Configs](docs/EXAMPLE_CONFIGS.md) for various copy-pasteable setups and troubleshooting. `nanobot-voice config` prints the current section back, paste-ready (API keys withheld unless `--secrets`). Every key - default, range, per-field note - is documented inline in the schema, see [config.py](nanobot_channel_voice/config.py).
 
+Setups vary too much for one recipe (hardware, languages, cloud vs local, interactivity), so let an agent drive: run a coding agent (e.g. Claude Code) on the target machine and paste this prompt:
+
+```
+Set up nanobot-channel-voice on this machine. Ground truth: docs/EXAMPLE_CONFIGS.md and the schema in nanobot_channel_voice/config.py; inspect first (OS/arch, RAM, sound devices via arecord -l / aplay -l, NPU, network, existing nanobot config).
+Ask me one round of questions (reply languages, cloud keys or fully local, barge-in or half-duplex, wake word, latency vs quality), then pick the stack: cloud engines when keys + network allow, else on-device ([ondevice]/[rknn] extras), models via nanobot-voice sync, AEC only with a raw-PCM TTS at a rate divisible by 100.
+Verify audio with a short record + replay (dsnoop/dmix if the card is shared), write channels.voice, validate with `nanobot channels status`, then a live smoke test - a robotic espeak voice means a fallback fired, fix the logged cause. Ask before installing packages or spending credits; finish with the final config and each choice's trade-off.
+```
+
 ## License
 
 See [LICENSE](LICENSE). Optional on-device model weights carry their own licenses, review them for your deployment, no weights are bundled.

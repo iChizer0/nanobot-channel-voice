@@ -142,7 +142,7 @@ class RealtimeProfile:
 # default_voice is best-effort; if a provider rejects it, set realtime.voice.
 
 PROFILES: dict[str, RealtimeProfile] = {
-    # ---- GA dialect (nested session.audio.*, response.output_audio.delta) ----
+    # ---- GA dialect (nested session.audio.*, response.output_audio.delta) ---
     "openai": RealtimeProfile(
         key="openai",
         dialect="ga",
@@ -178,7 +178,7 @@ PROFILES: dict[str, RealtimeProfile] = {
         auth_header="api-key",
         bearer_prefix="",
     ),
-    # ---- beta dialect (flat input_audio_format, response.audio.delta) --------
+    # ---- beta dialect (flat input_audio_format, response.audio.delta) -------
     # Alibaba DashScope. Outside mainland China use the -intl endpoint (workspace-scoped
     # *.maas.aliyuncs.com is now recommended; the legacy domain still works). Per-session
     # turn caps apply: expect clean server closes.

@@ -151,7 +151,7 @@ class OnDeviceRuntime(_VoiceBase):
     the parallel per-provider option list.
     """
 
-    # Store key ("stt/whisper-base/onnx") installed by ``nanobot-voice fetch``: unset
+    # Store key ("stt/whisper/base/onnx") installed by ``nanobot-voice fetch``: unset
     # ``*Path`` fields resolve from the fetched files by field stem (``encoderPath`` ->
     # ``encoder.<ext>``). Explicit paths always win.
     weights: str | None = None
@@ -451,23 +451,27 @@ class MmsTtsConfig(OnDeviceRuntime):
 
 
 class MatchaTtsConfig(OnDeviceRuntime):
-    """On-device Matcha-TTS (``tts.provider="matcha"``): the KTH flow-matching model
-    (github.com/shivammehta25/Matcha-TTS, MIT), 22.05 kHz out, ~18M params.
+    """On-device Matcha-TTS (``tts.provider="matcha"``, 22.05 kHz, ~18M params).
 
-    The preferred artifact is the OFFICIAL export - ``python -m matcha.onnx.export
-    <ckpt> model.onnx --vocoder-name hifigan_T2_v1 --vocoder-checkpoint-path
-    generator_v1`` - one graph with the vocoder embedded: only ``acousticModelPath``
-    is needed (the symbol table is fixed upstream; ``spks``-taking VCTK exports select
-    a voice with ``speakerId``). A mel-only export instead pairs with ``vocoderPath``
-    (a HiFi-GAN export, or Vocos whose ISTFT runs host-side). The icefall/sherpa-onnx
-    ``matcha-icefall-*`` releases are also consumed (front-end contract read from
-    their metadata): those need ``tokensPath``, zh-baker also ``lexiconPath`` (its
-    training data is non-commercial-use-only) - today's only zh option. English
-    phonemizes through espeak-ng: the system binary, or ``espeakPath`` for boards
-    without a package manager. ONNX only: the ODE decoder has no direct RKNN port."""
+    Preferred: the OFFICIAL embedded-vocoder export (``python -m matcha.onnx.export``,
+    only ``acousticModelPath`` needed; VCTK selects voices via ``speakerId``). Mel-only
+    exports add ``vocoderPath`` (HiFi-GAN or Vocos). icefall ``matcha-icefall-*``
+    releases also work: ``tokensPath``, zh-baker plus ``lexiconPath`` (non-commercial
+    training data) - the only zh option. English needs espeak-ng (binary or
+    ``espeakPath``). Static NPU splits name ``encoderPath``/``decoderPath``/
+    ``vocoderPath`` + ``tokensPath``; extension picks ONNX vs RKNN per graph."""
 
-    acoustic_model_path: str | None = None
-    vocoder_path: str | None = None         # only for mel-emitting exports
+    acoustic_model_path: str | None = None  # dynamic export
+    encoder_path: str | None = None         # static split (with decoder+vocoder+tokens)
+    decoder_path: str | None = None
+    vocoder_path: str | None = None         # mel-emitting dynamic exports AND the split
+    # Split geometry + mel statistics (the split cuts before the graph's denorm).
+    # None => the meta.json sidecar, else the en_US-ljspeech values; explicit wins.
+    encoder_len: int | None = Field(default=None, ge=1)
+    mel_len: int | None = Field(default=None, ge=4, multiple_of=4)
+    mel_scale: float | None = None
+    mel_bias: float | None = None
+    meta_path: str | None = None            # split sidecar; None => beside encoderPath
     tokens_path: str | None = None          # icefall exports; official table is built in
     lexicon_path: str | None = None         # lexicon-based (zh) models only
     espeak_path: str | None = None          # explicit espeak-ng binary; None => $PATH
@@ -475,9 +479,21 @@ class MatchaTtsConfig(OnDeviceRuntime):
     speaker_id: int = Field(default=0, ge=0)  # multi-speaker exports only; ignored otherwise
     noise_scale: float = Field(default=0.667, ge=0)  # upstream temperature default
     speed: float = Field(default=1.0, gt=0)          # >1 = faster (length_scale = 1/speed)
-    # Per-piece text budget in codepoints; 0 = the defaults (120 for lexicon models whose
-    # every char is a syllable, 300 for espeak ones). Longer chunks split at space/clause.
+    # Per-piece text budget in codepoints; 0 = the defaults (120 for dynamic lexicon
+    # models, 300 for dynamic espeak models, 80 for static espeak encoders, 40 for
+    # static lexicon encoders). Longer chunks split at space/clause.
     max_len: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _one_contract(self) -> MatchaTtsConfig:
+        # A config authored with BOTH contracts is a contradiction, not a preference;
+        # reject at parse time where the WebUI import check can show it.
+        if self.acoustic_model_path and (self.encoder_path or self.decoder_path):
+            raise ValueError(
+                "matcha: acousticModelPath (dynamic export) and encoderPath/decoderPath "
+                "(static split) are mutually exclusive"
+            )
+        return self
 
 
 class TtsConfig(_VoiceBase):

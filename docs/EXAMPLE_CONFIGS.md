@@ -142,7 +142,7 @@ STT and TTS on machines you control: any OpenAI-compatible Whisper server for tr
 
 ## On-device
 
-Every engine in-process (`[ondevice]` extra), no servers and no network: `.onnx` runs on CPU or Jetson GPU, `.rknn` on Rockchip NPUs, interchangeable per engine since the file extension picks the runtime. Weights are never bundled: name every file yourself or let the `nanobot-voice` CLI provision them from an index, so an engine block names one store key (`weights`) instead of a path per file. The [nanobot-channel-voice-models](https://huggingface.co/spaces/iChizer0/nanobot-channel-voice-models) currently serves only RKNN builds for RV1126B - hence the placeholder URL for the ONNX examples - and the package itself ships no entries and redistributes no weights, only the mechanism.
+Every engine runs in-process (`[ondevice]` extra), with no servers or network: `.onnx` uses the configured execution provider and `.rknn` uses the RKNN runtime. The file extension selects the runtime independently for each engine. Weights are never bundled: name every file yourself or let the `nanobot-voice` CLI provision them from an index, so an engine block names one store key (`weights`) instead of a path per file. The default index is [nanobot-channel-voice-models](https://huggingface.co/iChizer0/nanobot-channel-voice-models), currently serving RKNN builds; the package itself ships no entries and redistributes no weights, only the mechanism.
 
 ```sh
 export NANOBOT_VOICE_INDEX=https://example.com/voice-weights.json   # ONNX examples
@@ -165,7 +165,7 @@ SenseVoice STT (fast CTC, zh/yue/en/ja/ko) and Supertonic-3 TTS (31 languages, n
       },
       "stt": {
         "provider": "sensevoice",
-        "sensevoice": { "weights": "stt/sensevoice-small/onnx", "language": "en" }
+        "sensevoice": { "weights": "stt/sensevoice/small/onnx", "language": "en" }
       },
       "tts": {
         "provider": "supertonic",
@@ -176,7 +176,7 @@ SenseVoice STT (fast CTC, zh/yue/en/ja/ko) and Supertonic-3 TTS (31 languages, n
 }
 ```
 
-Swap `stt.provider` to `"whisper"` (with a `stt.whisper` block) for broader language coverage at more CPU, or to `"zipformer"` for streaming decodes and mid-sentence barge-in confirmation. For noisy rooms add `"vad": { "engine": "firered", "firered": { "weights": "vad/firered/onnx" } }` — the fewest false triggers from background noise, and a false trigger is a spurious duck once the mic is open. The alternative is Silero VAD, `"vad": { "engine": "silero", "silero": { "modelPath": "model/silero_vad.onnx" } }`.
+Swap `stt.provider` to `"whisper"` (with a `stt.whisper` block) for broader language coverage at more CPU, or to `"zipformer"` for streaming decodes and mid-sentence barge-in confirmation. For noisy rooms add `"vad": { "engine": "firered", "firered": { "weights": "vad/firered/streaming/onnx" } }` — the fewest false triggers from background noise, and a false trigger is a spurious duck once the mic is open. The alternative is Silero VAD, `"vad": { "engine": "silero", "silero": { "modelPath": "model/silero_vad.onnx" } }`.
 
 ### Matcha-TTS (CPU)
 
@@ -197,7 +197,7 @@ python -m matcha.onnx.export matcha_ljspeech.ckpt matcha_ljspeech_hifigan.onnx \
 }
 ```
 
-`matcha_vctk.ckpt` exports the same way (vocoder `hifigan_univ_v1`) and adds a `speakerId` choice of 108 voices. A mel-only export (no `--vocoder-name`) instead pairs with a `vocoderPath` graph — a HiFi-GAN export, or sherpa's `vocos-22khz-univ.onnx` whose inverse STFT runs host-side. English phonemizes through espeak-ng, resolved in order: an explicit `espeakPath` binary → the system binary (`apt install espeak-ng`) → the `[espeak]` pip extra, whose wheel bundles libespeak-ng + its data for boards with no package manager at all (espeak-ng itself is GPL-3; the extra is opt-in). With none of the three the channel falls back to system TTS and says so. `speed` (>1 = faster) and `noiseScale` (the flow temperature, default 0.667) tune delivery.
+`matcha_vctk.ckpt` exports the same way (vocoder `hifigan_univ_v1`) and adds 108 voices via `speakerId`. A mel-only export (no `--vocoder-name`) instead pairs with a `vocoderPath` graph — HiFi-GAN, or sherpa's `vocos-22khz-univ.onnx` (ISTFT runs host-side). English phonemizes through espeak-ng, resolved `espeakPath` → system binary → the `[espeak]` pip extra bundling libespeak-ng + data for boards without a package manager (GPL-3, opt-in); with none of the three the channel falls back to system TTS and says so. `speed` (>1 = faster) and `noiseScale` (flow temperature, default 0.667) tune delivery.
 
 The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata), and `matcha-icefall-zh-baker` is currently the only Chinese option (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically):
 
@@ -213,11 +213,29 @@ The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/s
 }
 ```
 
-ONNX/CPU only for now — the ODE decoder needs graph surgery (static split + periodic tiling) before it runs on an NPU.
+### Matcha-TTS static split (icefall, NPU-ready)
 
-### Rockchip NPU
+A static Matcha deployment uses a matched encoder/decoder/Vocos set — **not** a direct conversion of dynamic `model-steps-3.onnx`; the data-dependent duration regulator, noise, padding, and ISTFT stay in the adapter. Convert and validate the three artifacts together, never mixed across conversions.
 
-The same shape with `.rknn` artifacts on the NPU (`[ondevice,rknn]` extras on the board): Whisper STT, MMS TTS, and FireRed VAD, all three from the default RV1126B index, so plain `nanobot-voice sync` provisions them, CLI may prompt for confirmation on fetch since we respect the licenses.
+```json
+"tts": {
+  "provider": "matcha",
+  "matcha": {
+    "encoderPath": "models/matcha/encoder.rknn",
+    "decoderPath": "models/matcha/decoder.rknn",
+    "vocoderPath": "models/matcha/vocoder.rknn",
+    "tokensPath": "models/matcha/tokens.txt"
+  }
+}
+```
+
+The file extension picks the runtime per graph, so the same config with `.onnx` paths validates a split off-board before RKNN conversion (do not set `acousticModelPath`). The split cuts before the graph's final denormalization, so bucket geometry and mel statistics resolve from `encoderLen`/`melLen`/`melScale`/`melBias` in config, else an exporter `meta.json` beside the models (`{"mel_scale", "mel_bias", "encoder_len", "mel_len"}`, or named via `metaPath`), else the en_US-ljspeech values (200/800, `2.0661438`/`-5.5238085`). Output is 22,050 Hz PCM; a piece overflowing a bucket is halved and retried, so long content costs a pause, not an error.
+
+For an icefall Chinese split (`matcha-icefall-zh-baker`) add `lexiconPath`: this selects the lexicon frontend and 汉字 digit verbalization. Its mel statistics are `"melScale": 2.7628188, "melBias": -5.9870973` — required, the LJSpeech defaults play audibly wrong audio. Each artifact set needs its own ONNX-to-RKNN parity validation, and the Baker dataset/model is non-commercial-use-only.
+
+### RKNN runtime
+
+The same shape with `.rknn` artifacts (`[ondevice,rknn]` extras): Whisper STT, MMS TTS, and FireRed VAD can be provisioned from an index with `nanobot-voice sync`. The CLI may prompt for confirmation while fetching models whose licenses require acceptance.
 
 ```json
 {
@@ -231,26 +249,26 @@ The same shape with `.rknn` artifacts on the NPU (`[ondevice,rknn]` extras on th
       },
       "vad": {
         "engine": "firered",
-        "firered": { "weights": "vad/firered/rknn.rv1126b" }
+        "firered": { "weights": "vad/firered/streaming/rknn.rv1126b" }
       },
       "stt": {
         "provider": "whisper",
-        "whisper": { "weights": "stt/whisper-base/rknn.rv1126b", "language": "en" }
+        "whisper": { "weights": "stt/whisper/base/rknn.rv1126b", "language": "en" }
       },
       "tts": {
         "provider": "mms",
-        "mms": { "weights": "tts/mms-eng/rknn.rv1126b" }
+        "mms": { "weights": "tts/mms/en/rknn.rv1126b" }
       }
     }
   }
 }
 ```
 
-On a multi-core NPU, e.g., RK3588, swap in that board's own `rknn.rk3588` keys and pin each engine to its own NPU core (`"coreMask": "0_1"` on Whisper, `"2"` on the VAD and TTS) so a long decode never starves the VAD. If language detection on the quantized model gets flaky, add `"languageMinConfidence": 0.6` to the whisper block.
+On a multi-core accelerator, select the index key built for that target and optionally pin engines to separate cores with `coreMask`, so a long decode does not starve VAD. If language detection on a quantized model becomes unreliable, add `"languageMinConfidence": 0.6` to the Whisper block.
 
 #### Wiring it by hand, without an index
 
-For converted-it-yourself models or an air-gapped box, name every artifact directly. Explicit `*Path` fields always win over a `weights` key, and the two styles mix freely per engine, so drop these blocks in place of the ones above. `chunkLength` and `maxLength` must match the exported models; the Whisper and MMS exports follow Rockchip's `rknn_model_zoo` demos, and you convert `.onnx` to `.rknn` on a PC with `rknn-toolkit2`. `chunkLength` is a decode window, not a cap: audio longer than it (a `vad.maxUtteranceMs`-sized utterance, a WebUI dictation through `stt.serve`) is decoded in window-sized pieces cut at the quietest gap and joined, so there is no need to re-export a longer window for long speech.
+For converted-it-yourself models or an air-gapped installation, name every artifact directly. Explicit `*Path` fields always win over a `weights` key, and the two styles mix freely per engine, so drop these blocks in place of the ones above. `chunkLength` and `maxLength` must match the exported models. `chunkLength` is a decode window, not a cap: audio longer than it (a `vad.maxUtteranceMs`-sized utterance or a WebUI dictation through `stt.serve`) is decoded in window-sized pieces cut at the quietest gap and joined, so there is no need to re-export a longer window for long speech.
 
 ```json
 "vad": {
@@ -298,7 +316,7 @@ The same shape as [CPU](#cpu) but accelerated on the GPU: install a JetPack-matc
       "stt": {
         "provider": "whisper",
         "whisper": {
-          "weights": "stt/whisper-base/onnx",
+          "weights": "stt/whisper/base/onnx",
           "language": "en",
           "executionProviders": ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
           "providerOptions": [{ "trt_engine_cache_enable": true, "trt_engine_cache_path": "trt-cache" }, {}, {}]
@@ -336,7 +354,7 @@ On-device Whisper detecting between Japanese and English, MMS-TTS speaking Japan
       "stt": {
         "provider": "whisper",
         "whisper": {
-          "weights": "stt/whisper-base/onnx",
+          "weights": "stt/whisper/base/onnx",
           "language": "ja",
           "languages": ["ja", "en"],
           "languageMinConfidence": 0.5
@@ -379,7 +397,7 @@ One loaded model transcribing for everything (`[ondevice]` extra): the voice pip
       },
       "stt": {
         "provider": "sensevoice",
-        "sensevoice": { "weights": "stt/sensevoice-small/onnx" },
+        "sensevoice": { "weights": "stt/sensevoice/small/onnx" },
         "serve": { "enabled": true, "port": 8035, "apiKey": "shared-secret" }
       },
       "tts": {

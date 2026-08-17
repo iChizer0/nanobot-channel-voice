@@ -86,7 +86,7 @@ def test_endpointer_exposes_silence_and_active_runs():
     assert ep.silence_run_ms == 60  # 3 trailing silence frames
 
 
-# ---- the pause-probe ----------------------------------------------------------
+# ---- the pause-probe --------------------------------------------------------
 
 def test_probe_drops_a_leak_candidate_and_releases_the_pause():
     """5 speech frames (the buffered leak tail) then sustained silence: the
@@ -201,7 +201,7 @@ def test_probe_window_derives_from_playout_delay():
     assert h2.backend._leak_death_ms == 250.0
 
 
-# ---- early release (the acquittal twin) ---------------------------------------
+# ---- early release (the acquittal twin) -------------------------------------
 
 def _finished_task(text: str):
     async def _t():

@@ -108,7 +108,7 @@ class VoiceShell:
         self._tool_tasks: set[asyncio.Task] = set()
         self._log = logger.bind(component="voice")
 
-    # ---- lifecycle -------------------------------------------------------
+    # ---- lifecycle ----------------------------------------------------------
 
     async def start(
         self, *, instructions: str | None = None, tools: list[ToolDef] | None = None
@@ -159,7 +159,7 @@ class VoiceShell:
     def state(self) -> VoiceState:
         return self._state
 
-    # ---- capture pump ----------------------------------------------------
+    # ---- capture pump -------------------------------------------------------
 
     async def _capture_loop(self) -> None:
         eof_streak = 0
@@ -247,7 +247,7 @@ class VoiceShell:
             return False
         return self._state is VoiceState.SPEAKING
 
-    # ---- backend event dispatch (always on the loop) ---------------------
+    # ---- backend event dispatch (always on the loop) ------------------------
 
     async def _on_event(self, event) -> None:
         if self._stopped:

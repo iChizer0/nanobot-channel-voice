@@ -194,7 +194,7 @@ def test_verdict_after_natural_close_counts_stale_not_close():
     asyncio.run(scenario())
 
 
-# ---- feature extractor parity ----------------------------------------------
+# ---- feature extractor parity -----------------------------------------------
 
 def test_mel_matches_the_vendored_reference():
     np = pytest.importorskip("numpy")

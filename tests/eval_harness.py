@@ -118,7 +118,7 @@ class EvalConversation:
         elif isinstance(event, StateHint):
             self.states.append(event.state)
 
-    # ---- the two conversation roles --------------------------------------
+    # ---- the two conversation roles -----------------------------------------
 
     async def user_says(self, text: str, *, ms: int = 400) -> None:
         """Speak for ``ms`` (frame-counted), close the utterance, and wait for its
@@ -145,7 +145,7 @@ class EvalConversation:
     async def agent_replies(self, text: str) -> None:
         await self.backend.speak_final(text)
 
-    # ---- waiting ----------------------------------------------------------
+    # ---- waiting ------------------------------------------------------------
 
     async def wait_state(self, state: VoiceState, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout

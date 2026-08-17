@@ -50,9 +50,17 @@ def _build_supertonic(cfg: TtsConfig) -> TtsAdapter:
 
 
 def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
-    from nanobot_channel_voice.tts.matcha import MatchaTtsAdapter
+    from nanobot_channel_voice.tts.matcha import MatchaTtsAdapter, SplitMatchaTtsAdapter
 
-    return MatchaTtsAdapter.from_config(cfg.matcha)
+    # dynamic first: a bundle's stray encoder.* stem must not flip a working config
+    if cfg.matcha.acoustic_model_path:
+        return MatchaTtsAdapter.from_config(cfg.matcha)
+    if cfg.matcha.encoder_path or cfg.matcha.decoder_path:
+        return SplitMatchaTtsAdapter.from_config(cfg.matcha)
+    raise ValueError(
+        "matcha needs tts.matcha.acousticModelPath, or the complete static split: "
+        "encoderPath, decoderPath, vocoderPath, and tokensPath"
+    )
 
 
 ENGINES: dict[str, EngineSpec] = {
@@ -81,9 +89,15 @@ ENGINES: dict[str, EngineSpec] = {
         modules=("numpy",),
     ),
     "matcha": EngineSpec(
-        # Only the acoustic graph is universally required: an official embedded-vocoder
-        # export needs nothing else; from_config names what a given export still wants.
-        required=(("matcha.acoustic_model_path", "matcha.acousticModelPath"),),
+        required_any=(  # dynamic export, or the static split
+            (("matcha.acoustic_model_path", "matcha.acousticModelPath"),),
+            (
+                ("matcha.encoder_path", "matcha.encoderPath"),
+                ("matcha.decoder_path", "matcha.decoderPath"),
+                ("matcha.vocoder_path", "matcha.vocoderPath"),
+                ("matcha.tokens_path", "matcha.tokensPath"),
+            ),
+        ),
         build=_build_matcha,
         modules=("numpy",),
     ),

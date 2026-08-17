@@ -93,7 +93,7 @@ def test_config_rejects_floor_at_or_above_ceiling():
         VadConfig.model_validate({"hangoverMs": 400, "hangoverMinMs": 400})
 
 
-# ---- backend commit-on-publish ---------------------------------------------
+# ---- backend commit-on-publish ----------------------------------------------
 
 class _SilentVad(Vad):
     def is_speech(self, frame: bytes) -> bool:

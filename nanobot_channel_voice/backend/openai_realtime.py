@@ -215,7 +215,7 @@ class RealtimeBackend(TurnEventMixin):
         self._log = logger.bind(component="voice")  # before _reset_turn_state: it logs
         self._reset_turn_state()
 
-    # ---- turn/session bookkeeping ---------------------------------------
+    # ---- turn/session bookkeeping -------------------------------------------
 
     def _reset_turn_state(self, *, reason: str = "init") -> None:
         # Pending call_ids are obligations the model will never see answered — invisible
@@ -273,7 +273,7 @@ class RealtimeBackend(TurnEventMixin):
             )
         return key
 
-    # ---- VoiceBackend contract ------------------------------------------
+    # ---- VoiceBackend contract ----------------------------------------------
 
     async def start(
         self, *, instructions: str | None, tools: list[ToolDef], on_event: OnEvent
@@ -461,7 +461,7 @@ class RealtimeBackend(TurnEventMixin):
             with suppress(Exception):
                 await ws.close()
 
-    # ---- connection / io -------------------------------------------------
+    # ---- connection / io ----------------------------------------------------
 
     async def _rx_loop(self) -> None:
         attempt = 0
@@ -655,7 +655,7 @@ class RealtimeBackend(TurnEventMixin):
             "to the Realtime API."
         )
 
-    # ---- event mapping ---------------------------------------------------
+    # ---- event mapping ------------------------------------------------------
 
     async def _handle_event(self, evt: dict) -> None:
         t = evt.get("type", "")
@@ -978,7 +978,7 @@ class RealtimeBackend(TurnEventMixin):
         self._last_error = f"{code}: {msg}" if code else msg
         await self._emit(Error(message=f"realtime error: {msg}", fatal=fatal))
 
-    # ---- drain + watchdog -----------------------------------------------
+    # ---- drain + watchdog ---------------------------------------------------
 
     def _start_drain(self) -> None:
         self._cancel_drain()

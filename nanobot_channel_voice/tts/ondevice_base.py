@@ -42,7 +42,7 @@ class OnDeviceTtsAdapter(TtsAdapter):
         # chars every chunk.
         self._warned_unspeakable: set[str] = set()
 
-    # ---- knobs the engine supplies ---------------------------------------
+    # ---- knobs the engine supplies ------------------------------------------
 
     def _piece_budget(self) -> int:
         """Max characters per synthesized piece (model input budget)."""
@@ -61,7 +61,7 @@ class OnDeviceTtsAdapter(TtsAdapter):
         """One budget-sized piece -> float32 waveform at ``output_rate``."""
         raise NotImplementedError
 
-    # ---- the speakability guard ------------------------------------------
+    # ---- the speakability guard ---------------------------------------------
 
     def _speakability(self, text: str) -> tuple[float, set[str]]:
         """(voiceable fraction, unvoiceable chars) over the CONTENT (alnum) characters.
@@ -89,7 +89,7 @@ class OnDeviceTtsAdapter(TtsAdapter):
             self._label, "".join(sorted(fresh)), self.spoken_language or "unset",
         )
 
-    # ---- the shared shell -------------------------------------------------
+    # ---- the shared shell ---------------------------------------------------
 
     async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
         text = text.strip()
@@ -125,6 +125,25 @@ class OnDeviceTtsAdapter(TtsAdapter):
 
     def _join_gap(self) -> np.ndarray:
         return np.zeros(int(self._join_gap_s * self.output_rate), dtype=np.float32)
+
+    def _halve_and_retry(self, text: str) -> np.ndarray:
+        """Halve at the space (or midpoint) nearest the middle and synthesize both:
+        for fixed-window overflows. Callers own the unsplittable single-char case."""
+        text = text.strip()
+        mid = (len(text) + 1) // 2
+        left = text.rfind(" ", 1, mid)
+        right = text.find(" ", mid, len(text) - 1)
+        cands = [c for c in (left, right) if c > 0]
+        cut = (min(cands, key=lambda c: abs(c - mid)) + 1) if cands else mid
+        parts = [
+            p for p in (
+                self._synthesize_piece(text[:cut].strip()),
+                self._synthesize_piece(text[cut:].strip()),
+            ) if p.size
+        ]
+        if len(parts) == 2:
+            parts.insert(1, self._join_gap())
+        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
     def _synthesize_floats(self, text: str) -> np.ndarray:
         text = self._normalize(text)

@@ -179,7 +179,7 @@ def test_events_after_teardown_are_dropped():
     assert shell.state is VoiceState.IDLE
 
 
-# ---- tool outcome classification -------------------------------------------
+# ---- tool outcome classification --------------------------------------------
 
 class _ErrResult(str):
     is_error = True

@@ -106,7 +106,7 @@ class VoiceMetrics:
     # it, not as TTFA; folding them lets a slow tool look like a slow model.
     _in_continuation: bool = False
 
-    # ---- primitives ------------------------------------------------------
+    # ---- primitives ---------------------------------------------------------
 
     def count(self, key: str, n: int = 1) -> None:
         self.counters[key] = self.counters.get(key, 0) + n
@@ -119,7 +119,7 @@ class VoiceMetrics:
             bucket = self._latency[key] = _Samples()
         bucket.add(ms)
 
-    # ---- turn timeline ---------------------------------------------------
+    # ---- turn timeline ------------------------------------------------------
 
     def turn_anchor(self, offset_ms: float = 0.0) -> None:
         """End of user speech: the clock every turn metric is measured from.
@@ -160,7 +160,7 @@ class VoiceMetrics:
         self._ttfa_done = False
         self._in_continuation = False
 
-    # ---- tool call timeline ---------------------------------------------
+    # ---- tool call timeline -------------------------------------------------
 
     def call_seen(self, call_id: str, name: str) -> None:
         # Idempotent: `tool_calls` is the denominator of every success rate, and a
@@ -231,7 +231,7 @@ class VoiceMetrics:
                 del self._calls[cid]
                 self.count("tool_dropped.cancelled")
 
-    # ---- readout ---------------------------------------------------------
+    # ---- readout ------------------------------------------------------------
 
     @property
     def has_data(self) -> bool:

@@ -93,7 +93,7 @@ async def _drain_and_close(backend: LocalBackend) -> list[str]:
     return sorted(p.name for p in dump_dir.glob("*.wav"))
 
 
-# ---- dumper unit -------------------------------------------------------------
+# ---- dumper unit ------------------------------------------------------------
 
 def test_dumper_writes_verdict_named_pairs(tmp_path):
     d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
@@ -135,7 +135,7 @@ def test_dumper_prunes_old_sessions_at_startup(tmp_path):
     assert keep.exists()  # non-timestamped dirs are never touched
 
 
-# ---- backend integration -----------------------------------------------------
+# ---- backend integration ----------------------------------------------------
 
 def test_empty_verdict_segment_is_dumped(tmp_path):
     async def _case():

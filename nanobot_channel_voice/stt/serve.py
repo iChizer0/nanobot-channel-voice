@@ -102,7 +102,7 @@ class SttHttpServer:
             await self._server.wait_closed()
         self._server = None
 
-    # ---- request handling ------------------------------------------------
+    # ---- request handling ---------------------------------------------------
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -225,7 +225,7 @@ class SttHttpServer:
             )
         return await reader.readexactly(length)
 
-    # ---- audio ingest ----------------------------------------------------
+    # ---- audio ingest -------------------------------------------------------
 
     async def _ingest(self, audio: bytes, filename: str) -> tuple[bytes, int]:
         """Any uploaded container -> (S16_LE mono PCM, rate) for the adapter."""

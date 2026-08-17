@@ -93,7 +93,7 @@ def detect_language(
     return top_id
 
 
-# ---- decodable-language vocabulary mask ------------------------------------
+# ---- decodable-language vocabulary mask -------------------------------------
 # The DECODABLE set (``stt.languages``) is a guarantee on what may be EMITTED,
 # enforced by suppressing tokens whose script no enabled language uses. Latin is
 # allowed unconditionally: it carries the digits, names and loanwords that appear in

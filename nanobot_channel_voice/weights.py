@@ -1,10 +1,11 @@
 """Local model-weight store: fetch, prune, and engine-path resolution.
 
 The plugin never bundles model files. An INDEX (JSON) maps a weights key
-(``<kind>/<model>/<platform>``, e.g. ``stt/whisper-base/onnx`` or
-``stt/whisper-base/hef.hailo-10h``) to per-file URLs plus sha256::
+(``<kind>/<model-path>/<platform>``, with one or more model-path segments,
+e.g. ``stt/whisper/base/onnx`` or ``tts/matcha/en-US/ljspeech/rknn.rv1126b``)
+to per-file URLs plus sha256::
 
-    {"version": 1, "models": {"stt/whisper-base/onnx": {
+    {"version": 1, "models": {"stt/whisper/base/onnx": {
         "source": "https://... (where these files come from)",
         "license": "MIT", "accept": "non-commercial use only",
         "langs": ["en", "ja", "de"],
@@ -47,7 +48,7 @@ MANIFEST = ".manifest.json"
 # only, never a bundled data file, so `nanobot-voice list` works out of the box
 # while the wheel still ships no entries; an explicit source replaces this entirely.
 DEFAULT_INDEX_SOURCES: tuple[str, ...] = (
-    "https://huggingface.co/spaces/iChizer0/nanobot-channel-voice-models/resolve/main/weights-index.json",
+    "https://huggingface.co/iChizer0/nanobot-channel-voice-models/resolve/main/weights-index.json",
 )
 
 _KEY_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")  # no dot-prefix: kills "..", hidden dirs
@@ -69,11 +70,12 @@ def store_root() -> Path:
 
 
 def validate_key(key: str) -> str:
+    """``<kind>/<model-path...>/<platform>``, >=3 segments: kind first, platform last."""
     parts = key.split("/")
-    if len(parts) != 3 or not all(_KEY_SEGMENT.match(p) for p in parts):
+    if len(parts) < 3 or not all(_KEY_SEGMENT.fullmatch(p) for p in parts):
         raise WeightsError(
-            f"invalid weights key '{key}': expected <kind>/<model>/<platform>, "
-            "e.g. stt/whisper-base/onnx or stt/whisper-base/hef.hailo-10h"
+            f"invalid weights key '{key}': expected <kind>/<model-path>/<platform>, "
+            "e.g. stt/whisper/base/onnx or tts/matcha/en-US/ljspeech/rknn.rv1126b"
         )
     return key
 
@@ -82,7 +84,7 @@ def store_dir(key: str, root: Path | None = None) -> Path:
     return (root or store_root()).joinpath(*validate_key(key).split("/"))
 
 
-# ---------------------------------------------------------------- index
+# ---- index ------------------------------------------------------------------
 
 
 def _read_source(source: str) -> dict[str, Any]:
@@ -139,7 +141,7 @@ def load_index(sources: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
     return models
 
 
-# ---------------------------------------------------------------- fetch / prune
+# ---- fetch / prune ----------------------------------------------------------
 
 
 def _sha256_file(path: Path) -> str:
@@ -170,6 +172,12 @@ def fetch(
     ``force`` refetches everything. Downloads stream to ``.partial-*``, verify,
     then atomically replace, so a partial never lands on the final name."""
     d = store_dir(key, root)
+    # nested keys would let the stale-file sweep rmtree the inner installation
+    for other in installed(root):
+        if other != key and (other.startswith(key + "/") or key.startswith(other + "/")):
+            raise WeightsError(
+                f"key '{key}' would nest with installed '{other}'; prune one first"
+            )
     files: dict[str, Any] = entry.get("files") or {}
     if not files:
         raise WeightsError(f"index entry '{key}' lists no files")
@@ -254,14 +262,26 @@ def fetch(
 
 
 def installed(root: Path | None = None) -> dict[str, Path]:
-    """Fetched keys -> store dirs (anything holding a manifest, index or not)."""
+    """Fetched keys -> store dirs (anything holding a manifest, index or not).
+
+    Keys are hierarchical, so discover manifests at arbitrary depth. Validation keeps
+    stray or malformed directories from being exposed as installed model keys.
+    """
     base = root or store_root()
     if not base.is_dir():
         return {}
-    return {
-        "/".join(m.parent.relative_to(base).parts): m.parent
-        for m in sorted(base.glob(f"*/*/*/{MANIFEST}"))
-    }
+    found: dict[str, Path] = {}
+    # os.walk, not rglob: ** skips symlinked dirs, and users relocate subtrees that way
+    for dirpath, _dirnames, filenames in os.walk(base, followlinks=True):
+        if MANIFEST not in filenames:
+            continue
+        rel = Path(dirpath).relative_to(base).as_posix()
+        try:
+            validate_key(rel)
+        except WeightsError:
+            continue
+        found[rel] = Path(dirpath)
+    return dict(sorted(found.items()))
 
 
 def disk_usage(d: Path) -> int:
@@ -279,17 +299,21 @@ def prune(key: str, root: Path | None = None) -> int:
     """Remove one fetched key from the store; returns the bytes freed."""
     base = root or store_root()
     d = store_dir(key, base)
-    if not d.is_dir():
+    # manifest required: a bare ancestor dir would prune other keys' children
+    if not (d / MANIFEST).is_file():
         raise WeightsError(f"'{key}' is not in the store ({base})")
     freed = disk_usage(d)
     shutil.rmtree(d)
-    for parent in (d.parent, d.parent.parent):  # drop now-empty <kind>/<model> shells
-        if parent != base and parent.is_dir() and not any(parent.iterdir()):
-            parent.rmdir()
+    # A model path can have arbitrary depth. Remove every now-empty ancestor, but
+    # never the store root itself (and stop as soon as a sibling remains).
+    parent = d.parent
+    while parent != base and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
     return freed
 
 
-# ---------------------------------------------------------------- runtime resolution
+# ---- runtime resolution -----------------------------------------------------
 
 
 def fill_engine_paths(block: Any) -> Any:

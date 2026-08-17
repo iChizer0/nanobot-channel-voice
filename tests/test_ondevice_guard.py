@@ -53,7 +53,7 @@ def _warnings(fn) -> list[str]:
     return messages
 
 
-# ---- scoring --------------------------------------------------------------
+# ---- scoring ----------------------------------------------------------------
 
 
 def test_punctuation_and_spaces_never_count_against_a_piece():
@@ -76,7 +76,7 @@ def test_foreign_script_scores_zero():
     assert ratio < _MIN_SPEAKABLE
 
 
-# ---- the guard in the synthesis loop --------------------------------------
+# ---- the guard in the synthesis loop ----------------------------------------
 
 
 def test_unvoiceable_piece_is_skipped_and_the_rest_still_speaks():
@@ -121,7 +121,7 @@ def test_skipped_pieces_are_reported_separately_from_failures():
     assert any("mostly unvoiceable" in m and "silent" in m for m in msgs)
 
 
-# ---- the real engines' verdicts -------------------------------------------
+# ---- the real engines' verdicts ---------------------------------------------
 
 
 def test_mms_can_speak_follows_its_vocab():

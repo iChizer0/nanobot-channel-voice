@@ -167,7 +167,7 @@ class PyAlsaPlayback(PlaybackSink):
         self._lock = threading.Lock()
         self._log = logger.bind(component="pyalsa-playback")
 
-    # ---- blob mode ------------------------------------------------------
+    # ---- blob mode ----------------------------------------------------------
 
     async def play_wav(self, wav_bytes: bytes) -> bool:
         if not wav_bytes:
@@ -226,7 +226,7 @@ class PyAlsaPlayback(PlaybackSink):
                 with suppress(Exception):
                     pcm.close()
 
-    # ---- stream mode (gapless raw PCM) ----------------------------------
+    # ---- stream mode (gapless raw PCM) --------------------------------------
 
     async def open_stream(self, rate: int) -> PlaybackStream:
         pcm = await asyncio.get_running_loop().run_in_executor(
@@ -247,7 +247,7 @@ class PyAlsaPlayback(PlaybackSink):
             periodsize=max(64, rate // 50),
         )
 
-    # ---- lifecycle ------------------------------------------------------
+    # ---- lifecycle ----------------------------------------------------------
 
     async def abort(self) -> None:
         self._abort = True

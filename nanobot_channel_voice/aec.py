@@ -62,7 +62,7 @@ class EchoCanceller:
         clock runs during silence, when the filter learns nothing)."""
         return self._ref_ms
 
-    # ---- reference (our own playback), event-loop side --------------------
+    # ---- reference (our own playback), event-loop side ----------------------
 
     def push_reference(self, pcm: bytes, rate: int, playout_at: float) -> None:
         """Queue playback audio stamped with the wall-clock time it becomes
@@ -100,7 +100,7 @@ class EchoCanceller:
         self._pending.clear()
         self._ref_carry = b""
 
-    # ---- capture, single-consumer side ------------------------------------
+    # ---- capture, single-consumer side --------------------------------------
 
     def process(self, pcm: bytes) -> bytes:
         """Run one capture frame through the canceller; returns cleaned PCM.

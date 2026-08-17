@@ -147,7 +147,7 @@ def test_preroll_floor_tracks_firered_smoothing():
     assert resolve_preroll_ms(cfg, FRAME_MS) == 25 + 4 * 10 + 80
 
 
-# ---- consult tier (end-of-turn model) --------------------------------------
+# ---- consult tier (end-of-turn model) ---------------------------------------
 # consult_ms=40 = 2 frames of silence before the snapshot; hangover stays 5 frames.
 
 def test_consult_snapshot_once_per_pause_with_audio_so_far():

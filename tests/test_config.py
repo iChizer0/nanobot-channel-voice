@@ -258,7 +258,7 @@ def test_range_validation_still_applies():
         VoiceConfig.model_validate({"duckDb": 3.0})   # le=0
 
 
-# ---- importJson: the WebUI paste-to-import transport -------------------------
+# ---- importJson: the WebUI paste-to-import transport ------------------------
 
 
 def test_import_json_paste_wins_over_the_section():

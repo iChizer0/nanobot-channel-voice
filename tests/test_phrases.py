@@ -23,7 +23,7 @@ def _stop(text: str) -> bool:
     return pure_command(tokens_of(text), STOP, ACK, extra=FILLER_WORDS)
 
 
-# ---- spaced scripts ----------------------------------------------------------
+# ---- spaced scripts ---------------------------------------------------------
 
 def test_bare_and_decorated_stops():
     assert _stop("stop")
@@ -52,7 +52,7 @@ def test_multiword_phrases_need_contiguity_and_loose_words_never_hit():
     assert not _stop("never okay mind")
 
 
-# ---- fused CJK runs ----------------------------------------------------------
+# ---- fused CJK runs ---------------------------------------------------------
 
 def test_cjk_single_runs_segment_greedily():
     assert _stop("停")
@@ -77,7 +77,7 @@ def test_cjk_ack_repetition_is_covered():
     assert not covered([], ACK)
 
 
-# ---- per-token hit (the early-confirm / echo-override primitive) -------------
+# ---- per-token hit (the early-confirm / echo-override primitive) ------------
 
 def test_single_token_hits():
     assert pure_command(["stop"], STOP, ACK, extra=FILLER_WORDS)

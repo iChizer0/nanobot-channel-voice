@@ -94,7 +94,7 @@ class AudioDumper:
         self._thread.start()
         self._log.info("audio dump on: writing capture segments to {}", session)
 
-    # ---- producers (any thread) -------------------------------------------
+    # ---- producers (any thread) ---------------------------------------------
 
     def submit(
         self,
@@ -124,7 +124,7 @@ class AudioDumper:
             return  # writer wedged (dead disk): don't hang teardown behind it
         self._thread.join(timeout=5.0)
 
-    # ---- writer thread -----------------------------------------------------
+    # ---- writer thread ------------------------------------------------------
 
     def _writer(self) -> None:
         if self._header is not None:  # first manifest line, ahead of any queued record

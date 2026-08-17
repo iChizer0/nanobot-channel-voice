@@ -92,7 +92,7 @@ def _lfr_frames(pcm: bytes) -> int:
     return int(np.ceil(n_fbank / 6))
 
 
-# ---- construction / sidecar ----------------------------------------------------
+# ---- construction / sidecar -------------------------------------------------
 
 
 def test_rknn_builds_from_sidecar_and_probes(fake, sidecar):
@@ -156,7 +156,7 @@ def test_bad_cmvn_dim_raises(fake, sidecar):
         SenseVoiceOnDeviceStt.from_config(_cfg(sidecar))
 
 
-# ---- the static window contract -------------------------------------------------
+# ---- the static window contract ---------------------------------------------
 
 
 def test_mask_covers_queries_plus_valid_frames_and_logits_tail_is_sliced(fake, sidecar):
@@ -185,7 +185,7 @@ def test_over_window_audio_truncates_not_crashes(fake, sidecar):
     assert dict(fake.calls[0])["speech"].shape == (1, _WINDOW, 560)
 
 
-# ---- the dynamic .onnx contract -------------------------------------------------
+# ---- the dynamic .onnx contract ---------------------------------------------
 
 
 def test_onnx_uses_the_dynamic_original_contract(fake, sidecar):

@@ -225,7 +225,7 @@ class ZipformerOnDeviceStt(SttAdapter):
         for model in (self._encoder, self._decoder, self._joiner):
             model.release()
 
-    # ---- batch path (same engine, whole utterance) -----------------------
+    # ---- batch path (same engine, whole utterance) --------------------------
 
     async def transcribe(self, pcm: bytes, sample_rate: int) -> str:
         if not pcm:
@@ -243,7 +243,7 @@ class ZipformerOnDeviceStt(SttAdapter):
             self._log.warning("on-device zipformer STT failed: {}", exc)
             return ""
 
-    # ---- internals (all state via the handle argument) -------------------
+    # ---- internals (all state via the handle argument) ----------------------
 
     def _decode_ready(self, s: _ZipformerStream) -> None:
         """Run the encoder over every complete chunk available, greedy-decoding its

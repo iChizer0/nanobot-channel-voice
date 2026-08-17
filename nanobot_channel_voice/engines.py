@@ -22,10 +22,12 @@ class EngineSpec:
     camelCase name for the warning), the importable modules it needs beyond the
     hard dependencies (probed by :func:`preflight`, never imported here), and a
     lazily-importing factory. The factory signature is registry-specific
-    (stt/tts pass ``cfg``; vad adds the rates)."""
+    (stt/tts pass ``cfg``; vad adds the rates). ``required_any`` lists alternative
+    field-sets; satisfied when any one set is fully present."""
 
     build: Callable[..., Any]
     required: tuple[tuple[str, str], ...] = ()
+    required_any: tuple[tuple[tuple[str, str], ...], ...] = ()
     modules: tuple[str, ...] = ()
 
 
@@ -38,8 +40,18 @@ def resolve_attr(cfg: Any, dotted: str) -> Any:
 
 
 def missing_fields(cfg: Any, spec: EngineSpec) -> list[str]:
-    """The camelCase names of the spec's required fields that are unset."""
-    return [name for attr, name in spec.required if not resolve_attr(cfg, attr)]
+    """Unset required field names; for ``required_any``, the closest alternative's."""
+    missing = [name for attr, name in spec.required if not resolve_attr(cfg, attr)]
+    if spec.required_any:
+        best: list[str] | None = None
+        for alt in spec.required_any:
+            gaps = [name for attr, name in alt if not resolve_attr(cfg, attr)]
+            if not gaps:
+                return missing
+            if best is None or len(gaps) < len(best):
+                best = gaps
+        missing += best or []
+    return missing
 
 
 # Top-level module name of a failed import -> the pyproject extra providing it.
@@ -57,8 +69,6 @@ _EXTRA_BY_MODULE = {
     # elsewhere the fix is a .onnx artifact, but naming the extra still points at the doc.
     "rknn": "rknn",
     "rknnlite": "rknn",
-    # matcha's espeak fallback library; usually surfaced pre-wrapped by tts/espeak.py,
-    # kept here so a bare import failure still names the extra.
     "espeakng_loader": "espeak",
 }
 

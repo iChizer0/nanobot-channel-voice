@@ -782,7 +782,7 @@ class LocalBackend(TurnEventMixin):
         ns = started_ns(base)
         return ns is not None and ns < self._reject_started_before_ns
 
-    # ---- VoiceBackend contract ------------------------------------------
+    # ---- VoiceBackend contract ----------------------------------------------
 
     async def start(
         self, *, instructions: str | None, tools: list[ToolDef], on_event: OnEvent
@@ -1390,7 +1390,7 @@ class LocalBackend(TurnEventMixin):
         if self._dumper is not None:
             await asyncio.to_thread(self._dumper.close)
 
-    # ---- input: capture -> STT -> publish (bus) --------------------------
+    # ---- input: capture -> STT -> publish (bus) -----------------------------
 
     async def _on_utterance(self, pending: _PendingUtterance) -> str:
         """Run the verdict ladder over one closed utterance. Returns the verdict token
@@ -2054,7 +2054,7 @@ class LocalBackend(TurnEventMixin):
                 await stale
         return await self._transcribe(pending.pcm), "batch"
 
-    # ---- output: streamed reply -> chunker -> TTS -> sink ----------------
+    # ---- output: streamed reply -> chunker -> TTS -> sink -------------------
 
     async def on_delta(self, delta: str, stream_id: str | None = None) -> None:
         """A streamed assistant text chunk (``_stream_delta``)."""
@@ -2124,7 +2124,7 @@ class LocalBackend(TurnEventMixin):
             self._tts_enqueue(tail)
         self._schedule_drain()
 
-    # ---- TTS stage + drain ----------------------------------------------
+    # ---- TTS stage + drain --------------------------------------------------
 
     def _tts_enqueue(self, text: str) -> None:
         if not text:
@@ -2380,7 +2380,7 @@ class LocalBackend(TurnEventMixin):
             return pcm_ms(len(audio), self._tts.output_rate)
         return wav_duration_ms(audio)
 
-    # ---- prologue (filler while the agent works) -------------------------
+    # ---- prologue (filler while the agent works) ----------------------------
 
     def _arm_prologue(self, initial_ms: int | None = None, start_step: int = 0) -> None:
         """Arm the filler timer for the turn just published (cancels any prior).

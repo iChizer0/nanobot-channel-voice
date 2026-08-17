@@ -213,7 +213,7 @@ class AlsaPlayback(PlaybackSink):
         proc, self._proc = self._proc, None
         await _terminate(proc)  # blob only; streams die via their handles
 
-    # ---- streaming (raw PCM to one persistent aplay per handle) ----------
+    # ---- streaming (raw PCM to one persistent aplay per handle) -------------
 
     async def open_stream(self, rate: int) -> PlaybackStream:
         cmd = [

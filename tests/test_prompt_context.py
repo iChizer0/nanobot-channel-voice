@@ -31,7 +31,7 @@ class _FakeTts:
         self.spoken_language = language
 
 
-# ---- realtime instructions ------------------------------------------------
+# ---- realtime instructions --------------------------------------------------
 
 
 def test_default_persona_carries_the_mode_rules():
@@ -64,7 +64,7 @@ def test_direct_rules_survive_a_persona_override():
     assert _SUPERVISOR_RULES not in out
 
 
-# ---- local speakability context -------------------------------------------
+# ---- local speakability context ---------------------------------------------
 
 
 def test_no_tts_means_no_block():
@@ -112,7 +112,7 @@ def test_operator_context_survives_a_disabled_tts():
     assert _voice_context_blocks(None, "   ") == []  # whitespace is not guidance
 
 
-# ---- what make_tts settles ------------------------------------------------
+# ---- what make_tts settles --------------------------------------------------
 
 
 def test_tts_language_fills_an_engine_that_cannot_know_its_own():
@@ -154,7 +154,7 @@ def test_engine_declared_language_beats_a_conflicting_config():
     assert any("conflicts" in m and "'de'" in m for m in messages)
 
 
-# ---- what the adapters declare --------------------------------------------
+# ---- what the adapters declare ----------------------------------------------
 
 
 def test_system_adapter_declares_its_espeak_voice():
@@ -181,7 +181,7 @@ def test_mms_names_only_the_built_in_english_vocab():
     assert build(dict(_ENG_VOCAB)).spoken_language is None  # a loaded vocab.json
 
 
-# ---- the publish seam -----------------------------------------------------
+# ---- the publish seam -------------------------------------------------------
 
 
 def _capturing_channel() -> tuple[VoiceChannel, list[dict]]:

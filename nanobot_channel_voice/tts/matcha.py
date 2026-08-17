@@ -1,26 +1,17 @@
-"""On-device Matcha-TTS (``tts.provider="matcha"``): the KTH flow-matching acoustic
-model over ONNX, speaking BOTH export dialects, detected from the graph itself:
-
-* the OFFICIAL export (``python -m matcha.onnx.export``, the preferred source):
-  ``scales=[temperature, length_scale]`` input, no bos/eos, the fixed symbol table
-  vendored below (upstream bakes it in code, there is no tokens.txt), and - when the
-  vocoder was embedded at export - a direct ``wav`` output, no vocoder file at all;
-* the icefall/sherpa-onnx export (``matcha-icefall-*``): separate noise/length inputs,
-  front-end contract in the ONNX metadata (``has_espeak``/``jieba``/``use_eos_bos``),
-  ``tokens.txt`` [+ ``lexicon.txt`` for zh], and a mel output for a vocoder file.
-
-A mel-emitting model needs ``vocoderPath``: a Vocos graph (three outputs: STFT
-magnitude/cos/sin; the inverse STFT runs host-side in numpy, mirroring sherpa's
-knf::IStft) or any single-output waveform vocoder (HiFi-GAN). English phonemizes
-through espeak-ng - the system binary or an explicit ``espeakPath``. Imported lazily
-by :func:`make_tts`.
+"""On-device Matcha-TTS (``tts.provider="matcha"``), both export dialects detected
+from the graph: OFFICIAL (``scales`` input, in-code symbol table, optional embedded
+vocoder -> direct wav) and icefall/sherpa (metadata-driven front-end, tokens.txt
+[+ lexicon.txt for zh], mel out). Mel needs ``vocoderPath``: Vocos (mag/cos/sin ->
+host ISTFT) or any single-output waveform vocoder. Imported lazily by make_tts.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from contextlib import ExitStack
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -35,20 +26,17 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_zh
 _JOIN_GAP_S = 0.1
 _SAMPLE_RATE_DEFAULT = 22050  # every published matcha vocoder (HiFi-GAN, Vocos univ)
 
-# metadata "language" -> the ISO 639-1 code spoken_language wants. Only names seen on
-# published matcha exports; an unknown name leaves the config's tts.language in charge.
+# metadata "language" -> ISO 639-1; unknown names leave tts.language in charge
 _LANG_NAMES = {"english": "en", "chinese": "zh", "german": "de", "japanese": "ja"}
 
 
-# CJK terminators split anywhere; ASCII ones only before whitespace/end, so "3.14",
-# "3:30" and "e.g." survive intact (the chunker's _primary_cut applies the same rule).
+# CJK terminators split anywhere; ASCII only before whitespace/end ("3.14" survives)
 _SENTENCE_SPLIT_RE = re.compile(r"(?:(?<=[。！？…])(?![。！？…])|(?<=[.!?])(?=\s|$))")
 _CLAUSE_SPLIT_RE = re.compile(r"([、，；：]|[,;:](?=\s|$))")
 _SENTENCE_PUNCT = ".!?…。！？"
 _LANG_SWITCH_RE = re.compile(r"\([a-z0-9-]+\)")  # espeak "(zh)" language-switch flags
 
-# The official symbol table (matcha/text/symbols.py, from keithito/tacotron): ids are
-# list positions. Copied VERBATIM - character count and order define the embedding.
+# Verbatim official symbol table; list position IS the embedding id
 _OFFICIAL_PUNCTUATION = ';:,.!?¡¿—…"«»“” '
 _OFFICIAL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _OFFICIAL_LETTERS_IPA = (
@@ -73,13 +61,12 @@ def read_tokens(path: str) -> dict[str, int]:
             sym, tid = (" ", parts[0]) if len(parts) == 1 else (parts[0], parts[1])
             token2id[sym] = int(tid)
     if not token2id:
-        # An empty table maps every synthesis to zero ids: a mute TTS that looks healthy.
+        # empty table => healthy-looking mute TTS
         raise ValueError(f"no tokens parsed from {path} (wrong format?)")
     return token2id
 
 
-# Half-width/full-width punctuation twins (sherpa's CharacterLexicon::InitTokens): each
-# model's symbol table carries one spelling, agent text uses both.
+# Half/full-width twins: each table carries one spelling, agent text uses both
 _PUNCT_TWINS = (
     (",", "，"), (".", "。"), ("!", "！"), ("?", "？"), (":", "："),
     ('"', "“"), ('"', "”"), ("'", "‘"), ("'", "’"), (";", "；"),
@@ -121,19 +108,31 @@ def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
 
 
 def add_blank(ids: list[int], pad_id: int) -> list[int]:
-    """[pad, t0, pad, t1, ..., pad]: the training-time interleave (upstream
-    ``intersperse``, sherpa ``AddBlank``)."""
+    """[pad, t0, pad, t1, ..., pad]: the training-time interleave."""
     out = [pad_id] * (2 * len(ids) + 1)
     out[1::2] = ids
     return out
 
 
+def frame_ids(
+    frontend: EspeakFrontend | LexiconFrontend, text: str, *,
+    bos_id: int | None, eos_id: int | None, pad_id: int,
+) -> list[int]:
+    """Per-sentence bos/eos framing + blank interleave (shared by both adapters)."""
+    ids: list[int] = []
+    for seq in frontend.sentences(text):
+        if bos_id is not None:
+            seq = [bos_id, *seq]
+        if eos_id is not None:
+            seq = [*seq, eos_id]
+        ids.extend(add_blank(seq, pad_id))
+    return ids
+
+
 def istft(mag: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
           n_fft: int, hop_length: int, center: bool) -> np.ndarray:
-    """Vocos (bins, frames) magnitude/cos/sin -> waveform: periodic-hann overlap-add
-    with window-square normalization, torch.istft-compatible (= sherpa's knf::IStft)."""
-    # Fill the complex halves in place: mag.astype(complex) * (cos + 1j*sin) would
-    # allocate four full-size temporaries on a memory-bandwidth-bound path.
+    """Vocos (bins, frames) mag/cos/sin -> waveform; torch.istft-compatible."""
+    # in-place complex fill: the naive product allocates four full-size temporaries
     spec = np.empty(mag.shape, dtype=np.complex64)
     np.multiply(mag, cos, out=spec.real)
     np.multiply(mag, sin, out=spec.imag)
@@ -146,8 +145,7 @@ def istft(mag: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
     wsum = np.zeros(total, dtype=np.float32)
     w2 = win * win
     if n_fft % hop_length == 0:
-        # Overlap-add as n_fft/hop strided lane-adds (4 for Vocos) instead of a
-        # per-frame Python loop: within one lane the frame targets never overlap.
+        # n_fft/hop strided lane-adds; within a lane the frame targets never overlap
         for k in range(n_fft // hop_length):
             s = k * hop_length
             out[s : s + n_frames * hop_length].reshape(n_frames, hop_length)[...] += (
@@ -166,12 +164,10 @@ def istft(mag: np.ndarray, cos: np.ndarray, sin: np.ndarray, *,
 
 
 def _is_latin(ch: str) -> bool:
-    """Scripts the published espeak-fronted matcha voices (all Latin-written) can
-    plausibly speak. Everything else - CJK, Cyrillic, Greek, Arabic, ... - would be
-    voiced as garbage IPA after espeak switches language, so refusing it here lets
-    the shell's speakability guard skip and WARN instead (mms/supertonic parity)."""
+    """Non-Latin would be voiced as garbage IPA after espeak language-switches;
+    refusing it lets the speakability guard skip + warn instead."""
     cp = ord(ch)
-    return cp < 0x0250 or 0x1E00 <= cp <= 0x1EFF  # ASCII..IPA-block start; Latin ext additional
+    return cp < 0x0250 or 0x1E00 <= cp <= 0x1EFF  # ASCII..IPA block; Latin ext additional
 
 
 def _sentences(text: str) -> list[tuple[str, str]]:
@@ -187,10 +183,8 @@ def _sentences(text: str) -> list[tuple[str, str]]:
 
 
 class EspeakFrontend:
-    """Text -> per-sentence token-id sequences via espeak-ng IPA output, one
-    phonemizer call per clause so clause punctuation survives as its own token
-    (espeak never emits punctuation in IPA output). Unknown IPA codepoints are
-    skipped like the references; ties/affricate joiners fall out the same way."""
+    """Text -> per-sentence token ids via espeak IPA; clauses phonemize separately
+    because espeak drops the punctuation the model needs as pause tokens."""
 
     def __init__(self, token2id: dict[str, int], *, phonemize: Callable[[str], str]):
         self._token2id = token2id
@@ -198,13 +192,10 @@ class EspeakFrontend:
         self._space_id = token2id.get(" ")
 
     def can_speak(self, ch: str) -> bool:
-        # Phoneme coverage is decided post-G2P, so per-char only the wrong-script
-        # failure mode is answerable: non-Latin never survives these voices.
-        return _is_latin(ch)
+        return _is_latin(ch)  # per-char, only the wrong-script failure is answerable
 
     def _ipa_ids(self, ipa: str) -> list[int]:
-        # Strip "(zh)"-style switch flags BEFORE the per-codepoint map: their letters
-        # are valid phoneme symbols and would otherwise be voiced.
+        # strip "(zh)" switch flags first: their letters are valid phoneme symbols
         ipa = _LANG_SWITCH_RE.sub("", ipa)
         ids: list[int] = []
         for ch in ipa:
@@ -218,10 +209,8 @@ class EspeakFrontend:
         return ids
 
     def _phonemize_clauses(self, clauses: list[str]) -> list[str]:
-        """One phonemizer call for the whole batch: espeak emits one clause per line,
-        so newline-joined input maps back by line - saving a subprocess spawn per
-        clause on the hot path. A line-count mismatch (espeak re-split something)
-        falls back to per-clause calls, whose multi-line output _ipa_ids tolerates."""
+        """One call per batch (espeak emits one clause per line); a line-count
+        mismatch falls back to per-clause calls."""
         if len(clauses) > 1:
             lines = self._phonemize("\n".join(clauses)).splitlines()
             if len(lines) == len(clauses):
@@ -229,7 +218,6 @@ class EspeakFrontend:
         return [self._phonemize(c) for c in clauses]
 
     def sentences(self, text: str) -> list[list[int]]:
-        # Collect every clause first so the whole piece phonemizes in one call.
         chunks: list[tuple[list[str], list[str]]] = []  # (clauses, their punctuation)
         all_clauses: list[str] = []
         for body, final_punct in _sentences(text):
@@ -258,17 +246,13 @@ class EspeakFrontend:
 
 
 class LexiconFrontend:
-    """Text -> per-sentence token-id sequences by greedy longest match against
-    lexicon.txt (multi-char entries make this word- not char-level; sherpa's
-    PhraseMatcher without jieba), single chars falling back to the token table
-    (folded punctuation included). OOV is dropped; the shell's speakability guard
-    reports it."""
+    """Text -> per-sentence token ids by greedy longest lexicon match, single chars
+    falling back to the token table; OOV drops, the speakability guard reports."""
 
     def __init__(self, word2ids: dict[str, list[int]], token2id: dict[str, int]):
         self._word2ids = word2ids
         self._token2id = token2id
-        # Longest key PER FIRST CHAR: one long entry anywhere in a user lexicon must
-        # not multiply the match scan for every position in every text.
+        # longest key per first char: one long entry must not slow every position
         self._max_by_first: dict[str, int] = {}
         for word in word2ids:
             if len(word) > self._max_by_first.get(word[0], 0):
@@ -302,15 +286,42 @@ class LexiconFrontend:
 
 
 class VocoderSpec(NamedTuple):
-    """A mel-consuming vocoder graph; ``stft`` is set for Vocos (3-output STFT
-    frames needing the host ISTFT), None for direct-waveform vocoders (HiFi-GAN)."""
+    """Mel-consuming vocoder; ``stft`` set for Vocos (host ISTFT), None for HiFi-GAN."""
 
     model: OnDeviceModel
     input_name: str
     stft: dict | None
 
 
-class MatchaTtsAdapter(OnDeviceTtsAdapter):
+def _espeak_frontend(
+    cfg: MatchaTtsConfig, token2id: dict[str, int], default_voice: str = "en-us",
+) -> tuple[EspeakFrontend, str]:
+    """(frontend, language): the espeak voice IS the spoken language."""
+    voice = cfg.espeak_voice or default_voice
+    frontend = EspeakFrontend(
+        token2id, phonemize=make_ipa_phonemizer(voice, espeak_path=cfg.espeak_path)
+    )
+    prefix = voice.partition("-")[0].lower()
+    return frontend, (prefix if len(prefix) == 2 else _LANG_NAMES.get(prefix, "en"))
+
+
+class _MatchaCommon:
+    """Frontend hooks shared by both adapters (needs _frontend/_max_len/spoken_language)."""
+
+    def _piece_budget(self) -> int:
+        return self._max_len  # type: ignore[attr-defined]
+
+    def _normalize(self, text: str) -> str:
+        # espeak reads digits itself; the zh lexicon has 零..九 but no "0".."9"
+        if self.spoken_language == "zh":  # type: ignore[attr-defined]
+            return verbalize_numbers_zh(text)
+        return text
+
+    def _can_speak(self, ch: str) -> bool:
+        return self._frontend.can_speak(ch)  # type: ignore[attr-defined]
+
+
+class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     _label = "Matcha"
     _join_gap_s = _JOIN_GAP_S
 
@@ -353,6 +364,8 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
 
     @classmethod
     def from_config(cls, cfg: MatchaTtsConfig) -> MatchaTtsAdapter:
+        if not cfg.acoustic_model_path:
+            raise ValueError("matcha dynamic export needs tts.matcha.acousticModelPath")
         model_kw = dict(
             core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
@@ -367,8 +380,7 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
                     "matcha needs an introspectable ONNX export; .rknn is not supported"
                 )
             official = "scales" in input_names
-            # Resolve every graph input at BUILD time: an unrecognized layout must
-            # fall back to system TTS here, not fail mutely per chunk in the shell.
+            # resolve inputs at build: unknown layouts must degrade here, not per chunk
             length_input = next((n for n in input_names if n in ("x_lengths", "x_length")), None)
             needed = {"x", "scales"} if official else {"x", "noise_scale", "length_scale"}
             if length_input is None or not needed <= set(input_names):
@@ -377,22 +389,15 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
 
             frontend: EspeakFrontend | LexiconFrontend
             if official:
-                # No tokens.txt in the official world: the symbol table is code, and a
-                # supplied file cannot match the baked-in embedding.
+                # the official table is code; a supplied file cannot match the embedding
                 if cfg.tokens_path:
                     logger.warning(
                         "voice: tts.matcha.tokensPath is ignored for official matcha "
                         "exports (their symbol table is fixed upstream)"
                     )
                 token2id = fold_punct_aliases(official_token2id())
-                voice = cfg.espeak_voice or "en-us"
-                phonemize = make_ipa_phonemizer(voice, espeak_path=cfg.espeak_path)
-                frontend = EspeakFrontend(token2id, phonemize=phonemize)
+                frontend, language = _espeak_frontend(cfg, token2id)
                 pad_id, bos_id, eos_id = 0, None, None
-                # The voice IS the language: "de"/"de-x-..." speaks German even
-                # through an en-trained model, and the agent must be told which.
-                prefix = voice.partition("-")[0].lower()
-                language = prefix if len(prefix) == 2 else _LANG_NAMES.get(prefix, "en")
             else:
                 if not meta:
                     raise ValueError(
@@ -403,11 +408,7 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
                     raise ValueError("icefall/sherpa matcha exports need tts.matcha.tokensPath")
                 token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))
                 if int(meta.get("has_espeak", "0")):
-                    voice = cfg.espeak_voice or meta.get("voice", "en-us")
-                    frontend = EspeakFrontend(
-                        token2id,
-                        phonemize=make_ipa_phonemizer(voice, espeak_path=cfg.espeak_path),
-                    )
+                    frontend, _ = _espeak_frontend(cfg, token2id, meta.get("voice", "en-us"))
                 elif int(meta.get("jieba", "0")):
                     if not cfg.lexicon_path:
                         raise ValueError("this matcha model needs tts.matcha.lexiconPath")
@@ -424,10 +425,7 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
                 eos_id = token2id.get("$") if use_eos_bos else None
                 language = _LANG_NAMES.get(meta.get("language", "").lower())
                 if language is None and isinstance(frontend, LexiconFrontend):
-                    # Every published lexicon/jieba matcha export is Chinese; failing
-                    # open on a re-export's metadata spelling would silently skip the
-                    # digit verbalizer AND the agent's reply-in-zh context.
-                    language = "zh"
+                    language = "zh"  # fail closed: lexicon exports are all Chinese
 
             sample_rate = int(meta.get("sample_rate", str(_SAMPLE_RATE_DEFAULT)))
             out_names = acoustic.output_names()
@@ -487,24 +485,11 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
         if self._vocoder is not None:
             self._vocoder.model.release()
 
-    def _piece_budget(self) -> int:
-        return self._max_len
-
-    def _normalize(self, text: str) -> str:
-        # espeak verbalizes digits itself; the zh lexicon has 零..九 but no "0".."9".
-        return verbalize_numbers_zh(text) if self.spoken_language == "zh" else text
-
-    def _can_speak(self, ch: str) -> bool:
-        return self._frontend.can_speak(ch)
-
     def _synthesize_piece(self, text: str) -> np.ndarray:
-        ids: list[int] = []
-        for seq in self._frontend.sentences(text):
-            if self._bos_id is not None:
-                seq = [self._bos_id, *seq]
-            if self._eos_id is not None:
-                seq = [*seq, self._eos_id]
-            ids.extend(add_blank(seq, self._pad_id))
+        ids = frame_ids(
+            self._frontend, text,
+            bos_id=self._bos_id, eos_id=self._eos_id, pad_id=self._pad_id,
+        )
         if not ids:
             return np.zeros(0, dtype=np.float32)
 
@@ -532,3 +517,247 @@ class MatchaTtsAdapter(OnDeviceTtsAdapter):
                 np.asarray(vouts[2])[0], **self._vocoder.stft,
             )
         return np.asarray(vouts[0], dtype=np.float32).reshape(-1)
+
+
+class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
+    """Static three-graph icefall Matcha: the host bridges durations -> alignment ->
+    tiling -> denorm -> ISTFT between fixed buckets (RKNN cannot express them).
+    The decoder needs a PERIODIC tail - its attention has no time mask. Extension
+    picks the runtime, so an .onnx triple validates the split off-board."""
+
+    output_rate = _SAMPLE_RATE_DEFAULT
+    _label = "Matcha-split"
+
+    def __init__(
+        self,
+        *,
+        encoder: OnDeviceModel,
+        decoder: OnDeviceModel,
+        vocoder: OnDeviceModel,
+        frontend: EspeakFrontend | LexiconFrontend,
+        pad_id: int,
+        bos_id: int | None,
+        eos_id: int | None,
+        language: str,
+        encoder_len: int,
+        mel_len: int,
+        mel_scale: float,
+        mel_bias: float,
+        stft: dict,
+        noise_scale: float,
+        speed: float,
+        max_len: int,
+    ):
+        super().__init__()
+        self._encoder = encoder
+        self._decoder = decoder
+        self._vocoder = vocoder
+        self._frontend = frontend
+        self._pad_id = pad_id
+        self._bos_id = bos_id
+        self._eos_id = eos_id
+        self._encoder_len = encoder_len
+        self._mel_len = mel_len
+        self._mel_scale = mel_scale
+        self._mel_bias = mel_bias
+        self._stft = stft
+        self._noise_scale = noise_scale
+        self._speed = speed
+        self._max_len = max_len
+        self._rng = np.random.default_rng()
+        self._mask = np.ones((1, 1, mel_len), dtype=np.float32)  # decoder sees a full bucket
+        self.spoken_language = language
+        self._log = logger.bind(component="tts-matcha-split")
+
+    @classmethod
+    def from_config(cls, cfg: MatchaTtsConfig) -> SplitMatchaTtsAdapter:
+        missing = [
+            name for name, value in (
+                ("encoderPath", cfg.encoder_path),
+                ("decoderPath", cfg.decoder_path),
+                ("vocoderPath", cfg.vocoder_path),
+                ("tokensPath", cfg.tokens_path),
+            ) if not value
+        ]
+        if missing:
+            raise ValueError(
+                "matcha static split needs tts.matcha." + ", tts.matcha.".join(missing)
+            )
+        # explicit config > meta.json (named or beside the encoder) > ljspeech defaults;
+        # a wrong mel pair is never an error, just audibly wrong audio
+        meta_path = cfg.meta_path or (
+            p if (p := Path(cfg.encoder_path).with_name("meta.json")).is_file() else None  # type: ignore[arg-type]
+        )
+        side: dict = {"encoder_len": 200, "mel_len": 800,
+                      "mel_scale": 2.0661438, "mel_bias": -5.5238085}
+        if meta_path:
+            side.update(json.loads(Path(meta_path).read_text(encoding="utf-8")))
+        encoder_len = cfg.encoder_len or int(side["encoder_len"])
+        mel_len = cfg.mel_len or int(side["mel_len"])
+        mel_scale = cfg.mel_scale if cfg.mel_scale is not None else float(side["mel_scale"])
+        mel_bias = cfg.mel_bias if cfg.mel_bias is not None else float(side["mel_bias"])
+        if mel_len % 4:
+            raise ValueError(
+                "tts.matcha.melLen must be a multiple of 4 (the decoder U-Net downsamples twice)"
+            )
+
+        token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))  # type: ignore[arg-type]
+        # no metadata here: side files pick the frontend; lexicon exports are all zh
+        if cfg.lexicon_path:
+            frontend: EspeakFrontend | LexiconFrontend = LexiconFrontend(
+                load_lexicon(cfg.lexicon_path, token2id), token2id
+            )
+            language = "zh"
+        else:
+            frontend, language = _espeak_frontend(cfg, token2id)
+        pad_id = token2id.get("_", 0)
+        bos_id = token2id.get("^")
+        eos_id = token2id.get("$")
+        if (bos_id is None) != (eos_id is None):
+            raise ValueError("matcha split tokensPath must contain both '^' and '$', or neither")
+        model_kw = dict(
+            core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
+            providers=cfg.execution_providers, provider_options=cfg.provider_options,
+        )
+        with ExitStack() as models:
+            encoder, decoder, vocoder = (
+                models.enter_context(OnDeviceModel(path, **model_kw))  # type: ignore[arg-type]
+                for path in (cfg.encoder_path, cfg.decoder_path, cfg.vocoder_path)
+            )
+            # ONNX exposes static shapes (.rknn does not): catch geometry mismatch at build
+            for model, name, want in (
+                (encoder, "x", (1, encoder_len)),
+                (decoder, "mu_up", (1, 80, mel_len)),
+                (vocoder, "mels", (1, 80, mel_len)),
+            ):
+                shape = model.input_shape(name)
+                if shape is not None and tuple(shape) != want:
+                    raise ValueError(
+                        f"matcha split: graph input {name} is {list(shape)}, "
+                        f"configured geometry wants {list(want)}"
+                    )
+            vmeta = vocoder.metadata()
+            if int(vmeta.get("normalized", "0")):
+                raise ValueError("normalized-STFT vocos exports are not supported")
+            stft = {
+                "n_fft": int(vmeta.get("n_fft", "1024")),
+                "hop_length": int(vmeta.get("hop_length", "256")),
+                "center": bool(int(vmeta.get("center", "1"))),
+            }
+            adapter = cls(
+                encoder=encoder,
+                decoder=decoder,
+                vocoder=vocoder,
+                frontend=frontend,
+                pad_id=pad_id,
+                bos_id=bos_id,
+                eos_id=eos_id,
+                language=language,
+                encoder_len=encoder_len,
+                mel_len=mel_len,
+                mel_scale=mel_scale,
+                mel_bias=mel_bias,
+                stft=stft,
+                noise_scale=cfg.noise_scale,
+                speed=cfg.speed,
+                max_len=cfg.max_len or (40 if language == "zh" else 80),
+            )
+            models.pop_all()
+            return adapter
+
+    def release(self) -> None:
+        for model in (self._encoder, self._decoder, self._vocoder):
+            model.release()
+
+    def _ids(self, text: str) -> list[int]:
+        return frame_ids(
+            self._frontend, text,
+            bos_id=self._bos_id, eos_id=self._eos_id, pad_id=self._pad_id,
+        )
+
+    def _synthesize_piece(self, text: str) -> np.ndarray:
+        ids = self._ids(text)
+        if not ids:
+            return np.zeros(0, dtype=np.float32)
+        if len(ids) > self._encoder_len:
+            # IPA expansion can outrun the char budget; halve, never crop mid-word
+            return self._overflow_retry(
+                text, f"needs {len(ids)} tokens > encoderLen {self._encoder_len}"
+            )
+        x = np.full((1, self._encoder_len), self._pad_id, dtype=np.int64)
+        x[0, :len(ids)] = ids
+        x_length = np.array([len(ids)], dtype=np.int64)
+        mu, logw = self._encoder.run([("x", x), ("x_length", x_length)])
+        mu_up, total = self._length_regulator(mu, logw, len(ids))
+        if total <= 0:
+            return np.zeros(0, dtype=np.float32)
+        if total > self._mel_len:
+            return self._overflow_retry(
+                text, f"predicts {total} mel frames > melLen {self._mel_len}"
+            )
+        # fresh noise at mu_up's length: mu and z tile with ONE period
+        z = (
+            self._rng.standard_normal((1, 80, mu_up.shape[2])).astype(np.float32)
+            * self._noise_scale
+        )
+        mu_in = self._tile_to_bucket(mu_up, self._mel_len)
+        z_in = self._tile_to_bucket(z, self._mel_len)
+        mel_raw = self._decoder.run(
+            [("mu_up", mu_in), ("mask", self._mask), ("z", z_in)]
+        )[0]
+        mel = (
+            np.asarray(mel_raw, dtype=np.float32)[:, :, :total] * self._mel_scale
+            + self._mel_bias
+        )
+        # edge-replicate: zero is a loud, valid log-mel value
+        mel_in = self._edge_to_bucket(mel, self._mel_len)
+        mag, cos, sin = self._vocoder.run([("mels", mel_in)])
+        n_fft, hop = self._stft["n_fft"], self._stft["hop_length"]
+        # frames past total + n_fft/hop cannot touch a kept sample
+        keep = min(self._mel_len, total + max(1, n_fft // hop))
+        wav = istft(
+            np.asarray(mag, dtype=np.float32)[0, :, :keep],
+            np.asarray(cos, dtype=np.float32)[0, :, :keep],
+            np.asarray(sin, dtype=np.float32)[0, :, :keep],
+            **self._stft,
+        )
+        return wav[: total * hop]
+
+    def _overflow_retry(self, text: str, reason: str) -> np.ndarray:
+        if len(text.strip()) <= 1:
+            self._log.warning("Matcha-split: unsplittable piece {}", reason)
+            return np.zeros(0, dtype=np.float32)
+        return self._halve_and_retry(text)
+
+    def _length_regulator(self, mu: np.ndarray, logw: np.ndarray, token_len: int) -> tuple[np.ndarray, int]:
+        mu = np.asarray(mu, dtype=np.float32)
+        logw = np.asarray(logw, dtype=np.float32)
+        # ceil then scale, matching the dynamic graph
+        durations = np.ceil(np.exp(logw[0, 0, :token_len])) * (1.0 / self._speed)
+        total = int(durations.sum())
+        work_len = int(4 * np.ceil(total / 4))
+        if work_len <= 0:
+            return np.zeros((1, 80, 0), dtype=np.float32), 0
+        # the alignment is one-hot per frame: gather, not a dense matmul
+        ends = np.cumsum(durations)
+        idx = np.searchsorted(ends, np.arange(total), side="right")
+        mu_up = np.zeros((1, mu.shape[1], work_len), dtype=np.float32)
+        mu_up[:, :, :total] = mu[:, :, np.minimum(idx, token_len - 1)]
+        return mu_up, total
+
+    @staticmethod
+    def _tile_to_bucket(arr: np.ndarray, bucket: int) -> np.ndarray:
+        if arr.shape[2] <= 0:
+            raise ValueError("cannot pad an empty Matcha sequence")
+        reps = int(np.ceil(bucket / arr.shape[2]))
+        return np.tile(arr, (1, 1, reps))[:, :, :bucket].astype(np.float32, copy=False)
+
+    @staticmethod
+    def _edge_to_bucket(arr: np.ndarray, bucket: int) -> np.ndarray:
+        if arr.shape[2] > bucket:
+            raise ValueError(f"mel length {arr.shape[2]} exceeds bucket {bucket}")
+        if arr.shape[2] == bucket:
+            return arr.astype(np.float32, copy=False)
+        return np.concatenate(
+            [arr, np.repeat(arr[:, :, -1:], bucket - arr.shape[2], axis=2)], axis=2
+        ).astype(np.float32, copy=False)

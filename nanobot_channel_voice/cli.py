@@ -18,11 +18,13 @@ from nanobot_channel_voice import weights as w
 
 
 def _resolve_key(token: str, candidates: dict[str, Any], what: str) -> str:
-    """Exact key, or a unique prefix of one (``stt/whisper-base`` picks the sole
-    platform variant; several -> error listing them)."""
+    """Exact key, or a unique SEGMENT prefix of one (``stt/whisper/base`` picks the
+    sole platform variant; several -> error listing them). Segment-aware, or
+    ``tts/mms/en`` would string-match a sibling family like ``tts/mms/eng/...``."""
     if token in candidates:
         return token
-    hits = sorted(k for k in candidates if k.startswith(token))
+    prefix = token.rstrip("/") + "/"
+    hits = sorted(k for k in candidates if k.startswith(prefix))
     if len(hits) == 1:
         return hits[0]
     if not hits:
@@ -235,7 +237,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("fetch", help="download+verify weights into the store")
-    p.add_argument("keys", nargs="+", metavar="KEY", help="index key or unique prefix")
+    p.add_argument(
+        "keys", nargs="+", metavar="KEY",
+        help="index key or unique prefix (<kind>/<model-path>/<platform>)",
+    )
     p.add_argument("--force", action="store_true", help="refetch even if already installed")
     p.add_argument("-y", "--yes", action="store_true", help="accept license notices non-interactively")
 
@@ -253,7 +258,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-y", "--yes", action="store_true", help="accept license notices non-interactively")
 
     p = sub.add_parser("prune", help="remove fetched weights from the store")
-    p.add_argument("keys", nargs="*", metavar="KEY", help="fetched key or unique prefix")
+    p.add_argument(
+        "keys", nargs="*", metavar="KEY",
+        help="fetched key or unique prefix (<kind>/<model-path>/<platform>)",
+    )
     p.add_argument("--all", action="store_true", help="remove everything in the store")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
 

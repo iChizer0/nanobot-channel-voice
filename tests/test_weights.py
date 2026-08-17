@@ -43,12 +43,13 @@ def _src(tmp_path, name, blob=b"weights!"):
     return p
 
 
-# ---------------------------------------------------------------- keys / index
+# ---- keys / index -----------------------------------------------------------
 
 
 def test_key_shape_is_enforced():
     w.validate_key("stt/whisper-base/hef.hailo-10h")
-    for bad in ("stt/whisper-base", "a/b/c/d", "stt/../etc", "stt//onnx", "/stt/m/p", "stt/m/.p"):
+    w.validate_key("tts/matcha/en-US/ljspeech/rknn.rv1126b")
+    for bad in ("stt/whisper-base", "a/b", "stt/../etc", "stt//onnx", "/stt/m/p", "stt/m/.p"):
         with pytest.raises(w.WeightsError, match="invalid weights key"):
             w.validate_key(bad)
 
@@ -104,7 +105,7 @@ def test_malformed_index_shapes_are_errors_not_tracebacks(store, tmp_path, capsy
     assert "error:" in capsys.readouterr().err
 
 
-# ---------------------------------------------------------------- fetch
+# ---- fetch ------------------------------------------------------------------
 
 
 def test_fetch_file_url_links_and_verifies(store, tmp_path):
@@ -168,7 +169,7 @@ def test_fetch_rejects_unsafe_file_names(store):
             w.fetch("stt/m/onnx", {"files": {name: {"url": "file:///x"}}})
 
 
-# ---------------------------------------------------------------- prune / installed
+# ---- prune / installed ------------------------------------------------------
 
 
 def test_prune_frees_and_drops_empty_parents(store, tmp_path):
@@ -188,7 +189,36 @@ def test_disk_usage_counts_links_not_targets(store, tmp_path):
     assert w.disk_usage(d) < 1 << 16  # the symlink + manifest, not the 1 MiB target
 
 
-# ---------------------------------------------------------------- runtime resolution
+def test_installed_discovers_hierarchical_keys_and_prune_keeps_siblings(store, tmp_path):
+    src = _src(tmp_path, "encoder.onnx")
+    en = "tts/matcha/en-US/ljspeech/rknn.rv1126b"
+    zh = "tts/matcha/zh-CN/baker/rknn.rv1126b"
+    w.fetch(en, _entry_for(src))
+    w.fetch(zh, _entry_for(src))
+
+    assert set(w.installed()) == {en, zh}
+    w.prune(en)
+    assert set(w.installed()) == {zh}
+    assert (store / "tts" / "matcha" / "zh-CN" / "baker" / "rknn.rv1126b").is_dir()
+    assert not (store / "tts" / "matcha" / "en-US").exists()
+
+
+def test_nesting_keys_are_refused_and_ancestor_prune_rejected(store, tmp_path):
+    # Hierarchical keys must never nest: fetch's stale-file sweep (and prune) would
+    # otherwise rmtree the inner key's verified weights.
+    src = _src(tmp_path, "encoder.onnx")
+    child = "tts/matcha/en/ljspeech/onnx"
+    w.fetch(child, _entry_for(src))
+    for nesting in ("tts/matcha/en", "tts/matcha/en/ljspeech/onnx/sub"):
+        with pytest.raises(w.WeightsError, match="nest"):
+            w.fetch(nesting, _entry_for(src))
+    # Pruning an intermediate dir (a never-fetched ancestor) must not delete children.
+    with pytest.raises(w.WeightsError, match="not in the store"):
+        w.prune("tts/matcha/en")
+    assert set(w.installed()) == {child}
+
+
+# ---- runtime resolution -----------------------------------------------------
 
 
 def _fetched_whisper_store(store, tmp_path):
@@ -291,7 +321,7 @@ def test_make_vad_falls_back_when_weights_unfetched(store):
     assert isinstance(make_vad(cfg, 16000, 20), EnergyVad)
 
 
-# ---------------------------------------------------------------- CLI
+# ---- CLI --------------------------------------------------------------------
 
 
 def _write_index(tmp_path, models):

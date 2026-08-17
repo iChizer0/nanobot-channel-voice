@@ -60,7 +60,7 @@ class JapaneseFrontend:
         return self._roman.normalize(kana)
 
 
-# ---- English number verbalization ------------------------------------------
+# ---- English number verbalization -------------------------------------------
 #
 # MMS char vocabs carry few or no digits (mms-tts-eng has "0"-"6", no 7, 8, 9!), so
 # unverbalized numbers are silently mangled: "at 7:45" tokenizes to "4 5", corrupting
@@ -139,7 +139,7 @@ def verbalize_numbers_en(text: str) -> str:
     return _RE_INT.sub(lambda m: _int_words(int(m.group())), text)
 
 
-# ---- Chinese number verbalization ------------------------------------------
+# ---- Chinese number verbalization -------------------------------------------
 #
 # Same failure as English: the matcha zh lexicon voices 零..九 but has no "0".."9"
 # entries, so unverbalized digits are dropped as OOV: exactly the highest-value content.
@@ -205,10 +205,8 @@ def _zh_time_words(m: re.Match) -> str:
     return f"{_zh_int(hour)}点{pad}{_zh_int(minute)}分"
 
 
-# The en patterns anchor on \b, but CJK codepoints are \w so there is NO boundary
-# between 是 and 3 and none of them would ever fire in real Chinese text; these use
-# digit lookarounds instead. Percent is decimal-aware and runs BEFORE decimal, or
-# "3.5%" would lose its integer part to the percent match.
+# \b never fires beside CJK (both \w): anchor on digit lookarounds instead. Percent
+# is decimal-aware and runs BEFORE decimal or "3.5%" loses its integer part.
 _RE_TIME_ZH = re.compile(r"(?<!\d)(\d{1,2})[:：]([0-5]\d)(?!\d)")
 _RE_GROUPED_ZH = re.compile(r"(?<!\d)\d{1,3}(?:,\d{3})+(?!\d)")
 _RE_PERCENT_ZH = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*[%％]")

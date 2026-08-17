@@ -1,11 +1,6 @@
-"""espeak-ng IPA phonemization for the phoneme-input TTS engines (matcha).
-
-Resolution ladder: an explicit ``espeakPath`` binary -> the system binary -> the
-``[espeak]`` extra's ``espeakng-loader`` wheel, which bundles libespeak-ng + its data
-so boards WITHOUT a package manager still phonemize (note: espeak-ng itself is GPL-3;
-the extra is optional and never imported unless the binaries are absent). The library
-route drives the stable public C API (``espeak_TextToPhonemes``) via ctypes.
-"""
+"""espeak-ng IPA phonemization for matcha. Ladder: ``espeakPath`` binary -> system
+binary -> the ``[espeak]`` extra's espeakng-loader wheel (bundled GPL-3 libespeak-ng
++ data, for boards without a package manager), driven via ctypes."""
 
 from __future__ import annotations
 
@@ -19,27 +14,24 @@ from pathlib import Path
 
 _TIMEOUT_S = 10.0
 
-# espeak-ng/speak_lib.h constants (public API, unchanged for ~15 years).
+# speak_lib.h constants
 _AUDIO_OUTPUT_SYNCHRONOUS = 2
-_INITIALIZE_DONT_EXIT = 0x8000  # a bad data path otherwise exit(1)s the process
+_INITIALIZE_DONT_EXIT = 0x8000  # bad data path otherwise exit(1)s the process
 _CHARS_UTF8 = 1
 _PHONEMES_IPA = 0x02
 
-# The bundled 1.52.0 keeps the data path in a 160-byte buffer and snprintf-TRUNCATES:
-# init "succeeds" into a broken state and later calls crash. Symlink-shorten past it.
+# bundled 1.52.0 snprintf-truncates data paths at 160 bytes into a crashing state
 _MAX_DATA_PATH = 140
 
-_lock = threading.Lock()  # espeak-ng has pervasive global state: one call at a time
+_lock = threading.Lock()  # espeak has global state: one call at a time
 _lib: ctypes.CDLL | None = None  # one espeak_Initialize per process, ever
 _lib_voice: str | None = None
 
 
 def make_ipa_phonemizer(voice: str, *, espeak_path: str | None = None) -> Callable[[str], str]:
-    """Build text -> IPA (espeak ``--ipa`` form, one clause per line). Probed once
-    here so a bad binary path, voice, or library fails at BUILD time - where the
-    registry can fall back to system TTS - not per synthesized chunk, where the
-    on-device shell swallows errors into a permanently silent channel. Raises
-    RuntimeError naming the fix."""
+    """text -> IPA (espeak ``--ipa`` form, one clause per line). Probed once here so
+    a bad path/voice/library fails at BUILD time (registry falls back to system TTS),
+    not per chunk where the shell swallows errors into a silent channel."""
     if espeak_path and not (os.path.isfile(espeak_path) and os.access(espeak_path, os.X_OK)):
         raise RuntimeError(f"tts espeakPath '{espeak_path}' is not an executable file")
     exe = espeak_path or shutil.which("espeak-ng") or shutil.which("espeak")
@@ -111,8 +103,7 @@ def _load_library() -> ctypes.CDLL:
 
 
 def _shorten_data_path(data: Path) -> Path:
-    # A fresh mkdtemp per process: unique and 0700, so there is no fixed /tmp name
-    # to race another process (or user) over, and nothing pre-existing to trust.
+    # fresh mkdtemp: unique + 0700, no fixed /tmp name to race or trust
     import tempfile
 
     link = Path(tempfile.mkdtemp(prefix="nb-espeak-")) / "data"
@@ -133,8 +124,7 @@ def _library_phonemizer(lib: ctypes.CDLL, voice: str) -> Callable[[str], str]:
                 if lib.espeak_SetVoiceByName(voice.encode()) != 0:
                     raise RuntimeError(f"espeak-ng: unknown voice '{voice}'")
                 _lib_voice = voice
-            # TextToPhonemes consumes one clause per call, advancing the pointer
-            # and NULLing it at end of text.
+            # one clause per call; the pointer advances and NULLs at end of text
             buf = ctypes.create_string_buffer(text.encode("utf-8"))
             ptr = ctypes.c_void_p(ctypes.addressof(buf))
             clauses = []
