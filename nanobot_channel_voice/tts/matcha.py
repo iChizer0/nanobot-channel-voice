@@ -1,8 +1,10 @@
-"""On-device Matcha-TTS (``tts.provider="matcha"``), both export dialects detected
-from the graph: OFFICIAL (``scales`` input, in-code symbol table, optional embedded
+"""On-device Matcha-TTS (``tts.provider="matcha"``), export dialects detected from
+the graph: OFFICIAL (``scales`` input, in-code symbol table, optional embedded
 vocoder -> direct wav) and icefall/sherpa (metadata-driven front-end, tokens.txt
-[+ lexicon.txt for zh], mel out). Mel needs ``vocoderPath``: Vocos (mag/cos/sin ->
-host ISTFT) or any single-output waveform vocoder. Imported lazily by make_tts.
+[+ lexicon.txt for zh], mel out) — including the bilingual zh-en flavour
+(``voice: "zh en-us"``: lexicon zh + espeak English, no blank interleave). Mel needs
+``vocoderPath``: Vocos (mag/cos/sin -> host ISTFT) or any single-output waveform
+vocoder. Imported lazily by make_tts.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?:(?<=[。！？…])(?![。！？…])|(?<=[
 _CLAUSE_SPLIT_RE = re.compile(r"([、，；：]|[,;:](?=\s|$))")
 _SENTENCE_PUNCT = ".!?…。！？"
 _LANG_SWITCH_RE = re.compile(r"\([a-z0-9-]+\)")  # espeak "(zh)" language-switch flags
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']*")  # = LexiconFrontend's Latin runs
 
 # Verbatim official symbol table; list position IS the embedding id
 _OFFICIAL_PUNCTUATION = ';:,.!?¡¿—…"«»“” '
@@ -117,16 +120,17 @@ def add_blank(ids: list[int], pad_id: int) -> list[int]:
 
 def frame_ids(
     frontend: EspeakFrontend | LexiconFrontend, text: str, *,
-    bos_id: int | None, eos_id: int | None, pad_id: int,
+    bos_id: int | None, eos_id: int | None, pad_id: int, interleave: bool = True,
 ) -> list[int]:
-    """Per-sentence bos/eos framing + blank interleave (shared by both adapters)."""
+    """Per-sentence bos/eos framing + blank interleave (shared by both adapters);
+    the zh-en dialect trains without the interleave."""
     ids: list[int] = []
     for seq in frontend.sentences(text):
         if bos_id is not None:
             seq = [bos_id, *seq]
         if eos_id is not None:
             seq = [*seq, eos_id]
-        ids.extend(add_blank(seq, pad_id))
+        ids.extend(add_blank(seq, pad_id) if interleave else seq)
     return ids
 
 
@@ -262,21 +266,82 @@ class EspeakFrontend:
         return ans
 
 
+# sherpa-onnx kReplacements (PR #2853): the zh-en model trains English on a folded
+# espeak alphabet — diphthongs are single symbols, bare e/g/r never occur.
+_ZH_EN_IPA_FOLD = (
+    ("ɝ", "ɜɹ"), ("ɚ", "əɹ"),
+    ("eɪ", "A"), ("aɪ", "I"), ("ɔɪ", "Y"), ("oʊ", "O"), ("əʊ", "O"), ("aʊ", "W"),
+    ("tʃ", "ʧ"), ("dʒ", "ʤ"), ("ː", ""), ("g", "ɡ"), ("r", "ɹ"), ("e", "ɛ"),
+)
+_IPA_CACHE_CAP = 4096
+
+
+class EnglishToIpa:
+    """Word -> token ids for the bilingual zh-en table: espeak IPA folded to the
+    trained alphabet. Same shape as EnglishToPinyin, so LexiconFrontend cannot
+    tell native English from transliteration."""
+
+    def __init__(self, token2id: dict[str, int], phonemize: Callable[[str], str]):
+        self._token2id = token2id
+        self._phonemize = phonemize
+        self._cache: dict[str, list[int]] = {}
+
+    def _fold_ids(self, ipa: str) -> list[int]:
+        ipa = _LANG_SWITCH_RE.sub("", ipa)
+        for src, dst in _ZH_EN_IPA_FOLD:
+            ipa = ipa.replace(src, dst)
+        return [self._token2id[ch] for ch in ipa if ch in self._token2id]
+
+    def _put(self, word: str, ids: list[int]) -> list[int]:
+        if len(self._cache) >= _IPA_CACHE_CAP:
+            self._cache.clear()
+        self._cache[word] = ids
+        return ids
+
+    def prime(self, words: list[str]) -> None:
+        """Batch-phonemize uncached words in ONE espeak call — subprocess espeak
+        spawns per call, so a fresh English clause would otherwise spawn per word."""
+        fresh = list(dict.fromkeys(w for w in words if w not in self._cache))
+        if len(fresh) < 2:
+            return
+        try:
+            lines = self._phonemize("\n".join(fresh)).splitlines()
+        except Exception:  # noqa: BLE001 - the per-word path reports instead
+            return
+        if len(lines) != len(fresh):
+            return  # espeak re-claused the batch: per-word calls stay correct
+        for word, ipa in zip(fresh, lines):
+            self._put(word, self._fold_ids(ipa))
+
+    def word_ids(self, word: str) -> list[int]:
+        ids = self._cache.get(word)
+        if ids is None:
+            try:
+                ids = self._put(word, self._fold_ids(self._phonemize(word)))
+            except Exception:  # noqa: BLE001 - espeak hiccup drops the word, not the chunk
+                return []
+        return ids
+
+
 class LexiconFrontend:
     """Text -> per-sentence token ids by greedy longest lexicon match, single chars
     falling back to the token table; OOV drops, the speakability guard reports.
-    With an ``english`` fallback, Latin word runs voice as Mandarin letter
-    readings / pinyin transliteration instead of dropping (see pinyin_english)."""
+    With an ``english`` resolver, Latin word runs voice through it instead of
+    dropping: pinyin transliteration (see pinyin_english) or the zh-en model's
+    real espeak English. ``latin_space_id`` mirrors sherpa's zh-en frontend: the
+    id emitted after every voiced Latin word, before whatever follows."""
 
     def __init__(
         self,
         word2ids: dict[str, list[int]],
         token2id: dict[str, int],
-        english: EnglishToPinyin | None = None,
+        english: EnglishToPinyin | EnglishToIpa | None = None,
+        latin_space_id: int | None = None,
     ):
         self._word2ids = word2ids
         self._token2id = token2id
         self._english = english if english else None  # falsy = no resolvable letters
+        self._latin_space_id = latin_space_id
         # longest key per first char: one long entry must not slow every position
         self._max_by_first: dict[str, int] = {}
         for word in word2ids:
@@ -294,6 +359,17 @@ class LexiconFrontend:
         if len(low) != len(text):
             text = low  # exotic case-fold expansion: keep alignment, forfeit case
         ids: list[int] = []
+        after_latin = False
+
+        def emit(seq: list[int], latin: bool = False) -> None:
+            nonlocal after_latin
+            if not seq:
+                return
+            if after_latin and self._latin_space_id is not None:
+                ids.append(self._latin_space_id)
+            ids.extend(seq)
+            after_latin = latin
+
         i = 0
         while i < len(low):
             if self._english is not None and "a" <= low[i] <= "z":
@@ -303,24 +379,27 @@ class LexiconFrontend:
                 j = i + 1
                 while j < len(low) and ("a" <= low[j] <= "z" or low[j] == "'"):
                     j += 1
-                ids.extend(self._english.word_ids(text[i:j].replace("'", "")))
+                emit(self._english.word_ids(text[i:j]), latin=True)
                 i = j
                 continue
             longest = self._max_by_first.get(low[i], 0)
             for ln in range(min(longest, len(low) - i), 0, -1):
                 cand = low[i : i + ln]
                 if cand in self._word2ids:
-                    ids.extend(self._word2ids[cand])
+                    emit(self._word2ids[cand])
                     i += ln
                     break
             else:
                 ch = low[i]
                 if ch in self._token2id and not ch.isspace():
-                    ids.append(self._token2id[ch])
+                    emit([self._token2id[ch]])
                 i += 1
         return ids
 
     def sentences(self, text: str) -> list[list[int]]:
+        prime = getattr(self._english, "prime", None)
+        if prime is not None:
+            prime(_LATIN_WORD_RE.findall(text))
         return [ids for body, punct in _sentences(text) if (ids := self._tokenize(body + punct))]
 
 
@@ -443,6 +522,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         frontend: EspeakFrontend | LexiconFrontend,
         official: bool,                  # official export (scales input) vs icefall
         length_input: str,               # "x_lengths" (official) / "x_length" (icefall)
+        interleave: bool,                # blank-interleave ids (all dialects but zh-en)
         sample_rate: int,
         pad_id: int,
         bos_id: int | None,              # None => no bos/eos framing
@@ -462,6 +542,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         self._frontend = frontend
         self._official = official
         self._length_input = length_input
+        self._interleave = interleave
         self._pad_id = pad_id
         self._bos_id = bos_id
         self._eos_id = eos_id
@@ -505,6 +586,8 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             meta = acoustic.metadata()
 
             frontend: EspeakFrontend | LexiconFrontend
+            interleave = True
+            languages: tuple[str, ...] | None = None
             if official:
                 # the official table is code; a supplied file cannot match the embedding
                 if cfg.tokens_path:
@@ -524,7 +607,28 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 if not cfg.tokens_path:
                     raise ValueError("icefall/sherpa matcha exports need tts.matcha.tokensPath")
                 token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))
-                if int(meta.get("has_espeak", "0")):
+                if meta.get("voice") == "zh en-us":
+                    # dengcunqin bilingual (sherpa is_zh_en): zh via lexicon, English
+                    # via espeak IPA folded to the trained alphabet, no interleave.
+                    # espeak is mandatory here — English is half the model.
+                    if not cfg.lexicon_path:
+                        raise ValueError("this matcha model needs tts.matcha.lexiconPath")
+                    if cfg.espeak_voice:
+                        logger.warning(
+                            "voice: tts.matcha.espeakVoice is ignored for the zh-en "
+                            "model (its English is trained on en-us phonemes)"
+                        )
+                    frontend = LexiconFrontend(
+                        load_lexicon(cfg.lexicon_path, token2id), token2id,
+                        english=EnglishToIpa(
+                            token2id,
+                            make_ipa_phonemizer("en-us", espeak_path=cfg.espeak_path),
+                        ),
+                        latin_space_id=token2id.get(" "),
+                    )
+                    interleave = False
+                    languages = ("zh", "en")  # zh-primary (numbers, prologue), truly both
+                elif int(meta.get("has_espeak", "0")):
                     frontend, _ = _espeak_frontend(cfg, token2id, meta.get("voice", "en-us"))
                 elif int(meta.get("jieba", "0")):
                     if not cfg.lexicon_path:
@@ -585,6 +689,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 frontend=frontend,
                 official=official,
                 length_input=length_input,
+                interleave=interleave,
                 sample_rate=sample_rate,
                 pad_id=pad_id,
                 bos_id=bos_id,
@@ -600,6 +705,8 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                     denoiser_bias(vocoder, cfg.denoiser_strength) if vocoder else None
                 ),
             )
+            if languages:
+                adapter.spoken_languages = languages
             models.pop_all()  # success: the adapter owns the models now
             return adapter
 
@@ -612,6 +719,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         ids = frame_ids(
             self._frontend, text,
             bos_id=self._bos_id, eos_id=self._eos_id, pad_id=self._pad_id,
+            interleave=self._interleave,
         )
         if not ids:
             return np.zeros(0, dtype=np.float32)

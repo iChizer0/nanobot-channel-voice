@@ -203,6 +203,183 @@ def test_istft_inverts_a_forward_stft():
     assert np.allclose(out[:n], signal[:n], atol=1e-4)
 
 
+# ---- the bilingual zh-en dialect --------------------------------------------
+
+
+def test_english_to_ipa_folds_to_the_trained_alphabet():
+    from nanobot_channel_voice.tts.matcha import EnglishToIpa
+
+    tokens = {"h": 1, "ə": 2, "l": 3, "O": 4, "ˈ": 5, "ɛ": 6, "ɡ": 7, "ɹ": 8,
+              "ʧ": 9, "A": 10, "t": 11, "i": 12, "d": 13}
+    ipa = {"hello": "həlˈoʊ", "great": "ɡɹˈeɪt", "teach": "tˈiːtʃ", "red": "rˈɛd", "e": "e"}
+    e2i = EnglishToIpa(tokens, phonemize=lambda w: ipa[w])
+    assert e2i.word_ids("hello") == [1, 2, 3, 5, 4]        # oʊ -> O
+    assert e2i.word_ids("great") == [7, 8, 5, 10, 11]      # eɪ -> A; g/r fold to ɡ/ɹ
+    assert e2i.word_ids("teach") == [11, 5, 12, 9]         # ː stripped, tʃ -> ʧ
+    assert e2i.word_ids("red") == [8, 5, 6, 13]
+    assert e2i.word_ids("e") == [6]                        # bare e never trained: -> ɛ
+
+
+def test_english_to_ipa_drops_the_word_on_espeak_failure():
+    from nanobot_channel_voice.tts.matcha import EnglishToIpa
+
+    def boom(_word: str) -> str:
+        raise OSError("espeak died")
+
+    assert EnglishToIpa({"h": 1}, phonemize=boom).word_ids("hello") == []
+
+
+def test_english_words_prime_in_one_espeak_call():
+    """Subprocess espeak spawns per call: a fresh English clause must batch."""
+    from nanobot_channel_voice.tts.matcha import EnglishToIpa
+
+    tokens = {"h": 1, "i": 2, "O": 3, " ": 9, "。": 8}
+    ipa = {"hi": "hi", "ho": "hoʊ"}
+    calls: list[str] = []
+
+    def phonemize(text: str) -> str:
+        calls.append(text)
+        return "\n".join(ipa[w] for w in text.split("\n"))
+
+    fe = LexiconFrontend({}, tokens, english=EnglishToIpa(tokens, phonemize),
+                         latin_space_id=9)
+    (seq,) = fe.sentences("hi ho。")
+    assert seq == [1, 2, 9, 1, 3, 9, 8]
+    assert calls == ["hi\nho"]          # one batch, no per-word spawns
+    fe.sentences("ho hi。")
+    assert calls == ["hi\nho"]          # everything served from the cache
+
+
+def test_prime_recovers_per_word_when_espeak_reclauses():
+    from nanobot_channel_voice.tts.matcha import EnglishToIpa
+
+    calls: list[str] = []
+
+    def phonemize(text: str) -> str:
+        calls.append(text)
+        if "\n" in text:
+            return "hi"  # espeak merged the batch: line count lies
+        return {"hi": "hi", "ho": "hoʊ"}[text]
+
+    e2i = EnglishToIpa({"h": 1, "i": 2, "O": 3}, phonemize)
+    e2i.prime(["hi", "ho"])
+    assert e2i.word_ids("hi") == [1, 2] and e2i.word_ids("ho") == [1, 3]
+    assert calls == ["hi\nho", "hi", "ho"]  # batch rejected, per-word correct
+
+
+def test_lexicon_inserts_the_latin_space_like_sherpa():
+    """A space id follows every voiced Latin word — before the next English word,
+    a zh run, or punctuation alike (sherpa MatchaTtsLexicon parity)."""
+    from nanobot_channel_voice.tts.matcha import EnglishToIpa
+
+    tokens = {"。": 44, " ": 1, "h": 20, "i": 21}
+    lex = {"你": [10], "好": [11], "你好": [10, 11]}
+    fe = LexiconFrontend(
+        lex, tokens,
+        english=EnglishToIpa(tokens, phonemize=lambda _w: "hi"),
+        latin_space_id=1,
+    )
+    (seq,) = fe.sentences("hi hi你好 hi。")
+    assert seq == [20, 21, 1, 20, 21, 1, 10, 11, 20, 21, 1, 44]
+
+
+def test_frame_ids_interleave_off_keeps_plain_sequences():
+    from nanobot_channel_voice.tts.matcha import frame_ids
+
+    class _Fe:
+        def sentences(self, _text):
+            return [[5, 6], [7]]
+
+    assert frame_ids(_Fe(), "x", bos_id=None, eos_id=None, pad_id=0,
+                     interleave=False) == [5, 6, 7]
+    assert frame_ids(_Fe(), "x", bos_id=1, eos_id=2, pad_id=0,
+                     interleave=False) == [1, 5, 6, 2, 1, 7, 2]
+
+
+def test_from_config_detects_the_bilingual_zh_en_export(monkeypatch, tmp_path):
+    """voice: "zh en-us" metadata (no jieba/has_espeak keys) selects the hybrid
+    frontend, kills the interleave, and declares both languages."""
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts import matcha
+
+    (tmp_path / "tokens.txt").write_text(
+        " 1\n, 4\n。 44\nh 20\ni 21\nni3 30\nhao3 31\n", encoding="utf-8"
+    )
+    (tmp_path / "lexicon.txt").write_text(
+        "你 ni3\n好 hao3\n你好 ni3 hao3\n", encoding="utf-8"
+    )
+
+    class FakeModel:
+        def __init__(self, path, **_kw):
+            self.path = path
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def release(self):
+            pass
+
+        def input_specs(self):
+            if "acoustic" in self.path:
+                return [("x", 0, 0), ("x_length", 0, 0),
+                        ("noise_scale", 0, 0), ("length_scale", 0, 0)]
+            return [("mels", 0, 0)]
+
+        def metadata(self):
+            if "acoustic" in self.path:
+                # the real model's exact keys: use_eos_bos lies (no ^/$ in tokens)
+                return {"voice": "zh en-us", "language": "chinese English",
+                        "sample_rate": "16000", "pad_id": "0", "use_eos_bos": "1"}
+            return {}
+
+        def output_names(self):
+            return ["mel"] if "acoustic" in self.path else ["mag", "x", "y"]
+
+        def input_shape(self, _name):
+            return None
+
+        def run(self, inputs):
+            self.calls.append(inputs)
+            if "acoustic" in self.path:
+                return [np.zeros((1, 80, 4), np.float32)]
+            return [np.ones((1, 513, 4), np.float32)] * 3
+
+    monkeypatch.setattr(matcha, "OnDeviceModel", FakeModel)
+    voices: list[str] = []
+    monkeypatch.setattr(
+        matcha, "make_ipa_phonemizer",
+        lambda voice, **_k: voices.append(voice) or (lambda _w: "hi"),
+    )
+    base = {
+        "acousticModelPath": str(tmp_path / "acoustic.onnx"),
+        "vocoderPath": str(tmp_path / "vocos.onnx"),
+        "tokensPath": str(tmp_path / "tokens.txt"),
+    }
+    with pytest.raises(ValueError, match="lexiconPath"):
+        matcha.MatchaTtsAdapter.from_config(MatchaTtsConfig.model_validate(base))
+
+    cfg = MatchaTtsConfig.model_validate(
+        base | {"lexiconPath": str(tmp_path / "lexicon.txt"), "espeakVoice": "de"}
+    )
+    tts = matcha.MatchaTtsAdapter.from_config(cfg)
+    assert voices == ["en-us"]  # the fold table is en-us-trained: espeakVoice ignored
+    assert tts.spoken_language == "zh" and tts.spoken_languages == ("zh", "en")
+    assert tts.output_rate == 16000
+    assert tts._bos_id is None and tts._eos_id is None
+    # no vocos metadata -> sherpa's own defaults (verified against its C++ source)
+    assert tts._vocoder.stft == {"n_fft": 1024, "hop_length": 256, "center": True}
+
+    wav = tts._synthesize_piece("hi你好。")
+    assert wav.size > 0
+    x = tts._acoustic.calls[0][0][1]
+    # h i _sp ni3 hao3 。 — hybrid English + latin space, and NO blank interleave
+    assert x.tolist() == [[20, 21, 1, 30, 31, 44]]
+
+
 # ---- adapter verdicts and normalization -------------------------------------
 
 
@@ -677,7 +854,7 @@ def _waveform_adapter(vocoder_model, bias):
 
     return MatchaTtsAdapter(
         acoustic=Acoustic(), vocoder=VocoderSpec(vocoder_model, "mels", None),
-        frontend=Frontend(), official=False, length_input="x_length",
+        frontend=Frontend(), official=False, length_input="x_length", interleave=True,
         sample_rate=22050, pad_id=0, bos_id=None, eos_id=None, spk_input=None,
         speaker_id=0, noise_scale=0.667, speed=1.0, max_len=300, language="en",
         denoise_bias=bias,

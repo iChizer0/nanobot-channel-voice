@@ -201,7 +201,7 @@ python -m matcha.onnx.export matcha_ljspeech.ckpt matcha_ljspeech_hifigan.onnx \
 
 Timbre: `--n-timesteps` (ODE steps) is baked at export — 5 is the export default, upstream's demo runs 10, 3 audibly flattens prosody; only the small flow decoder scales with it. Upstream's CLI also denoises HiFi-GAN output but its ONNX export doesn't, so the plugin applies the same spectral denoiser host-side to separate waveform vocoders (`denoiserStrength`, default 0.00025, 0 = off) — an embedded vocoder can't be probed for its bias and keeps a faint hiss, making mel-only + `vocoderPath` the higher-fidelity route; Vocos has no such bias and needs none. `speed` (>1 = faster) and `noiseScale` (flow temperature, default 0.667; lower = cleaner but flatter, higher = breathier) tune delivery.
 
-The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata), and `matcha-icefall-zh-baker` is currently the only Chinese option (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically). Embedded English is voiced as Mandarin nativizes it — acronyms spell as the letter readings (USB → you-ai-si-bi), words transliterate through espeak IPA to the nearest pinyin syllables (hello → he-lou, python → pai-sen; letters-only without any espeak) — a loanword accent that makes "打开 WiFi" speakable, not bilingual synthesis; full English replies still belong on an English engine:
+The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata). For pure Chinese, `matcha-icefall-zh-baker` (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically). Embedded English is voiced as Mandarin nativizes it — acronyms spell as the letter readings (USB → you-ai-si-bi), words transliterate through espeak IPA to the nearest pinyin syllables (hello → he-lou, python → pai-sen; letters-only without any espeak) — a loanword accent that makes "打开 WiFi" speakable, not bilingual synthesis:
 
 ```json
 "tts": {
@@ -215,7 +215,21 @@ The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/s
 }
 ```
 
-**Bilingual (en + zh)**: `matcha.secondary` loads a second complete matcha engine for the other script — text routes per script run (CJK runs to the zh engine, Latin to the en one, digits/punctuation riding along), the agent is told it may reply in either language, and one Vocos session serves both when the dynamic engines name the same `vocoderPath` (measured ~+54 MB over a single engine). Each language speaks in its own checkpoint's voice, so code-switching mid-sentence switches voices — the G2P fallback above stays single-voice if that matters more:
+**Bilingual in one voice (zh + en)**: [`matcha-icefall-zh-en`](https://huggingface.co/csukuangfj/matcha-icefall-zh-en) speaks real English natively — Chinese through its lexicon, English through espeak IPA (espeak is mandatory here, not a fallback tier, and the voice is fixed to en-us — the phoneme set the model was trained on) — so code-switching keeps one voice with no engine seam. 16 kHz, single speaker; the agent is told it may reply in either language, digits verbalize to 汉字. The bundled zh normalization FSTs are not used (the plugin's own verbalizer covers numbers); its `espeak-ng-data` copy is also unused — the resolved espeak install supplies the data:
+
+```json
+"tts": {
+  "provider": "matcha",
+  "matcha": {
+    "acousticModelPath": "model/matcha-icefall-zh-en/model-steps-3.onnx",
+    "vocoderPath": "model/vocos-16khz-univ.onnx",
+    "tokensPath": "model/matcha-icefall-zh-en/tokens.txt",
+    "lexiconPath": "model/matcha-icefall-zh-en/lexicon.txt"
+  }
+}
+```
+
+**Bilingual in two voices (en + zh)**: `matcha.secondary` loads a second complete matcha engine for the other script — text routes per script run (CJK runs to the zh engine, Latin to the en one, digits/punctuation riding along), the agent is told it may reply in either language, and one Vocos session serves both when the dynamic engines name the same `vocoderPath` (measured ~+54 MB over a single engine). Each language speaks in its own checkpoint's voice, so code-switching mid-sentence switches voices — the zh-en model above stays single-voice if that matters more:
 
 ```json
 "tts": {
