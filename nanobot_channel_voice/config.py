@@ -568,7 +568,10 @@ class PrologueConfig(_VoiceBase):
     real speech; keep phrases short (the half-duplex mic is gated while one plays)."""
 
     enabled: bool = False
-    after_ms: int = Field(default=2000, ge=0)        # THINKING silence before filler 1
+    # Floor for filler 1: the live delay stretches past the session's typical
+    # first-reply latency (EMA), so fillers mark anomalous waits, not ordinary
+    # generation (filler + instant answer reads as broken).
+    after_ms: int = Field(default=2000, ge=0)
     interval_ms: int = Field(default=8000, ge=1000)  # re-filler cadence during long waits
     # Escalation script; None = built-ins matched to the TTS engine's language (an
     # on-device engine speaks exactly one, and English through a zh lexicon is silence).

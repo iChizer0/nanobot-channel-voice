@@ -71,10 +71,18 @@ def _primary_cut(buf: str) -> int:
 
 
 def _secondary_cut(buf: str, min_chars: int) -> int:
-    """Index of the first clause boundary at/after ``min_chars``, or -1."""
+    """Index of the first clause boundary at/after ``min_chars``, or -1. A
+    separator BETWEEN digits (1,902,567 / 7:45) is number punctuation, not a
+    clause: cutting there mangles the reading and can strand a digits-only
+    chunk on the wrong bilingual engine. Digit+separator at the buffer END is
+    the same case mid-arrival, so it waits for the next delta to disambiguate
+    (mirrors the primary cut's trailing-terminator hold)."""
     for i in range(min_chars - 1, len(buf)):
-        if buf[i] in _SECONDARY:
-            return i
+        if buf[i] not in _SECONDARY:
+            continue
+        if i > 0 and buf[i - 1].isdigit() and (i + 1 == len(buf) or buf[i + 1].isdigit()):
+            continue
+        return i
     return -1
 
 

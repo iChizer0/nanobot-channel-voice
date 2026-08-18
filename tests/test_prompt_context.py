@@ -85,7 +85,9 @@ def test_block_is_wrapped_and_names_the_engine_language():
 
 def test_context_nudges_pre_tool_narration():
     [block] = _voice_context_blocks(_FakeTts("en"))
-    assert "tools that may take more than a moment" in block.content
+    assert "tool work that will keep the user waiting" in block.content
+    assert "Skip that sentence" in block.content  # fast answers narrate NOTHING
+    assert "begin with the answer itself" in block.content  # no throat-clearing
 
 
 def test_unrestricted_engine_claims_no_language():

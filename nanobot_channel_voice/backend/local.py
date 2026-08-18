@@ -149,12 +149,17 @@ def _swallow_result(task: asyncio.Task) -> None:
 # prologue.phrases=None: built-ins keyed to the TTS engine's language — every on-device
 # engine speaks exactly one, and an unspeakable phrase synthesizes to silence.
 _PROLOGUE_BUILTINS = {
-    "zh": ["稍等。", "还在处理中。"],
-    "ja": ["少々お待ちください。", "まだ作業中です。"],
-    "ko": ["잠시만요.", "아직 처리 중입니다."],
-    "de": ["Einen Moment.", "Ich arbeite noch daran."],
+    "zh": ["稍等。", "还在处理中。", "还需要一点时间。"],
+    "ja": ["少々お待ちください。", "まだ作業中です。", "もう少し時間がかかりそうです。"],
+    "ko": ["잠시만요.", "아직 처리 중입니다.", "시간이 조금 더 걸릴 것 같습니다."],
+    "de": ["Einen Moment.", "Ich arbeite noch daran.", "Es dauert noch einen Moment."],
 }
-_PROLOGUE_FALLBACK = ["One moment.", "Still working on it."]
+_PROLOGUE_FALLBACK = ["One moment.", "Still working on it.", "This is taking a little longer."]
+
+# First-filler delay stretches to this multiple of the session's typical
+# first-reply latency: a filler at TYPICAL latency collides ("One moment." +
+# the answer back-to-back) and delays the reply behind its own audio.
+_PROLOGUE_TTFT_FACTOR = 1.5
 
 
 def _prologue_phrases(configured: list[str] | None, language: str | None) -> list[str]:
@@ -447,6 +452,7 @@ class LocalBackend(TurnEventMixin):
         self._prologue_phrases = _prologue_phrases(
             config.prologue.phrases, getattr(tts, "spoken_language", None)
         )
+        self._first_reply_ema: float | None = None  # ms; feeds _prologue_delay_ms
         self._sink = sink
         self._transcribe = transcribe
         self._publish_text = publish_text
@@ -2259,6 +2265,7 @@ class LocalBackend(TurnEventMixin):
             self._cur_turn.await_first_token = False
             first_ms = (time.monotonic() - self._cur_turn.published_at) * 1000.0
             self._metrics.observe("agent_first_token_ms", first_ms)
+            self._note_first_reply(first_ms)
             self._log.info("first_token ({} ms after publish)", int(first_ms))
         if self._cur_turn.continuation_pending:
             # First post-tool token: re-anchor so the resumed segment's audio lands in
@@ -2302,6 +2309,12 @@ class LocalBackend(TurnEventMixin):
         """A non-streamed final assistant message (streaming disabled / fallback)."""
         self._cancel_prologue()
         self._cancel_midturn()
+        if self._cur_turn.await_first_token and self._cur_turn.published_at:
+            # Non-streaming: the whole generation IS the wait the filler masks.
+            self._cur_turn.await_first_token = False
+            self._note_first_reply(
+                (time.monotonic() - self._cur_turn.published_at) * 1000.0
+            )
         await self._set_turn(VoiceState.SPEAKING)
         self._duck_if_capturing()
         for chunk in self._chunker.feed(text):
@@ -2591,6 +2604,23 @@ class LocalBackend(TurnEventMixin):
     def _cancel_prologue(self) -> None:
         self._cur_turn.cancel_prologue()
 
+    def _note_first_reply(self, ms: float) -> None:
+        """Feed the filler-delay EMA. Sample clamped: one pathological turn must
+        not push the filler horizon out for the rest of the session."""
+        sample = min(ms, 15000.0)
+        ema = self._first_reply_ema
+        self._first_reply_ema = sample if ema is None else 0.3 * sample + 0.7 * ema
+
+    def _prologue_delay_ms(self, initial_ms: int | None) -> float:
+        """First-filler delay: ``afterMs`` is the floor, stretched past the
+        session's typical first-reply latency so fillers mark ANOMALOUS waits
+        (tool runs, long thinking), not ordinary generation."""
+        if initial_ms is not None:
+            return float(initial_ms)
+        base = float(self._cfg.prologue.after_ms)
+        ema = self._first_reply_ema
+        return base if ema is None else max(base, _PROLOGUE_TTFT_FACTOR * ema)
+
     def _arm_midturn(self, spoke: bool) -> None:
         """Arm the tool-boundary watcher after a ``resuming`` stream end."""
         self._cancel_midturn()
@@ -2705,7 +2735,7 @@ class LocalBackend(TurnEventMixin):
         the script: nothing was said."""
         try:
             cfg = self._cfg.prologue
-            await asyncio.sleep((cfg.after_ms if initial_ms is None else initial_ms) / 1000)
+            await asyncio.sleep(self._prologue_delay_ms(initial_ms) / 1000)
             step = start_step
             while (
                 not self._closing

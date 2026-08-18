@@ -20,7 +20,7 @@ def test_script_runs_split_by_script_with_neutral_riders():
     ]
     assert script_runs("Hello 世界 42.") == [(False, "Hello "), (True, "世界 42.")]
     assert script_runs("3个") == [(True, "3个")]          # leading neutral rides forward
-    assert script_runs("42!") == [(False, "42!")]          # nothing scripted -> primary
+    assert script_runs("42!") == [(None, "42!")]           # nothing scripted -> primary
     assert script_runs("你好。OK") == [(True, "你好。"), (False, "OK")]  # 。 is neutral
 
 
@@ -65,6 +65,9 @@ def test_router_dispatches_runs_with_continuation_hints():
     flipped = ScriptRoutedTts(_Eng("en", "en"), _Eng("zh", "zh"))
     assert asyncio.run(flipped.synthesize_pcm("你好。")) == "[zh:你好。]".encode()
     assert asyncio.run(flipped.synthesize_pcm("42!")) == b"[en:42!]"  # primary takes neutral
+    # ... whichever slot the primary is: a digits-only chunk must speak the
+    # session's main language, not whichever engine happens to be Latin.
+    assert asyncio.run(r.synthesize_pcm("338!")) == b"[zh:338!]"
 
     asyncio.run(r.warmup())
     r.release()

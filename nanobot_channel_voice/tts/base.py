@@ -83,7 +83,13 @@ def split_for_budget(text: str, max_len: int) -> list[str]:
         cut = window.rfind(" ")
         if cut <= 0:
             cut = max(
-                (i + 1 for i in range(max_len) if window[i] in _SPLIT_PUNCT),
+                (
+                    i + 1 for i in range(max_len)
+                    if window[i] in _SPLIT_PUNCT
+                    # between digits = number punctuation (1,902,567), not a clause
+                    and not (0 < i < len(text) - 1
+                             and text[i - 1].isdigit() and text[i + 1].isdigit())
+                ),
                 default=max_len,
             )
         pieces.append(text[:cut].strip())

@@ -30,10 +30,12 @@ def _is_cjk(ch: str) -> bool:
     return cp >= 0x2E80
 
 
-def script_runs(text: str) -> list[tuple[bool, str]]:
+def script_runs(text: str) -> list[tuple[bool | None, str]]:
     """(is_cjk, run) spans covering ``text``; a text with no scripted character
-    at all yields one ``(False, text)`` run (the caller's primary handles it)."""
-    runs: list[tuple[bool, str]] = []
+    at all yields one ``(None, text)`` run — the router's PRIMARY takes it, so a
+    digits-only chunk ("338。" cut off a long sentence) speaks in the session's
+    main language, not whichever engine happens to be Latin."""
+    runs: list[tuple[bool | None, str]] = []
     cls: bool | None = None
     start = 0
     for i, ch in enumerate(text):
@@ -45,7 +47,7 @@ def script_runs(text: str) -> list[tuple[bool, str]]:
         elif c != cls:
             runs.append((cls, text[start:i]))
             cls, start = c, i
-    runs.append((cls if cls is not None else False, text[start:]))
+    runs.append((cls, text[start:]))
     return runs
 
 
@@ -95,7 +97,9 @@ class ScriptRoutedTts(TtsAdapter):
     async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
         runs = script_runs(text)
         if len(runs) == 1:
-            return await self._engine(runs[0][0]).synthesize_pcm(runs[0][1])
+            cjk, run = runs[0]
+            engine = self._primary if cjk is None else self._engine(cjk)
+            return await engine.synthesize_pcm(run)
         parts = []
         for i, (cjk, run) in enumerate(runs):
             if i < len(runs) - 1:

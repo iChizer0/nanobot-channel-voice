@@ -40,6 +40,24 @@ def test_sentence_cut_needs_following_separator():
     assert c.feed("Pi is 3.14 exactly. And") == ["Pi is 3.14 exactly."]
 
 
+def test_clause_cut_skips_grouped_number_commas():
+    c = SentenceChunker(min_chars=6, max_chars=240)
+    # The floor lands inside 1,902,567,338: digit-flanked commas are number
+    # punctuation, so the cut waits for the real clause boundary after 美元.
+    chunks = collect(c, "总收入达到了1,902,567,338美元，", "非常可观。")
+    assert chunks[0].endswith("美元，")
+    assert "1,902,567,338" in chunks[0]
+
+
+def test_number_comma_at_delta_boundary_waits():
+    c = SentenceChunker(min_chars=6, max_chars=240)
+    # A delta ending "…1,902," is ambiguous: the comma must not cut until the
+    # next delta shows whether a digit follows.
+    assert c.feed("总收入达到了1,902,") == []
+    chunks = c.feed("567,338美元，好的。")
+    assert any("1,902,567,338" in ch for ch in chunks)
+
+
 def test_terminator_at_buffer_end_waits_for_next_delta():
     # A '.' as the last buffered char can't prove it's a sentence end yet.
     c = SentenceChunker(min_chars=60, max_chars=240)

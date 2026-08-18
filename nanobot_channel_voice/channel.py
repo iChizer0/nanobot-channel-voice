@@ -53,9 +53,11 @@ _DEFAULT_PERSONA = (
 # Direct tool mode: the filler preamble is what the user hears across a tool round-trip;
 # without it the line goes dead. Appended only when tools are actually declared.
 _DIRECT_RULES = (
-    "Before calling a tool, say a brief neutral filler in the user's language, such "
-    "as \"One moment.\" or \"Let me check.\" (never implying success or failure) "
-    "then call it."
+    "Before a tool call that will keep the user waiting, say a brief neutral filler "
+    "in the user's language, such as \"One moment.\" or \"Let me check.\" (never "
+    "implying success or failure), then call it. Skip the filler when you expect "
+    "the answer immediately: filler plus instant answer sounds broken. When no "
+    "tool is needed, begin with the answer itself — never a wait phrase."
 )
 
 # Silence-is-the-ack, model-side half: the enforcement is the client's transcript-gated
@@ -178,9 +180,14 @@ def _voice_context_blocks(
             "or as mangled words.",
             # The backend detects this spoken status line (agent_prologue) and defers
             # the canned filler behind it.
-            "Before using tools that may take more than a moment, first say one short "
-            "sentence about what you are doing (never implying success or failure), "
-            "then proceed.",
+            "Before tool work that will keep the user waiting — a search, a web "
+            "request, multi-step work — first say one short sentence about what you "
+            "are doing (never implying success or failure), then proceed. Skip that "
+            "sentence when you expect to answer right away: a status line followed "
+            "immediately by the answer sounds broken.",
+            "When you can answer without tools, begin with the answer itself. Never "
+            "open with a wait phrase (\"One moment\", \"Let me think\"): every word "
+            "is spoken aloud before the answer and only delays it.",
         ]
         langs = getattr(tts, "spoken_languages", None)  # bilingual router
         lang = getattr(tts, "spoken_language", None)

@@ -135,6 +135,11 @@ def test_split_falls_back_to_cjk_punctuation():
     assert split_for_budget("你好，世界。再见吧", 4) == ["你好，", "世界。", "再见吧"]
 
 
+def test_split_never_cuts_inside_a_grouped_number():
+    pieces = split_for_budget("金额是1,902,567,338，请再次核对确认", 18)
+    assert pieces[0].endswith("1,902,567,338，")
+
+
 def test_split_hard_cuts_unbroken_runs():
     pieces = split_for_budget("a" * 10, 4)
     assert pieces == ["aaaa", "aaaa", "aa"]

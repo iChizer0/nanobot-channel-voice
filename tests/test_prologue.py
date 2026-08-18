@@ -161,6 +161,37 @@ def test_first_delta_cancels_the_filler_watch():
     asyncio.run(_t())
 
 
+def test_first_filler_delay_adapts_to_typical_first_reply():
+    b, _, _ = _build(afterMs=2000)
+    # No history: the configured floor.
+    assert b._prologue_delay_ms(None) == 2000.0
+    # Fast model: the floor still rules.
+    b._note_first_reply(400.0)
+    assert b._prologue_delay_ms(None) == 2000.0
+    # Slow model: stretch past typical latency so filler + answer never collide.
+    b._first_reply_ema = None
+    b._note_first_reply(4000.0)
+    assert b._prologue_delay_ms(None) == 6000.0  # 1.5x EMA
+    # EMA blends; a pathological turn is clamped at the 15 s sample cap.
+    b._note_first_reply(120000.0)
+    assert b._first_reply_ema == 0.3 * 15000.0 + 0.7 * 4000.0
+    # Tool-boundary re-arms pass an explicit delay: no stretching.
+    assert b._prologue_delay_ms(500) == 500.0
+
+
+def test_speak_final_feeds_the_first_reply_ema():
+    async def _t():
+        b, _, _ = _build(afterMs=2000)
+        await _started(b)
+        b._cur_turn.await_first_token = True
+        b._cur_turn.published_at = __import__("time").monotonic() - 3.0
+        await b.speak_final("hello there")
+        assert b._first_reply_ema is not None and 2800 <= b._first_reply_ema <= 3500
+        await b.close()
+
+    asyncio.run(_t())
+
+
 def test_prewarm_fills_the_cache_and_respects_probe_ok_and_enabled():
     async def _t():
         b, tts, sink = _build(phrases=["one", "two"])
