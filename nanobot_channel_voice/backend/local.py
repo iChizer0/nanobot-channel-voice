@@ -35,7 +35,7 @@ from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_rms, pcm_to_wav_bytes, w
 from nanobot_channel_voice.chunker import SentenceChunker
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.dump import AudioDumper, default_dump_root
-from nanobot_channel_voice.echo_reject import SelfEchoFilter
+from nanobot_channel_voice.echo_reject import SelfEchoFilter, units_of
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.phrases import (
     FILLER_WORDS,
@@ -575,7 +575,9 @@ class LocalBackend(TurnEventMixin):
         # churn on the frame-hop poll path.
         self._ack_lex = PhraseLexicon(config.barge_in.ack_phrases)
         self._stop_lex = PhraseLexicon(config.barge_in.stop_phrases)
-        self._ack_words = self._ack_lex.words
+        # In the echo filter's UNIT alphabet, so backchannel material subtracts
+        # from fresh evidence whatever its script (a 2-char zh ack IS its bigram).
+        self._ack_words = units_of(" ".join(config.barge_in.ack_phrases))
         self._ack_match = PhraseMatcher(self._ack_lex)
         self._stop_match = PhraseMatcher(
             self._stop_lex, self._ack_lex, extra=FILLER_WORDS
@@ -2115,8 +2117,10 @@ class LocalBackend(TurnEventMixin):
     @staticmethod
     def _fresh_seq(text: str, fresh: set[str]) -> list[str]:
         """The fresh words in UTTERANCE order: multi-word stop phrases need contiguity,
-        which the fresh SET destroyed."""
-        return [t for t in tokens_of(text) if t in fresh]
+        which the fresh SET destroyed. ``fresh`` is the echo filter's UNIT alphabet
+        (CJK bigrams); tokens are the lexicon's — a token is fresh when any of its
+        units is, so a fused zh stop run survives into PhraseMatcher whole."""
+        return [t for t in tokens_of(text) if units_of(t) & fresh]
 
     def _judge_fresh(self, text: str, fresh: set[str]) -> str | None:
         """The shared confirm arm of both early-verdict sites (streaming partials, eager

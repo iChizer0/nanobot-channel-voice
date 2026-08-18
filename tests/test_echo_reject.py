@@ -50,3 +50,42 @@ def test_reset_forgets_everything():
     f.note_spoken("something spoken")
     f.reset()
     assert f.is_self_echo("something spoken") is False
+
+
+def test_units_of_uses_cjk_bigrams():
+    from nanobot_channel_voice.echo_reject import units_of
+
+    assert units_of("Hello world") == {"hello", "world"}
+    assert units_of("今天天气") == {"今天", "天天", "天气"}
+    assert units_of("好") == {"好"}                    # lone CJK char: unigram
+    assert units_of("WiFi密码") == {"wifi", "密码"}    # mixed run splits by script
+
+
+def test_cjk_echo_is_detected_whatever_the_punctuation():
+    f = SelfEchoFilter()
+    f.note_spoken("今天天气很好，")   # the chunker feeds per clause
+    f.note_spoken("适合出门。")
+    assert f.is_self_echo("今天天气很好适合出门")       # streaming STT: no punct
+    assert f.is_self_echo("今天天气很好。适合。出门。")  # different punct: still echo
+    assert not f.is_self_echo("不要说了换个话题")        # genuine speech passes
+    # A pure echo yields (almost) no fresh evidence: only the chunk-seam bigram.
+    assert len(f.fresh_words("今天天气很好适合出门")) <= 1
+
+
+def test_zh_wake_phrase_containment_for_the_echo_veto():
+    f = SelfEchoFilter()
+    f.note_spoken("只要说小助手就能唤醒我。")
+    assert not f.fresh_words("小助手")  # fully contained -> the veto fires
+    assert f.fresh_words("关灯")        # a different phrase stays fresh
+
+
+def test_fresh_seq_bridges_units_to_lexicon_tokens():
+    from nanobot_channel_voice.backend.local import LocalBackend
+
+    f = SelfEchoFilter()
+    f.note_spoken("正在为你播放音乐。")
+    text = "别说了"  # fused zh stop said through the leak
+    fresh = f.fresh_words(text)
+    assert fresh  # its bigrams are not the bot's words
+    # The fused token survives WHOLE, so PhraseMatcher can segment it as a stop.
+    assert LocalBackend._fresh_seq(text, fresh) == ["别说了"]

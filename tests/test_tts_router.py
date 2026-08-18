@@ -51,16 +51,17 @@ class _Eng(TtsAdapter):
         self.released = True
 
 
-def test_router_dispatches_runs_and_joins_with_a_gap():
+def test_router_dispatches_runs_with_continuation_hints():
     zh, en = _Eng("zh", "zh"), _Eng("en", "en")
     r = ScriptRoutedTts(zh, en)
     assert r.spoken_languages == ("zh", "en") and r.output_rate == 22050
+    # Non-final fragments carry a continuation comma (clause contour + voiced
+    # pause AT THE ENGINE), so the join is plain concatenation, no silent gap.
     out = asyncio.run(r.synthesize_pcm("你好，请打开WiFi设置。"))
-    gap = b"\x00\x00" * int(0.06 * 22050)
-    assert out == (
-        "[zh:你好，请打开]".encode() + gap + b"[en:WiFi]" + gap + "[zh:设置。]".encode()
-    )
-    # Single-run text passes through gapless, whatever the language order.
+    assert out == "[zh:你好，请打开，][en:WiFi,][zh:设置。]".encode()
+    # A fragment already ending in pause punctuation is not double-hinted.
+    assert asyncio.run(r.synthesize_pcm("你好。OK")) == "[zh:你好。][en:OK]".encode()
+    # Single-run text passes through untouched, whatever the language order.
     flipped = ScriptRoutedTts(_Eng("en", "en"), _Eng("zh", "zh"))
     assert asyncio.run(flipped.synthesize_pcm("你好。")) == "[zh:你好。]".encode()
     assert asyncio.run(flipped.synthesize_pcm("42!")) == b"[en:42!]"  # primary takes neutral

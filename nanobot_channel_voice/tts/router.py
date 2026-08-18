@@ -2,9 +2,14 @@
 engines behind one adapter, text split into script runs — CJK runs to the
 CJK-language engine, everything else to the Latin one, neutral characters
 (digits, punctuation, space) riding with the run they follow. Runs synthesize
-SEQUENTIALLY (on-device engines keep one decode in flight) and concatenate with
-a short gap; each engine's own frontend/normalization applies to its runs.
-Engine-agnostic in principle, but both must share ``output_rate``.
+SEQUENTIALLY (on-device engines keep one decode in flight); a non-final run
+without trailing pause punctuation gets a continuation comma, so the engine
+renders a clause contour + its own pause instead of end-of-utterance prosody —
+the seams are model-voiced, never synthetic silence. Each engine's own
+frontend/normalization applies to its runs. Engine-agnostic in principle, but
+both must share ``output_rate``. (Loudness is deliberately NOT equalized:
+measured cross-engine mismatch ~1.5 dB is below within-engine variance, and
+RMS scaling would pump natural dynamics.)
 """
 
 from __future__ import annotations
@@ -13,7 +18,7 @@ from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
 from nanobot_channel_voice.tts.base import TtsAdapter
 
 _CJK_LANGS = frozenset({"zh", "ja", "ko"})
-_GAP_S = 0.06  # code-switch seam; the engines' edge fades land in it
+_PAUSE_PUNCT = set("，,、；;。.!?！？…：:")
 
 
 def _is_cjk(ch: str) -> bool:
@@ -42,6 +47,15 @@ def script_runs(text: str) -> list[tuple[bool, str]]:
             cls, start = c, i
     runs.append((cls if cls is not None else False, text[start:]))
     return runs
+
+
+def _hint(run: str, cjk: bool) -> str:
+    """Continuation comma for a NON-FINAL fragment: measured on both engines, it
+    buys a voiced pause and a non-terminal pitch contour at the seam."""
+    stripped = run.rstrip()
+    if not stripped or stripped[-1] in _PAUSE_PUNCT:
+        return run
+    return stripped + ("，" if cjk else ",")
 
 
 class ScriptRoutedTts(TtsAdapter):
@@ -73,7 +87,6 @@ class ScriptRoutedTts(TtsAdapter):
         self._engines = (primary, secondary)
         self.output_rate = primary.output_rate
         self.spoken_languages = (p_lang, s_lang)
-        self._gap = b"\x00\x00" * int(_GAP_S * self.output_rate)
 
     async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
         pcm = await self.synthesize_pcm(text, voice=voice)
@@ -84,11 +97,13 @@ class ScriptRoutedTts(TtsAdapter):
         if len(runs) == 1:
             return await self._engine(runs[0][0]).synthesize_pcm(runs[0][1])
         parts = []
-        for cjk, run in runs:
+        for i, (cjk, run) in enumerate(runs):
+            if i < len(runs) - 1:
+                run = _hint(run, cjk)
             pcm = await self._engine(cjk).synthesize_pcm(run)
             if pcm:
                 parts.append(pcm)
-        return self._gap.join(parts)
+        return b"".join(parts)
 
     def _engine(self, cjk: bool) -> TtsAdapter:
         return self._cjk if cjk else self._latin
