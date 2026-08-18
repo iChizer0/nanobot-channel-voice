@@ -287,3 +287,184 @@ def test_mode_off_neither_gates_nor_strips():
             assert conv.texts() == ["hey nanobot what time is it"]
 
     _run(_case())
+
+
+# ---- acoustic-tier audio hygiene: the wake sound never reaches STT ----------
+
+
+def _spy_backend(conv):
+    """(seen, pendings): record batch-STT inputs and queued utterances."""
+    b = conv.backend
+    seen, pendings = [], []
+    orig_t = b._transcribe
+
+    async def spy(pcm):
+        seen.append(pcm)
+        return await orig_t(pcm)
+
+    b._transcribe = spy
+    orig_q = b._queue_utterance
+
+    def q(p):
+        pendings.append(p)
+        orig_q(p)
+
+    b._queue_utterance = q
+    return seen, pendings
+
+
+async def _push_frames(conv, n, *, fire_at=None, det=None):
+    for i in range(n):
+        if fire_at is not None and i == fire_at:
+            det.fire = True
+        await conv.backend.push_audio(_FRAME)
+
+
+async def _close_utterance(conv):
+    conv.vad.flag = False
+    hangover = conv.backend._cfg.vad.hangover_ms // 20
+    for _ in range(hangover + 2):
+        await conv.backend.push_audio(_FRAME)
+    await conv.backend._utt_queue.join()
+
+
+def test_acoustic_hit_trims_the_phrase_from_batch_stt():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            seen, pendings = _spy_backend(conv)
+            conv._stt.append("what time is it")
+            conv.vad.flag = True
+            await _push_frames(conv, 20, fire_at=8, det=det)
+            await _close_utterance(conv)
+            (p,) = pendings
+            assert p.wake_hit and 0 < p.trim_bytes < len(p.pcm)
+            assert len(seen[0]) == len(p.pcm) - p.trim_bytes  # STT saw only the tail
+            assert conv.texts() == ["what time is it"]
+            assert conv.counter("wake_trim") == 1
+
+    _run(_case())
+
+
+def test_bare_acoustic_wake_is_attention_only_after_the_trim():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            conv._stt.append("")  # a language-limited STT yields nothing for the tail
+            conv.vad.flag = True
+            await _push_frames(conv, 20, fire_at=10, det=det)
+            await _close_utterance(conv)
+            assert conv.texts() == []
+            assert conv.counter("wake_only") == 1
+            await conv.user_says("what time is it")  # the window is open: publishes cold
+            assert conv.texts() == ["what time is it"]
+
+    _run(_case())
+
+
+def test_half_duplex_wake_hit_is_the_only_barge_in():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, aec="auto", **_wake("gate")
+        ) as conv:
+            assert not conv.backend._open_mic
+            await _speaking_reply(conv)
+            det.fire = True
+            await conv.backend.push_gated_audio(_FRAME)  # the shell's gated-mic tap
+            assert conv.counter("wake_kill") == 1
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("what time is it")
+            # The wake kill's heard-up-to note rides the follow-up publish.
+            assert conv.texts()[-1].startswith("what time is it")
+            assert "[note: the user cut your reply short with the wake word" in conv.texts()[-1]
+
+    _run(_case())
+
+
+class _StreamHandle:
+    def __init__(self):
+        self.fed = 0
+
+    def accept(self, frame: bytes) -> None:
+        self.fed += len(frame)
+
+    def partial(self) -> str:
+        return ""
+
+    def finish(self) -> str:
+        return "stream text"
+
+
+class _StreamStt:
+    streaming = True
+
+    def __init__(self):
+        self.handles: list[_StreamHandle] = []
+
+    def stream_start(self) -> _StreamHandle:
+        handle = _StreamHandle()
+        self.handles.append(handle)
+        return handle
+
+
+def test_streaming_stt_restarts_at_the_claim_and_drops_the_phrase():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            stt = _StreamStt()
+            conv.backend._stt_stream = stt  # detector => threaded hop, streaming path live
+            conv.vad.flag = True
+            await _push_frames(conv, 8, fire_at=6, det=det)  # onset at 4, hit at 6
+            await _push_frames(conv, 6)                       # the command tail
+            await _close_utterance(conv)
+            assert len(stt.handles) == 2                      # fresh handle at the claim
+            assert conv.texts() == ["stream text"]            # finish of the CLEAN handle
+            assert conv.counter("wake_trim") == 1
+
+    _run(_case())
+
+
+def test_streaming_close_racing_the_restart_demotes_to_batch():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            stt = _StreamStt()
+            conv.backend._stt_stream = stt
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            conv.vad.flag = False
+            hangover = conv.backend._cfg.vad.hangover_ms // 20
+            for i in range(hangover):
+                if i == hangover - 1:
+                    det.fire = True  # hit lands ON the closing hop: no restart possible
+                await conv.backend.push_audio(_FRAME)
+            await conv.backend._utt_queue.join()
+            assert len(stt.handles) == 1                # the restart never ran
+            # The handle ate the phrase; the whole span trims away -> attention only.
+            assert conv.texts() == []
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("stt_eager_stale") == 1  # the tainted finish was drained
+
+    _run(_case())
+
+
+def test_eager_speculation_is_pretrimmed_and_survives_the_wake_close():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            b = conv.backend
+            b._endpointer._eager_frames = 5  # re-enable eager (the harness builds with 0)
+            seen, pendings = _spy_backend(conv)
+            conv._stt.append("what time is it")
+            conv.vad.flag = True
+            await _push_frames(conv, 20, fire_at=8, det=det)
+            await _close_utterance(conv)
+            (p,) = pendings
+            assert p.trim_bytes > 0 and p.eager_trim == p.trim_bytes
+            assert len(seen) == 1                       # ONE decode: the speculation held
+            assert len(seen[0]) < len(p.pcm)            # and it saw pre-trimmed audio
+            assert conv.texts() == ["what time is it"]
+            assert conv.counter("stt_eager_hit") == 1   # accepted, not drained
+
+    _run(_case())

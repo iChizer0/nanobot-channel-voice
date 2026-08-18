@@ -42,6 +42,7 @@ from nanobot_channel_voice.streamid import started_ns, unique_token
 from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, write_temp_wav
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
+from nanobot_channel_voice.tts.base import CALIBRATION_TEXT, startup_text
 from nanobot_channel_voice.vad import make_turn_analyzer, make_vad
 from nanobot_channel_voice.wake import make_wake_detector
 
@@ -181,8 +182,17 @@ def _voice_context_blocks(
             "sentence about what you are doing (never implying success or failure), "
             "then proceed.",
         ]
+        langs = getattr(tts, "spoken_languages", None)  # bilingual router
         lang = getattr(tts, "spoken_language", None)
-        if lang:
+        if langs:
+            named = " and ".join(f"'{code}'" for code in langs)
+            lines.append(
+                f"The speech engine can only pronounce ISO 639-1 languages {named}. "
+                "Reply in whichever of these the user speaks (mixing them is fine), "
+                "and avoid quoting words in other scripts: they are dropped or "
+                "voiced as noise."
+            )
+        elif lang:
             lines.append(
                 f"The speech engine can only pronounce ISO 639-1 language '{lang}'. "
                 f"Reply in '{lang}' regardless of the language spoken to you, and "
@@ -795,7 +805,11 @@ class VoiceChannel(BaseChannel):
             # probe_ok is False for cloud-backed adapters: nothing at startup may be
             # billed, and a cloud RTF measures the network, not the box.
             if tts is not None and getattr(tts, "probe_ok", True):
-                text = "This is a short calibration sentence for timing."
+                # The engine's own language: an English probe through a zh/ja
+                # lexicon would trip the empty-synth guard below (see tts.base).
+                text = startup_text(
+                    CALIBRATION_TEXT, getattr(tts, "spoken_language", None)
+                )
                 rate = getattr(tts, "output_rate", None)
                 t0 = time.monotonic()
                 if rate:

@@ -184,7 +184,10 @@ class OpenWakeWord(WakeDetector):
                 if score is None:
                     continue
                 self.last_score = score
-                hit = self._debounce(score) or hit
+                if self._debounce(score):
+                    hit = True
+                    # Everything still pending lies AFTER the hit chunk's end.
+                    self.last_hit_back_bytes = 2 * self._pending.size
             return hit
         except Exception as exc:  # noqa: BLE001 - never let wake detection crash the hop
             if self._fail_throttle.ready():

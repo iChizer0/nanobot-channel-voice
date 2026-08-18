@@ -453,3 +453,25 @@ def test_cli_env_index_default(store, tmp_path, monkeypatch, capsys):
     assert cli_main(["list"]) == 0
     assert "stt/m/onnx" in capsys.readouterr().out
 
+
+
+def test_apply_weights_resolves_the_bilingual_secondary(store, tmp_path):
+    from nanobot_channel_voice.config import TtsConfig
+
+    zh = [_src(tmp_path, n) for n in
+          ("acoustic_model.onnx", "vocoder.onnx", "tokens.txt", "lexicon.txt")]
+    w.fetch("tts/matcha/zh/onnx", _entry_for(*zh))
+    en_dir = tmp_path / "en-src"
+    en_dir.mkdir()
+    en = [_src(en_dir, n) for n in ("acoustic_model.onnx", "tokens.txt")]
+    w.fetch("tts/matcha/en/onnx", _entry_for(*en))
+
+    cfg = TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {"weights": "tts/matcha/zh/onnx",
+                   "secondary": {"weights": "tts/matcha/en/onnx"}},
+    })
+    filled = w.apply_weights(cfg, "matcha")
+    assert filled.matcha.acoustic_model_path.endswith("acoustic_model.onnx")
+    assert "tts/matcha/en" in filled.matcha.secondary.acoustic_model_path
+    assert cfg.matcha.secondary.acoustic_model_path is None  # source cfg untouched

@@ -201,7 +201,7 @@ python -m matcha.onnx.export matcha_ljspeech.ckpt matcha_ljspeech_hifigan.onnx \
 
 Timbre: `--n-timesteps` (ODE steps) is baked at export — 5 is the export default, upstream's demo runs 10, 3 audibly flattens prosody; only the small flow decoder scales with it. Upstream's CLI also denoises HiFi-GAN output but its ONNX export doesn't, so the plugin applies the same spectral denoiser host-side to separate waveform vocoders (`denoiserStrength`, default 0.00025, 0 = off) — an embedded vocoder can't be probed for its bias and keeps a faint hiss, making mel-only + `vocoderPath` the higher-fidelity route; Vocos has no such bias and needs none. `speed` (>1 = faster) and `noiseScale` (flow temperature, default 0.667; lower = cleaner but flatter, higher = breathier) tune delivery.
 
-The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata), and `matcha-icefall-zh-baker` is currently the only Chinese option (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically):
+The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/matcha.html) are also consumed unmodified (front-end contract read from their metadata), and `matcha-icefall-zh-baker` is currently the only Chinese option (training data licensed non-commercial-use-only; digits are verbalized to 汉字 automatically). Embedded English is voiced as Mandarin nativizes it — acronyms spell as the letter readings (USB → you-ai-si-bi), words transliterate through espeak IPA to the nearest pinyin syllables (hello → he-lou, python → pai-sen; letters-only without any espeak) — a loanword accent that makes "打开 WiFi" speakable, not bilingual synthesis; full English replies still belong on an English engine:
 
 ```json
 "tts": {
@@ -211,6 +211,25 @@ The icefall/sherpa-onnx [`matcha-icefall-*` releases](https://k2-fsa.github.io/s
     "vocoderPath": "model/vocos-22khz-univ.onnx",
     "tokensPath": "model/matcha-icefall-zh-baker/tokens.txt",
     "lexiconPath": "model/matcha-icefall-zh-baker/lexicon.txt"
+  }
+}
+```
+
+**Bilingual (en + zh)**: `matcha.secondary` loads a second complete matcha engine for the other script — text routes per script run (CJK runs to the zh engine, Latin to the en one, digits/punctuation riding along), the agent is told it may reply in either language, and one Vocos session serves both when the dynamic engines name the same `vocoderPath` (measured ~+54 MB over a single engine). Each language speaks in its own checkpoint's voice, so code-switching mid-sentence switches voices — the G2P fallback above stays single-voice if that matters more:
+
+```json
+"tts": {
+  "provider": "matcha",
+  "matcha": {
+    "acousticModelPath": "model/matcha-icefall-zh-baker/model-steps-3.onnx",
+    "vocoderPath": "model/vocos-22khz-univ.onnx",
+    "tokensPath": "model/matcha-icefall-zh-baker/tokens.txt",
+    "lexiconPath": "model/matcha-icefall-zh-baker/lexicon.txt",
+    "secondary": {
+      "acousticModelPath": "model/matcha-icefall-en_US-ljspeech/model-steps-3.onnx",
+      "vocoderPath": "model/vocos-22khz-univ.onnx",
+      "tokensPath": "model/matcha-icefall-en_US-ljspeech/tokens.txt"
+    }
   }
 }
 ```
@@ -461,6 +480,8 @@ The turn model is an on-device engine like any other: the file extension picks t
 ### Wake word for public spaces
 
 `wake.mode` gates the pipeline behind a wake phrase (local backend only). `"gate"` requires the phrase to *start* a conversation from cold; once engaged, follow-ups and barge-in stay natural for `windowS` seconds after each turn. `"strict"` additionally requires it to interrupt a live reply: while the bot speaks, non-wake speech neither ducks nor stops playback — the whole duck-then-confirm machinery stays cold until a wake hit claims the utterance, which is both the robust posture for public/multi-speaker spaces and the *simple* barge-in path (a hit is the entire verdict). Detection is two-tier and both tiers feed the same gate: the transcript prefix (`phrases`, zero models, any language the STT covers — hesitation fillers may precede it, and the phrase is stripped from the published turn) always counts, and `engine: "openwakeword"` adds an acoustic detector (openWakeWord/livekit-wakeword-format ONNX, ~3.7 MB total, one decision per 80 ms, `[ondevice]` extra, 16 kHz capture) that hears through the bot's own playback — the bot never says its own wake phrase, so an acoustic hit mid-reply is a high-precision interrupt that confirms without the min-words bar. An utterance that is *only* the phrase publishes nothing: it kills a live reply, opens the attention window, and listens.
+
+An acoustic hit also cleans the *audio*: the detector reports where the phrase ended, and everything before that point is cut out of what STT decodes (streaming decoders restart their handle at the hit) — so a language-limited STT (a ja/de/zh model hearing an English phrase) can neither smear the phrase into the transcript nor turn a bare phrase into garbage content, and a hit whose trimmed remainder is silence resolves to attention-only. Only the transcript tier depends on STT being able to *spell* the phrase; with a mismatched language, configure the acoustic engine. In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays hot over the muted mic and a hit is the *only* barge-in: the reply stops, the mic reopens (the gate flush discards the phrase audio), and the follow-up is captured normally — wake-word barge-in with none of the open-mic duck/confirm machinery, the controlled posture for public spaces; keep the open-mic modes for personal environments where free interruption matters.
 
 ```json
 {

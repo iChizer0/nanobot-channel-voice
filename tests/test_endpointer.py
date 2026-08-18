@@ -308,3 +308,22 @@ def test_prob_stats_are_none_for_binary_vads():
     outs = push_all(ep, 8)
     assert len(outs) == 1
     assert ep.closed_prob_peak is None and ep.closed_prob_mean is None
+
+
+def test_stream_position_marks_buffer_start_and_survives_reset():
+    decisions = [False] + [True] * 4 + [False] * 7 + [True] * 3
+    ep = make(decisions)
+    out = None
+    for i in range(10):
+        out = ep.push(frame(i)) or out
+    # Close on frame 9 (5 hangover frames): the utterance spans frames 0..9.
+    assert out is not None and len(out) == 40
+    assert ep.closed_open_pos == 0  # its buffer began at the stream start
+    assert ep.pos == 40             # close/reset did NOT zero the stream position
+    ep.push(frame(10))
+    ep.push(frame(11))              # idle context
+    for i in range(12, 15):         # 3 speech frames: onset (start_frames=3)
+        ep.push(frame(i))
+    assert ep.in_speech
+    # Pretrigger held frames 10..14: the second buffer starts at byte 40.
+    assert ep.open_pos == 40

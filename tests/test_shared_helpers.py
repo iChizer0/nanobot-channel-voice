@@ -298,3 +298,33 @@ def test_ondevice_tts_shell_split_join_and_degrade():
         assert await broken.synthesize_pcm("hello") == b""
 
     asyncio.run(_case())
+
+
+# ---- language-keyed startup texts -------------------------------------------
+
+
+def test_warmup_speaks_the_engine_language():
+    from nanobot_channel_voice.tts.base import CALIBRATION_TEXT, WARMUP_TEXT, startup_text
+    from nanobot_channel_voice.tts.ondevice_base import OnDeviceTtsAdapter
+
+    assert startup_text(WARMUP_TEXT, "zh") == "好的。"
+    assert startup_text(CALIBRATION_TEXT, None).startswith("This is")
+    assert startup_text(CALIBRATION_TEXT, "fr").startswith("This is")  # no row -> default
+
+    calls = []
+
+    class Adapter(OnDeviceTtsAdapter):
+        output_rate = 16000
+        _label = "fake"
+        spoken_language = "zh"
+
+        async def synthesize(self, text, *, voice=None):
+            calls.append(text)
+            return b"x"
+
+        def _synthesize_piece(self, text):  # pragma: no cover - protocol completeness
+            raise NotImplementedError
+
+    adapter = Adapter.__new__(Adapter)
+    asyncio.run(adapter.warmup())
+    assert calls == ["好的。"]  # English "Okay." would be zero lexicon tokens: no warm at all

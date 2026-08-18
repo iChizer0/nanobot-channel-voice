@@ -325,7 +325,8 @@ def test_matcha_registry_routes_dynamic_first(monkeypatch):
         matcha.SplitMatchaTtsAdapter, "from_config", classmethod(lambda _c, m: ("static", m))
     )
     monkeypatch.setattr(
-        matcha.MatchaTtsAdapter, "from_config", classmethod(lambda _c, m: ("dynamic", m))
+        matcha.MatchaTtsAdapter, "from_config",
+        classmethod(lambda _c, m, **_kw: ("dynamic", m)),
     )
     enc = TtsConfig.model_validate({"provider": "matcha", "matcha": {"encoderPath": "e.rknn"}})
     assert _build_matcha(enc)[0] == "static"
@@ -562,11 +563,9 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
             ]
 
     monkeypatch.setattr(matcha, "OnDeviceModel", FakeModel)
-    monkeypatch.setattr(
-        matcha,
-        "make_ipa_phonemizer",
-        lambda *_args, **_kw: pytest.fail("lexicon-based zh must not invoke espeak"),
-    )
+    # The zh TOKENIZATION never needs espeak; the optional English-fallback tier
+    # builds one at from_config, so hand it a benign stand-in.
+    monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_args, **_kw: str)
     cfg = MatchaTtsConfig.model_validate({
         "encoderPath": str(tmp_path / "encoder.rknn"),
         "decoderPath": str(tmp_path / "decoder.rknn"),
@@ -762,3 +761,68 @@ def test_matcha_split_waveform_vocoder_is_probed_and_denoised(monkeypatch, tmp_p
     )
     assert off._denoise_bias is None
     off.release()
+
+
+# ---- English-into-pinyin fallback -------------------------------------------
+
+
+def test_english_letters_spell_with_token_validation():
+    from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
+
+    tokens = {s: i for i, s in enumerate(["ei1", "si1", "bi4", "you1", "ai4"])}
+    eng = EnglishToPinyin(tokens)
+    assert bool(eng)
+    # U-S-B: the Mandarin letter readings, each syllable a live token id.
+    assert eng.word_ids("USB") == [
+        tokens["you1"], tokens["ai4"], tokens["si1"], tokens["bi4"],
+    ]
+    # A letter whose syllables are absent drops silently ('c' needs xi1).
+    assert eng.word_ids("UC") == [tokens["you1"]]
+    # The tone ladder falls back to other tones / the toneless twin.
+    bare = EnglishToPinyin({"bi": 7})
+    assert bare.word_ids("B") == [7]
+    # No resolvable letter at all => falsy => the frontend disables the tier.
+    assert not EnglishToPinyin({"zzz": 0})
+
+
+def test_english_words_transliterate_via_espeak_ipa():
+    import pytest as _pytest
+
+    from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
+
+    tokens = {s: i for i, s in enumerate(
+        ["he1", "lou1", "ban1", "ei1", "ai4", "you1", "si1", "bi4"]
+    )}
+    ipa = {"hello": "həlˈoʊ", "ban": "bˈæn"}
+    eng = EnglishToPinyin(tokens, phonemize=lambda w: ipa[w])
+    assert eng.word_ids("hello") == [tokens["he1"], tokens["lou1"]]
+    assert eng.word_ids("ban") == [tokens["ban1"]]  # nasal coda folds into the syllable
+    # Acronyms never consult espeak (a raising phonemizer proves the routing).
+    strict = EnglishToPinyin(
+        tokens, phonemize=lambda w: _pytest.fail("acronym reached espeak")
+    )
+    assert strict.word_ids("USB") == [tokens["you1"], tokens["ai4"], tokens["si1"], tokens["bi4"]]
+    # A word the mapping cannot carry falls back to spelling.
+    sparse = EnglishToPinyin(tokens, phonemize=lambda w: "ʘ")
+    assert sparse.word_ids("ab") == [tokens["ei1"], tokens["bi4"]]
+
+
+def test_lexicon_frontend_voices_latin_runs_via_the_fallback():
+    from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
+
+    tokens = fold_punct_aliases(
+        {"。": 3, "ni3": 10, "hao3": 11, "you1": 20, "ai4": 21, "si1": 22,
+         "bi4": 23, "ei1": 24, "o": 25}
+    )
+    lex = {"你": [10], "好": [11]}
+    fe = LexiconFrontend(lex, tokens, english=EnglishToPinyin(tokens))
+    assert fe.can_speak("w") and fe.can_speak("Z")
+    (seq,) = fe.sentences("你好USB。")
+    assert seq == [10, 11, 20, 21, 22, 23, 3]
+    # The run is consumed WHOLE: 'o' must not leak as the pinyin vowel token.
+    (seq2,) = fe.sentences("好ok。")
+    assert 25 not in seq2
+    # Without the fallback, behavior is unchanged: Latin drops and reports.
+    fe0 = LexiconFrontend(lex, tokens)
+    assert not fe0.can_speak("w")
+    assert fe0.sentences("你好USB。") == [[10, 11, 3]]

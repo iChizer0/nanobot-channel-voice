@@ -85,6 +85,13 @@ class Endpointer:
         # audio in last_rejected instead of vanishing; the caller consumes the slot.
         self.keep_rejected = False
         self.last_rejected: bytes | None = None
+        # Stream position (bytes pushed, session-cumulative — NEVER reset, so a
+        # wake hit latched in this coordinate stays comparable across utterances).
+        # open_pos = where the open utterance's buffer starts; closed_open_pos =
+        # the same, frozen at close (open_pos dies with the next onset).
+        self._pos = 0
+        self.open_pos = 0
+        self.closed_open_pos = 0
         self.reset()
 
     def reset(self) -> None:
@@ -110,6 +117,11 @@ class Endpointer:
         against the hop thread; a shrunken hangover below the eager/consult marks
         simply stops those tiers firing."""
         self._hangover_frames = max(1, ms // self._frame_ms)
+
+    @property
+    def pos(self) -> int:
+        """Bytes pushed so far (the wake-trim coordinate system)."""
+        return self._pos
 
     @property
     def in_speech(self) -> bool:
@@ -193,6 +205,7 @@ class Endpointer:
     def _snap_close(self, reason: str) -> None:
         """Freeze the close-time snapshot fields; the caller resets right after."""
         self.closed_reason = reason
+        self.closed_open_pos = self.open_pos
         self.closed_silence_ms = self._silence_run * self._frame_ms
         self.closed_active_ms = self._active * self._frame_ms
         self.closed_prob_peak = self._prob_peak
@@ -211,6 +224,7 @@ class Endpointer:
     def push(self, frame: bytes) -> bytes | None:
         if not frame:
             return None
+        self._pos += len(frame)
         speech = self._vad.is_speech(frame)
 
         if not self._in_speech:
@@ -222,6 +236,7 @@ class Endpointer:
                 if self._speech_run >= start:
                     self._in_speech = True
                     self._buf = bytearray(b"".join(self._pretrigger))  # pre-roll + confirm frames
+                    self.open_pos = self._pos - len(self._buf)  # buffer start, stream coords
                     self._frames = self._speech_run
                     self._active = self._speech_run
                     self._silence_run = 0

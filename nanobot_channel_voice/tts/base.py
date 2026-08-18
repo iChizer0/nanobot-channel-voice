@@ -47,6 +47,24 @@ class TtsAdapter(abc.ABC):
         no-op and clear ``probe_ok``."""
 
 
+# Startup texts keyed by spoken_language (None = the default/unknown row): a
+# single-language engine turns English into silence (lexicon: zero tokens, no
+# inference at all) or noise, so an English-only warmup never warms and an
+# English-only calibration measures nothing — exactly on the boards that need it.
+WARMUP_TEXT = {None: "Okay.", "zh": "好的。", "ja": "はい。", "ko": "네.", "de": "Okay."}
+CALIBRATION_TEXT = {
+    None: "This is a short calibration sentence for timing.",
+    "zh": "这是一句用来测量语音合成速度的校准语句。",
+    "ja": "これは音声合成の速度を測るための校正用の文です。",
+    "ko": "이것은 음성 합성 속도를 측정하기 위한 짧은 교정 문장입니다.",
+    "de": "Dies ist ein kurzer Kalibrierungssatz zur Zeitmessung.",
+}
+
+
+def startup_text(table: dict, language: str | None) -> str:
+    return table.get(language, table[None])
+
+
 def is_wav(data: bytes) -> bool:
     return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"
 

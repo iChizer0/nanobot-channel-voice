@@ -80,6 +80,10 @@ class VoiceShell:
         self._capture = capture
         self._sink = sink
         self._backend = backend
+        # Half-duplex wake tap: a backend exposing push_gated_audio still hears
+        # gated frames (wake detector only), so the wake word can barge in even
+        # with the mic otherwise muted. Absent on cloud backends.
+        self._gated_push = getattr(backend, "push_gated_audio", None)
         # Mic policy comes from the channel: local = config.open_mic (full|soft|webrtc);
         # cloud = realtime.bargeIn ("aec" => open, "gated" => gated while SPEAKING).
         self._open_mic = open_mic
@@ -210,6 +214,13 @@ class VoiceShell:
 
             if self._mic_gated():
                 was_gated = True
+                if self._gated_push is not None:
+                    try:
+                        await self._gated_push(frame)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - the tap must not kill capture
+                        self._log.warning("gated wake push error: {}", exc)
                 continue
             if was_gated:
                 # Gate-reopen edge: the gate is applied at READ time, but under lag

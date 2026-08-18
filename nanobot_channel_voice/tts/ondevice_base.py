@@ -15,10 +15,12 @@ import numpy as np
 from loguru import logger
 
 from nanobot_channel_voice.tts.base import (
+    WARMUP_TEXT,
     TtsAdapter,
     floats_to_pcm,
     floats_to_wav,
     split_for_budget,
+    startup_text,
 )
 
 # Below this fraction of voiceable content chars a piece is a language the engine does
@@ -105,7 +107,7 @@ class OnDeviceTtsAdapter(TtsAdapter):
         return await asyncio.to_thread(self._synthesize_pcm_sync, text)
 
     async def warmup(self) -> None:
-        await self.synthesize("Okay.")
+        await self.synthesize(startup_text(WARMUP_TEXT, self.spoken_language))
 
     def _synthesize_sync(self, text: str) -> bytes:
         try:

@@ -70,12 +70,15 @@ def test_every_credential_shaped_field_has_the_api_key_leaf():
     under any OTHER leaf must fail here instead of exporting in cleartext."""
     from nanobot_channel_voice.config import VoiceConfig
 
-    def walk(model, prefix=""):
+    def walk(model, prefix="", seen=frozenset()):
+        if model in seen:
+            return  # self-referential models (matcha.secondary) terminate here
+        seen = seen | {model}
         for name, info in model.model_fields.items():
             ann = info.annotation
             for nested in (ann, *getattr(ann, "__args__", ())):
                 if isinstance(nested, type) and hasattr(nested, "model_fields"):
-                    yield from walk(nested, f"{prefix}{name}.")
+                    yield from walk(nested, f"{prefix}{name}.", seen)
             yield f"{prefix}{name}"
 
     credential_words = {"key", "token", "secret", "password", "credential", "bearer", "auth"}

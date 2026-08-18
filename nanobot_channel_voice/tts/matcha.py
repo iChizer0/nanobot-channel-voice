@@ -21,6 +21,7 @@ from nanobot_channel_voice.config import MatchaTtsConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
 from nanobot_channel_voice.tts.espeak import make_ipa_phonemizer
 from nanobot_channel_voice.tts.ondevice_base import OnDeviceTtsAdapter
+from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
 from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_zh
 
 _JOIN_GAP_S = 0.1
@@ -263,11 +264,19 @@ class EspeakFrontend:
 
 class LexiconFrontend:
     """Text -> per-sentence token ids by greedy longest lexicon match, single chars
-    falling back to the token table; OOV drops, the speakability guard reports."""
+    falling back to the token table; OOV drops, the speakability guard reports.
+    With an ``english`` fallback, Latin word runs voice as Mandarin letter
+    readings / pinyin transliteration instead of dropping (see pinyin_english)."""
 
-    def __init__(self, word2ids: dict[str, list[int]], token2id: dict[str, int]):
+    def __init__(
+        self,
+        word2ids: dict[str, list[int]],
+        token2id: dict[str, int],
+        english: EnglishToPinyin | None = None,
+    ):
         self._word2ids = word2ids
         self._token2id = token2id
+        self._english = english if english else None  # falsy = no resolvable letters
         # longest key per first char: one long entry must not slow every position
         self._max_by_first: dict[str, int] = {}
         for word in word2ids:
@@ -276,22 +285,36 @@ class LexiconFrontend:
 
     def can_speak(self, ch: str) -> bool:
         ch = ch.lower()
+        if self._english is not None and "a" <= ch <= "z":
+            return True
         return ch in self._word2ids or ch in self._token2id
 
     def _tokenize(self, text: str) -> list[int]:
-        text = text.lower()
+        low = text.lower()
+        if len(low) != len(text):
+            text = low  # exotic case-fold expansion: keep alignment, forfeit case
         ids: list[int] = []
         i = 0
-        while i < len(text):
-            longest = self._max_by_first.get(text[i], 0)
-            for ln in range(min(longest, len(text) - i), 0, -1):
-                cand = text[i : i + ln]
+        while i < len(low):
+            if self._english is not None and "a" <= low[i] <= "z":
+                # Whole Latin run at once, ORIGINAL case (all-caps = acronym): a
+                # per-char walk would leak letters that coincide with pinyin
+                # syllables ("o" -> 哦) into the ids.
+                j = i + 1
+                while j < len(low) and ("a" <= low[j] <= "z" or low[j] == "'"):
+                    j += 1
+                ids.extend(self._english.word_ids(text[i:j].replace("'", "")))
+                i = j
+                continue
+            longest = self._max_by_first.get(low[i], 0)
+            for ln in range(min(longest, len(low) - i), 0, -1):
+                cand = low[i : i + ln]
                 if cand in self._word2ids:
                     ids.extend(self._word2ids[cand])
                     i += ln
                     break
             else:
-                ch = text[i]
+                ch = low[i]
                 if ch in self._token2id and not ch.isspace():
                     ids.append(self._token2id[ch])
                 i += 1
@@ -355,6 +378,20 @@ def denoise(wav: np.ndarray, bias: np.ndarray) -> np.ndarray:
     mag, cos, sin = stft(padded, **_DENOISE_STFT)
     out = istft(np.maximum(mag - bias, 0.0), cos, sin, **_DENOISE_STFT)
     return out[: wav.size]
+
+
+def _english_fallback(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> EnglishToPinyin:
+    """The zh lexicon models' English tier; letters-only when no espeak resolves."""
+    try:
+        return EnglishToPinyin(
+            token2id, make_ipa_phonemizer("en-us", espeak_path=cfg.espeak_path)
+        )
+    except Exception as exc:  # noqa: BLE001 - an optional tier, never a build error
+        logger.info(
+            "voice: matcha zh English fallback is letters-only (espeak unavailable: {})",
+            exc,
+        )
+        return EnglishToPinyin(token2id)
 
 
 def _espeak_frontend(
@@ -438,7 +475,12 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         self._log = logger.bind(component="tts-matcha")
 
     @classmethod
-    def from_config(cls, cfg: MatchaTtsConfig) -> MatchaTtsAdapter:
+    def from_config(
+        cls, cfg: MatchaTtsConfig, *, vocoder_share: VocoderSpec | None = None
+    ) -> MatchaTtsAdapter:
+        """``vocoder_share``: a sibling engine's already-loaded vocoder (bilingual
+        router, same vocoderPath) — used instead of loading a second session, and
+        deliberately NOT registered with this build's cleanup stack."""
         if not cfg.acoustic_model_path:
             raise ValueError("matcha dynamic export needs tts.matcha.acousticModelPath")
         model_kw = dict(
@@ -488,7 +530,8 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                     if not cfg.lexicon_path:
                         raise ValueError("this matcha model needs tts.matcha.lexiconPath")
                     frontend = LexiconFrontend(
-                        load_lexicon(cfg.lexicon_path, token2id), token2id
+                        load_lexicon(cfg.lexicon_path, token2id), token2id,
+                        english=_english_fallback(cfg, token2id),
                     )
                 else:
                     raise ValueError(
@@ -507,7 +550,9 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             wav_direct = bool(out_names) and out_names[0] in ("wav", "audio_output")
 
             vocoder = None
-            if not wav_direct:
+            if not wav_direct and vocoder_share is not None:
+                vocoder = vocoder_share
+            elif not wav_direct:
                 if not cfg.vocoder_path:
                     raise ValueError(
                         "this matcha export outputs mel; set tts.matcha.vocoderPath "
@@ -692,7 +737,8 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         # no metadata here: side files pick the frontend; lexicon exports are all zh
         if cfg.lexicon_path:
             frontend: EspeakFrontend | LexiconFrontend = LexiconFrontend(
-                load_lexicon(cfg.lexicon_path, token2id), token2id
+                load_lexicon(cfg.lexicon_path, token2id), token2id,
+                english=_english_fallback(cfg, token2id),
             )
             language = "zh"
         else:

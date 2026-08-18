@@ -356,9 +356,14 @@ def fill_engine_paths(block: Any) -> Any:
 
 
 def apply_weights(cfg: Any, block_name: str) -> Any:
-    """``cfg`` with the named engine block store-resolved; a no-op when the
-    block is absent or sets no ``weights`` key. Local filesystem only."""
+    """``cfg`` with the named engine block store-resolved (a bilingual
+    ``secondary`` sub-block resolves too); a no-op when nothing names a
+    ``weights`` key. Local filesystem only."""
     block = getattr(cfg, block_name, None)
-    if block is None or not getattr(block, "weights", None):
+    if block is None:
         return cfg
-    return cfg.model_copy(update={block_name: fill_engine_paths(block)})
+    filled = fill_engine_paths(block) if getattr(block, "weights", None) else block
+    second = getattr(filled, "secondary", None)
+    if second is not None and getattr(second, "weights", None):
+        filled = filled.model_copy(update={"secondary": fill_engine_paths(second)})
+    return cfg if filled is block else cfg.model_copy(update={block_name: filled})

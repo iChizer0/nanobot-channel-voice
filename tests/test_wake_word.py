@@ -340,3 +340,17 @@ def test_voice_config_carries_wake_block():
         {"wake": {"mode": "strict", "phrases": ["hey nanobot"], "windowS": 10}}
     )
     assert cfg.wake.mode == "strict" and cfg.wake.window_s == 10.0
+
+
+def test_hit_position_marks_the_chunk_end(fakes):
+    det = _detector(threshold=0.5)
+    head = fakes["head.onnx"]
+    _warm(det, 9)
+    head.probs = [0.9]
+    # One full chunk plus a 400-sample tail: the hit chunk ends 800 bytes back.
+    assert det.push(_CHUNK + b"\x01\x00" * 400) is True
+    assert det.last_hit_back_bytes == 800
+    head.probs = [0.2, 0.9]
+    assert det.push(b"\x01\x00" * 880) is False  # completes the tail chunk; 0.2 re-arms
+    assert det.push(_CHUNK) is True
+    assert det.last_hit_back_bytes == 0          # hit landed on the frame boundary

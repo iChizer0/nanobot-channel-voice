@@ -197,7 +197,7 @@ def test_phrase_defaults_follow_the_tts_language():
 
     assert _prologue_phrases(None, "zh") == _PROLOGUE_BUILTINS["zh"]
     assert _prologue_phrases(None, None) == _PROLOGUE_FALLBACK
-    assert _prologue_phrases(None, "ko") == _PROLOGUE_FALLBACK  # no builtin -> English
+    assert _prologue_phrases(None, "fr") == _PROLOGUE_FALLBACK  # no builtin -> English
     assert _prologue_phrases(["custom"], "zh") == ["custom"]    # explicit always wins
     assert _prologue_phrases([], "zh") == []                    # explicit off
 

@@ -49,18 +49,48 @@ def _build_supertonic(cfg: TtsConfig) -> TtsAdapter:
     return SupertonicTtsAdapter.from_config(cfg.supertonic)
 
 
-def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
+def _build_one_matcha(cfg, *, vocoder_share=None) -> TtsAdapter:
     from nanobot_channel_voice.tts.matcha import MatchaTtsAdapter, SplitMatchaTtsAdapter
 
     # dynamic first: a bundle's stray encoder.* stem must not flip a working config
-    if cfg.matcha.acoustic_model_path:
-        return MatchaTtsAdapter.from_config(cfg.matcha)
-    if cfg.matcha.encoder_path or cfg.matcha.decoder_path:
-        return SplitMatchaTtsAdapter.from_config(cfg.matcha)
+    if cfg.acoustic_model_path:
+        return MatchaTtsAdapter.from_config(cfg, vocoder_share=vocoder_share)
+    if cfg.encoder_path or cfg.decoder_path:
+        return SplitMatchaTtsAdapter.from_config(cfg)
     raise ValueError(
         "matcha needs tts.matcha.acousticModelPath, or the complete static split: "
         "encoderPath, decoderPath, vocoderPath, and tokensPath"
     )
+
+
+def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
+    from nanobot_channel_voice.tts.router import ScriptRoutedTts
+
+    primary = _build_one_matcha(cfg.matcha)
+    second = cfg.matcha.secondary
+    if second is None:
+        return primary
+    try:
+        # One vocoder session serves both when the dynamic engines name the same
+        # file; the share is caller-decided so a failed secondary build can never
+        # tear down the primary's session.
+        share = (
+            primary._vocoder  # type: ignore[union-attr]
+            if cfg.matcha.acoustic_model_path and second.acoustic_model_path
+            and cfg.matcha.vocoder_path
+            and cfg.matcha.vocoder_path == second.vocoder_path
+            else None
+        )
+        secondary = _build_one_matcha(second, vocoder_share=share)
+    except BaseException:
+        primary.release()
+        raise
+    try:
+        return ScriptRoutedTts(primary, secondary)
+    except BaseException:  # incoherent pair: neither engine may leak (RKNN!)
+        primary.release()
+        secondary.release()
+        raise
 
 
 ENGINES: dict[str, EngineSpec] = {

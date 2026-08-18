@@ -168,6 +168,12 @@ def test_matcha_real_zh_synthesis():
     pcm = asyncio.run(tts.synthesize_pcm("你好，现在是7点45分。"))  # digits verbalize
     duration_s = len(pcm) / 2 / 22050
     assert 1.0 < duration_s < 10.0, duration_s
+
+    # English fallback: acronym spells, word transliterates — both must add
+    # real audio over the zh-only remainder instead of dropping to silence.
+    base = asyncio.run(tts.synthesize_pcm("打开设置。"))
+    mixed = asyncio.run(tts.synthesize_pcm("打开WiFi和USB设置。"))
+    assert len(mixed) > len(base) + 22050 // 2  # >0.25 s of voiced English
     tts.release()
 
 
@@ -517,3 +523,37 @@ def test_zipformer_rknn_real_transcription():
     stt.release()
     assert isinstance(text, str) and len(text.strip()) > 0
     assert any(c.isalpha() for c in text)  # True for CJK too: bilingual-safe
+
+
+def test_matcha_real_bilingual_router():
+    zh = _MATCHA / "matcha-icefall-zh-baker"
+    en = _MATCHA / "matcha-icefall-en_US-ljspeech"
+    vocoder = _MATCHA / "vocos-22khz-univ.onnx"
+    _need(zh / "model-steps-3.onnx", en / "model-steps-3.onnx", vocoder)
+    _need_espeak()
+    from nanobot_channel_voice.config import TtsConfig
+    from nanobot_channel_voice.tts import make_tts
+    from nanobot_channel_voice.tts.router import ScriptRoutedTts
+
+    tts = make_tts(TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {
+            "acousticModelPath": str(zh / "model-steps-3.onnx"),
+            "vocoderPath": str(vocoder),
+            "tokensPath": str(zh / "tokens.txt"),
+            "lexiconPath": str(zh / "lexicon.txt"),
+            "secondary": {
+                "acousticModelPath": str(en / "model-steps-3.onnx"),
+                "vocoderPath": str(vocoder),
+                "tokensPath": str(en / "tokens.txt"),
+            },
+        },
+    }))
+    assert isinstance(tts, ScriptRoutedTts)
+    assert tts.spoken_languages == ("zh", "en")
+    assert tts._cjk._vocoder is tts._latin._vocoder  # one shared vocos session
+
+    pcm = asyncio.run(tts.synthesize_pcm("你好，please turn on the WiFi，谢谢。"))
+    duration_s = len(pcm) / 2 / 22050
+    assert 2.0 < duration_s < 15.0, duration_s
+    tts.release()

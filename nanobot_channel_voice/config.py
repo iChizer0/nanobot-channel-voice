@@ -486,6 +486,10 @@ class MatchaTtsConfig(OnDeviceRuntime):
     # models, 300 for dynamic espeak models, 80 for static espeak encoders, 40 for
     # static lexicon encoders). Longer chunks split at space/clause.
     max_len: int = Field(default=0, ge=0)
+    # Bilingual: a SECOND complete matcha engine for the other script (one must be
+    # CJK-language, one Latin). Text routes per script run; the vocoder session is
+    # shared when both dynamic engines name the same vocoderPath (~+54 MB total).
+    secondary: MatchaTtsConfig | None = None
 
     @model_validator(mode="after")
     def _one_contract(self) -> MatchaTtsConfig:
@@ -496,6 +500,8 @@ class MatchaTtsConfig(OnDeviceRuntime):
                 "matcha: acousticModelPath (dynamic export) and encoderPath/decoderPath "
                 "(static split) are mutually exclusive"
             )
+        if self.secondary is not None and self.secondary.secondary is not None:
+            raise ValueError("matcha: secondary engines do not nest")
         return self
 
 
