@@ -27,6 +27,24 @@ def test_verbalize_numbers_en(text, expected):
     assert verbalize_numbers_en(text) == expected
 
 
+@pytest.mark.parametrize(
+    ("run", "value"),
+    [
+        ("四十五", 45), ("十", 10), ("十二", 12), ("二十", 20),
+        ("一百零五", 105), ("两千零二十六", 2026), ("三万五千", 35000),
+        ("零", 0), ("七", 7), ("一二三", 123),  # no unit char: positional
+        ("四零四", 404), ("一亿", 100000000),
+        ("一亿零五万", 100050000), ("三亿五千万", 350000000),
+        ("一万亿", 10**12), ("五万三千", 53000), ("万", 10000),
+        ("好", None),  # not numeral material
+    ],
+)
+def test_zh_numeral_value(run, value):
+    from nanobot_channel_voice.tts.text_frontend import zh_numeral_value
+
+    assert zh_numeral_value(run) == value
+
+
 def test_huge_digit_runs_are_read_out():
     # Phone-number/id territory: scale words would be absurd; read the digits.
     out = verbalize_numbers_en("call 8005551212000")

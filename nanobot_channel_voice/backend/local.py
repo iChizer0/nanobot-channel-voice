@@ -461,7 +461,12 @@ class LocalBackend(TurnEventMixin):
         # Mic open while speaking -> the echo filter stops the bot barging in on itself (with
         # AEC, on the residual); user speech still interrupts.
         self._open_mic = config.open_mic
-        self._echo = SelfEchoFilter(config.echo_reject_threshold)
+        # Protected stop words survive the Latin-respacing absorption ("stop"
+        # inside spoken "unstoppable"): the kill switch stays fresh evidence.
+        self._echo = SelfEchoFilter(
+            config.echo_reject_threshold,
+            protect=units_of(" ".join(config.barge_in.stop_phrases)),
+        )
         self._vad = vad  # kept for duck floor scaling and release() at close
         # Continuation hysteresis: half the onset bar while a reply is pending (THINKING), so
         # quick "...and also--" follow-ups confirm faster.

@@ -81,7 +81,7 @@ _ORDINAL_IRREGULAR = {
 
 def _int_words(n: int) -> str:
     if n >= 10**12:  # phone-number/id territory: read the digits out
-        return _digit_words(str(n))
+        return en_digit_words(str(n))
     if n < 20:
         return _ONES[n]
     if n < 100:
@@ -94,7 +94,7 @@ def _int_words(n: int) -> str:
     raise AssertionError("unreachable")
 
 
-def _digit_words(digits: str) -> str:
+def en_digit_words(digits: str) -> str:
     return " ".join(_ONES[int(d)] for d in digits)
 
 
@@ -132,7 +132,7 @@ def verbalize_numbers_en(text: str) -> str:
     text = _RE_TIME.sub(_time_words, text)
     text = _RE_GROUPED.sub(lambda m: _int_words(int(m.group().replace(",", ""))), text)
     text = _RE_DECIMAL.sub(
-        lambda m: f"{_int_words(int(m.group(1)))} point {_digit_words(m.group(2))}", text
+        lambda m: f"{_int_words(int(m.group(1)))} point {en_digit_words(m.group(2))}", text
     )
     text = _RE_ORDINAL.sub(lambda m: _ordinal_words(int(m.group(1))), text)
     text = _RE_PERCENT.sub(lambda m: f"{_int_words(int(m.group(1)))} percent", text)
@@ -169,7 +169,7 @@ def _zh_int(n: int) -> str:
     if n == 0:
         return "零"
     if n >= 10**13:  # id/phone territory: read the digits out
-        return _zh_digit_words(str(n))
+        return zh_digit_words(str(n))
     groups = []
     while n:
         groups.append(n % 10000)
@@ -187,14 +187,14 @@ def _zh_int(n: int) -> str:
     return out
 
 
-def _zh_digit_words(digits: str) -> str:
+def zh_digit_words(digits: str) -> str:
     return "".join(_ZH_DIGITS[int(d)] for d in digits)
 
 
 def _zh_number(number: str) -> str:
     """"3" -> 三, "3.5" -> 三点五."""
     head, _, frac = number.partition(".")
-    return _zh_int(int(head)) + (f"点{_zh_digit_words(frac)}" if frac else "")
+    return _zh_int(int(head)) + (f"点{zh_digit_words(frac)}" if frac else "")
 
 
 def _zh_time_words(m: re.Match) -> str:
@@ -214,13 +214,40 @@ _RE_DECIMAL_ZH = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
 _RE_INT_ZH = re.compile(r"\d+")
 
 
+_ZH_VALUE = {ch: i for i, ch in enumerate(_ZH_DIGITS)} | {"两": 2}
+
+
+def zh_numeral_value(run: str) -> int | None:
+    """Value of a zh numeral run (四十五 -> 45, 两百 -> 200); a run with no unit
+    character reads positionally (一二三 -> 123). None when any character is
+    not numeral material."""
+    if not run or any(ch not in _ZH_VALUE and ch not in "十百千万亿" for ch in run):
+        return None
+    if all(ch in _ZH_VALUE for ch in run):
+        return int("".join(str(_ZH_VALUE[ch]) for ch in run))
+    total = section = num = 0
+    for ch in run:
+        if ch in _ZH_VALUE:
+            num = _ZH_VALUE[ch]
+        elif ch == "万":  # closes its own section only (一亿零五万 keeps the 亿)
+            total += ((section + num) or 1) * 10000
+            section = num = 0
+        elif ch == "亿":  # 万亿 composes, so 亿 scales everything accumulated
+            total = ((total + section + num) or 1) * 10**8
+            section = num = 0
+        else:
+            section += (num or 1) * {"十": 10, "百": 100, "千": 1000}[ch]
+            num = 0
+    return total + section + num
+
+
 def verbalize_numbers_zh(text: str) -> str:
     """Expand digits into Chinese words the matcha zh lexicon can actually speak."""
     text = _RE_TIME_ZH.sub(_zh_time_words, text)
     text = _RE_GROUPED_ZH.sub(lambda m: m.group().replace(",", ""), text)
     text = _RE_PERCENT_ZH.sub(lambda m: f"百分之{_zh_number(m.group(1))}", text)
     text = _RE_DECIMAL_ZH.sub(
-        lambda m: f"{_zh_int(int(m.group(1)))}点{_zh_digit_words(m.group(2))}", text
+        lambda m: f"{_zh_int(int(m.group(1)))}点{zh_digit_words(m.group(2))}", text
     )
     return _RE_INT_ZH.sub(lambda m: _zh_int(int(m.group())), text)
 
@@ -253,4 +280,7 @@ __all__ = [
     "make_text_frontend",
     "verbalize_numbers_en",
     "verbalize_numbers_zh",
+    "en_digit_words",
+    "zh_digit_words",
+    "zh_numeral_value",
 ]

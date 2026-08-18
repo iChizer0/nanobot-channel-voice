@@ -1,6 +1,6 @@
 """Lexicon matching for spoken command/backchannel classification.
 
-The alphabet is lower-cased ``\\w+`` runs. Spaced scripts tokenize per word;
+The alphabet is NFKC-folded, lower-cased ``\\w+`` runs. Spaced scripts tokenize per word;
 unspaced CJK comes out as fused runs ("好的好的", "止めてください"), so
 single-token phrases also match as greedy longest-prefix segments inside a
 run — the one extra rule CJK needs, a no-op for spaced scripts.
@@ -9,6 +9,7 @@ run — the one extra rule CJK needs, a no-op for spaced scripts.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
@@ -24,7 +25,8 @@ FILLER_WORDS = frozenset({
 
 
 def tokens_of(text: str) -> list[str]:
-    return _WORD_RE.findall(text.lower())
+    # NFKC: STT compatibility forms (fullwidth ＷｉＦｉ/７) meet canonical TTS text
+    return _WORD_RE.findall(unicodedata.normalize("NFKC", text).lower())
 
 
 def words_of(text: str) -> set[str]:

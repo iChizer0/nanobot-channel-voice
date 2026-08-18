@@ -79,6 +79,56 @@ def test_zh_wake_phrase_containment_for_the_echo_veto():
     assert f.fresh_words("关灯")        # a different phrase stays fresh
 
 
+def test_number_reading_variance_still_matches():
+    # STT renders spoken digits per ITS normalization, not the TTS text's: a
+    # character-output zh model hears 7点45分 as 七点四十五分, a word-output en
+    # model hears 7:45 as "seven forty five", ITN goes the other way.
+    for spoken, heard in [
+        ("现在是7点45分。", "现在是七点四十五分"),
+        ("温度是23.5度。", "温度是二十三点五度"),
+        ("房间号是404。", "房间号是四零四"),          # digitwise reading
+        ("还有四十五分钟。", "还有45分钟"),           # reverse: ITN STT
+        ("It is 7:45 now.", "it is seven forty five now"),
+    ]:
+        f = SelfEchoFilter()
+        f.note_spoken(spoken)
+        assert f.is_self_echo(heard), (spoken, heard)
+        assert not f.fresh_words(heard), (spoken, heard)
+
+
+def test_latin_respacing_still_matches():
+    # STT respaces/hyphenates Latin runs differently than the TTS text: units
+    # bridge via substring-of-the-latin-stream, both split and fused directions.
+    for spoken, heard in [
+        ("请打开WiFi设置。", "请打开Wi-Fi设置"),
+        ("请打开WiFi设置。", "请打开WI FI设置"),
+        ("请打开WiFi设置。", "请打开ＷｉＦｉ设置"),   # fullwidth folds via NFKC
+        ("play some music", "playsomemusic"),
+    ]:
+        f = SelfEchoFilter()
+        f.note_spoken(spoken)
+        assert f.is_self_echo(heard), (spoken, heard)
+        assert not f.fresh_words(heard), (spoken, heard)
+    # Genuine distinct words never absorb: "why fight" is no substring of "wifi".
+    f = SelfEchoFilter()
+    f.note_spoken("请打开WiFi设置。")
+    assert not f.is_self_echo("why fight")
+
+
+def test_protected_units_stay_fresh_through_absorption():
+    from nanobot_channel_voice.echo_reject import units_of
+
+    # "stop" hides inside spoken "unstoppable": scoring may absorb it (echo
+    # containment), but fresh evidence keeps it, so the stop override upstream
+    # still sees the kill switch.
+    f = SelfEchoFilter(protect=units_of("stop"))
+    f.note_spoken("unstoppable progress")
+    assert f.fresh_words("stop") == {"stop"}
+    # Exactly-spoken protected words still subtract: no false stop on echo.
+    f.note_spoken("please stop doing that")
+    assert "stop" not in f.fresh_words("please stop doing that")
+
+
 def test_fresh_seq_bridges_units_to_lexicon_tokens():
     from nanobot_channel_voice.backend.local import LocalBackend
 
