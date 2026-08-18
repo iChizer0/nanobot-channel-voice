@@ -55,9 +55,9 @@ _DEFAULT_PERSONA = (
 _DIRECT_RULES = (
     "Before a tool call that will keep the user waiting, say a brief neutral filler "
     "in the user's language, such as \"One moment.\" or \"Let me check.\" (never "
-    "implying success or failure), then call it. Skip the filler when you expect "
-    "the answer immediately: filler plus instant answer sounds broken. When no "
-    "tool is needed, begin with the answer itself — never a wait phrase."
+    "implying success or failure), then call it with no further speech. Skip the "
+    "filler when you expect the answer immediately. The reply that delivers the "
+    "answer is pure answer: never open it with wait phrases or progress narration."
 )
 
 # Silence-is-the-ack, model-side half: the enforcement is the client's transcript-gated
@@ -181,13 +181,14 @@ def _voice_context_blocks(
             # The backend detects this spoken status line (agent_prologue) and defers
             # the canned filler behind it.
             "Before tool work that will keep the user waiting — a search, a web "
-            "request, multi-step work — first say one short sentence about what you "
-            "are doing (never implying success or failure), then proceed. Skip that "
-            "sentence when you expect to answer right away: a status line followed "
-            "immediately by the answer sounds broken.",
-            "When you can answer without tools, begin with the answer itself. Never "
-            "open with a wait phrase (\"One moment\", \"Let me think\"): every word "
-            "is spoken aloud before the answer and only delays it.",
+            "request, multi-step work — say one short sentence about what you are "
+            "doing (never implying success or failure) and put NOTHING else in "
+            "that message: the tool call follows it. Skip the sentence when you "
+            "expect to answer right away.",
+            "The message that delivers the answer is pure answer: begin with it. "
+            "Never include wait phrases or progress narration (\"One moment\", "
+            "\"I'm checking...\") there — it plays after the work is done, so "
+            "those words are false and only delay the answer.",
         ]
         langs = getattr(tts, "spoken_languages", None)  # bilingual router
         lang = getattr(tts, "spoken_language", None)
