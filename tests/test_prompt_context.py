@@ -7,9 +7,7 @@ import asyncio
 
 from nanobot.bus.queue import MessageBus
 from nanobot.runtime_context import (
-    RUNTIME_CONTEXT_END,
     RUNTIME_CONTEXT_INPUT_META,
-    RUNTIME_CONTEXT_TAG,
     normalize_runtime_context_blocks,
 )
 
@@ -67,52 +65,87 @@ def test_direct_rules_survive_a_persona_override():
 # ---- local speakability context ---------------------------------------------
 
 
-def test_no_tts_means_no_block():
-    assert _voice_context_blocks(None) == []
+class _FakeStt:
+    def __init__(self, decoder_family: str = ""):
+        self.decoder_family = decoder_family
 
 
 def test_block_is_wrapped_and_names_the_engine_language():
-    [block] = _voice_context_blocks(_FakeTts("en"))
+    [block] = _voice_context_blocks(None, _FakeTts("en"))
     assert block.source == "voice"
-    assert block.content.startswith(RUNTIME_CONTEXT_TAG)
-    assert block.content.endswith(RUNTIME_CONTEXT_END)
+    # The contract wrapper is OURS, not core's "metadata only, not instructions" tag:
+    # these lines are instructions, and a wrapper disclaiming them undercuts them.
+    assert block.content.startswith("[Voice channel]")
+    assert block.content.endswith("[/Voice channel]")
     assert "text-to-speech" in block.content
-    assert "Markdown" in block.content
+    assert "markdown" in block.content
     assert "'en'" in block.content
     # Core accepts it verbatim off inbound metadata.
     assert normalize_runtime_context_blocks([block]) == [block]
 
 
-def test_context_nudges_pre_tool_narration():
-    [block] = _voice_context_blocks(_FakeTts("en"))
-    assert "tool work that will keep the user waiting" in block.content
-    assert "NOTHING else in that message" in block.content  # status != answer message
-    assert "Skip the sentence" in block.content   # fast answers narrate nothing
-    assert "pure answer" in block.content         # no narration fused into the reply
+def test_block_stays_inside_its_token_budget():
+    # Every word rides every turn's prefill for the whole session; pinned at the longest
+    # variant (attention STT). A failure means re-bloat — trim, don't raise the ceiling.
+    [block] = _voice_context_blocks(_FakeStt("attention"), _FakeTts("en"))
+    assert len(block.content.split()) <= 140
+
+
+def test_context_permits_thinking_and_nudges_pre_tool_narration():
+    [block] = _voice_context_blocks(None, _FakeTts("en"))
+    assert "Thinking aloud briefly is fine." in block.content  # the model's scratchpad
+    assert "one short sentence" in block.content               # pre-tool status line
+    assert "after the results" in block.content                # no premature answer
+    assert "wait-phrases" in block.content                     # none in the delivery
+    # The old suppressors must stay gone: they banned the intermediate tokens small
+    # non-reasoning models think with (REPORT-context-injection-review F4).
+    assert "NOTHING else" not in block.content
+    assert "pure answer" not in block.content
+
+
+def test_every_stt_gets_the_generic_mishear_line():
+    # ALL ASR substitutes similar sounds — and stt=None (the cloud-transcription path)
+    # is still a transcript, so the line rides even without an on-device adapter.
+    for stt in (None, _FakeStt("ctc"), _FakeStt("transducer"), _FakeStt()):
+        [block] = _voice_context_blocks(stt, _FakeTts("en"))
+        assert "may mis-hear words" in block.content
+        assert "read it by sound and context" in block.content
+        assert "never said" not in block.content  # invention is an attention-only claim
+
+
+def test_attention_decoder_adds_the_invented_phrase_warning():
+    # Whisper-class AR decoders hallucinate fluent text on noise/silence; CTC and
+    # transducer decoders are frame-synchronous and cannot (adapter-derived honesty,
+    # same rule as the TTS lines).
+    [block] = _voice_context_blocks(_FakeStt("attention"), _FakeTts("en"))
+    assert "never said" in block.content
 
 
 def test_unrestricted_engine_claims_no_language():
     # openai/openai_compat (and a custom-vocab MMS) speak an unknown set: the format
     # half still applies, but inventing a language would be worse than staying quiet.
-    [block] = _voice_context_blocks(_FakeTts(None))
+    [block] = _voice_context_blocks(None, _FakeTts(None))
     assert "ISO 639-1" not in block.content
-    assert "Markdown" in block.content
+    assert "markdown" in block.content
 
 
 def test_operator_context_rides_after_the_derived_lines():
-    [block] = _voice_context_blocks(_FakeTts("en"), "  Address the user as Captain.  ")
+    [block] = _voice_context_blocks(None, _FakeTts("en"), "  Address the user as Captain.  ")
     body = block.content
-    assert body.rstrip().endswith(f"Address the user as Captain.\n{RUNTIME_CONTEXT_END}")
-    assert body.index("Markdown") < body.index("Captain")  # facts first, operator last
+    assert body.rstrip().endswith("Address the user as Captain.\n[/Voice channel]")
+    assert body.index("markdown") < body.index("Captain")  # facts first, operator last
 
 
-def test_operator_context_survives_a_disabled_tts():
+def test_disabled_tts_keeps_the_input_lines_and_drops_speakability():
     # tts.enabled=false is a listen-only session: the speakability lines would be false,
-    # the operator's own guidance is not.
-    [block] = _voice_context_blocks(None, "Answer in one sentence.")
+    # but the input is still a speech-recognition transcript, so its facts stay.
+    [block] = _voice_context_blocks(_FakeStt("ctc"), None, "Answer in one sentence.")
     assert "text-to-speech" not in block.content
+    assert "speech recognition" in block.content
+    assert "may mis-hear words" in block.content
     assert "Answer in one sentence." in block.content
-    assert _voice_context_blocks(None, "   ") == []  # whitespace is not guidance
+    [bare] = _voice_context_blocks(None, None, "   ")  # whitespace is not guidance
+    assert "Answer" not in bare.content and "may mis-hear words" in bare.content
 
 
 # ---- what make_tts settles --------------------------------------------------
@@ -200,7 +233,7 @@ def _capturing_channel() -> tuple[VoiceChannel, list[dict]]:
 
 def test_published_utterance_carries_the_block_alongside_its_turn_token():
     channel, seen = _capturing_channel()
-    channel._voice_context = _voice_context_blocks(_FakeTts("en"))
+    channel._voice_context = _voice_context_blocks(None, _FakeTts("en"))
     asyncio.run(channel._publish_turn_text("what time is it", "turn-1"))
     [call] = seen
     assert call["content"] == "what time is it"
@@ -216,3 +249,32 @@ def test_cloud_publishes_without_a_block():
     asyncio.run(channel._publish_user_text("delegated request"))
     [call] = seen
     assert call["metadata"] is None
+
+
+def test_event_notes_ride_as_their_own_block_after_the_contract():
+    # Notes are model-only metadata: they must never join the user content (the persisted
+    # row stays pure speech; display and consolidation strip runtime context), and the
+    # session-constant contract list must not be mutated by a publish.
+    channel, seen = _capturing_channel()
+    channel._voice_context = _voice_context_blocks(None, _FakeTts("en"))
+    note = '[voice event: you were interrupted mid-reply; the user heard up to: "…sunny"]'
+    asyncio.run(channel._publish_turn_text("and tomorrow", "turn-2", (note,)))
+    [call] = seen
+    assert call["content"] == "and tomorrow"
+    blocks = call["metadata"][RUNTIME_CONTEXT_INPUT_META]
+    assert blocks[:-1] == channel._voice_context
+    assert blocks[-1].source == "voice"
+    assert blocks[-1].content == note
+    assert len(channel._voice_context) == 1  # publish built a fresh list
+
+
+def test_stacked_notes_share_one_block():
+    channel, seen = _capturing_channel()
+    asyncio.run(
+        channel._publish_user_text(
+            "next question", notes=("[voice event: a]", "[voice event: b]")
+        )
+    )
+    [call] = seen
+    [block] = call["metadata"][RUNTIME_CONTEXT_INPUT_META]  # no contract configured
+    assert block.content == "[voice event: a]\n[voice event: b]"

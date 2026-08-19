@@ -178,7 +178,7 @@ def _backend(mode: str) -> tuple[LocalBackend, AudioSink, _SilentVad]:
     async def transcribe(pcm: bytes) -> str:
         return ""
 
-    async def publish(text: str, token: str) -> None:
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         pass
 
     async def interrupt() -> None:

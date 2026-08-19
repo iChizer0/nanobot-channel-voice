@@ -42,11 +42,69 @@ def test_content_barge_in_kills_and_carries_the_heard_marker():
             await c.user_says("turn off the desk lamp")
             assert c.interrupts == 1                     # /stop went out
             assert len(c.texts()) == 2
-            barge = c.texts()[1]
-            assert barge.startswith("turn off the desk lamp")
-            assert "[note: you were interrupted mid-reply" in barge
-            assert "The weather" in barge                # heard-up-to names real words
+            assert c.texts()[1] == "turn off the desk lamp"  # pure speech, no note in-text
+            [note] = c.notes()[1]                        # the marker rides BESIDE the text
+            assert note.startswith("[voice event: you were interrupted mid-reply")
+            assert "The weather" in note                 # heard-up-to names real words
             assert c.backend._turn is VoiceState.THINKING
+
+    _run(_case())
+
+
+def test_wait_phrase_and_markdown_probes():
+    from nanobot_channel_voice.backend.local import _MD_PROBE, _opens_with_wait_phrase
+
+    assert _opens_with_wait_phrase('"One moment." said the bot')
+    assert _opens_with_wait_phrase("稍等，我看看天气")
+    assert not _opens_with_wait_phrase("It is sunny today")
+    assert not _opens_with_wait_phrase("Moments later it rained")  # prefix, not substring
+    assert _MD_PROBE.search("plain prose, no formatting at all") is None
+    assert _MD_PROBE.search("a **bold** claim")
+    assert _MD_PROBE.search("see [the docs](http://example.com)")
+    assert _MD_PROBE.search("```py\nprint(1)\n```")
+
+
+def test_reply_contract_counters_markdown_and_wait_phrase():
+    """The P3 observability pair: turns whose reply carried markdown, and answer-bearing
+    segments that opened on a wait-phrase (REPORT-context-injection-review). Wait-phrases
+    are judged only where they are false — a status line before a tool call is allowed."""
+    async def _case():
+        async with EvalConversation() as c:
+            await c.user_says("format something for me")
+            await c.agent_replies("Here is **bold** and a [link](http://x). More **bold**.")
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_markdown") == 1  # per-turn latch, not per-hit
+
+            # No tools at all: a wait-phrase opening the delivery is the classic
+            # filler-plus-instant-answer failure.
+            await c.user_says("quick question")
+            await c.agent_replies("One moment. It is sunny today.")
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_wait_phrase") == 1
+
+            # Tool chain: wait-phrases in the status slots (resuming segments) are
+            # allowed; only the final segment is the delivery.
+            b = c.backend
+            await c.user_says("check the weather")
+            await b.on_delta("Let me check the weather.")
+            await b.on_stream_end(resuming=True)
+            await b.on_delta("One moment.")               # status for the SECOND tool
+            await b.on_stream_end(resuming=True)
+            await b.on_delta("It is sunny in Tokyo today, all day long.")
+            await b.on_stream_end(resuming=False)
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_wait_phrase") == 1    # unchanged: no false stall
+            assert c.counter("agent_prologue") == 2       # both status lines spoke
+
+            # Same chain, but the delivery itself opens on the stall.
+            await c.user_says("and tomorrow")
+            await b.on_delta("Let me check again.")
+            await b.on_stream_end(resuming=True)
+            await b.on_delta("One moment. Tomorrow will be cloudy all day long.")
+            await b.on_stream_end(resuming=False)
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_wait_phrase") == 2
+            assert c.counter("reply_markdown") == 1       # prose turns added nothing
 
     _run(_case())
 
@@ -67,10 +125,10 @@ def test_stop_mid_reply_goes_silent_and_notes_the_next_turn():
             assert c.counter("barge_in_stop") == 1
             assert c.counter("barge_in_duck") >= 1       # yielded before the verdict
             await c.user_says("what about osaka")
-            note = c.texts()[1]
-            assert note.startswith("what about osaka")
+            assert c.texts()[1] == "what about osaka"
+            [note] = c.notes()[1]
             assert "stopped your previous reply" in note
-            assert 'heard only: "The weather' in note
+            assert 'heard up to: "The weather' in note
 
     _run(_case())
 

@@ -160,11 +160,11 @@ def test_build_releases_the_primary_when_the_secondary_fails(monkeypatch):
 def test_context_line_names_both_languages():
     from nanobot_channel_voice.channel import _voice_context_blocks
 
-    (block,) = _voice_context_blocks(ScriptRoutedTts(_Eng("zh", "a"), _Eng("en", "b")))
+    (block,) = _voice_context_blocks(None, ScriptRoutedTts(_Eng("zh", "a"), _Eng("en", "b")))
     assert "'zh' and 'en'" in block.content
-    assert "mixing them is fine" in block.content
-    (single,) = _voice_context_blocks(_Eng("zh", "a"))
-    assert "only pronounce ISO 639-1 language 'zh'" in single.content
+    assert "mixing is fine" in block.content
+    (single,) = _voice_context_blocks(None, _Eng("zh", "a"))
+    assert "only pronounces ISO 639-1 language 'zh'" in single.content
 
 
 def test_router_requires_declared_languages():

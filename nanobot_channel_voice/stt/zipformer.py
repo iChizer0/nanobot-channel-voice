@@ -98,6 +98,7 @@ class _ZipformerStream(SttStream):
 
 
 class ZipformerOnDeviceStt(SttAdapter):
+    decoder_family = "transducer"
     streaming = True
 
     def __init__(

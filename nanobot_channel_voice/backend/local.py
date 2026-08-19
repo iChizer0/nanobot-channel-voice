@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import io
 import math
+import re
 import threading
 import time
 import wave
@@ -54,7 +55,9 @@ from .base import OnEvent, OutputAudio, ToolDef, VoiceState
 from .common import TurnEventMixin, loggable_text
 
 TranscribeFn = Callable[[bytes], Awaitable[str]]
-PublishTextFn = Callable[[str, str], Awaitable[None]]
+# (text, turn_token, event notes) — notes ride the publish as model-only metadata, so the
+# user row the channel persists stays pure speech (see channel._publish_user_text).
+PublishTextFn = Callable[[str, str, tuple[str, ...]], Awaitable[None]]
 InterruptFn = Callable[[], Awaitable[None]]
 
 # Inbound-metadata key carrying the publishing turn's token; core echoes it onto that turn's
@@ -168,15 +171,51 @@ def _prologue_phrases(configured: list[str] | None, language: str | None) -> lis
     return _PROLOGUE_BUILTINS.get(language or "", _PROLOGUE_FALLBACK)
 
 
+# Contract-regression rates for the metrics snapshot (never enforcement; the line-start
+# patterns can undercount across delta boundaries). Stall-claims only — think-aloud
+# openers ("let me see") are contract-welcome and must not count.
+_MD_PROBE = re.compile(r"(?m)```|^[ \t]{0,3}(?:#{1,6}\s|[-*+]\s)|\[[^\]]+\]\([^)]+\)|\*\*")
+_WAIT_PHRASES = tuple(dict.fromkeys(
+    [
+        phrase.rstrip(".。").lower()
+        for phrases in (*_PROLOGUE_BUILTINS.values(), _PROLOGUE_FALLBACK)
+        for phrase in phrases
+    ]
+    + ["one moment", "just a moment", "hold on", "请稍等"]
+))
+
+
+def _opens_with_wait_phrase(text: str) -> bool:
+    return text.lstrip(" \t\"'“”‘’(（[【").lower().startswith(_WAIT_PHRASES)
+
+
+_NOTE_CJK_FLOOR = 0x2E80  # same script split as echo_reject/phrases
+
+
+def _heard_tail(heard: str, *, max_words: int = 12, max_cjk_chars: int = 20) -> str:
+    """Bound a heard-up-to quote to its tail: the cut point is the only new information
+    (the full reply is the assistant turn above). Words for Latin; characters for an
+    unspaced CJK tail (a zh reply is one giant "word")."""
+    heard = " ".join(heard.split())
+    if any(ord(ch) >= _NOTE_CJK_FLOOR for ch in heard[-6:]):
+        cut, tail = len(heard) > max_cjk_chars, heard[-max_cjk_chars:]
+    else:
+        parts = heard.split(" ")
+        cut, tail = len(parts) > max_words, " ".join(parts[-max_words:])
+    if len(tail) > 80:  # a mid-text unspaced run escapes both counts: hard cap, chars
+        cut, tail = True, tail[-80:]
+    return f"…{tail}" if cut else tail
+
+
 def _interrupt_marker(heard: str | None) -> str | None:
-    """The heard-up-to note riding an interrupting utterance's publish. ``heard`` is the
-    heard text ("" = cut before anything sounded), None = marker disabled/blob mode."""
+    """The heard-up-to event note riding an interrupting utterance's publish. ``heard`` is
+    the heard text ("" = cut before anything sounded), None = marker disabled/blob mode."""
     if heard is None:
         return None
     return (
-        f'[note: you were interrupted mid-reply; the user heard only: "{heard}"]'
+        f'[voice event: you were interrupted mid-reply; the user heard up to: "{_heard_tail(heard)}"]'
         if heard
-        else "[note: you were interrupted before your reply was heard]"
+        else "[voice event: you were interrupted before your reply was heard]"
     )
 
 
@@ -185,16 +224,16 @@ def _wake_note(heard: str | None) -> str:
     itself publishes nothing) — same contract as a consumed stop's note."""
     if heard:
         return (
-            "[note: the user cut your reply short with the wake word; "
-            f'they heard only: "{heard}"; do not resume it unless asked]'
+            "[voice event: the user cut your reply short with the wake word; "
+            f'they heard up to: "{_heard_tail(heard)}"; do not resume it unless asked]'
         )
     if heard == "":
         return (
-            "[note: the user cut your reply short with the wake word "
+            "[voice event: the user cut your reply short with the wake word "
             "before hearing it; do not resume it unless asked]"
         )
     return (
-        "[note: the user cut your reply short with the wake word; "
+        "[voice event: the user cut your reply short with the wake word; "
         "do not resume it unless asked]"
     )
 
@@ -207,16 +246,16 @@ def _stop_note(stop_text: str, heard: str | None) -> str:
     "" may claim the cut landed before anything sounded."""
     if heard:
         return (
-            f'[note: the user stopped your previous reply with "{stop_text}"; '
-            f'they heard only: "{heard}"; do not resume it unless asked]'
+            f'[voice event: the user stopped your previous reply with "{stop_text}"; '
+            f'they heard up to: "{_heard_tail(heard)}"; do not resume it unless asked]'
         )
     if heard == "":
         return (
-            f'[note: the user stopped your previous reply with "{stop_text}" '
+            f'[voice event: the user stopped your previous reply with "{stop_text}" '
             "before hearing it; do not resume it unless asked]"
         )
     return (
-        f'[note: the user stopped your previous reply with "{stop_text}"; '
+        f'[voice event: the user stopped your previous reply with "{stop_text}"; '
         "do not resume it unless asked]"
     )
 
@@ -284,6 +323,7 @@ class _Turn:
         "published_at", "chunk_await", "tts_first_pending", "await_first_token",
         "segment_spoke", "prologue_task", "midturn_task", "timeout_task", "base",
         "last_activity", "dead", "token", "audible_at", "continuation_pending",
+        "md_counted", "segment_first",
     )
 
     def __init__(self, token: str = ""):
@@ -305,6 +345,11 @@ class _Turn:
         # A resuming stream end passed: the next delta (the earliest observable resume
         # edge) re-anchors the metrics clock so tool time never lands in ttfa_ms.
         self.continuation_pending = False
+        self.md_counted = False  # reply_markdown counted once per turn
+        # First chunk of the CURRENT stream segment; judged for reply_wait_phrase only
+        # when the segment turns out to be the answer-bearing one (non-resuming end) —
+        # the same opener BEFORE a tool call is a legitimate status line.
+        self.segment_first: str | None = None
 
     @classmethod
     def idle(cls) -> _Turn:
@@ -334,6 +379,7 @@ class _Turn:
         self.segment_spoke = False
         self.chunk_await = self.tts_first_pending = self.await_first_token = False
         self.continuation_pending = False
+        self.segment_first = None
 
 
 def _dump_session_header(config: VoiceConfig, frame_ms: int) -> dict:
@@ -1799,17 +1845,17 @@ class LocalBackend(TurnEventMixin):
         await self._set_turn(VoiceState.THINKING)
         self._cur_turn = _Turn(unique_token())
         self._heard_prefix = ""        # heard accounting restarts with the new turn
-        parts = [text]
+        notes: list[str] = []
         marker = _interrupt_marker(heard)
         if marker:
-            parts.append(marker)
+            notes.append(marker)
         if self._pending_note is not None:
             # A consumed stop's note describes the PREVIOUS (killed) reply; the marker above
             # describes the one killed by THIS utterance. Both may ride one publish.
-            parts.append(self._pending_note)
+            notes.append(self._pending_note)
             self._pending_note = None
         self._touch_wake()  # an accepted turn keeps the conversation's attention
-        await self._publish_text("\n\n".join(parts), self._cur_turn.token)
+        await self._publish_text(text, self._cur_turn.token, tuple(notes))
         self._arm_prologue()
         self._arm_timeout()
         return _summary("interrupt" if killed else "publish")
@@ -2272,10 +2318,13 @@ class LocalBackend(TurnEventMixin):
             # continuation_ms, never in ttfa_ms (a slow tool must not read as a slow model).
             self._cur_turn.continuation_pending = False
             self._metrics.turn_continuation()
+        self._note_reply_markdown(delta)
         if self._turn is not VoiceState.SPEAKING:
             await self._set_turn(VoiceState.SPEAKING)
             self._duck_if_capturing()
         for chunk in self._chunker.feed(delta):
+            if self._cur_turn.segment_first is None:
+                self._cur_turn.segment_first = chunk
             self._tts_enqueue(chunk)  # echo filter is fed at EMIT time (see _tts_worker)
             self._cur_turn.segment_spoke = True
 
@@ -2292,8 +2341,15 @@ class LocalBackend(TurnEventMixin):
         self._cur_turn.last_activity = time.monotonic()
         tail = self._chunker.flush()
         if tail:
+            if self._cur_turn.segment_first is None:
+                self._cur_turn.segment_first = tail
             self._tts_enqueue(tail)
             self._cur_turn.segment_spoke = True
+        # Judged only now: the same opener before a tool call is a status line, and only a
+        # non-resuming end marks this segment as the one that delivers the answer.
+        first, self._cur_turn.segment_first = self._cur_turn.segment_first, None
+        if not resuming and first and _opens_with_wait_phrase(first):
+            self._metrics.count("reply_wait_phrase")
         if resuming:
             spoke, self._cur_turn.segment_spoke = self._cur_turn.segment_spoke, False
             if spoke:
@@ -2305,10 +2361,19 @@ class LocalBackend(TurnEventMixin):
         self._cur_turn.segment_spoke = False
         self._schedule_drain()
 
+    def _note_reply_markdown(self, text: str) -> None:
+        """Turn-level latch: rate of turns whose reply contained markdown at all."""
+        if not self._cur_turn.md_counted and _MD_PROBE.search(text):
+            self._cur_turn.md_counted = True
+            self._metrics.count("reply_markdown")
+
     async def speak_final(self, text: str) -> None:
         """A non-streamed final assistant message (streaming disabled / fallback)."""
         self._cancel_prologue()
         self._cancel_midturn()
+        self._note_reply_markdown(text)
+        if _opens_with_wait_phrase(text):  # the whole message IS the delivery
+            self._metrics.count("reply_wait_phrase")
         if self._cur_turn.await_first_token and self._cur_turn.published_at:
             # Non-streaming: the whole generation IS the wait the filler masks.
             self._cur_turn.await_first_token = False

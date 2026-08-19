@@ -549,7 +549,7 @@ For latency questions rather than by-ear ones, `debug.metricsIntervalS` (e.g. `3
 
 ### Filler while the agent works
 
-Long waits (tool calls, slow reasoning) are masked in two layers. The voice context already asks the agent to speak one short status sentence before slow tools - a contextual "let me check the calendar" beats any canned phrase, and the backend detects it (`agent_prologue`) and defers the canned filler behind it. The fallback is opt-in canned filler:
+Long waits (tool calls, slow reasoning) are masked in two layers. The voice context already asks the agent to speak one short status sentence before slow tools - a contextual "let me check the calendar" beats any canned phrase, and the backend detects it (`agent_prologue`) and defers the canned filler behind it. The fallback is opt-in canned filler - recommended on for tool-using deployments, since the status sentence is a preference the model may skip, and the filler is what guarantees the line never goes dead:
 
 ```json
 {

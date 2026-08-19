@@ -119,6 +119,7 @@ def ctc_greedy(ids) -> list[int]:
 
 
 class SenseVoiceOnDeviceStt(SttAdapter):
+    decoder_family = "ctc"
     # Dynamic-.onnx policy bound (O(T^2) SAN-M activations, short-form training audio:
     # past ~30 s memory and accuracy slide); a static .rknn window tightens it per instance.
     max_decode_ms = 30_000

@@ -82,7 +82,7 @@ class EvalConversation:
         })
         self.vad = _FlagVad()
         self.sink = AudioSink(NullPlayback(), mode="stream")
-        self.published: list[tuple[str, str]] = []
+        self.published: list[tuple[str, str, tuple[str, ...]]] = []
         self.interrupts = 0
         self.states: list[VoiceState] = []
         self._stt: deque[str] = deque()
@@ -90,8 +90,8 @@ class EvalConversation:
         async def transcribe(pcm: bytes) -> str:
             return self._stt.popleft() if self._stt else ""
 
-        async def publish(text: str, token: str) -> None:
-            self.published.append((text, token))
+        async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
+            self.published.append((text, token, notes))
 
         async def interrupt() -> None:
             self.interrupts += 1
@@ -167,7 +167,11 @@ class EvalConversation:
     # ---- inspection ---------------------------------------------------------
 
     def texts(self) -> list[str]:
-        return [t for t, _ in self.published]
+        return [t for t, _, _ in self.published]
+
+    def notes(self) -> list[tuple[str, ...]]:
+        """Event notes per publish, index-aligned with texts()."""
+        return [n for _, _, n in self.published]
 
     def counter(self, name: str) -> int:
         return self.backend._metrics.counters.get(name, 0)

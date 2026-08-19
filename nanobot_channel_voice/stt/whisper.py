@@ -72,6 +72,8 @@ def log_mel_spectrogram(audio: np.ndarray, mel_filters: np.ndarray) -> np.ndarra
 
 
 class WhisperOnDeviceStt(SttAdapter):
+    decoder_family = "attention"
+
     def __init__(
         self,
         *,

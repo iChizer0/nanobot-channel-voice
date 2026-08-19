@@ -113,7 +113,7 @@ def test_publish_commits_and_retargets_the_endpointer():
     async def transcribe(pcm: bytes) -> str:
         return "hello there"
 
-    async def publish(text: str, token: str) -> None:
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         published.append(text)
 
     async def interrupt() -> None:

@@ -51,6 +51,11 @@ class SttAdapter(abc.ABC):
     # capture, finishing the SttStream at the endpoint instead of calling transcribe().
     streaming: bool = False
 
+    # Decode architecture for the voice context's transcript-accuracy line: "attention"
+    # (AR decoder — can hallucinate fluent text never spoken) vs "ctc"/"transducer"
+    # (frame-synchronous — mis-substitutions only). "" = undeclared: claim no invention.
+    decoder_family: str = ""
+
     # Longest audio one transcribe() call decodes faithfully (None = unbounded).
     # Callers with possibly-longer input route it through transcribe_chunked().
     max_decode_ms: int | None = None

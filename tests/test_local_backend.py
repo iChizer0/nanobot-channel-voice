@@ -62,7 +62,7 @@ def _build(**cfg_over) -> _Harness:
             await harness.on_transcribe()
         return harness.transcript
 
-    async def publish(text: str, token: str) -> None:
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         harness.published.append((text, token))
 
     async def interrupt() -> None:

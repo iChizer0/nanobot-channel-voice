@@ -14,7 +14,7 @@ import time
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import VoiceState
-from nanobot_channel_voice.backend.local import LocalBackend, _PendingUtterance
+from nanobot_channel_voice.backend.local import LocalBackend, _heard_tail, _PendingUtterance
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.vad.base import Vad
 
@@ -29,7 +29,7 @@ class _SilentVad(Vad):
 
 class _Harness:
     def __init__(self) -> None:
-        self.published: list[tuple[str, str]] = []
+        self.published: list[tuple[str, str, tuple[str, ...]]] = []
         self.interrupts = 0
         self.transcript = ""
         self.on_transcribe = None
@@ -56,8 +56,8 @@ def _build(**cfg_over) -> _Harness:
             await harness.on_transcribe()
         return harness.transcript
 
-    async def publish(text: str, token: str) -> None:
-        harness.published.append((text, token))
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
+        harness.published.append((text, token, notes))
 
     async def interrupt() -> None:
         harness.interrupts += 1
@@ -97,6 +97,20 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_heard_tail_bounds_the_quote():
+    # The cut point is the note's only new information — the full reply is already the
+    # assistant turn above it. Short heard text passes through whole (no false ellipsis).
+    assert _heard_tail("the first bit") == "the first bit"
+    long = " ".join(f"w{i}" for i in range(30))
+    tail = _heard_tail(long)
+    assert tail.startswith("…") and tail.endswith("w29")
+    assert len(tail.lstrip("…").split()) == 12
+    # A zh reply is one unspaced run: character-bounded, same cut marker.
+    zh = "明天上午晴转多云下午有阵雨气温二十到二十八度东南风三级预计夜间转小雨请记得带伞"
+    zh_tail = _heard_tail(zh)
+    assert zh_tail == "…" + zh[-20:]
+
+
 def test_stop_while_speaking_is_consumed_silently():
     h = _build()
     b = h.backend
@@ -120,13 +134,15 @@ def test_stop_note_rides_the_next_publish_once():
     b._turn = VoiceState.IDLE
     h.transcript = "what about tomorrow"
     _run(b._on_utterance(_utt()))
-    text, _ = h.published[0]
-    assert text.startswith("what about tomorrow")
-    assert "stopped your previous reply" in text
+    text, _, notes = h.published[0]
+    assert text == "what about tomorrow"      # the user row stays pure speech
+    assert any("stopped your previous reply" in n for n in notes)
     assert b._pending_note is None
     h.transcript = "and the day after"
     _run(b._on_utterance(_utt()))
-    assert "stopped" not in h.published[1][0]  # the note rides exactly one publish
+    # The STOP note rides exactly one publish; this third utterance interrupts the
+    # still-thinking second turn, so an interrupt marker legitimately rides instead.
+    assert not any("stopped" in n for n in h.published[1][2])
 
 
 def test_cold_stop_with_nothing_live_publishes():
@@ -134,7 +150,7 @@ def test_cold_stop_with_nothing_live_publishes():
     h.backend._turn = VoiceState.IDLE
     h.transcript = "stop"
     _run(h.backend._on_utterance(_utt()))
-    assert [t for t, _ in h.published] == ["stop"]
+    assert [t for t, _, _ in h.published] == ["stop"]
     assert h.interrupts == 0
     assert "barge_in_stop" not in h.backend._metrics.counters
 
@@ -173,7 +189,7 @@ def test_preempted_stop_consumes_without_a_second_kill():
     _run(b._on_utterance(_utt(preempted=True, heard="the first bit")))
     assert h.published == []
     assert h.interrupts == 0
-    assert 'they heard only: "the first bit"' in b._pending_note
+    assert 'they heard up to: "the first bit"' in b._pending_note
 
 
 def test_stop_through_echo_is_consumed():
@@ -239,7 +255,7 @@ def test_content_kill_does_not_arm_the_stop_grace():
     b._turn = VoiceState.IDLE
     h.transcript = "stop"
     _run(b._on_utterance(_utt(onset_at=time.monotonic())))
-    assert [t for t, _ in h.published][1] == "stop"  # forwarded, not consumed
+    assert [t for t, _, _ in h.published][1] == "stop"  # forwarded, not consumed
     assert "barge_in_stop" not in b._metrics.counters
 
 

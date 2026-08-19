@@ -57,7 +57,7 @@ def _build(vad: Vad, tmp, *, mode: str = "duck", aec=None) -> _Harness:
     async def transcribe(pcm: bytes) -> str:
         return harness.transcript
 
-    async def publish(text: str, token: str) -> None:
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         harness.published.append((text, token))
 
     async def interrupt() -> None:
@@ -252,7 +252,7 @@ def test_flooring_aec_keeps_the_twin_aligned(tmp_path):
 def test_dump_off_keeps_endpointer_lean(tmp_path):
     cfg = VoiceConfig.model_validate({"aec": "soft"})
 
-    async def _noop_text(text: str, token: str) -> None:
+    async def _noop_text(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         pass
 
     async def _noop_stt(pcm: bytes) -> str:

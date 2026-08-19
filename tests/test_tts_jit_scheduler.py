@@ -46,7 +46,7 @@ def _build(tts: _FakeTts | None = None) -> tuple[LocalBackend, _FakeTts, AudioSi
     async def transcribe(pcm: bytes) -> str:
         return ""
 
-    async def publish(text: str, token: str) -> None:
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         pass
 
     async def interrupt() -> None:

@@ -20,7 +20,6 @@ from nanobot.channels.base import BaseChannel
 from nanobot.runtime_context import (
     RUNTIME_CONTEXT_INPUT_META,
     RuntimeContextBlock,
-    wrap_runtime_context_lines,
 )
 
 from nanobot_channel_voice.aio import cancel_and_wait
@@ -157,61 +156,79 @@ def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: boo
     )
 
 
-def _voice_context_blocks(
-    tts: TtsAdapter | None, extra: str | None = None
-) -> list[RuntimeContextBlock]:
-    """The local backend's turn context: what the agent must know to be SPEAKABLE, the
-    pre-tool narration nudge, plus the operator's voice-scoped ``context`` lines.
+# Our own wrapper, NOT core's "metadata only, not instructions" tag: these lines ARE
+# instructions, and a disclaiming wrapper undercuts them. Core never parses the tag
+# (display/consolidation stripping is marker-based), so the wording is ours.
+_VOICE_WRAP_OPEN = "[Voice channel]"
+_VOICE_WRAP_CLOSE = "[/Voice channel]"
 
-    Core's format-hint ladder has no ``voice`` branch, so without this the agent writes
-    for a screen and answers in whatever language the user spoke; markdown the chunker
-    strips after the fact, but every on-device engine is fixed to ONE language and
-    non-Latin text survives ``sanitize`` intact. Derived from the RESOLVED adapter, not
-    config, so a degrade-to-system fallback cannot leave claims true of an engine that
-    never loaded; ``extra`` stands alone, so a text-out session (tts.enabled=false) still
-    carries it. Both absent => no block."""
+
+def _voice_context_blocks(
+    stt: SttAdapter | None, tts: TtsAdapter | None, extra: str | None = None
+) -> list[RuntimeContextBlock]:
+    """The channel contract riding every local-mode publish: transcript-accuracy facts
+    (input side), the speakability contract (output side), then the operator's ``context``.
+
+    Claims derive from the RESOLVED adapters, never config: the input lines always ride
+    (``stt`` None is the cloud-transcription path — still a transcript; TTS off is still
+    a listening session), but only a declared attention decoder gets the invented-phrase
+    warning — CTC/transducer decoders are frame-synchronous and cannot confabulate, and
+    a remote decoder is unverifiable. Budget: core persists this into EVERY user row, so
+    each word is paid on every turn's prefill for the whole session — keep it under ~135
+    words, byte-stable, and permission-shaped ("thinking aloud is fine" is the small
+    non-reasoning model's only scratchpad); see REPORT-context-injection-review."""
     lines: list[str] = []
     if tts is not None:
-        lines += [
-            "This message was spoken aloud, and your reply is read back through a "
-            "text-to-speech engine; it is never displayed.",
-            "Write plain conversational prose. Markdown, headings, tables, code blocks, "
-            "URLs and emoji are stripped before speaking, so they are heard as nothing "
-            "or as mangled words.",
-            # The backend detects this spoken status line (agent_prologue) and defers
-            # the canned filler behind it.
-            "Before tool work that will keep the user waiting — a search, a web "
-            "request, multi-step work — say one short sentence about what you are "
-            "doing (never implying success or failure) and put NOTHING else in "
-            "that message: the tool call follows it. Skip the sentence when you "
-            "expect to answer right away.",
-            "The message that delivers the answer is pure answer: begin with it. "
-            "Never include wait phrases or progress narration (\"One moment\", "
-            "\"I'm checking...\") there — it plays after the work is done, so "
-            "those words are false and only delay the answer.",
-        ]
+        lines.append(
+            "This is a spoken conversation: the user's words arrive via speech "
+            "recognition and your reply is spoken by a text-to-speech voice, never "
+            "displayed."
+        )
+    else:
+        lines.append("The user's words arrive via speech recognition.")
+    # Read-by-sound licenses charitable decoding (homophones); confirm-before-ACTING
+    # keeps ordinary answers free of verification questions.
+    if getattr(stt, "decoder_family", "") == "attention":
+        lines.append(
+            "The transcript may mis-hear words or occasionally include a phrase that "
+            "was never said — read it by sound and context, and confirm surprising "
+            "names or numbers before acting on them."
+        )
+    else:
+        lines.append(
+            "The transcript may mis-hear words — read it by sound and context, and "
+            "confirm surprising names or numbers before acting on them."
+        )
+    if tts is not None:
+        lines.append(
+            "Write plain prose for the ear — no markdown, code, URLs, or emoji."
+        )
         langs = getattr(tts, "spoken_languages", None)  # bilingual router
         lang = getattr(tts, "spoken_language", None)
         if langs:
             named = " and ".join(f"'{code}'" for code in langs)
             lines.append(
-                f"The speech engine can only pronounce ISO 639-1 languages {named}. "
-                "Reply in whichever of these the user speaks (mixing them is fine), "
-                "and avoid quoting words in other scripts: they are dropped or "
-                "voiced as noise."
+                f"The voice pronounces ISO 639-1 languages {named}; reply in "
+                "whichever the user speaks — mixing is fine; words in other "
+                "scripts are dropped or voiced as noise."
             )
         elif lang:
             lines.append(
-                f"The speech engine can only pronounce ISO 639-1 language '{lang}'. "
-                f"Reply in '{lang}' regardless of the language spoken to you, and "
-                "avoid quoting words in other scripts: they are dropped or voiced "
-                "as noise."
+                f"The voice only pronounces ISO 639-1 language '{lang}'; reply in "
+                f"'{lang}' only — words in other scripts are dropped or voiced as noise."
             )
+        lines.append(
+            # The backend detects the spoken status line (agent_prologue) and defers
+            # the canned filler behind it.
+            "Thinking aloud briefly is fine. Before a slow tool call, say one short "
+            "sentence about what you are doing; keep the answer itself for after the "
+            "results. Never say wait-phrases (\"One moment\") when delivering an "
+            "answer — by then the wait is over."
+        )
     if extra and extra.strip():
         lines.append(extra.strip())
-    if not lines:
-        return []
-    return [RuntimeContextBlock(source="voice", content=wrap_runtime_context_lines(lines))]
+    content = "\n".join((_VOICE_WRAP_OPEN, *lines, _VOICE_WRAP_CLOSE))
+    return [RuntimeContextBlock(source="voice", content=content)]
 
 
 # Stamped on a delegated ask_nanobot request; the AgentLoop echoes inbound metadata onto
@@ -471,7 +488,7 @@ class VoiceChannel(BaseChannel):
         )
         tts = make_tts(self.config.tts)
         self._tts_adapter = tts
-        self._voice_context = _voice_context_blocks(tts, self.config.context)
+        self._voice_context = _voice_context_blocks(self._stt, tts, self.config.context)
         # A raw-PCM TTS (MMS, openai with audioFormat=pcm) streams gaplessly through one
         # persistent player, no per-chunk aplay spawn; WAV-only adapters keep blob mode.
         pcm_capable = tts is not None and getattr(tts, "output_rate", None) is not None
@@ -895,18 +912,29 @@ class VoiceChannel(BaseChannel):
             with suppress(OSError):
                 await asyncio.to_thread(os.unlink, path)
 
-    async def _publish_turn_text(self, text: str, turn_token: str) -> None:
+    async def _publish_turn_text(
+        self, text: str, turn_token: str, notes: tuple[str, ...] = ()
+    ) -> None:
         """Publish a captured utterance tagged with the turn it opens: core echoes inbound
         metadata onto that turn's final send, so ``send`` can tell the live turn's reply
         from a barged-out one's straggler."""
-        await self._publish_user_text(text, metadata={TURN_META: turn_token})
+        await self._publish_user_text(text, metadata={TURN_META: turn_token}, notes=notes)
 
-    async def _publish_user_text(self, text: str, metadata: dict[str, Any] | None = None) -> None:
+    async def _publish_user_text(
+        self,
+        text: str,
+        metadata: dict[str, Any] | None = None,
+        notes: tuple[str, ...] = (),
+    ) -> None:
         meta = dict(metadata or {})
-        if self._voice_context:
-            # Per turn, not once per session: the block rides the user message, so
-            # compaction can drop an older copy, and there is no signal here to notice.
-            meta[RUNTIME_CONTEXT_INPUT_META] = self._voice_context
+        # Per turn, not once per session (compaction can drop an older copy, with no
+        # signal here to notice). Event notes join as their own block on a fresh list:
+        # the user row stays pure speech; display/consolidation strip runtime context.
+        blocks = list(self._voice_context)
+        if notes:
+            blocks.append(RuntimeContextBlock(source="voice", content="\n".join(notes)))
+        if blocks:
+            meta[RUNTIME_CONTEXT_INPUT_META] = blocks
         await self._handle_message(
             sender_id=self.config.sender_id,
             chat_id=self.config.chat_id,

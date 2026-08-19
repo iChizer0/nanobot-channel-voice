@@ -375,9 +375,10 @@ def test_half_duplex_wake_hit_is_the_only_barge_in():
             assert conv.counter("wake_kill") == 1
             await conv.wait_state(VoiceState.IDLE)
             await conv.user_says("what time is it")
-            # The wake kill's heard-up-to note rides the follow-up publish.
-            assert conv.texts()[-1].startswith("what time is it")
-            assert "[note: the user cut your reply short with the wake word" in conv.texts()[-1]
+            # The wake kill's heard-up-to note rides the follow-up publish, beside the text.
+            assert conv.texts()[-1] == "what time is it"
+            [note] = conv.notes()[-1]
+            assert note.startswith("[voice event: the user cut your reply short with the wake word")
 
     _run(_case())
 

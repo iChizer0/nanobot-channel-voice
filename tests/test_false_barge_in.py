@@ -47,7 +47,7 @@ def _build(vad: Vad, *, mode: str = "pause", stt_stream=None, **cfg_over) -> _Ha
     async def transcribe(pcm: bytes) -> str:
         return harness.transcript
 
-    async def publish(text: str, token: str) -> None:
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
         harness.published.append((text, token))
 
     async def interrupt() -> None:
