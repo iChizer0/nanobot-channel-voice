@@ -91,6 +91,42 @@ def test_pcm_rms_measures_normalized_amplitude(monkeypatch):
     assert abs(pcm_rms(full) - with_np) < 1e-9
 
 
+# ---- quietest_split (wake-trim snap) ----------------------------------------
+
+def test_quietest_split_finds_the_dip():
+    from nanobot_channel_voice.audio.pcm import quietest_split
+
+    # 100 ms loud, a 10 ms near-silent gap, 100 ms loud: the cut is the gap's end.
+    pcm = tone(1600, amp=8000) + tone(160, amp=10) + tone(1600, amp=8000)
+    assert quietest_split(pcm, RATE) == (1600 + 160) * 2
+
+
+def test_quietest_split_ties_latest_and_short_input_passes():
+    from nanobot_channel_voice.audio.pcm import quietest_split
+
+    flat = tone(1600, amp=1)  # constant amplitude: every window ties
+    assert quietest_split(flat, RATE) == len(flat)  # latest wins -> the hit cut
+    assert quietest_split(tone(8), RATE) == 16      # under one window: unchanged
+
+
+def test_quietest_split_only_searches_the_back_window():
+    from nanobot_channel_voice.audio.pcm import quietest_split
+
+    # The true silence lies 300 ms back, outside back_ms=240: it must not win.
+    pcm = tone(160, amp=0) + tone(4800, amp=8000) + tone(160, amp=100)
+    assert quietest_split(pcm, RATE) == len(pcm)
+
+
+def test_quietest_split_pure_python_path_matches(monkeypatch):
+    import nanobot_channel_voice.audio.pcm as pcm_mod
+    from nanobot_channel_voice.audio.pcm import quietest_split
+
+    pcm = tone(1600, amp=8000) + tone(160, amp=10) + tone(1600, amp=8000)
+    with_np = quietest_split(pcm, RATE)
+    monkeypatch.setattr(pcm_mod, "_np", None)
+    assert quietest_split(pcm, RATE) == with_np
+
+
 # ---- WAV codec --------------------------------------------------------------
 
 def test_pcm_to_wav_bytes_roundtrip():

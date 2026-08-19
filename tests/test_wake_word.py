@@ -88,6 +88,44 @@ def test_leads_mirrors_strip():
     assert wp.leads("that's ok computer stuff") is False
 
 
+def test_present_finds_a_mention_anywhere():
+    wp = WakePhrase(["hey nanobot"])
+    assert wp.present("you can always say hey, nanobot! anytime") is True
+
+
+def test_present_needs_the_ordered_phrase_not_its_units():
+    # The wake echo veto's whole point: a reply saying the phrase's words APART
+    # ("they" absorbs "hey" as a substring) is not a mention.
+    wp = WakePhrase(["hey nanobot"])
+    assert wp.present("they asked what nanobot can do") is False
+
+
+def test_present_respects_word_boundaries_both_sides():
+    wp = WakePhrase(["bot"])
+    assert wp.present("the robot is here") is False
+    assert wp.present("bots everywhere") is False
+    assert wp.present("my bot, yes") is True
+
+
+def test_present_matches_inside_fused_cjk_runs():
+    wp = WakePhrase(["小助手"])
+    assert wp.present("大家都叫我小助手呢") is True
+
+
+def test_strip_extra_lead_admits_caller_approved_tokens():
+    # The leak-tolerant lead the backend passes: known-echo tokens may precede
+    # the phrase; anything else still demotes it to content.
+    wp = WakePhrase(["hey nanobot"])
+    leak = {"the", "weather", "is", "sunny"}
+    assert wp.strip(
+        "the weather is sunny hey nanobot stop", extra_lead=lambda t: t in leak
+    ) == (True, "stop")
+    assert wp.strip("the weather is sunny hey nanobot stop")[0] is False
+    assert wp.strip(
+        "the fresh guy said hey nanobot stop", extra_lead=lambda t: t in leak
+    )[0] is False
+
+
 # ---- acoustic tier: OpenWakeWord against fake models ------------------------
 
 _CHUNK = b"\x01\x00" * 1280  # one 80 ms step

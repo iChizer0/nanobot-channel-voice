@@ -37,6 +37,33 @@ def pcm_rms(pcm: bytes) -> float:
     return math.sqrt(acc / len(samples)) / 32768.0
 
 
+def quietest_split(pcm: bytes, rate: int, *, back_ms: float = 240.0, win_ms: float = 10.0) -> int:
+    """Byte offset (even) of the END of the quietest ``win_ms`` window inside
+    the trailing ``back_ms`` of ``pcm``; ties go to the LATEST window;
+    ``len(pcm)`` when no full window fits."""
+    n = len(pcm) & ~1
+    win_b = max(2, int(rate * win_ms / 1000.0) * 2)
+    if n < win_b or rate <= 0:
+        return len(pcm)
+    lo = max(0, n - (int(rate * back_ms / 1000.0) * 2)) // win_b * win_b
+    lo = min(lo, (n - win_b) // win_b * win_b)  # >=1 full window on the grid
+    if _np is not None:
+        a = _np.frombuffer(pcm[lo : lo + (n - lo) // win_b * win_b], dtype="<i2")
+        power = (a.astype(_np.float64) ** 2).reshape(-1, win_b // 2).sum(axis=1)
+        idx = power.size - 1 - int(_np.argmin(power[::-1]))  # ties -> latest
+        return lo + (idx + 1) * win_b
+    best_end, best_power = n, None
+    for off in range(lo, n - win_b + 1, win_b):
+        samples = array.array("h")
+        samples.frombytes(pcm[off : off + win_b])
+        power = 0
+        for v in samples:
+            power += v * v
+        if best_power is None or power <= best_power:
+            best_power, best_end = power, off + win_b
+    return best_end
+
+
 def wav_duration_ms(blob: bytes) -> float:
     """Playback duration of a WAV blob in ms (0.0 for empty/unparseable)."""
     if not blob:

@@ -469,3 +469,141 @@ def test_eager_speculation_is_pretrimmed_and_survives_the_wake_close():
             assert conv.counter("stt_eager_hit") == 1   # accepted, not drained
 
     _run(_case())
+
+
+# ---- 2026-08-19 review refinements ------------------------------------------
+
+
+def test_name_mention_reply_does_not_suppress_the_wake():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot introduce yourself")
+            await conv.agent_replies("They asked what nanobot can do yesterday")
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(30)
+            # The reply says the phrase's words APART (and "they" contains
+            # "hey"): a mention, not the phrase — the veto must not lock the
+            # wake word out.
+            conv.backend._wake_hit_at = time.monotonic()
+            conv.backend._wake_claimed = True
+            await conv.user_noise(speech_frames=0, silence_frames=3)
+            assert conv.counter("wake_echo_suppressed") == 0
+            assert conv.counter("wake_kill") == 1
+            assert conv.interrupts == 1
+
+    _run(_case())
+
+
+def test_strict_wake_through_leak_prefix_unlocks():
+    async def _case():
+        async with EvalConversation(**_wake("strict")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.agent_replies("The weather in tokyo is sunny today and tomorrow")
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(30)
+            # Mixture transcript: OUR leaked words precede the phrase (below
+            # the echo threshold, so the verdict site judges it). The leak
+            # prefix must not demote the wake.
+            await conv.user_says("the weather is sunny hey nanobot stop")
+            assert conv.interrupts == 1
+            assert conv.counter("barge_in_stop") == 1
+            assert conv.texts() == ["tell me a story"]
+
+    _run(_case())
+
+
+def test_strict_wake_through_echoed_mixture_unlocks():
+    async def _case():
+        async with EvalConversation(**_wake("strict")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.agent_replies("The weather in tokyo is sunny today and tomorrow")
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(30)
+            # Echo-CLASSIFIED mixture (6/9 covered): the echo rung's
+            # wake_blocked gate must accept the leak-prefixed phrase too.
+            await conv.user_says("the weather in tokyo is sunny hey nanobot stop")
+            assert conv.counter("barge_in_through_echo") == 1
+            assert conv.counter("barge_in_stop") == 1
+            assert conv.interrupts == 1
+
+    _run(_case())
+
+
+def test_wake_kill_is_measured_and_engages_no_duck():
+    async def _case():
+        async with EvalConversation(**_wake("strict")) as conv:
+            await _speaking_reply(conv)
+            conv._stt.append("turn off the lights")
+            conv.vad.flag = True
+            for _ in range(6):
+                await conv.backend.push_audio(_FRAME)
+            conv.backend._wake_hit_at = time.monotonic()  # hop latch writes
+            conv.backend._wake_claimed = True
+            for _ in range(14):
+                await conv.backend.push_audio(_FRAME)
+            await _close_utterance(conv)
+            assert conv.interrupts == 1
+            assert conv.texts()[-1].startswith("turn off the lights")
+            # The confirm claimed the utterance: no duck engages in the kill
+            # cycle NOR over the dead reply's remainder, and the hit->silence
+            # latency landed in the new metric.
+            assert conv.counter("barge_in_duck") == 0
+            assert "wake_kill_ms" in conv.backend._metrics._latency
+
+    _run(_case())
+
+
+def test_probe_drop_preserves_a_held_wake_claim():
+    async def _case():
+        async with EvalConversation(**_wake("strict")) as conv:
+            # An AEC-warmup-held claim: the pause-probe acquitting the LEAK
+            # must not eat the wake evidence (onset staleness bounds it).
+            conv.backend._wake_claimed = True
+            conv.backend._wake_hit_at = time.monotonic()
+            await conv.backend._drop_candidate("probe")
+            assert conv.backend._wake_claimed is True
+
+    _run(_case())
+
+
+def test_strict_batch_no_acoustic_warns_at_startup():
+    from loguru import logger as loguru_logger
+
+    async def _case():
+        messages: list[str] = []
+        sink = loguru_logger.add(lambda m: messages.append(str(m)), level="WARNING")
+        try:
+            async with EvalConversation(**_wake("strict")):
+                pass  # batch STT, no detector: the slow-confirm config
+            assert sum("eager/endpoint decode" in m for m in messages) == 1
+            async with EvalConversation(wake_detector=_ScriptDetector(), **_wake("strict")):
+                pass  # an acoustic tier silences it
+            assert sum("eager/endpoint decode" in m for m in messages) == 1
+        finally:
+            loguru_logger.remove(sink)
+
+    _run(_case())
+
+
+def test_wake_trim_snaps_to_the_quiet_gap_before_the_hit():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            _, pendings = _spy_backend(conv)
+            conv._stt.append("what time is it")
+            conv.vad.flag = True
+            await _push_frames(conv, 8)
+            await conv.backend.push_audio(b"\x00\x00" * 320)  # phrase/command gap
+            det.fire = True
+            await _push_frames(conv, 6)  # hit trails into the command's audio
+            await _close_utterance(conv)
+            (p,) = pendings
+            # The cut lands at the gap's END, not at the later hit-chunk end:
+            # silence before it, the command's first sample after it.
+            assert p.trim_bytes > 0
+            assert p.pcm[p.trim_bytes - 2 : p.trim_bytes] == b"\x00\x00"
+            assert p.pcm[p.trim_bytes : p.trim_bytes + 2] == b"\x01\x00"
+            assert conv.counter("wake_trim") == 1
+            assert conv.texts() == ["what time is it"]
+
+    _run(_case())

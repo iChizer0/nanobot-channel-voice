@@ -14,7 +14,7 @@ matching its fused run.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from nanobot_channel_voice.phrases import FILLER_WORDS, _segments, tokens_of
 
@@ -40,13 +40,27 @@ _SEP_RE = re.compile(r"^[\s,.!?;:…、，。．！？；：]+")
 _CJK_FLOOR = 0x2E80
 
 
-def _lead_ok(prefix: str) -> bool:
+def _lead_ok(prefix: str, extra: Callable[[str], bool] | None = None) -> bool:
     """Only filler material precedes the phrase; fused CJK runs are accepted
-    when they segment entirely into ``_LEAD_OK`` entries."""
+    when they segment entirely into ``_LEAD_OK`` entries. ``extra`` widens the
+    acceptable set per token (the caller's leak test — see ``strip``)."""
     return all(
-        t in _LEAD_OK or _segments(t, _LEAD_OK) is not None
+        t in _LEAD_OK
+        or _segments(t, _LEAD_OK) is not None
+        or (extra is not None and extra(t))
         for t in tokens_of(prefix)
     )
+
+
+def _clean_start(text: str, start: int) -> bool:
+    """Mirror of ``_clean_end`` for the left edge, needed where no ``_lead_ok``
+    runs (``present``): a spaced-script match must not continue a same-script
+    word leftward ("ro|bot" never matches phrase "bot"); a CJK-initial match
+    may continue its fused run."""
+    if start <= 0 or ord(text[start]) >= _CJK_FLOOR:
+        return True
+    prev = text[start - 1]
+    return not (prev.isalnum() or prev == "_") or ord(prev) >= _CJK_FLOOR
 
 
 def _clean_end(text: str, end: int) -> bool:
@@ -82,22 +96,37 @@ class WakePhrase:
     def __bool__(self) -> bool:
         return bool(self._patterns)
 
-    def leads(self, text: str) -> bool:
-        return self.strip(text)[0]
+    def leads(
+        self, text: str, extra_lead: Callable[[str], bool] | None = None
+    ) -> bool:
+        return self.strip(text, extra_lead)[0]
 
-    def strip(self, text: str) -> tuple[bool, str]:
+    def present(self, text: str) -> bool:
+        """A wake phrase occurs ANYWHERE in *text* (word-boundary rules of
+        ``strip``, no leading demand): the mention test the wake echo veto
+        runs against recently-spoken TTS."""
+        return any(
+            _clean_start(text, m.start()) and _clean_end(text, m.end())
+            for pat in self._patterns
+            for m in pat.finditer(text)
+        )
+
+    def strip(
+        self, text: str, extra_lead: Callable[[str], bool] | None = None
+    ) -> tuple[bool, str]:
         """``(matched, remainder)``: whether a wake phrase leads *text* (only
-        ``_LEAD_OK`` tokens may precede it), and the text after it with leading
-        separators removed. ``(False, text)`` otherwise. ``search()`` per
-        pattern suffices: any occurrence after a rejected one necessarily has
-        non-filler content in front of it."""
+        ``_LEAD_OK`` tokens — widened per token by ``extra_lead`` — may precede
+        it), and the text after it with leading separators removed. ``(False,
+        text)`` otherwise. ``search()`` per pattern suffices: any occurrence
+        after a rejected one necessarily has non-acceptable content in front of
+        it."""
         best = None
         for pat in self._patterns:
             m = pat.search(text)
             if (
                 m is None
                 or not _clean_end(text, m.end())
-                or not _lead_ok(text[: m.start()])
+                or not _lead_ok(text[: m.start()], extra_lead)
             ):
                 continue
             if best is None or m.start() < best.start() or (

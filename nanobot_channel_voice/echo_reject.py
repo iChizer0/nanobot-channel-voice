@@ -114,7 +114,8 @@ class SelfEchoFilter:
         self._threshold = threshold
         self._window_secs = window_secs
         self._protect = frozenset(protect)
-        self._spoken: deque[tuple[float, set[str], str]] = deque()
+        # (last-audible deadline, units, latin stream, raw text) per note.
+        self._spoken: deque[tuple[float, set[str], str, str]] = deque()
 
     def note_spoken(self, text: str, hold_ms: float = 0.0) -> None:
         """Record TTS text about to play. ``hold_ms``, the estimated delay until
@@ -127,7 +128,9 @@ class SelfEchoFilter:
             return
         for variant in _number_variants(text):
             units |= units_of(variant)
-        self._spoken.append((time.monotonic() + hold_ms / 1000.0, units, _latin_stream(text)))
+        self._spoken.append(
+            (time.monotonic() + hold_ms / 1000.0, units, _latin_stream(text), text)
+        )
 
     def is_self_echo(self, transcript: str) -> bool:
         """True if *transcript* is mostly the bot's recently-spoken units (echo)."""
@@ -154,16 +157,23 @@ class SelfEchoFilter:
             and (u in self._protect or not self._absorbed(u, streams))
         }
 
+    def recent_text(self) -> str:
+        """The unexpired spoken texts, oldest first, joined: the ordered view
+        the wake echo veto searches for a literal phrase mention. Loop-side
+        only (evicts; ``fresh_words`` keeps the thread-safe contract)."""
+        self._evict()
+        return " ".join(t for _, _, _, t in self._spoken)
+
     def reset(self) -> None:
         self._spoken.clear()
 
     @staticmethod
     def _spoken_view(
-        entries: Iterable[tuple[float, set[str], str]],
+        entries: Iterable[tuple[float, set[str], str, str]],
     ) -> tuple[set[str], list[str]]:
         units: set[str] = set()
         streams: list[str] = []
-        for _, u, stream in entries:
+        for _, u, stream, _text in entries:
             units |= u
             if stream:
                 streams.append(stream)

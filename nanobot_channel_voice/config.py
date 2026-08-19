@@ -761,7 +761,10 @@ class WakeConfig(_VoiceBase):
     counts, and ``engine="openwakeword"`` adds an acoustic detector that hears
     through the bot's own playback. A leading wake phrase is stripped from the
     published text; an utterance that is ONLY the phrase publishes nothing and
-    just opens the attention window."""
+    just opens the attention window. Half-duplex contract: detection trails the
+    phrase and the mic-reopen flush discards audio up to it, so the command
+    belongs AFTER the reply stops (phrase, beat, command) — same-breath content
+    survives only in the open-mic modes."""
 
     mode: Literal["off", "gate", "strict"] = "off"
     # The spoken wake phrases, matched at utterance START (hesitation fillers may
