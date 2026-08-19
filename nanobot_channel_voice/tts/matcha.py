@@ -24,7 +24,10 @@ from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
 from nanobot_channel_voice.tts.espeak import make_ipa_phonemizer
 from nanobot_channel_voice.tts.ondevice_base import OnDeviceTtsAdapter
 from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
-from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_zh
+from nanobot_channel_voice.tts.text_frontend import (
+    space_digit_sequences,
+    verbalize_numbers_zh,
+)
 
 _JOIN_GAP_S = 0.1
 _SAMPLE_RATE_DEFAULT = 22050  # every published matcha vocoder (HiFi-GAN, Vocos univ)
@@ -534,10 +537,11 @@ class _MatchaCommon:
         return self._max_len  # type: ignore[attr-defined]
 
     def _normalize(self, text: str) -> str:
-        # espeak reads digits itself; the zh lexicon has 零..九 but no "0".."9"
+        # The zh lexicon has 零..九 but no "0".."9". espeak reads digits itself, but its
+        # grammar is cardinal-biased, so only the sequences are re-spaced for it to name.
         if self.spoken_language == "zh":  # type: ignore[attr-defined]
             return verbalize_numbers_zh(text)
-        return text
+        return space_digit_sequences(text)
 
     def _can_speak(self, ch: str) -> bool:
         return self._frontend.can_speak(ch)  # type: ignore[attr-defined]

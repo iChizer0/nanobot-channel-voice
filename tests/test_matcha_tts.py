@@ -388,7 +388,9 @@ def test_matcha_normalize_verbalizes_digits_for_zh_only():
     adapter.spoken_language = "zh"
     assert adapter._normalize("现在7点") == "现在七点"
     adapter.spoken_language = "en"
-    assert adapter._normalize("at 7 pm") == "at 7 pm"  # espeak reads digits itself
+    assert adapter._normalize("at 7 pm") == "at 7 pm"  # espeak reads quantities itself
+    # …but its grammar is cardinal-biased, so sequences are re-spaced for it.
+    assert adapter._normalize("zip 94105") == "zip 9 4 1 0 5"
 
 
 def test_verbalize_numbers_zh_inside_cjk_text():
@@ -410,13 +412,43 @@ def test_verbalize_numbers_zh():
     assert verbalize_numbers_zh("1005") == "一千零五"
     assert verbalize_numbers_zh("10000") == "一万"
     assert verbalize_numbers_zh("100200") == "十万零二百"
-    assert verbalize_numbers_zh("100000001") == "一亿零一"
+    assert verbalize_numbers_zh("100000001个") == "一亿零一个"  # a counter keeps it a quantity
     assert verbalize_numbers_zh("1,234") == "一千二百三十四"
     assert verbalize_numbers_zh("7:45") == "七点四十五分"
     assert verbalize_numbers_zh("8:00") == "八点"
     assert verbalize_numbers_zh("9:05") == "九点零五分"
     assert verbalize_numbers_zh("50%") == "百分之五十"
     assert verbalize_numbers_zh("3.14") == "三点一四"
+
+
+def test_verbalize_numbers_zh_reads_sequences_digit_wise():
+    # Mandarin years are digit-read; the cardinal reading is simply wrong.
+    assert verbalize_numbers_zh("2026年") == "二零二六年"
+    assert verbalize_numbers_zh("1949年10月1日") == "一九四九年十月一日"
+    assert verbalize_numbers_zh("3年") == "三年"        # a duration, not a year
+    assert verbalize_numbers_zh("10000年") == "一万年"   # 4-digit runs only
+    # A leading zero marks an identifier; the cardinal reading deletes it.
+    assert verbalize_numbers_zh("第007号") == "第零零七号"
+    assert verbalize_numbers_zh("订单号0755") == "订单号零七五五"
+    # Multi-dot runs kept a literal "." the lexicon cannot voice.
+    assert verbalize_numbers_zh("IP是192.168.1.1") == "IP是一九二点一六八点一点一"
+    assert verbalize_numbers_zh("版本3.14.2") == "版本三点十四点二"
+
+
+def test_verbalize_numbers_zh_sequences():
+    assert verbalize_numbers_zh("请拨打13800138000") == "请拨打一三八零零一三八零零零"
+    assert verbalize_numbers_zh("邮编100084") == "邮编一零零零八四"
+    assert verbalize_numbers_zh("验证码是482913") == "验证码是四八二九一三"
+    assert verbalize_numbers_zh("分机8021") == "分机八零二一"
+    assert verbalize_numbers_zh("车牌京A88888") == "车牌京A八八八八八"
+    assert verbalize_numbers_zh("2020-2024年") == "二零二零到二零二四年"
+    # A unit or counter after the run keeps it a quantity.
+    assert verbalize_numbers_zh("账单总额1234元") == "账单总额一千二百三十四元"
+    assert verbalize_numbers_zh("一共1234个文件") == "一共一千二百三十四个文件"
+    assert verbalize_numbers_zh("大概需要45分钟") == "大概需要四十五分钟"
+    # Ungrouped and long is an identifier: a quantity that size carries a counter.
+    assert verbalize_numbers_zh("100000001") == "一零零零零零零零一"
+    assert verbalize_numbers_zh("总额 10000000 元") == "总额 一千万 元"  # counter behind a space
 
 
 # ---- the espeak resolution ladder -------------------------------------------
