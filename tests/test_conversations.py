@@ -52,16 +52,35 @@ def test_content_barge_in_kills_and_carries_the_heard_marker():
 
 
 def test_wait_phrase_and_markdown_probes():
-    from nanobot_channel_voice.backend.local import _MD_PROBE, _opens_with_wait_phrase
+    from nanobot_channel_voice.backend.local import (
+        _MD_CARRY,
+        _MD_PROBE,
+        _opens_with_wait_phrase,
+    )
 
     assert _opens_with_wait_phrase('"One moment." said the bot')
     assert _opens_with_wait_phrase("稍等，我看看天气")
     assert not _opens_with_wait_phrase("It is sunny today")
     assert not _opens_with_wait_phrase("Moments later it rained")  # prefix, not substring
+    assert _opens_with_wait_phrase("\r\nOne moment. sunny")  # speak_final gets raw text
     assert _MD_PROBE.search("plain prose, no formatting at all") is None
     assert _MD_PROBE.search("a **bold** claim")
     assert _MD_PROBE.search("see [the docs](http://example.com)")
     assert _MD_PROBE.search("```py\nprint(1)\n```")
+    assert _MD_PROBE.search("steps:\n- one\n- two")
+    # A marker counts only after a real newline: these are mid-line delta fragments of
+    # "nine - ten" and "3 * 4", not lists.
+    assert _MD_PROBE.search("- ten, and that holds") is None
+    assert _MD_PROBE.search("* 4 equals twelve") is None
+    # Every separator the chunker's _line_start_at accepts, and _MD_CARRY wide enough that
+    # no marker is lost wherever the delta seam falls inside the longest one.
+    for sep in ("\n", "\r\n", "\r"):
+        assert _MD_PROBE.search(f"steps:{sep}- one")
+        longest = f"{sep}   ###### "
+        assert all(
+            _MD_PROBE.search(("x" * 20 + longest[:i])[-_MD_CARRY:] + longest[i:])
+            for i in range(1, len(longest))
+        )
 
 
 def test_reply_contract_counters_markdown_and_wait_phrase():
@@ -105,6 +124,23 @@ def test_reply_contract_counters_markdown_and_wait_phrase():
             await c.wait_state(VoiceState.IDLE)
             assert c.counter("reply_wait_phrase") == 2
             assert c.counter("reply_markdown") == 1       # prose turns added nothing
+
+            # Streamed the way a provider splits prose: the dash fragment lands at a
+            # delta start, where re.M's ^ read it as a list.
+            await c.user_says("what is nine minus one")
+            for delta in ("It is", " eight", " - ", "give or take", " - all day."):
+                await b.on_delta(delta)
+            await b.on_stream_end(resuming=False)
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_markdown") == 1
+
+            # A real marker split across the seam still counts (the carried tail).
+            await c.user_says("list them")
+            for delta in ("Steps:", "\n", "- one, then two, then three."):
+                await b.on_delta(delta)
+            await b.on_stream_end(resuming=False)
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_markdown") == 2
 
     _run(_case())
 

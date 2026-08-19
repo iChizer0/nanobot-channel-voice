@@ -171,10 +171,12 @@ def _prologue_phrases(configured: list[str] | None, language: str | None) -> lis
     return _PROLOGUE_BUILTINS.get(language or "", _PROLOGUE_FALLBACK)
 
 
-# Contract-regression rates for the metrics snapshot (never enforcement; the line-start
-# patterns can undercount across delta boundaries). Stall-claims only — think-aloud
-# openers ("let me see") are contract-welcome and must not count.
-_MD_PROBE = re.compile(r"(?m)```|^[ \t]{0,3}(?:#{1,6}\s|[-*+]\s)|\[[^\]]+\]\([^)]+\)|\*\*")
+# Contract-regression rates for the snapshot, never enforcement. Line-start markers anchor
+# on a real separator, never re.M's ^: a delta begins mid-line, where ^ read "9 - ten"
+# as a list. Separator set matches the chunker's _line_start_at. _WAIT_PHRASES is
+# stall-claims only — "let me see" is contract-welcome.
+_MD_PROBE = re.compile(r"```|[\r\n][ \t]{0,3}(?:#{1,6}\s|[-*+]\s)|\[[^\]]+\]\([^)]+\)|\*\*")
+_MD_CARRY = 10  # len("\n   ###### ") - 1: no line-start marker is lost at a delta seam
 _WAIT_PHRASES = tuple(dict.fromkeys(
     [
         phrase.rstrip(".。").lower()
@@ -186,7 +188,7 @@ _WAIT_PHRASES = tuple(dict.fromkeys(
 
 
 def _opens_with_wait_phrase(text: str) -> bool:
-    return text.lstrip(" \t\"'“”‘’(（[【").lower().startswith(_WAIT_PHRASES)
+    return text.lstrip(" \t\r\n\"'“”‘’(（[【").lower().startswith(_WAIT_PHRASES)
 
 
 _NOTE_CJK_FLOOR = 0x2E80  # same script split as echo_reject/phrases
@@ -323,7 +325,7 @@ class _Turn:
         "published_at", "chunk_await", "tts_first_pending", "await_first_token",
         "segment_spoke", "prologue_task", "midturn_task", "timeout_task", "base",
         "last_activity", "dead", "token", "audible_at", "continuation_pending",
-        "md_counted", "segment_first",
+        "md_counted", "md_carry", "segment_first",
     )
 
     def __init__(self, token: str = ""):
@@ -346,6 +348,7 @@ class _Turn:
         # edge) re-anchors the metrics clock so tool time never lands in ttfa_ms.
         self.continuation_pending = False
         self.md_counted = False  # reply_markdown counted once per turn
+        self.md_carry = "\n"     # delta-seam tail (see _note_reply_markdown)
         # First chunk of the CURRENT stream segment; judged for reply_wait_phrase only
         # when the segment turns out to be the answer-bearing one (non-resuming end) —
         # the same opener BEFORE a tool call is a legitimate status line.
@@ -2362,10 +2365,16 @@ class LocalBackend(TurnEventMixin):
         self._schedule_drain()
 
     def _note_reply_markdown(self, text: str) -> None:
-        """Turn-level latch: rate of turns whose reply contained markdown at all."""
-        if not self._cur_turn.md_counted and _MD_PROBE.search(text):
-            self._cur_turn.md_counted = True
+        """Turn-level latch: rate of turns whose reply carried markdown at all. The carry
+        joins a marker split across deltas; it starts as a newline because a reply opens one."""
+        turn = self._cur_turn
+        if turn.md_counted:
+            return
+        probe = turn.md_carry + text
+        if _MD_PROBE.search(probe):
+            turn.md_counted = True
             self._metrics.count("reply_markdown")
+        turn.md_carry = probe[-_MD_CARRY:]
 
     async def speak_final(self, text: str) -> None:
         """A non-streamed final assistant message (streaming disabled / fallback)."""

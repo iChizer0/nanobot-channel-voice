@@ -852,12 +852,10 @@ class VoiceConfig(_VoiceBase):
     # consume_import_json(), which deletes the blob — a transport, never a stored copy.
     import_json: str | None = None
 
-    # LOCAL backend: operator text appended to the voice runtime-context block that rides
-    # every published utterance: the voice-scoped seam for guidance that must not leak to
-    # other channels (a SOUL.md/AGENTS.md directive applies everywhere; THIS is spoken
-    # turns only). Core marks runtime context "metadata only, not instructions": a nudge,
-    # not a persona override; nanobot owns the local persona, cloud ones go in
-    # realtime.persona.
+    # LOCAL backend: operator text appended to the voice runtime-context block — the
+    # voice-scoped seam for guidance that must not leak elsewhere (a SOUL.md directive
+    # applies to every channel; THIS is spoken turns only). Re-sent on every turn, so
+    # keep it to a nudge; nanobot owns the local persona, cloud ones realtime.persona.
     context: str | None = None
 
     audio: AudioConfig = Field(default_factory=AudioConfig)

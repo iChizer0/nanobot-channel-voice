@@ -25,8 +25,10 @@ from nanobot_channel_voice.config import VoiceConfig
 
 
 class _FakeTts:
-    def __init__(self, language: str | None = None):
+    def __init__(self, language: str | None = None, languages: tuple[str, ...] = ()):
         self.spoken_language = language
+        if languages:  # only a router / a bilingual model declares the plural
+            self.spoken_languages = languages
 
 
 # ---- realtime instructions --------------------------------------------------
@@ -85,10 +87,13 @@ def test_block_is_wrapped_and_names_the_engine_language():
 
 
 def test_block_stays_inside_its_token_budget():
-    # Every word rides every turn's prefill for the whole session; pinned at the longest
-    # variant (attention STT). A failure means re-bloat — trim, don't raise the ceiling.
-    [block] = _voice_context_blocks(_FakeStt("attention"), _FakeTts("en"))
-    assert len(block.content.split()) <= 140
+    # Every word rides every turn's prefill, so the ceiling is pinned at the LONGEST
+    # variant: an unverified decoder (invented-phrase clause) plus a bilingual voice
+    # (6 words over the mono line). A failure means re-bloat — trim, don't raise it.
+    [block] = _voice_context_blocks(_FakeStt(), _FakeTts("zh", ("zh", "en")))
+    assert len(block.content.split()) <= 145
+    [mono] = _voice_context_blocks(_FakeStt("ctc"), _FakeTts("en"))
+    assert len(mono.content.split()) < len(block.content.split())
 
 
 def test_context_permits_thinking_and_nudges_pre_tool_narration():
@@ -103,22 +108,34 @@ def test_context_permits_thinking_and_nudges_pre_tool_narration():
     assert "pure answer" not in block.content
 
 
-def test_every_stt_gets_the_generic_mishear_line():
+def test_every_stt_gets_the_mishear_line():
     # ALL ASR substitutes similar sounds — and stt=None (the cloud-transcription path)
     # is still a transcript, so the line rides even without an on-device adapter.
-    for stt in (None, _FakeStt("ctc"), _FakeStt("transducer"), _FakeStt()):
+    for stt in (None, _FakeStt("ctc"), _FakeStt("transducer"), _FakeStt("attention")):
         [block] = _voice_context_blocks(stt, _FakeTts("en"))
         assert "may mis-hear words" in block.content
         assert "read it by sound and context" in block.content
-        assert "never said" not in block.content  # invention is an attention-only claim
 
 
-def test_attention_decoder_adds_the_invented_phrase_warning():
-    # Whisper-class AR decoders hallucinate fluent text on noise/silence; CTC and
-    # transducer decoders are frame-synchronous and cannot (adapter-derived honesty,
-    # same rule as the TTS lines).
-    [block] = _voice_context_blocks(_FakeStt("attention"), _FakeTts("en"))
-    assert "never said" in block.content
+def test_only_a_frame_synchronous_decoder_claims_no_invention():
+    # Frame-synchronous decoders cannot confabulate, so they alone drop the clause.
+    # Everything else keeps it: whisper-class AR decoders hallucinate on noise, and
+    # remote/undeclared are unverified (core's transcription defaults are all whisper-*).
+    for family in ("ctc", "transducer"):
+        [block] = _voice_context_blocks(_FakeStt(family), _FakeTts("en"))
+        assert "never said" not in block.content
+    for stt in (_FakeStt("attention"), _FakeStt(), None):
+        [block] = _voice_context_blocks(stt, _FakeTts("en"))
+        assert "never said" in block.content
+
+
+def test_bilingual_voice_invites_code_switching_instead_of_one_language():
+    # A router (or the single zh-en model) says both, so pinning one would leave half
+    # the voice unused.
+    [block] = _voice_context_blocks(_FakeStt("ctc"), _FakeTts("zh", ("zh", "en")))
+    assert "'zh' and 'en'" in block.content
+    assert "mixing is fine" in block.content
+    assert "reply in 'zh' only" not in block.content
 
 
 def test_unrestricted_engine_claims_no_language():

@@ -171,10 +171,11 @@ def _voice_context_blocks(
 
     Claims derive from the RESOLVED adapters, never config: the input lines always ride
     (``stt`` None is the cloud-transcription path — still a transcript; TTS off is still
-    a listening session), but only a declared attention decoder gets the invented-phrase
-    warning — CTC/transducer decoders are frame-synchronous and cannot confabulate, and
-    a remote decoder is unverifiable. Budget: core persists this into EVERY user row, so
-    each word is paid on every turn's prefill for the whole session — keep it under ~135
+    a listening session). Only a declared frame-synchronous family drops the invented-
+    phrase warning: CTC/transducer cannot confabulate, while remote and undeclared stay
+    suspect (core's transcription defaults are all whisper-*). Budget: core persists this
+    into EVERY user row, so every word is paid on every turn's prefill for the whole
+    session — keep the longest variant (unverified decoder + bilingual voice) under ~145
     words, byte-stable, and permission-shaped ("thinking aloud is fine" is the small
     non-reasoning model's only scratchpad); see REPORT-context-injection-review."""
     lines: list[str] = []
@@ -188,16 +189,16 @@ def _voice_context_blocks(
         lines.append("The user's words arrive via speech recognition.")
     # Read-by-sound licenses charitable decoding (homophones); confirm-before-ACTING
     # keeps ordinary answers free of verification questions.
-    if getattr(stt, "decoder_family", "") == "attention":
+    if getattr(stt, "decoder_family", "") in ("ctc", "transducer"):
+        lines.append(
+            "The transcript may mis-hear words — read it by sound and context, and "
+            "confirm surprising names or numbers before acting on them."
+        )
+    else:
         lines.append(
             "The transcript may mis-hear words or occasionally include a phrase that "
             "was never said — read it by sound and context, and confirm surprising "
             "names or numbers before acting on them."
-        )
-    else:
-        lines.append(
-            "The transcript may mis-hear words — read it by sound and context, and "
-            "confirm surprising names or numbers before acting on them."
         )
     if tts is not None:
         lines.append(
@@ -502,6 +503,11 @@ class VoiceChannel(BaseChannel):
                 "+".join(lang for lang in langs if lang) or "language unknown",
             )
         self._voice_context = _voice_context_blocks(self._stt, tts, self.config.context)
+        # `context` is unbounded and the per-turn cost is invisible: say it once.
+        self.logger.info(
+            "voice context: {} words ride every published utterance",
+            sum(len(block.content.split()) for block in self._voice_context),
+        )
         # A raw-PCM TTS (MMS, openai with audioFormat=pcm) streams gaplessly through one
         # persistent player, no per-chunk aplay spawn; WAV-only adapters keep blob mode.
         pcm_capable = tts is not None and getattr(tts, "output_rate", None) is not None
