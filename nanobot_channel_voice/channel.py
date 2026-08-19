@@ -488,6 +488,19 @@ class VoiceChannel(BaseChannel):
         )
         tts = make_tts(self.config.tts)
         self._tts_adapter = tts
+        if tts is not None:
+            # The engine that actually LOADED: a failed build degrades to the system
+            # voice behind a lone warning, which sounds like the configured engine
+            # mispronouncing everything rather than like a different engine speaking.
+            langs = getattr(tts, "spoken_languages", None) or (
+                getattr(tts, "spoken_language", None),
+            )
+            self.logger.info(
+                "voice tts resolved: {} (configured '{}', {} Hz, {})",
+                type(tts).__name__, self.config.tts.provider,
+                getattr(tts, "output_rate", None) or "wav",
+                "+".join(lang for lang in langs if lang) or "language unknown",
+            )
         self._voice_context = _voice_context_blocks(self._stt, tts, self.config.context)
         # A raw-PCM TTS (MMS, openai with audioFormat=pcm) streams gaplessly through one
         # persistent player, no per-chunk aplay spawn; WAV-only adapters keep blob mode.

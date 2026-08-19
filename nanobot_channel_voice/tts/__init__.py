@@ -70,6 +70,14 @@ def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
     second = cfg.matcha.secondary
     if second is None:
         return primary
+    if getattr(primary, "spoken_languages", None):
+        # Routing script runs away from an already-bilingual model trades its one voice
+        # for two and leaves the half it was trained to speak unused.
+        logger.warning(
+            "voice: tts.matcha.secondary is set while the primary model already speaks "
+            "{} in one voice; code-switching will change voice instead",
+            "+".join(primary.spoken_languages),  # type: ignore[attr-defined]
+        )
     try:
         # One vocoder session serves both when the dynamic engines name the same
         # file; the share is caller-decided so a failed secondary build can never

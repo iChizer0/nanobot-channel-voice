@@ -450,7 +450,7 @@ def test_espeak_ladder_rejects_a_bad_explicit_path(tmp_path):
 def test_espeak_ladder_names_every_fix_when_nothing_is_found(monkeypatch):
     from nanobot_channel_voice.tts import espeak
 
-    def no_loader():
+    def no_loader(_root=None):
         raise ImportError("espeakng_loader")
 
     monkeypatch.setattr(espeak.shutil, "which", lambda _: None)
@@ -459,6 +459,98 @@ def test_espeak_ladder_names_every_fix_when_nothing_is_found(monkeypatch):
         espeak.make_ipa_phonemizer("en-us")  # no binary AND no espeakng-loader
     msg = str(exc.value)
     assert "espeakPath" in msg and "[espeak]" in msg and "apt install" in msg
+
+
+def test_split_path_refuses_zh_en_artifacts(tmp_path):
+    """The split path frames ids for every OTHER dialect (blank interleave, pinyin
+    English); handed zh-en tokens it would synthesize fluent rhythm over wrong sounds,
+    so it must refuse. Both halves of the signature are load-bearing: an espeak table
+    carries the capitals alone, a zh-only table the tonal pinyin alone."""
+    import string
+
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts.matcha import SplitMatchaTtsAdapter, is_zh_en_tokens
+
+    assert is_zh_en_tokens(dict.fromkeys([*"AIOWY", "zhong1"], 1))
+    assert not is_zh_en_tokens({"zhong1": 1, "ong1": 2, "zh": 3})  # zh-only export
+    # A character-level English table holds every capital (see _OFFICIAL_LETTERS).
+    assert not is_zh_en_tokens(dict.fromkeys(string.ascii_letters, 1))
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text(
+        "\n".join(f"{t} {i}" for i, t in enumerate(["_", *"AIOWY", "zhong1"])), encoding="utf-8"
+    )
+    cfg = MatchaTtsConfig.model_validate({
+        "encoderPath": str(tmp_path / "enc.onnx"), "decoderPath": str(tmp_path / "dec.onnx"),
+        "vocoderPath": str(tmp_path / "voc.onnx"), "tokensPath": str(tokens),
+    })
+    with pytest.raises(ValueError, match="acousticModelPath"):
+        SplitMatchaTtsAdapter.from_config(cfg)
+
+
+def test_espeak_data_dir_pins_the_models_own_voice_pack(monkeypatch, tmp_path):
+    """IPA spellings drift between espeak releases (en-us FORCE: oː -> ɔː), and a
+    drifted vowel lands on a different embedding id, so the phonemizer must run against
+    the data the model was trained with — passed as espeak's parent-of-data --path."""
+    from nanobot_channel_voice.tts import espeak
+
+    (tmp_path / "espeak-ng-data").mkdir()
+    argv: list[list[str]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "ˈoːɹ\n"
+        stderr = ""
+
+    monkeypatch.setattr(espeak.shutil, "which", lambda _: "/usr/bin/espeak-ng")
+    monkeypatch.setattr(espeak.subprocess, "run", lambda cmd, **kw: argv.append(cmd) or _Proc())
+    espeak.make_ipa_phonemizer("en-us", data_dir=str(tmp_path / "espeak-ng-data"))("more")
+    assert f"--path={tmp_path}" in argv[-1]  # the PARENT, per espeak's convention
+    # Either spelling of the same directory resolves identically...
+    espeak.make_ipa_phonemizer("en-us", data_dir=str(tmp_path))("more")
+    assert f"--path={tmp_path}" in argv[-1]
+    # ...and no data dir leaves the installed espeak's own data in charge.
+    espeak.make_ipa_phonemizer("en-us")("more")
+    assert not any(a.startswith("--path") for a in argv[-1])
+    with pytest.raises(RuntimeError, match="espeakDataDir"):
+        espeak.make_ipa_phonemizer("en-us", data_dir=str(tmp_path / "nope"))
+
+
+def test_espeak_data_dir_defaults_to_a_sibling_of_the_model(tmp_path):
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts.matcha import _espeak_data_dir
+
+    (tmp_path / "espeak-ng-data").mkdir()
+    (tmp_path / "model.onnx").touch()
+    cfg = MatchaTtsConfig.model_validate({"acousticModelPath": str(tmp_path / "model.onnx")})
+    assert _espeak_data_dir(cfg) == str(tmp_path / "espeak-ng-data")
+    # An explicit setting always wins, and a model without a pack claims none.
+    assert _espeak_data_dir(
+        MatchaTtsConfig.model_validate({
+            "acousticModelPath": str(tmp_path / "model.onnx"), "espeakDataDir": "/opt/pack",
+        })
+    ) == "/opt/pack"
+    assert _espeak_data_dir(
+        MatchaTtsConfig.model_validate({"acousticModelPath": str(tmp_path / "sub/m.onnx")})
+    ) is None
+
+
+def test_lexicon_mismatch_against_the_token_table_is_reported(tmp_path):
+    """Wrong-model file pairing keeps every id in range but points it at another
+    phone: fluent rhythm over wrong sounds, which no exception would ever surface."""
+    from loguru import logger as loguru_logger
+
+    from nanobot_channel_voice.tts.matcha import load_lexicon
+
+    lex = tmp_path / "lexicon.txt"
+    lex.write_text("\n".join(["你好 ni3 hao3", *(f"字{i} zi{i}" for i in range(9))]), encoding="utf-8")
+    messages: list[str] = []
+    sink = loguru_logger.add(lambda m: messages.append(str(m)), level="WARNING")
+    try:
+        word2ids = load_lexicon(str(lex), {"ni3": 1, "hao3": 2})
+    finally:
+        loguru_logger.remove(sink)
+    assert word2ids == {"你好": [1, 2]}
+    assert any("same model" in m for m in messages)
 
 
 def test_espeak_bundled_library_phonemizes():

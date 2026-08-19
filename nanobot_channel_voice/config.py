@@ -476,6 +476,9 @@ class MatchaTtsConfig(OnDeviceRuntime):
     lexicon_path: str | None = None         # lexicon-based (zh) models only
     espeak_path: str | None = None          # explicit espeak-ng binary; None => $PATH
     espeak_voice: str | None = None         # None => the model's own voice (en-us)
+    # Voice pack the model was trained against (IPA spellings drift between espeak
+    # releases); None => an espeak-ng-data beside the model files, else the install's own
+    espeak_data_dir: str | None = None
     speaker_id: int = Field(default=0, ge=0)  # multi-speaker exports only; ignored otherwise
     noise_scale: float = Field(default=0.667, ge=0)  # upstream temperature default
     speed: float = Field(default=1.0, gt=0)          # >1 = faster (length_scale = 1/speed)

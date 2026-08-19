@@ -96,6 +96,7 @@ def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
     """``lexicon.txt``: ``<word> <phone>...`` per line, first spelling wins; a word
     with any unknown phone is dropped (sherpa behaviour)."""
     word2ids: dict[str, list[int]] = {}
+    dropped = 0
     with open(path, encoding="utf-8") as f:
         for line in f:
             parts = line.split()
@@ -107,7 +108,17 @@ def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
             try:
                 word2ids[word] = [token2id[p] for p in parts[1:]]
             except KeyError:
-                continue
+                dropped += 1
+    # Heuristic, deliberately sensitive: a correct pairing drops ~0 (measured 0 of 68k
+    # for zh-en, 4 of 66k for baker) while a cross-model one drops 2% (same pinyin
+    # inventory, different ids) to ~100% (different alphabet). It only ever costs a log
+    # line, and the failure it names is otherwise silent — right rhythm, wrong sounds.
+    if dropped * 100 > dropped + len(word2ids):
+        logger.warning(
+            "voice: matcha lexicon '{}' dropped {} of {} entries whose phones are "
+            "absent from the token table — are lexiconPath and tokensPath from the "
+            "same model?", path, dropped, dropped + len(word2ids),
+        )
     return word2ids
 
 
@@ -274,6 +285,18 @@ _ZH_EN_IPA_FOLD = (
     ("tʃ", "ʧ"), ("dʒ", "ʤ"), ("ː", ""), ("g", "ɡ"), ("r", "ɹ"), ("e", "ɛ"),
 )
 _IPA_CACHE_CAP = 4096
+_ZH_EN_FOLDED = frozenset("AIOWY")
+_PINYIN_SYLLABLE = re.compile(r"[a-z]{1,6}[1-5]\Z")
+
+
+def is_zh_en_tokens(token2id: dict[str, int]) -> bool:
+    """Only the zh-en table carries BOTH halves: folded English diphthongs and tonal
+    pinyin. A zh-only export has the pinyin alone, a character-level English table the
+    capitals alone. For the dynamic path the graph metadata settles the dialect; the
+    split path has no metadata and only this."""
+    return _ZH_EN_FOLDED <= token2id.keys() and any(
+        _PINYIN_SYLLABLE.match(token) for token in token2id
+    )
 
 
 class EnglishToIpa:
@@ -459,11 +482,27 @@ def denoise(wav: np.ndarray, bias: np.ndarray) -> np.ndarray:
     return out[: wav.size]
 
 
+def _espeak_data_dir(cfg: MatchaTtsConfig) -> str | None:
+    """The voice pack this model was trained against: config, else the ``espeak-ng-data``
+    beside the model files (every sherpa espeak export ships one). Absent it, the
+    installed espeak's release picks the phonemes — en-us FORCE drifted oː -> ɔː, which
+    lands English on a different embedding."""
+    if cfg.espeak_data_dir:
+        return cfg.espeak_data_dir
+    for path in (cfg.acoustic_model_path, cfg.tokens_path, cfg.lexicon_path):
+        if path and (data := Path(path).expanduser().parent / "espeak-ng-data").is_dir():
+            return str(data)
+    return None
+
+
 def _english_fallback(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> EnglishToPinyin:
     """The zh lexicon models' English tier; letters-only when no espeak resolves."""
     try:
         return EnglishToPinyin(
-            token2id, make_ipa_phonemizer("en-us", espeak_path=cfg.espeak_path)
+            token2id,
+            make_ipa_phonemizer(
+                "en-us", espeak_path=cfg.espeak_path, data_dir=_espeak_data_dir(cfg)
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - an optional tier, never a build error
         logger.info(
@@ -479,7 +518,10 @@ def _espeak_frontend(
     """(frontend, language): the espeak voice IS the spoken language."""
     voice = cfg.espeak_voice or default_voice
     frontend = EspeakFrontend(
-        token2id, phonemize=make_ipa_phonemizer(voice, espeak_path=cfg.espeak_path)
+        token2id,
+        phonemize=make_ipa_phonemizer(
+            voice, espeak_path=cfg.espeak_path, data_dir=_espeak_data_dir(cfg)
+        ),
     )
     prefix = voice.partition("-")[0].lower()
     return frontend, (prefix if len(prefix) == 2 else _LANG_NAMES.get(prefix, "en"))
@@ -618,11 +660,20 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                             "voice: tts.matcha.espeakVoice is ignored for the zh-en "
                             "model (its English is trained on en-us phonemes)"
                         )
+                    data_dir = _espeak_data_dir(cfg)
+                    if data_dir is None:
+                        logger.warning(
+                            "voice: no espeak-ng-data beside this zh-en matcha model, so "
+                            "its English phonemes come from the installed espeak-ng and "
+                            "may not match training (set tts.matcha.espeakDataDir)"
+                        )
                     frontend = LexiconFrontend(
                         load_lexicon(cfg.lexicon_path, token2id), token2id,
                         english=EnglishToIpa(
                             token2id,
-                            make_ipa_phonemizer("en-us", espeak_path=cfg.espeak_path),
+                            make_ipa_phonemizer(
+                                "en-us", espeak_path=cfg.espeak_path, data_dir=data_dir
+                            ),
                         ),
                         latin_space_id=token2id.get(" "),
                     )
@@ -842,6 +893,14 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             )
 
         token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))  # type: ignore[arg-type]
+        if is_zh_en_tokens(token2id):
+            # Refusing beats synthesizing: this path frames ids as every other dialect
+            # wants them, which for zh-en artifacts is fluent rhythm over wrong sounds.
+            raise ValueError(
+                "the bilingual zh-en matcha dialect needs the dynamic export "
+                "(tts.matcha.acousticModelPath): the static split cannot express its "
+                "no-blank-interleave framing or its espeak English"
+            )
         # no metadata here: side files pick the frontend; lexicon exports are all zh
         if cfg.lexicon_path:
             frontend: EspeakFrontend | LexiconFrontend = LexiconFrontend(
