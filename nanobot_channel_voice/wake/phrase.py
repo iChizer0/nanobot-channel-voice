@@ -82,9 +82,12 @@ class WakePhrase:
 
     def __init__(self, phrases: Iterable[str]):
         self._patterns = [
-            re.compile(
-                r"[\W_]*".join(re.escape(t) for t in toks),
-                re.IGNORECASE | re.UNICODE,
+            (
+                p,
+                re.compile(
+                    r"[\W_]*".join(re.escape(t) for t in toks),
+                    re.IGNORECASE | re.UNICODE,
+                ),
             )
             for p in phrases
             # casefold() folds what IGNORECASE's simple folding misses
@@ -99,7 +102,7 @@ class WakePhrase:
     def leads(
         self, text: str, extra_lead: Callable[[str], bool] | None = None
     ) -> bool:
-        return self.strip(text, extra_lead)[0]
+        return self.strip(text, extra_lead)[0] is not None
 
     def present(self, text: str) -> bool:
         """A wake phrase occurs ANYWHERE in *text* (word-boundary rules of
@@ -107,21 +110,21 @@ class WakePhrase:
         runs against recently-spoken TTS."""
         return any(
             _clean_start(text, m.start()) and _clean_end(text, m.end())
-            for pat in self._patterns
+            for _, pat in self._patterns
             for m in pat.finditer(text)
         )
 
     def strip(
         self, text: str, extra_lead: Callable[[str], bool] | None = None
-    ) -> tuple[bool, str]:
-        """``(matched, remainder)``: whether a wake phrase leads *text* (only
+    ) -> tuple[str | None, str]:
+        """``(matched, remainder)``: the SOURCE phrase that leads *text* (only
         ``_LEAD_OK`` tokens — widened per token by ``extra_lead`` — may precede
-        it), and the text after it with leading separators removed. ``(False,
-        text)`` otherwise. ``search()`` per pattern suffices: any occurrence
-        after a rejected one necessarily has non-acceptable content in front of
-        it."""
-        best = None
-        for pat in self._patterns:
+        it; earliest/longest match wins) and the text after it, separators
+        stripped; ``(None, text)`` otherwise. Truthy exactly on a match, so
+        boolean callers read as before. ``search()`` per pattern suffices: any
+        occurrence after a rejected one has non-acceptable content in front."""
+        best, best_phrase = None, None
+        for phrase, pat in self._patterns:
             m = pat.search(text)
             if (
                 m is None
@@ -132,7 +135,7 @@ class WakePhrase:
             if best is None or m.start() < best.start() or (
                 m.start() == best.start() and m.end() > best.end()
             ):
-                best = m
+                best, best_phrase = m, phrase
         if best is None:
-            return False, text
-        return True, _SEP_RE.sub("", text[best.end():])
+            return None, text
+        return best_phrase, _SEP_RE.sub("", text[best.end():])

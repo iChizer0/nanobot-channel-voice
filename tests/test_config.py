@@ -349,3 +349,38 @@ def test_consume_import_json_leaves_files_without_a_pending_paste(tmp_path):
     assert consume_import_json(path) == 0
     # the '' filler stays put, like every other materialized secret default
     assert json.loads(path.read_text(encoding="utf-8")) == original
+
+
+def test_wake_ack_validators():
+    from nanobot_channel_voice.config import VoiceConfig
+
+    base = {"mode": "gate", "phrases": ["hey nanobot"]}
+    ok = VoiceConfig.model_validate({"wake": {**base, "ack": {"enabled": True}}})
+    assert ok.wake.ack.enabled and ok.wake.ack.phrases is None
+    # Off by default, and inert config parses without wake at all.
+    assert VoiceConfig().wake.ack.enabled is False
+
+    with pytest.raises(ValidationError, match="wake.mode"):
+        VoiceConfig.model_validate({"wake": {"mode": "off", "ack": {"enabled": True}}})
+    with pytest.raises(ValidationError, match="windowS"):
+        VoiceConfig.model_validate(
+            {"wake": {**base, "windowS": 0, "ack": {"enabled": True}}}
+        )
+    with pytest.raises(ValidationError, match="nothing to say"):
+        VoiceConfig.model_validate(
+            {"wake": {**base, "ack": {"enabled": True, "phrases": []}}}
+        )
+    # An ack that speaks a wake phrase would echo-veto the bot's own hits.
+    with pytest.raises(ValidationError, match="contains a wake phrase"):
+        VoiceConfig.model_validate(
+            {"wake": {**base, "ack": {"enabled": True, "phrases": ["just say hey nanobot"]}}}
+        )
+    with pytest.raises(ValidationError, match="contains a wake phrase"):
+        VoiceConfig.model_validate(
+            {"wake": {"mode": "gate", "phrases": ["小助手"],
+                      "ack": {"enabled": True, "phrases": ["我在，小助手在听"]}}}
+        )
+    # Boundary-aware, not substring panic: "hey" inside "they" is no mention.
+    VoiceConfig.model_validate(
+        {"wake": {**base, "ack": {"enabled": True, "phrases": ["they say I am here"]}}}
+    )

@@ -828,7 +828,7 @@ class VoiceChannel(BaseChannel):
                         "voice warmup failed for {}: {}", type(target).__name__, exc
                     )
             if local is not None:
-                await local.prewarm_fillers()  # gated internally on probe_ok + IDLE
+                await local.prewarm_canned()  # gated internally on probe_ok + IDLE
         finally:
             if local is not None:
                 local.hold_hop_accounting(False)

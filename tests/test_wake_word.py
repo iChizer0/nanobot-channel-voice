@@ -22,49 +22,49 @@ from nanobot_channel_voice.wake.phrase import WakePhrase  # noqa: E402
 
 def test_strip_leading_phrase_and_punctuation():
     wp = WakePhrase(["hey nanobot"])
-    assert wp.strip("Hey, Nanobot! what's the weather") == (True, "what's the weather")
+    assert wp.strip("Hey, Nanobot! what's the weather") == ("hey nanobot", "what's the weather")
 
 
 def test_phrase_must_lead_not_merely_occur():
     wp = WakePhrase(["hey nanobot"])
     matched, text = wp.strip("I said hey nanobot yesterday")
-    assert matched is False and text == "I said hey nanobot yesterday"
+    assert matched is None and text == "I said hey nanobot yesterday"
 
 
 def test_hesitation_fillers_may_precede():
     wp = WakePhrase(["hey nanobot"])
-    assert wp.strip("um, hey nanobot turn on the light")[0] is True
+    assert wp.strip("um, hey nanobot turn on the light")[0] == "hey nanobot"
 
 
 def test_fused_cjk_fillers_may_precede():
     # "嗯" and "那个" arrive as ONE fused token from unspaced STT output; the
     # prefix check must segment it instead of demanding exact membership.
     wp = WakePhrase(["小助手"])
-    assert wp.strip("嗯那个小助手开灯")[0] is True
+    assert wp.strip("嗯那个小助手开灯")[0] == "小助手"
 
 
 def test_cjk_fused_run_matches_and_strips():
     wp = WakePhrase(["小助手"])
-    assert wp.strip("小助手今天天气怎么样") == (True, "今天天气怎么样")
+    assert wp.strip("小助手今天天气怎么样") == ("小助手", "今天天气怎么样")
 
 
 def test_no_partial_word_match_in_spaced_scripts():
     wp = WakePhrase(["nanobot"])
-    assert wp.strip("nanobots are cool") == (False, "nanobots are cool")
+    assert wp.strip("nanobots are cool") == (None, "nanobots are cool")
     wp2 = WakePhrase(["hey nanobot"])
-    assert wp2.strip("hey nanobotics lab")[0] is False
+    assert wp2.strip("hey nanobotics lab")[0] is None
 
 
 def test_spaced_phrase_may_run_into_cjk():
     # A following ideograph starts a new word by definition (zh STT emits
     # "hey nanobot今天天气" with no separator).
     wp = WakePhrase(["hey nanobot"])
-    assert wp.strip("hey nanobot今天天气") == (True, "今天天气")
+    assert wp.strip("hey nanobot今天天气") == ("hey nanobot", "今天天气")
 
 
 def test_separator_strip_keeps_sign_characters():
     wp = WakePhrase(["hey nanobot"])
-    assert wp.strip("hey nanobot -3 degrees is cold") == (True, "-3 degrees is cold")
+    assert wp.strip("hey nanobot -3 degrees is cold") == ("hey nanobot", "-3 degrees is cold")
 
 
 def test_casefold_variants_match():
@@ -74,12 +74,12 @@ def test_casefold_variants_match():
 
 def test_bare_phrase_strips_to_empty():
     wp = WakePhrase(["hey nanobot"])
-    assert wp.strip("hey nanobot.") == (True, "")
+    assert wp.strip("hey nanobot.") == ("hey nanobot", "")
 
 
 def test_earliest_widest_match_wins():
     wp = WakePhrase(["nanobot", "hey nanobot"])
-    assert wp.strip("hey nanobot hello") == (True, "hello")
+    assert wp.strip("hey nanobot hello") == ("hey nanobot", "hello")
 
 
 def test_leads_mirrors_strip():
@@ -119,11 +119,11 @@ def test_strip_extra_lead_admits_caller_approved_tokens():
     leak = {"the", "weather", "is", "sunny"}
     assert wp.strip(
         "the weather is sunny hey nanobot stop", extra_lead=lambda t: t in leak
-    ) == (True, "stop")
-    assert wp.strip("the weather is sunny hey nanobot stop")[0] is False
+    ) == ("hey nanobot", "stop")
+    assert wp.strip("the weather is sunny hey nanobot stop")[0] is None
     assert wp.strip(
         "the fresh guy said hey nanobot stop", extra_lead=lambda t: t in leak
-    )[0] is False
+    )[0] is None
 
 
 # ---- acoustic tier: OpenWakeWord against fake models ------------------------
@@ -392,3 +392,81 @@ def test_hit_position_marks_the_chunk_end(fakes):
     assert det.push(b"\x01\x00" * 880) is False  # completes the tail chunk; 0.2 re-arms
     assert det.push(_CHUNK) is True
     assert det.last_hit_back_bytes == 0          # hit landed on the frame boundary
+
+
+# ---- ack language routing (script of the called name) ------------------------
+
+
+def test_script_class_and_uniform_script():
+    from nanobot_channel_voice.backend.local import _script_class, _uniform_script
+
+    assert _script_class("hey nanobot") == "latin"
+    assert _script_class("小助手") == "han"
+    assert _script_class("ねえアシスタント") == "kana"
+    assert _script_class("小娜ちゃん") == "kana"  # kana wins: ja mixes both scripts
+    assert _script_class("비서야") == "hangul"
+    assert _script_class("123 !") is None
+    assert _uniform_script(["小助手", "小娜"]) == "han"
+    assert _uniform_script(["hey nanobot", "小娜"]) is None
+    assert _uniform_script([]) is None
+
+
+def test_ack_pool_routes_by_the_called_name():
+    import asyncio
+
+    from eval_harness import EvalConversation
+
+    from nanobot_channel_voice.backend.local import (
+        _WAKE_ACK_BUILTINS,
+        _WAKE_ACK_FALLBACK,
+    )
+
+    async def _pool(matched, *, phrases, tts_lang=None, tts_langs=None, ack=None):
+        wake = {"mode": "gate", "phrases": phrases, "ack": {"enabled": True}}
+        if ack is not None:
+            wake["ack"]["phrases"] = ack
+        async with EvalConversation(wake=wake) as conv:
+            b = conv.backend
+            if tts_lang is not None:
+                b._tts.spoken_language = tts_lang
+            if tts_langs is not None:
+                b._tts.spoken_languages = tts_langs
+            return b._ack_pool(matched)
+
+    async def _t():
+        # Bilingual deployment, built-ins: the called name picks the row.
+        both = ["hey nanobot", "小娜"]
+        assert await _pool("小娜", phrases=both, tts_langs=("zh", "en")) == (
+            _WAKE_ACK_BUILTINS["zh"]
+        )
+        assert await _pool("hey nanobot", phrases=both, tts_langs=("zh", "en")) == (
+            _WAKE_ACK_FALLBACK
+        )
+        # Unrestricted TTS reaches every row (kana -> ja).
+        assert await _pool("ねえアシスタント", phrases=["ねえアシスタント"]) == (
+            _WAKE_ACK_BUILTINS["ja"]
+        )
+        # A zh-only engine must NOT cross to an English ack it cannot voice:
+        # honest zh beats silence for an English summon.
+        assert await _pool_zh_engine() == _WAKE_ACK_BUILTINS["zh"]
+        # Configured mixed list: same-script entries win, whole list otherwise.
+        mixed = ["在呢。", "I'm here."]
+        assert await _pool("小娜", phrases=both, ack=mixed) == ["在呢。"]
+        assert await _pool("hey nanobot", phrases=both, ack=mixed) == ["I'm here."]
+        assert await _pool(None, phrases=both, ack=mixed) == mixed
+        # Acoustic-only summon (no matched text): a uniform phrase set still routes.
+        assert await _pool(None, phrases=["小助手", "小娜"], tts_langs=("zh", "en")) == (
+            _WAKE_ACK_BUILTINS["zh"]
+        )
+
+    async def _pool_zh_engine():
+        # The list a zh-fixed engine resolves at construction is zh; a latin
+        # summon finds no same-script entry and no speakable crossover.
+        wake = {"mode": "gate", "phrases": ["hey nanobot", "小娜"], "ack": {"enabled": True}}
+        async with EvalConversation(wake=wake) as conv:
+            b = conv.backend
+            b._tts.spoken_language = "zh"
+            b._wake_ack_list = _WAKE_ACK_BUILTINS["zh"]  # as construction resolves for zh
+            return b._ack_pool("hey nanobot")
+
+    asyncio.run(_t())

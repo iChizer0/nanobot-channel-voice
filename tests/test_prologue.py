@@ -195,23 +195,23 @@ def test_speak_final_feeds_the_first_reply_ema():
 def test_prewarm_fills_the_cache_and_respects_probe_ok_and_enabled():
     async def _t():
         b, tts, sink = _build(phrases=["one", "two"])
-        await b.prewarm_fillers()
+        await b.prewarm_canned()
         assert tts.calls == ["one", "two"]
-        await b.prewarm_fillers()  # cached: no re-synthesis
+        await b.prewarm_canned()  # cached: no re-synthesis
         assert tts.calls == ["one", "two"]
 
         b2, tts2, _ = _build(phrases=["one"])
         tts2.probe_ok = False  # a billing adapter must never prewarm
-        await b2.prewarm_fillers()
+        await b2.prewarm_canned()
         assert tts2.calls == []
 
         b3, tts3, _ = _build(enabled=False)
-        await b3.prewarm_fillers()
+        await b3.prewarm_canned()
         assert tts3.calls == []
 
         b4, tts4, _ = _build(phrases=["one"])
         b4._turn = VoiceState.THINKING  # a live turn owns the adapter: prewarm yields
-        await b4.prewarm_fillers()
+        await b4.prewarm_canned()
         assert tts4.calls == []
         for backend in (b, b2, b3, b4):
             await backend.close()

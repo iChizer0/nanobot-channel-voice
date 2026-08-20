@@ -754,6 +754,21 @@ class OpenWakeWordConfig(OnDeviceRuntime):
     refractory_s: float = Field(default=2.0, ge=0.0)
 
 
+class WakeAckConfig(_VoiceBase):
+    """Spoken acknowledgment at every bare-wake settle ("hey nanobot" → "I'm here.").
+
+    The cold summon's only feedback, and in half-duplex the audible mic-open marker:
+    the contract becomes *phrase — ack — command*. Synthesized once with the session's
+    own TTS and cached; canned audio — it yields to user speech, any real turn flushes
+    it, and the agent never sees it. Keep phrases SHORT (≤ ~0.6 s spoken): the
+    half-duplex mic is gated while one plays."""
+
+    enabled: bool = False
+    # Rotated round-robin across summons. None = built-ins keyed to the TTS engine's
+    # language; a phrase the engine cannot speak synthesizes to silence (prewarm warns).
+    phrases: list[str] | None = None
+
+
 class WakeConfig(_VoiceBase):
     """Wake-word gate (LOCAL backend only; the cloud paths are ungated by design).
 
@@ -767,10 +782,12 @@ class WakeConfig(_VoiceBase):
     counts, and ``engine="openwakeword"`` adds an acoustic detector that hears
     through the bot's own playback. A leading wake phrase is stripped from the
     published text; an utterance that is ONLY the phrase publishes nothing and
-    just opens the attention window. Half-duplex contract: detection trails the
-    phrase and the mic-reopen flush discards audio up to it, so the command
-    belongs AFTER the reply stops (phrase, beat, command) — same-breath content
-    survives only in the open-mic modes."""
+    just opens the attention window — silently, unless ``ack`` speaks a short
+    acknowledgment ("hey nanobot" → "I'm here."). Half-duplex contract:
+    detection trails the phrase and the mic-reopen flush discards audio up to
+    it, so the command belongs AFTER the reply stops (phrase, beat, command) —
+    same-breath content survives only in the open-mic modes. With the ack on,
+    the ack IS the beat: wait for it, then speak."""
 
     mode: Literal["off", "gate", "strict"] = "off"
     # The spoken wake phrases, matched at utterance START (hesitation fillers may
@@ -781,6 +798,7 @@ class WakeConfig(_VoiceBase):
     window_s: float = Field(default=45.0, ge=0.0)
     engine: Literal["text", "openwakeword"] = "text"
     openwakeword: OpenWakeWordConfig = Field(default_factory=OpenWakeWordConfig)
+    ack: WakeAckConfig = Field(default_factory=WakeAckConfig)
 
     @model_validator(mode="after")
     def _phrases_required(self) -> WakeConfig:
@@ -789,6 +807,37 @@ class WakeConfig(_VoiceBase):
                 f'wake.mode="{self.mode}" requires wake.phrases: the transcript tier '
                 "is the always-available fallback (the acoustic engine is "
                 "best-effort and may degrade), and phrases drive wake stripping"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _ack_needs_attention(self) -> WakeConfig:
+        if not self.ack.enabled:
+            return self
+        if self.mode == "off":
+            raise ValueError('wake.ack.enabled requires wake.mode != "off"')
+        if self.window_s <= 0:
+            raise ValueError(
+                "wake.ack.enabled requires wake.windowS > 0: with every cold start "
+                "gated, the ack would promise attention the gate does not grant"
+            )
+        if self.ack.phrases is not None and not self.ack.phrases:
+            raise ValueError(
+                "wake.ack.enabled with an empty phrases list has nothing to say "
+                "(omit phrases for the built-ins)"
+            )
+        # Import here: wake/__init__ imports this module (top level would cycle).
+        from nanobot_channel_voice.wake.phrase import WakePhrase
+
+        contains = WakePhrase(self.phrases)
+        offender = next(
+            (p for p in self.ack.phrases or [] if contains.present(p)), None
+        )
+        if offender is not None:
+            raise ValueError(
+                f"wake.ack phrase '{offender}' contains a wake phrase: every ack "
+                "would veto acoustic wake hits for the whole echo window (the bot "
+                "hearing itself say its own name)"
             )
         return self
 
