@@ -17,6 +17,13 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
         ("in 1989", "in nineteen eighty nine"),          # a year, not a quantity
         ("in 2008", "in two thousand eight"),            # …but not pairwise in the 2000s
         ("battery at 87%", "battery at eighty seven percent"),
+        # Percent is amount-aware and runs before the decimal/grouped passes, which
+        # would eat the digits and strand a "%" no char vocab can voice.
+        ("growth of 3.5%", "growth of three point five percent"),
+        ("up 1,234% overall", "up one thousand two hundred thirty four percent overall"),
+        # A glued unit is still a decimal; \b never fired between digit and letter.
+        ("add 3.5kg of flour", "add three point five kg of flour"),
+        ("the v3.5 release", "the v three point five release"),
         ("August 3rd", "August third"),
         ("the 21st time", "the twenty first time"),
         ("1,234 items", "one thousand two hundred thirty four items"),
@@ -59,13 +66,44 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
         ("released on 2026-08-19", "released on August nineteenth, twenty twenty six"),
         ("due 2026/8/1", "due August first, twenty twenty six"),
         ("back in 2008-05-03", "back in May third, two thousand eight"),
+        ("on 2026.08.19.", "on August nineteenth, twenty twenty six."),
+        ("at 2026-08-19T21:33", "at August nineteenth, twenty twenty six twenty one thirty three"),
+        # Written-out dates: ordinal day, spoken year — the shape "what's the
+        # date" answers take.
+        ("Today is August 20, 2026.", "Today is August twentieth, twenty twenty six."),
+        ("due August 19", "due August nineteenth"),
+        ("back in August 2026", "back in August twenty twenty six"),
+        # …with the unit and calendar guards that keep quantities quantities.
+        ("May 5 minutes later", "May five minutes later"),
+        ("March 2000 meters up", "March two thousand meters up"),
+        ("meet on September 31", "meet on September thirty one"),
+        ("May 12:30 works", "May twelve thirty works"),  # a month and a clock, not a day
+        ("May 12: the schedule", "May twelfth: the schedule"),
+        # Decades; a 2-digit one needs a determiner ("30s" is thirty seconds).
+        ("the 1990s were wild", "the nineteen nineties were wild"),
+        ("music of the 2000s", "music of the two thousands"),
+        ("in her 30s", "in her thirties"),
+        ("mid-2020s style", "mid-twenty twenties style"),
+        ("a 30s timeout", "a thirty s timeout"),
+        ("the 1990's were wild", "the nineteen nineties were wild"),  # possessive homophone
+        # A hyphen glued to a word is a compound, not a minus sign.
+        ("wind-3°C reading", "wind-three degrees Celsius reading"),
         ("costs $5.99", "costs five point nine nine dollars"),
+        # Trailing fraction zeros are price formatting, not speech.
+        ("$5.00 total", "five dollars total"),
+        ("$3.50 each", "three point five dollars each"),
+        ("a $1.00 fee", "a one dollar fee"),
         ("just $1", "just one dollar"),
         ("a $1,000 grant", "a one thousand dollars grant"),
         ("about ¥199", "about one hundred ninety nine yuan"),
         ("it's 25°C out", "it's twenty five degrees Celsius out"),
         ("low of 1°C", "low of one degree Celsius"),
         ("oven to 350 ℉", "oven to three hundred fifty degrees Fahrenheit"),
+        # The sign survives only on temperatures, where a leading hyphen is
+        # unambiguous; the digit lookbehind keeps "20-30°C" a range.
+        ("it is -3.5°C now", "it is minus three point five degrees Celsius now"),
+        ("−5℃ tonight", "minus five degrees Celsius tonight"),
+        ("between 20-30°C", "between twenty-thirty degrees Celsius"),
         # A scale word rides in front of the relocated unit.
         ("about $5 million", "about five million dollars"),
         ("a $1.5 billion round", "a one point five billion dollars round"),
@@ -118,9 +156,16 @@ def test_space_digit_sequences_is_engine_native():
     assert space_digit_sequences("on 2008-05-03") == "on May third, two thousand eight"
     assert space_digit_sequences("ticket 2026-08-19") == "ticket August nineteenth, twenty twenty six"
     assert space_digit_sequences("from 2020-2024") == "from 20 20 to 20 24"  # a range, not a date
+    # Written-out dates and decades render on this path too — the trailing "s" of
+    # "1990s" is letter glue, which would digit-shred the year.
+    assert space_digit_sequences("Today is August 20, 2026.") == \
+        "Today is August twentieth, twenty twenty six."
+    assert space_digit_sequences("the 1990s were wild") == "the nineteen nineties were wild"
     # Currency and degree policy hold on this path too (espeak alone says "yen").
     assert space_digit_sequences("about ¥199") == "about 199 yuan"
     assert space_digit_sequences("it is 25°C") == "it is 25 degrees Celsius"
+    assert space_digit_sequences("$5.00 total") == "5 dollars total"
+    assert space_digit_sequences("it is -3.5°C") == "it is minus 3.5 degrees Celsius"
     # Any other language keeps the language-neutral digit spacing — month names
     # are English words a German or Japanese voice cannot say.
     assert space_digit_sequences("Termin am 2026-08-19", "de") == "Termin am 2 0 2 6, 0 8, 1 9"

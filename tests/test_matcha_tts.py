@@ -423,6 +423,12 @@ def test_verbalize_numbers_zh_inside_cjk_text():
     assert verbalize_numbers_zh("增长3.5%") == "增长百分之三点五"  # percent before decimal
     assert verbalize_numbers_zh("费率0.5％") == "费率百分之零点五"  # full-width percent
     assert verbalize_numbers_zh("共1,234元") == "共一千二百三十四元"
+    assert verbalize_numbers_zh("价格¥30.00") == "价格三十元"  # print zeros are not speech
+    assert verbalize_numbers_zh("¥3.50一个") == "三点五元一个"
+    # The sign survives only on temperatures — elsewhere a hyphen is a range or id —
+    # and would otherwise drop as lexicon OOV, reading the temperature as positive.
+    assert verbalize_numbers_zh("今天-3.5°C") == "今天零下三点五摄氏度"
+    assert verbalize_numbers_zh("20-30°C之间") == "二十-三十摄氏度之间"
 
 
 def test_verbalize_numbers_zh():
@@ -445,6 +451,13 @@ def test_verbalize_numbers_zh_reads_sequences_digit_wise():
     # Mandarin years are digit-read; the cardinal reading is simply wrong.
     assert verbalize_numbers_zh("2026年") == "二零二六年"
     assert verbalize_numbers_zh("1949年10月1日") == "一九四九年十月一日"
+    assert verbalize_numbers_zh("2026.8.19发布") == "二零二六年八月十九日发布"  # dot date
+    # A range's head carries no 年 of its own; both ends read digit-wise.
+    assert verbalize_numbers_zh("从2020至2024年") == "从二零二零至二零二四年"
+    # Generation labels are digit-wise cohorts; 后面 marks position, not a cohort.
+    assert verbalize_numbers_zh("我是90后") == "我是九零后"
+    assert verbalize_numbers_zh("他是85后") == "他是八五后"
+    assert verbalize_numbers_zh("排在10后面") == "排在十后面"
     assert verbalize_numbers_zh("3年") == "三年"        # a duration, not a year
     assert verbalize_numbers_zh("10000年") == "一万年"   # 4-digit runs only
     # A leading zero marks an identifier; the cardinal reading deletes it.

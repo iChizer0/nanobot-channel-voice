@@ -152,10 +152,24 @@ _RE_DOTTED = re.compile(r"(?<!\d)\d+(?:\.\d+){2,}(?!\d)")
 _RE_TIME = re.compile(r"\b(\d{1,2}):([0-5]\d)\b")
 _GROUPED = r"\d{1,3}(?:,\d{3})+"  # the thousands-separator grammar, shared by every amount pattern
 _RE_GROUPED = re.compile(rf"\b{_GROUPED}\b")
-_RE_DECIMAL = re.compile(rf"\b({_GROUPED}|\d+)\.(\d+)\b")
+# Lookaround anchors, not \b: a glued unit ("3.5kg") is still a decimal, and \b
+# between digit and letter never fires.
+_RE_DECIMAL = re.compile(rf"(?<!\d)({_GROUPED}|\d+)\.(\d+)(?!\d)")
 _RE_ORDINAL = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
-_RE_PERCENT = re.compile(r"\b(\d+)\s*%")
+# Amount-aware like the zh twin, and run BEFORE decimal/grouped: those passes eat
+# the digits and strand a "%" no char vocab can voice.
+_RE_PERCENT = re.compile(rf"(?<!\d)(?:{_GROUPED}|\d+)(?:\.\d+)?\s*%")
 _RE_INT = re.compile(r"\d+")
+
+
+def _en_amount_words(amount: str) -> str:
+    head, _, frac = amount.partition(".")
+    words = _int_words(int(head.replace(",", "")))
+    return f"{words} point {en_digit_words(frac)}" if frac else words
+
+
+def _en_percent(text: str) -> str:
+    return _en_amount_words(text.rstrip("%").strip()) + " percent"
 
 
 def _dotted_words(
@@ -172,22 +186,22 @@ def verbalize_numbers_en(text: str) -> str:
     """Expand digits into English words a char-vocab TTS can actually speak."""
     if not _RE_INT.search(text):
         return text
+    text = _RE_ISO_T.sub(" ", text)
     text = _sub_dates(text, _en_date_words)
+    text = _sub_month_dates(text)
+    text = _RE_EN_DECADE.sub(_en_decade, text)
     text = _sub_padded(_RE_CURRENCY, text, _en_currency)
     text = _RE_DEGREES.sub(_en_degrees, text)
     text = _RE_DOTTED.sub(
         lambda m: _dotted_words(m.group(), " point ", en_digit_words, _en_run_words), text
     )
     text = _RE_TIME.sub(_time_words, text)
+    text = _sub_padded(_RE_PERCENT, text, _en_percent)
     # Decimal before grouped, or "1,234.56" loses its integer part to words and
     # strands an unspeakable "."
-    text = _RE_DECIMAL.sub(
-        lambda m: f"{_int_words(int(m.group(1).replace(',', '')))} point "
-                  f"{en_digit_words(m.group(2))}", text
-    )
+    text = _sub_padded(_RE_DECIMAL, text, _en_amount_words)
     text = _RE_GROUPED.sub(lambda m: _int_words(int(m.group().replace(",", ""))), text)
     text = _RE_ORDINAL.sub(lambda m: _ordinal_words(int(m.group(1))), text)
-    text = _RE_PERCENT.sub(lambda m: f"{_int_words(int(m.group(1)))} percent", text)
     text = _read_sequences(text, "en", en_digit_words, _en_year_words)
     return _sub_padded(_RE_INT, text, _en_run_words)
 
@@ -271,7 +285,12 @@ _RE_PERCENT_ZH = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*[%％]")
 _RE_DECIMAL_ZH = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
 # A year is read digit-wise in Mandarin — 2026年 is 二零二六年, never 两千零二十六年.
 # Bounded to 1000-2999: the residue it cannot separate is a round duration ("共2000年").
-_RE_YEAR_ZH = re.compile(r"(?<!\d)([12]\d{3})(?=年)")
+# A range's head carries no 年 of its own (2020至2024年), so the lookahead reaches
+# through the connective.
+_RE_YEAR_ZH = re.compile(r"(?<!\d)[12]\d{3}(?=年|[至到~～][12]\d{3}年)")
+# Generation labels read digit-wise: 90后/85后 are 九零后/八五后, never 九十后.
+# 后面/后边/后方/后头 mark position ("排在10后面"), not a cohort.
+_RE_ZH_GEN = re.compile(r"(?<!\d)\d[05](?=后(?![面边方头]))")
 # "08月" is a date field, not an identifier: drop the pad before the leading-zero
 # sequence rule claims it (零八月). Only 月/日 are safe — 号 marks an identifier
 # (订单08号) as often as a day, and 分/秒 keep their 零 (三点零五分).
@@ -310,6 +329,7 @@ def verbalize_numbers_zh(text: str) -> str:
     """Expand digits into Chinese words the matcha zh lexicon can actually speak."""
     if not _RE_INT_ZH.search(text):
         return text
+    text = _RE_ISO_T.sub(" ", text)
     text = _sub_dates(text, _zh_date)
     text = _RE_ZH_PADDED_DATE.sub(r"\1", text)
     text = _sub_padded(_RE_CURRENCY, text, _zh_currency)
@@ -326,6 +346,7 @@ def verbalize_numbers_zh(text: str) -> str:
     # Sequences first: _RE_YEAR_ZH would eat the tail of "2020-2024年" and strand the head.
     text = _read_sequences(text, "zh", zh_digit_words)
     text = _RE_YEAR_ZH.sub(lambda m: zh_digit_words(m.group()), text)
+    text = _RE_ZH_GEN.sub(lambda m: zh_digit_words(m.group()), text)
     return _sub_padded(_RE_INT_ZH, text, _zh_run_words)
 
 
@@ -339,11 +360,15 @@ _MONTHS_EN = ("January", "February", "March", "April", "May", "June", "July",
               "August", "September", "October", "November", "December")
 _MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)  # Feb 29 allowed blind
 # Same separator both times; a trailing 日/号 means the writer already suffixed the
-# date, which the renderers would double.
+# date, which the renderers would double. "." is a separator too (2026.8.19, common
+# in zh/ja writing) — a year-based software version (2024.1.2) then reads as a date,
+# the rarer shape in speech; ".digit" after the day marks a version and bails out.
 _RE_ISO_DATE = re.compile(
-    rf"(?<![\d{_HYPHENS}/])[12]\d{{3}}([{_HYPHENS}/])(?:0?[1-9]|1[0-2])\1"
-    rf"(?:0?[1-9]|[12]\d|3[01])(?![\d{_HYPHENS}/日号])"
+    rf"(?<![\d{_HYPHENS}/.])[12]\d{{3}}([{_HYPHENS}/.])(?:0?[1-9]|1[0-2])\1"
+    rf"(?:0?[1-9]|[12]\d|3[01])(?![\d{_HYPHENS}/日号]|\.\d)"
 )
+# The ISO timestamp's T reads as a letter and glues the time shut ("19T21:33").
+_RE_ISO_T = re.compile(r"(?<=\d)T(?=\d{1,2}:\d{2})")
 # symbol -> (en singular, en plural, zh); the regex class derives from the keys so
 # they cannot drift. ¥ reads as CNY: bilingual context makes yuan the likelier unit.
 _CURRENCIES = {
@@ -363,8 +388,12 @@ _RE_CURRENCY = re.compile(
     rf"|\s?(?:元|(?:dollars?|euros?|pounds?|yuan|yen|thousand|million|billion|trillion)\b))",
     re.IGNORECASE,
 )
+# The minus survives only here: elsewhere a hyphen marks a range or id as often as a
+# sign, but "-3.5°C" is a temperature, and the sign is OOV in every lexicon path.
+# The lookbehinds keep "20-30°C" a range and "wind-3°C" a compound.
 _RE_DEGREES = re.compile(
-    r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:°\s?[CF](?![A-Za-z])|℃|℉)", re.IGNORECASE
+    r"(?<!\d)(?:(?<![A-Za-z])([-−])\s?)?(\d+(?:\.\d+)?)\s*(?:°\s?[CF](?![A-Za-z])|℃|℉)",
+    re.IGNORECASE,
 )
 # The two-codepoint spellings _RE_DEGREES accepts, foldable to their single
 # codepoints — which are non-alpha, so a script classifier keeps them neutral.
@@ -403,24 +432,81 @@ def _en_date_words(date: str) -> str:
     return f"{_MONTHS_EN[month - 1]} {_ordinal_words(day)}, {_en_year_words(year)}"
 
 
+# Written-out dates — the shape "what's the date" answers take. Case-sensitive:
+# "may 15 minutes" and "march 5 miles" are verbs.
+_MONTH_ALT = "|".join(_MONTHS_EN)
+_RE_EN_MONTH_DAY = re.compile(
+    rf"\b({_MONTH_ALT})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,?\s+([12]\d{{3}})\b)?"
+    rf"(?!\d|[:：]\d)"  # "May 12:30" is a month and a clock, not a day
+)
+_RE_EN_MONTH_YEAR = re.compile(rf"\b({_MONTH_ALT}),?\s+([12]\d{{3}})\b(?![\d:：])")
+# A bare 4-digit decade is unambiguous; a 2-digit one needs a determiner or "30s"
+# could as well be thirty seconds. The possessive ("1990's hits") is a spoken
+# homophone of the plural, so the apostrophe is welcome either side.
+_RE_EN_DECADE = re.compile(
+    r"\b(?:([12]\d{2}0)|(?:the|his|her|their|your|my|our|early|late|mid)"
+    r"[ \-]['’]?([2-9]0))['’]?s\b"
+)
+
+
+def _en_decade(m: re.Match[str]) -> str:
+    run = m.group(1) or m.group(2)
+    words = _en_year_words(run) if len(run) == 4 else _TENS[int(run) // 10]
+    plural = words[:-1] + "ies" if words.endswith("y") else words + "s"
+    return plural if m.group(1) else m.group()[: m.start(2) - m.start()] + plural
+
+
+def _sub_month_dates(text: str) -> str:
+    """"August 19(, 2026)" and "August(,) 2026": ordinal day, spoken year. A unit
+    after the number keeps a quantity a quantity ("May 5 minutes"); so does an
+    impossible day."""
+
+    def _day(m: re.Match[str]) -> str:
+        day = int(m.group(2))
+        if not 1 <= day <= _MONTH_DAYS[_MONTHS_EN.index(m.group(1))]:
+            return m.group()
+        if m.group(3) is None and _RE_EN_UNIT.match(text[m.end():]):
+            return m.group()
+        year = f", {_en_year_words(m.group(3))}" if m.group(3) else ""
+        return f"{m.group(1)} {_ordinal_words(day)}{year}"
+
+    def _year(m: re.Match[str]) -> str:
+        if _RE_EN_UNIT.match(text[m.end():]):
+            return m.group()
+        return f"{m.group(1)} {_en_year_words(m.group(2))}"
+
+    text = _RE_EN_MONTH_DAY.sub(_day, text)
+    return _RE_EN_MONTH_YEAR.sub(_year, text)
+
+
+# Trailing fraction zeros are price formatting, not speech: $5.00 is five dollars.
+_RE_FRAC_TAIL = re.compile(r"(\.\d*[1-9])0+(?!\d)")  # 3.50 -> 3.5
+_RE_FRAC_ZEROS = re.compile(r"\.0+(?!\d)")           # 5.00 -> 5
+
+
+def _trim_frac_zeros(amount: str) -> str:
+    return _RE_FRAC_ZEROS.sub("", _RE_FRAC_TAIL.sub(r"\1", amount))
+
+
 def _en_currency(text: str) -> str:
-    amount = text[1:].lstrip()
+    amount = _trim_frac_zeros(text[1:].lstrip())
     singular, plural, _ = _CURRENCIES[text[0]]
     return f"{amount} {singular if _RE_ONE.fullmatch(amount) else plural}"
 
 
 def _zh_currency(text: str) -> str:
-    return text[1:].lstrip() + _CURRENCIES[text[0]][2]
+    return _trim_frac_zeros(text[1:].lstrip()) + _CURRENCIES[text[0]][2]
 
 
 def _en_degrees(m: re.Match[str]) -> str:
-    unit = "degree" if _RE_ONE.fullmatch(m.group(1)) else "degrees"
+    unit = "degree" if _RE_ONE.fullmatch(m.group(2)) else "degrees"
     scale = "Fahrenheit" if m.group()[-1] in "Ff℉" else "Celsius"
-    return f"{m.group(1)} {unit} {scale}"
+    return f"{'minus ' if m.group(1) else ''}{m.group(2)} {unit} {scale}"
 
 
 def _zh_degrees(m: re.Match[str]) -> str:
-    return m.group(1) + ("华氏度" if m.group()[-1] in "Ff℉" else "摄氏度")
+    scale = "华氏度" if m.group()[-1] in "Ff℉" else "摄氏度"
+    return ("零下" if m.group(1) else "") + m.group(2) + scale
 
 
 def fold_degree_marks(text: str) -> str:
@@ -588,8 +674,11 @@ def space_digit_sequences(text: str, language: str | None = "en") -> str:
     re-shred them; other (or unknown) languages keep the language-neutral spacing."""
     if not _RE_INT.search(text):
         return text
+    text = _RE_ISO_T.sub(" ", text)
     if language and language.startswith("en"):
         text = _sub_dates(text, _en_date_words)
+        text = _sub_month_dates(text)
+        text = _RE_EN_DECADE.sub(_en_decade, text)
         text = _sub_padded(_RE_CURRENCY, text, _en_currency)
         text = _RE_DEGREES.sub(_en_degrees, text)
     return _read_sequences(text, "en", lambda run: " ".join(run), _en_year_split)
