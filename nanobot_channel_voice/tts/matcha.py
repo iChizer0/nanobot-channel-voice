@@ -514,7 +514,9 @@ def _espeak_data_dir(cfg: MatchaTtsConfig) -> str | None:
     lands English on a different embedding."""
     if cfg.espeak_data_dir:
         return cfg.espeak_data_dir
-    for path in (cfg.acoustic_model_path, cfg.tokens_path, cfg.lexicon_path):
+    # encoder_path last: a conversion output dir may hold a stale pack, and split
+    # deployments keep the authoritative one beside tokens/lexicon.
+    for path in (cfg.acoustic_model_path, cfg.tokens_path, cfg.lexicon_path, cfg.encoder_path):
         if path and (data := Path(path).expanduser().parent / "espeak-ng-data").is_dir():
             return str(data)
     return None
@@ -535,6 +537,44 @@ def _english_fallback(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> English
             exc,
         )
         return EnglishToPinyin(token2id)
+
+
+def _lexicon_frontend(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> LexiconFrontend:
+    """The zh lexicon dialect with the en-in-zh pinyin fallback tier."""
+    if not cfg.lexicon_path:
+        raise ValueError("this matcha model needs tts.matcha.lexiconPath")
+    return LexiconFrontend(
+        _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
+        english=_english_fallback(cfg, token2id),
+    )
+
+
+def _zh_en_frontend(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> LexiconFrontend:
+    """dengcunqin bilingual (sherpa is_zh_en): zh via lexicon, English via espeak IPA
+    folded to the trained alphabet, no blank interleave. espeak is mandatory here —
+    English is half the model."""
+    if not cfg.lexicon_path:
+        raise ValueError("this matcha model needs tts.matcha.lexiconPath")
+    if cfg.espeak_voice:
+        logger.warning(
+            "voice: tts.matcha.espeakVoice is ignored for the zh-en "
+            "model (its English is trained on en-us phonemes)"
+        )
+    data_dir = _espeak_data_dir(cfg)
+    if data_dir is None:
+        logger.warning(
+            "voice: no espeak-ng-data beside this zh-en matcha model, so "
+            "its English phonemes come from the installed espeak-ng and "
+            "may not match training (set tts.matcha.espeakDataDir)"
+        )
+    return LexiconFrontend(
+        _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
+        english=EnglishToIpa(
+            token2id,
+            make_ipa_phonemizer("en-us", espeak_path=cfg.espeak_path, data_dir=data_dir),
+        ),
+        latin_space_id=token2id.get(" "),
+    )
 
 
 def _espeak_frontend(
@@ -676,44 +716,13 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                     raise ValueError("icefall/sherpa matcha exports need tts.matcha.tokensPath")
                 token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))
                 if meta.get("voice") == "zh en-us":
-                    # dengcunqin bilingual (sherpa is_zh_en): zh via lexicon, English
-                    # via espeak IPA folded to the trained alphabet, no interleave.
-                    # espeak is mandatory here — English is half the model.
-                    if not cfg.lexicon_path:
-                        raise ValueError("this matcha model needs tts.matcha.lexiconPath")
-                    if cfg.espeak_voice:
-                        logger.warning(
-                            "voice: tts.matcha.espeakVoice is ignored for the zh-en "
-                            "model (its English is trained on en-us phonemes)"
-                        )
-                    data_dir = _espeak_data_dir(cfg)
-                    if data_dir is None:
-                        logger.warning(
-                            "voice: no espeak-ng-data beside this zh-en matcha model, so "
-                            "its English phonemes come from the installed espeak-ng and "
-                            "may not match training (set tts.matcha.espeakDataDir)"
-                        )
-                    frontend = LexiconFrontend(
-                        _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
-                        english=EnglishToIpa(
-                            token2id,
-                            make_ipa_phonemizer(
-                                "en-us", espeak_path=cfg.espeak_path, data_dir=data_dir
-                            ),
-                        ),
-                        latin_space_id=token2id.get(" "),
-                    )
+                    frontend = _zh_en_frontend(cfg, token2id)
                     interleave = False
                     languages = ("zh", "en")  # zh-primary (numbers, prologue), truly both
                 elif int(meta.get("has_espeak", "0")):
                     frontend, _ = _espeak_frontend(cfg, token2id, meta.get("voice", "en-us"))
                 elif int(meta.get("jieba", "0")):
-                    if not cfg.lexicon_path:
-                        raise ValueError("this matcha model needs tts.matcha.lexiconPath")
-                    frontend = LexiconFrontend(
-                        _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
-                        english=_english_fallback(cfg, token2id),
-                    )
+                    frontend = _lexicon_frontend(cfg, token2id)
                 else:
                     raise ValueError(
                         "unsupported matcha export: metadata has neither has_espeak nor jieba"
@@ -862,6 +871,8 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         noise_scale: float,
         speed: float,
         max_len: int,
+        interleave: bool,                # the zh-en dialect trains without it
+        sample_rate: int,
     ):
         super().__init__()
         self._encoder = encoder
@@ -871,6 +882,8 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         self._pad_id = pad_id
         self._bos_id = bos_id
         self._eos_id = eos_id
+        self._interleave = interleave
+        self.output_rate = sample_rate
         self._encoder_len = encoder_len
         self._mel_len = mel_len
         self._mel_scale = mel_scale
@@ -919,28 +932,56 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             )
 
         token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))  # type: ignore[arg-type]
-        if is_zh_en_tokens(token2id):
-            # Refusing beats synthesizing: this path frames ids as every other dialect
-            # wants them, which for zh-en artifacts is fluent rhythm over wrong sounds.
+        # No graph metadata here: the exporter's sidecar declares the frontend
+        # ({"frontend": "zh_en" | "lexicon" | "espeak"}); undeclared falls back to
+        # side-file inference (lexicon exports are all zh).
+        declared = side.get("frontend")
+        if declared not in (None, "zh_en", "lexicon", "espeak"):
             raise ValueError(
-                "the bilingual zh-en matcha dialect needs the dynamic export "
-                "(tts.matcha.acousticModelPath): the static split cannot express its "
-                "no-blank-interleave framing or its espeak English"
+                f"matcha split: meta.json frontend={declared!r} "
+                "(expected zh_en, lexicon, or espeak)"
             )
-        # no metadata here: side files pick the frontend; lexicon exports are all zh
-        if cfg.lexicon_path:
-            frontend: EspeakFrontend | LexiconFrontend = LexiconFrontend(
-                _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
-                english=_english_fallback(cfg, token2id),
+        if declared is None and is_zh_en_tokens(token2id):
+            # Refusing beats synthesizing (fluent rhythm over wrong sounds): the
+            # dialect needs the exporter's word, not a heuristic's.
+            raise ValueError(
+                "these look like bilingual zh-en artifacts: the split builds that "
+                'dialect only when the exporter declares it (meta.json {"frontend": '
+                '"zh_en"}); otherwise use the dynamic export '
+                "(tts.matcha.acousticModelPath)"
             )
+        if declared in ("lexicon", "espeak") and is_zh_en_tokens(token2id):
+            # A stale or copied sidecar beside zh-en artifacts would otherwise build
+            # the wrong dialect with no complaint.
+            raise ValueError(
+                f'matcha split: meta.json declares frontend="{declared}" but the '
+                'token table carries the bilingual zh-en signature — wrong sidecar? '
+                '(a zh-en split needs {"frontend": "zh_en"})'
+            )
+        if declared is None:
+            declared = "lexicon" if cfg.lexicon_path else "espeak"
+        interleave = True
+        languages: tuple[str, ...] | None = None
+        frontend: EspeakFrontend | LexiconFrontend
+        if declared == "zh_en":
+            frontend = _zh_en_frontend(cfg, token2id)
+            interleave = False
             language = "zh"
-        else:
+            languages = ("zh", "en")
+        elif declared == "espeak":
             frontend, language = _espeak_frontend(cfg, token2id)
-        pad_id = token2id.get("_", 0)
-        bos_id = token2id.get("^")
-        eos_id = token2id.get("$")
+        else:
+            frontend = _lexicon_frontend(cfg, token2id)
+            language = "zh"
+        # Framing and rate come from the sidecar when the exporter declares them,
+        # else from the token-table conventions ("_" pad, ^/$ framing, 22.05 kHz).
+        pad_id = int(side["pad_id"]) if "pad_id" in side else token2id.get("_", 0)
+        framing = bool(int(side["use_eos_bos"])) if "use_eos_bos" in side else True
+        bos_id = token2id.get("^") if framing else None
+        eos_id = token2id.get("$") if framing else None
         if (bos_id is None) != (eos_id is None):
             raise ValueError("matcha split tokensPath must contain both '^' and '$', or neither")
+        sample_rate = int(side.get("sample_rate", _SAMPLE_RATE_DEFAULT))
         model_kw = dict(
             core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
@@ -1005,7 +1046,11 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 noise_scale=cfg.noise_scale,
                 speed=cfg.speed,
                 max_len=cfg.max_len or (40 if language == "zh" else 80),
+                interleave=interleave,
+                sample_rate=sample_rate,
             )
+            if languages:
+                adapter.spoken_languages = languages
             models.pop_all()
             return adapter
 
@@ -1017,6 +1062,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         return frame_ids(
             self._frontend, text,
             bos_id=self._bos_id, eos_id=self._eos_id, pad_id=self._pad_id,
+            interleave=self._interleave,
         )
 
     def _synthesize_piece(self, text: str) -> np.ndarray:

@@ -366,6 +366,9 @@ _RE_CURRENCY = re.compile(
 _RE_DEGREES = re.compile(
     r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:°\s?[CF](?![A-Za-z])|℃|℉)", re.IGNORECASE
 )
+# The two-codepoint spellings _RE_DEGREES accepts, foldable to their single
+# codepoints — which are non-alpha, so a script classifier keeps them neutral.
+_RE_DEGREE_MARK = re.compile(r"(?<=\d)(\s?)°\s?([CF])(?![A-Za-z])", re.IGNORECASE)
 _RE_ONE = re.compile(r"1(?:\.0+)?")  # the amounts that read singular
 
 
@@ -418,6 +421,14 @@ def _en_degrees(m: re.Match[str]) -> str:
 
 def _zh_degrees(m: re.Match[str]) -> str:
     return m.group(1) + ("华氏度" if m.group()[-1] in "Ff℉" else "摄氏度")
+
+
+def fold_degree_marks(text: str) -> str:
+    """``25°C``/``25° F`` -> ``25℃``/``25℉``, the single-codepoint twins: one degree
+    grammar for callers that must not split the scale letter from its number."""
+    return _RE_DEGREE_MARK.sub(
+        lambda m: m.group(1) + ("℉" if m.group(2) in "Ff" else "℃"), text
+    )
 
 
 # ---- sequence detection ------------------------------------------------------
@@ -570,14 +581,14 @@ def _read_sequences(
     return "".join(out)
 
 
-def space_digit_sequences(text: str, language: str = "en") -> str:
+def space_digit_sequences(text: str, language: str | None = "en") -> str:
     """Sequences re-spaced into single digits, for an engine that owns its own number
     grammar (espeak names spaced digits in every voice). English also renders dates,
     currency and degrees to words — dates as full words so the sequence pass cannot
-    re-shred them; other languages keep the language-neutral digit spacing."""
+    re-shred them; other (or unknown) languages keep the language-neutral spacing."""
     if not _RE_INT.search(text):
         return text
-    if language.startswith("en"):
+    if language and language.startswith("en"):
         text = _sub_dates(text, _en_date_words)
         text = _sub_padded(_RE_CURRENCY, text, _en_currency)
         text = _RE_DEGREES.sub(_en_degrees, text)

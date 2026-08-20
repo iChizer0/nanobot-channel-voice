@@ -21,6 +21,21 @@ def test_script_runs_split_by_script_with_neutral_riders():
     assert script_runs("Hello 世界 42.") == [(False, "Hello "), (True, "世界 42.")]
     assert script_runs("3个") == [(True, "3个")]          # leading neutral rides forward
     assert script_runs("42!") == [(None, "42!")]           # nothing scripted -> primary
+
+
+def test_degree_fold_keeps_temperatures_whole_across_the_split():
+    # synthesize_pcm folds °C/°F to their single non-alpha codepoints before
+    # classifying: splitting "今天25°C" before the C would strand it on the Latin
+    # engine and hide the unit from the zh degrees pass. One grammar (_RE_DEGREE_MARK)
+    # owns the fold, so the spaced form works and "°Chill"-style words stay words.
+    from nanobot_channel_voice.tts.text_frontend import fold_degree_marks
+
+    assert script_runs(fold_degree_marks("今天25°C很热")) == [(True, "今天25℃很热")]
+    assert script_runs(fold_degree_marks("今天25° C很热")) == [(True, "今天25℃很热")]
+    assert fold_degree_marks("今天25°Chill很热") == "今天25°Chill很热"
+    assert script_runs(fold_degree_marks("It is 25°F, 挺热")) == [
+        (False, "It is 25℉, "), (True, "挺热"),
+    ]
     assert script_runs("你好。OK") == [(True, "你好。"), (False, "OK")]  # 。 is neutral
 
 

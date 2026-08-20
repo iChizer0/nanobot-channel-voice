@@ -537,11 +537,13 @@ def test_espeak_ladder_names_every_fix_when_nothing_is_found(monkeypatch):
     assert "espeakPath" in msg and "[espeak]" in msg and "apt install" in msg
 
 
-def test_split_path_refuses_zh_en_artifacts(tmp_path):
-    """The split path frames ids for every OTHER dialect (blank interleave, pinyin
-    English); handed zh-en tokens it would synthesize fluent rhythm over wrong sounds,
-    so it must refuse. Both halves of the signature are load-bearing: an espeak table
-    carries the capitals alone, a zh-only table the tonal pinyin alone."""
+def test_split_path_refuses_undeclared_zh_en_artifacts(tmp_path):
+    """Framed like every other dialect (blank interleave, pinyin English), zh-en
+    artifacts synthesize fluent rhythm over wrong sounds, so an UNDECLARED zh-en
+    table must refuse — the dialect needs the exporter's word (meta.json
+    {"frontend": "zh_en"}), not a heuristic's. Both halves of the signature are
+    load-bearing: an espeak table carries the capitals alone, a zh-only table the
+    tonal pinyin alone."""
     import string
 
     from nanobot_channel_voice.config import MatchaTtsConfig
@@ -559,8 +561,121 @@ def test_split_path_refuses_zh_en_artifacts(tmp_path):
         "encoderPath": str(tmp_path / "enc.onnx"), "decoderPath": str(tmp_path / "dec.onnx"),
         "vocoderPath": str(tmp_path / "voc.onnx"), "tokensPath": str(tokens),
     })
-    with pytest.raises(ValueError, match="acousticModelPath"):
+    with pytest.raises(ValueError, match="frontend.*zh_en"):
         SplitMatchaTtsAdapter.from_config(cfg)
+    # An unknown declaration is a loud config error, not a silent fallback.
+    (tmp_path / "meta.json").write_text('{"frontend": "bilingual"}', encoding="utf-8")
+    cfg = cfg.model_copy(update={"meta_path": str(tmp_path / "meta.json")})
+    with pytest.raises(ValueError, match="expected zh_en"):
+        SplitMatchaTtsAdapter.from_config(cfg)
+
+
+class _SplitFakeModel:
+    """The OnDeviceModel protocol as the split path exercises it: RKNN-like (no
+    introspectable geometry), encoder/decoder keyed on path suffix, Vocos vocoder.
+    ``made`` collects construction order; clear it per test."""
+
+    made: list["_SplitFakeModel"] = []
+
+    def __init__(self, path, **_kw):
+        self.path = path
+        self.calls = []
+        self.made.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def release(self):
+        pass
+
+    def input_shape(self, _name):
+        return None  # RKNN-like: geometry not introspectable
+
+    def metadata(self):
+        return {}
+
+    def run(self, inputs):
+        self.calls.append(inputs)
+        if self.path.endswith("encoder.rknn"):
+            # One mel frame per input token makes the static contract visible.
+            return [np.zeros((1, 80, 200), np.float32), np.zeros((1, 1, 200), np.float32)]
+        if self.path.endswith("decoder.rknn"):
+            return [np.zeros((1, 80, 16), np.float32)]
+        return [
+            np.ones((1, 513, 16), np.float32),
+            np.ones((1, 513, 16), np.float32),
+            np.zeros((1, 513, 16), np.float32),
+        ]
+
+
+def test_split_builds_declared_zh_en_dialect(monkeypatch, tmp_path):
+    """meta.json {"frontend": "zh_en"} is the exporter's word: the split builds the
+    bilingual frontend with the dialect's own framing — no blank interleave, espeak
+    English, the Latin-run space id — instead of refusing on the token heuristic."""
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts import matcha
+
+    (tmp_path / "tokens.txt").write_text("1\nni3 2\nh 3\nI 4\n. 5\n", encoding="utf-8")
+    (tmp_path / "lexicon.txt").write_text("你 ni3\n", encoding="utf-8")
+    (tmp_path / "meta.json").write_text(
+        '{"frontend": "zh_en", "encoder_len": 200, "mel_len": 16, '
+        '"mel_scale": 1.0, "mel_bias": 0.0, "sample_rate": 16000}', encoding="utf-8"
+    )
+    _SplitFakeModel.made.clear()
+    monkeypatch.setattr(matcha, "OnDeviceModel", _SplitFakeModel)
+    monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_a, **_k: lambda _t: "haɪ")
+    tts = matcha.SplitMatchaTtsAdapter.from_config(MatchaTtsConfig.model_validate({
+        "encoderPath": str(tmp_path / "encoder.rknn"),
+        "decoderPath": str(tmp_path / "decoder.rknn"),
+        "vocoderPath": str(tmp_path / "vocoder.rknn"),
+        "tokensPath": str(tmp_path / "tokens.txt"),
+        "lexiconPath": str(tmp_path / "lexicon.txt"),
+    }))
+    assert tts.spoken_language == "zh" and tts.spoken_languages == ("zh", "en")
+    assert tts.output_rate == 16000  # the sidecar's rate, not the 22.05 kHz default
+    # 你 via lexicon, "hi" via espeak IPA (haɪ folds to hI), the Latin-run space id,
+    # then the period — RAW ids: the dialect trains without the blank interleave.
+    assert tts._ids("你hi.") == [2, 3, 4, 1, 5]
+    assert tts._synthesize_piece("你hi.").dtype == np.float32  # host bridge runs
+
+
+def test_split_sidecar_declares_framing_and_a_stale_sidecar_contradicts(monkeypatch, tmp_path):
+    """pad_id/use_eos_bos come from the sidecar when declared (the token-table
+    conventions are only the fallback), and a lexicon/espeak declaration beside a
+    zh-en token table is refused as a wrong sidecar."""
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts import matcha
+
+    (tmp_path / "tokens.txt").write_text("_ 0\n^ 1\n$ 2\n 3\n. 4\nh 5\ni 6\n", encoding="utf-8")
+    (tmp_path / "meta.json").write_text(
+        '{"use_eos_bos": 0, "pad_id": 7, "mel_len": 16}', encoding="utf-8"
+    )
+    _SplitFakeModel.made.clear()
+    monkeypatch.setattr(matcha, "OnDeviceModel", _SplitFakeModel)
+    monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_a, **_k: lambda _t: "hi")
+    cfg = MatchaTtsConfig.model_validate({
+        "encoderPath": str(tmp_path / "encoder.rknn"),
+        "decoderPath": str(tmp_path / "decoder.rknn"),
+        "vocoderPath": str(tmp_path / "vocoder.rknn"),
+        "tokensPath": str(tmp_path / "tokens.txt"),
+    })
+    tts = matcha.SplitMatchaTtsAdapter.from_config(cfg)
+    assert tts._pad_id == 7
+    # use_eos_bos=0 suppresses the ^/$ framing the table alone would have implied.
+    assert tts._ids("hi.") == [7, 5, 7, 6, 7, 4, 7]
+
+    zh_en_tokens = tmp_path / "zh-en-tokens.txt"
+    zh_en_tokens.write_text(
+        "\n".join(f"{t} {i}" for i, t in enumerate(["_", *"AIOWY", "zhong1"])), encoding="utf-8"
+    )
+    (tmp_path / "meta.json").write_text('{"frontend": "lexicon"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="wrong sidecar"):
+        matcha.SplitMatchaTtsAdapter.from_config(
+            cfg.model_copy(update={"tokens_path": str(zh_en_tokens)})
+        )
 
 
 def test_espeak_data_dir_pins_the_models_own_voice_pack(monkeypatch, tmp_path):
@@ -706,43 +821,9 @@ def test_matcha_split_host_bridge_tiles_decoder_and_edges_vocos(monkeypatch, tmp
     # A minimal valid icefall-style English table. The fake phonemizer below only emits h/i.
     tokens.write_text("_ 0\n^ 1\n$ 2\n 3\n. 4\nh 5\ni 6\n", encoding="utf-8")
 
-    made = []
-
-    class FakeModel:
-        def __init__(self, path, **_kw):
-            self.path = path
-            self.calls = []
-            made.append(self)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def release(self):
-            pass
-
-        def input_shape(self, _name):
-            return None  # RKNN-like: geometry not introspectable
-
-        def metadata(self):
-            return {}
-
-        def run(self, inputs):
-            self.calls.append(inputs)
-            if self.path.endswith("encoder.rknn"):
-                # One frame per real token: short enough to force extensive bucket padding.
-                return [np.zeros((1, 80, 200), np.float32), np.zeros((1, 1, 200), np.float32)]
-            if self.path.endswith("decoder.rknn"):
-                return [np.zeros((1, 80, 16), np.float32)]
-            return [
-                np.ones((1, 513, 16), np.float32),
-                np.ones((1, 513, 16), np.float32),
-                np.zeros((1, 513, 16), np.float32),
-            ]
-
-    monkeypatch.setattr(matcha, "OnDeviceModel", FakeModel)
+    made = _SplitFakeModel.made
+    made.clear()
+    monkeypatch.setattr(matcha, "OnDeviceModel", _SplitFakeModel)
     monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_args, **_kw: lambda _text: "hi")
     cfg = MatchaTtsConfig.model_validate({
         "encoderPath": str(tmp_path / "encoder.rknn"),
@@ -871,43 +952,9 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
     tokens.write_text("  0\n_ 1\n。 2\nni3 3\nhao3 4\nqi1 5\n", encoding="utf-8")
     lexicon = tmp_path / "lexicon.txt"
     lexicon.write_text("你 ni3\n好 hao3\n七 qi1\n", encoding="utf-8")
-    made = []
-
-    class FakeModel:
-        def __init__(self, path, **_kw):
-            self.path = path
-            self.calls = []
-            made.append(self)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def release(self):
-            pass
-
-        def input_shape(self, _name):
-            return None  # RKNN-like: geometry not introspectable
-
-        def metadata(self):
-            return {}
-
-        def run(self, inputs):
-            self.calls.append(inputs)
-            if self.path.endswith("encoder.rknn"):
-                # One mel frame per input token makes the expected static contract visible.
-                return [np.zeros((1, 80, 200), np.float32), np.zeros((1, 1, 200), np.float32)]
-            if self.path.endswith("decoder.rknn"):
-                return [np.zeros((1, 80, 16), np.float32)]
-            return [
-                np.ones((1, 513, 16), np.float32),
-                np.ones((1, 513, 16), np.float32),
-                np.zeros((1, 513, 16), np.float32),
-            ]
-
-    monkeypatch.setattr(matcha, "OnDeviceModel", FakeModel)
+    made = _SplitFakeModel.made
+    made.clear()
+    monkeypatch.setattr(matcha, "OnDeviceModel", _SplitFakeModel)
     # The zh TOKENIZATION never needs espeak; the optional English-fallback tier
     # builds one at from_config, so hand it a benign stand-in.
     monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_args, **_kw: str)

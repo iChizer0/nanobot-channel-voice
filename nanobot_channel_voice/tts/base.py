@@ -27,6 +27,8 @@ class TtsAdapter(abc.ABC):
     # the agent's context so replies are written in a language the speaker can say.
     # Per-INSTANCE: the same class serves several languages.
     spoken_language: str | None = None
+    # A bilingual adapter (zh-en dialect, script router) declares both here.
+    spoken_languages: tuple[str, ...] | None = None
 
     @abc.abstractmethod
     async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:

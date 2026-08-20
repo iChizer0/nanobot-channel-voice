@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
 from nanobot_channel_voice.tts.base import TtsAdapter
+from nanobot_channel_voice.tts.text_frontend import fold_degree_marks
 
 _CJK_LANGS = frozenset({"zh", "ja", "ko"})
 _PAUSE_PUNCT = set("，,、；;。.!?！？…：:")
@@ -95,7 +96,9 @@ class ScriptRoutedTts(TtsAdapter):
         return pcm_to_wav_bytes(pcm, self.output_rate) if pcm else b""
 
     async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
-        runs = script_runs(text)
+        # ℃/℉ are non-alpha: folded, a temperature never splits its scale letter
+        # onto the Latin engine ("今天25°C"), and both verbalizers read the twins.
+        runs = script_runs(fold_degree_marks(text))
         if len(runs) == 1:
             cjk, run = runs[0]
             engine = self._primary if cjk is None else self._engine(cjk)
