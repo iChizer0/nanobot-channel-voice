@@ -95,11 +95,11 @@ def fold_punct_aliases(token2id: dict[str, int]) -> dict[str, int]:
     return token2id
 
 
-def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
+def _parse_lexicon(path: str, token2id: dict[str, int]) -> tuple[dict[str, list[int]], list[str]]:
     """``lexicon.txt``: ``<word> <phone>...`` per line, first spelling wins; a word
-    with any unknown phone is dropped (sherpa behaviour)."""
+    with any unknown phone is dropped (sherpa behaviour) and returned by name."""
     word2ids: dict[str, list[int]] = {}
-    dropped = 0
+    dropped: list[str] = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             parts = line.split()
@@ -111,17 +111,39 @@ def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
             try:
                 word2ids[word] = [token2id[p] for p in parts[1:]]
             except KeyError:
-                dropped += 1
+                dropped.append(word)
+    return word2ids, dropped
+
+
+def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
+    word2ids, dropped = _parse_lexicon(path, token2id)
     # Heuristic, deliberately sensitive: a correct pairing drops ~0 (measured 0 of 68k
     # for zh-en, 4 of 66k for baker) while a cross-model one drops 2% (same pinyin
     # inventory, different ids) to ~100% (different alphabet). It only ever costs a log
     # line, and the failure it names is otherwise silent — right rhythm, wrong sounds.
-    if dropped * 100 > dropped + len(word2ids):
+    if len(dropped) * 100 > len(dropped) + len(word2ids):
         logger.warning(
             "voice: matcha lexicon '{}' dropped {} of {} entries whose phones are "
             "absent from the token table — are lexiconPath and tokensPath from the "
-            "same model?", path, dropped, dropped + len(word2ids),
+            "same model?", path, len(dropped), len(dropped) + len(word2ids),
         )
+    return word2ids
+
+
+def _load_lexicons(
+    path: str, overrides_path: str | None, token2id: dict[str, int]
+) -> dict[str, list[int]]:
+    """Override entries win over the model lexicon."""
+    word2ids = load_lexicon(path, token2id)
+    if overrides_path:
+        overrides, dropped = _parse_lexicon(overrides_path, token2id)
+        if dropped:  # every override line is hand-authored: a drop is a typo, name it
+            logger.warning(
+                "voice: matcha lexicon overrides '{}' dropped {} entries whose phones "
+                "are absent from the token table: {}",
+                overrides_path, len(dropped), " ".join(dropped[:8]),
+            )
+        word2ids |= overrides
     return word2ids
 
 
@@ -541,7 +563,7 @@ class _MatchaCommon:
         # grammar is cardinal-biased, so only the sequences are re-spaced for it to name.
         if self.spoken_language == "zh":  # type: ignore[attr-defined]
             return verbalize_numbers_zh(text)
-        return space_digit_sequences(text)
+        return space_digit_sequences(text, self.spoken_language)  # type: ignore[attr-defined]
 
     def _can_speak(self, ch: str) -> bool:
         return self._frontend.can_speak(ch)  # type: ignore[attr-defined]
@@ -672,7 +694,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                             "may not match training (set tts.matcha.espeakDataDir)"
                         )
                     frontend = LexiconFrontend(
-                        load_lexicon(cfg.lexicon_path, token2id), token2id,
+                        _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
                         english=EnglishToIpa(
                             token2id,
                             make_ipa_phonemizer(
@@ -689,7 +711,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                     if not cfg.lexicon_path:
                         raise ValueError("this matcha model needs tts.matcha.lexiconPath")
                     frontend = LexiconFrontend(
-                        load_lexicon(cfg.lexicon_path, token2id), token2id,
+                        _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
                         english=_english_fallback(cfg, token2id),
                     )
                 else:
@@ -908,7 +930,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         # no metadata here: side files pick the frontend; lexicon exports are all zh
         if cfg.lexicon_path:
             frontend: EspeakFrontend | LexiconFrontend = LexiconFrontend(
-                load_lexicon(cfg.lexicon_path, token2id), token2id,
+                _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,
                 english=_english_fallback(cfg, token2id),
             )
             language = "zh"

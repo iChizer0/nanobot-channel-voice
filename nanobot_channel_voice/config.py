@@ -474,6 +474,7 @@ class MatchaTtsConfig(OnDeviceRuntime):
     meta_path: str | None = None            # split sidecar; None => beside encoderPath
     tokens_path: str | None = None          # icefall exports; official table is built in
     lexicon_path: str | None = None         # lexicon-based (zh) models only
+    lexicon_overrides_path: str | None = None  # same format; entries win over lexiconPath
     espeak_path: str | None = None          # explicit espeak-ng binary; None => $PATH
     espeak_voice: str | None = None         # None => the model's own voice (en-us)
     # Voice pack the model was trained against (IPA spellings drift between espeak
@@ -505,6 +506,11 @@ class MatchaTtsConfig(OnDeviceRuntime):
             )
         if self.secondary is not None and self.secondary.secondary is not None:
             raise ValueError("matcha: secondary engines do not nest")
+        if self.lexicon_overrides_path and not self.lexicon_path:
+            raise ValueError(
+                "matcha: lexiconOverridesPath layers over lexiconPath "
+                "(lexicon-frontend models only) — set lexiconPath too"
+            )
         return self
 
 

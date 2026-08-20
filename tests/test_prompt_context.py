@@ -4,6 +4,7 @@ speakability context block."""
 from __future__ import annotations
 
 import asyncio
+import re
 
 from nanobot.bus.queue import MessageBus
 from nanobot.runtime_context import (
@@ -256,7 +257,15 @@ def test_published_utterance_carries_the_block_alongside_its_turn_token():
     assert call["content"] == "what time is it"
     # The block must not displace the turn token: send() correlates the reply on it.
     assert call["metadata"][TURN_META] == "turn-1"
-    assert call["metadata"][RUNTIME_CONTEXT_INPUT_META] == channel._voice_context
+    blocks = call["metadata"][RUNTIME_CONTEXT_INPUT_META]
+    assert blocks[:-1] == channel._voice_context
+    # Every spoken turn is stamped with the model's only clock: core injects no date
+    # or time anywhere, and without one the model invents a placeholder when asked.
+    assert re.fullmatch(
+        r"\[time now: \d{4}-\d{2}-\d{2} \((?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day\) "
+        r"\d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\]",
+        blocks[-1].content,
+    )
 
 
 def test_cloud_publishes_without_a_block():
@@ -281,7 +290,10 @@ def test_event_notes_ride_as_their_own_block_after_the_contract():
     blocks = call["metadata"][RUNTIME_CONTEXT_INPUT_META]
     assert blocks[:-1] == channel._voice_context
     assert blocks[-1].source == "voice"
-    assert blocks[-1].content == note
+    # The time stamp shares the per-turn block; the event note rides right after it.
+    stamp, event = blocks[-1].content.split("\n")
+    assert stamp.startswith("[time now: ")
+    assert event == note
     assert len(channel._voice_context) == 1  # publish built a fresh list
 
 

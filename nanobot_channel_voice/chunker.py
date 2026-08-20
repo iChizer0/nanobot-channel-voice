@@ -25,6 +25,18 @@ _RE_INLINE_CODE = re.compile(r"`([^`]*)`")
 _RE_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _RE_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 _RE_EMPHASIS = re.compile(r"([*_~]{1,3})(\S(?:.*?\S)?)\1")
+# Bracketed spans are labels, stage directions or leaked placeholders, never speech:
+# "[Current Date and Time]", "[laughs]", "【注意】", "<date>", "{current_time}" — the
+# whitelist below would drop only the brackets and SPEAK the placeholder words.
+# Runs after _RE_LINK so "[text](url)" has already kept its text. Bounded and
+# single-line (best effort: a span a mid-sentence cut splits is not re-joined);
+# CJK quote pairs (「」『』) stay — they quote words meant to be spoken.
+_RE_STAGE = re.compile(
+    r"\[[^\[\]\n]{0,60}\]"
+    r"|【[^【】\n]{0,60}】"
+    r"|\{[^{}\n]{0,60}\}"
+    r"|<[^<>\s][^<>\n]{0,58}>"
+)
 _RE_HEADER = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
 _RE_BULLET = re.compile(r"(?m)^\s{0,3}[-*+]\s+")
 _RE_QUOTE = re.compile(r"(?m)^\s{0,3}>\s?")
@@ -47,6 +59,7 @@ def sanitize(text: str) -> str:
     text = _RE_INLINE_CODE.sub(r"\1", text)
     text = _RE_IMAGE.sub(" ", text)
     text = _RE_LINK.sub(r"\1", text)
+    text = _RE_STAGE.sub(" ", text)
     text = _RE_EMPHASIS.sub(r"\2", text)
     text = _RE_HEADER.sub("", text)
     text = _RE_BULLET.sub("", text)

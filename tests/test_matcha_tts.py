@@ -57,6 +57,26 @@ def test_load_lexicon_first_spelling_wins_and_oov_phones_drop(tmp_path):
     assert "坏" not in lex            # unknown phones drop the word (sherpa behaviour)
 
 
+def test_lexicon_overrides_layer_over_the_model_lexicon(tmp_path):
+    from nanobot_channel_voice.tts.matcha import _load_lexicons
+
+    base = tmp_path / "lexicon.txt"
+    base.write_text("空 kong1\n抽 chou1\n", encoding="utf-8")
+    over = tmp_path / "overrides.txt"
+    over.write_text("抽空 chou1 kong4\n空 kong9\n", encoding="utf-8")
+    tokens = {"kong1": 1, "kong4": 2, "chou1": 3}
+    lex = _load_lexicons(str(base), str(over), tokens)
+    assert lex["抽空"] == [3, 2]      # new phrase entry wins greedy longest-match
+    assert lex["空"] == [1]           # bad override phone drops; the model entry stays
+
+
+def test_lexicon_overrides_require_a_lexicon():
+    from nanobot_channel_voice.config import MatchaTtsConfig
+
+    with pytest.raises(ValueError, match="lexiconOverridesPath"):
+        MatchaTtsConfig.model_validate({"lexiconOverridesPath": "overrides.txt"})
+
+
 def test_add_blank_frames_every_token():
     assert add_blank([5, 6], pad_id=1) == [1, 5, 1, 6, 1]
     assert add_blank([], pad_id=0) == [0]
@@ -433,6 +453,30 @@ def test_verbalize_numbers_zh_reads_sequences_digit_wise():
     # Multi-dot runs kept a literal "." the lexicon cannot voice.
     assert verbalize_numbers_zh("IP是192.168.1.1") == "IP是一九二点一六八点一点一"
     assert verbalize_numbers_zh("版本3.14.2") == "版本三点十四点二"
+
+
+def test_verbalize_numbers_zh_dates_currency_degrees():
+    assert verbalize_numbers_zh("会议定在2026-08-19") == "会议定在二零二六年八月十九日"
+    assert verbalize_numbers_zh("2026/8/1发布") == "二零二六年八月一日发布"
+    assert verbalize_numbers_zh("08月09日截止") == "八月九日截止"  # date pad, not identifier
+    assert verbalize_numbers_zh("三点05分") == "三点零五分"        # minutes keep their 零
+    assert verbalize_numbers_zh("订单08号") == "订单零八号"        # 号 ids keep their pad
+    assert verbalize_numbers_zh("价格$5.99") == "价格五点九九美元"
+    assert verbalize_numbers_zh("¥199起") == "一百九十九元起"
+    assert verbalize_numbers_zh("罚款￥1,000") == "罚款一千元"
+    # A scale suffix rides in front of the relocated unit; ambiguous or already-suffixed
+    # shapes fall back to the plain number reading (the symbol drops as OOV downstream).
+    assert verbalize_numbers_zh("¥200万") == "二百万元"
+    assert verbalize_numbers_zh("大概¥1.5万") == "大概一点五万元"
+    assert verbalize_numbers_zh("¥199元起") == "¥一百九十九元起"
+    assert verbalize_numbers_zh("¥200多万") == "¥二百多万"
+    assert verbalize_numbers_zh("今天25°C") == "今天二十五摄氏度"
+    assert verbalize_numbers_zh("烤箱调到200℃") == "烤箱调到二百摄氏度"
+    assert verbalize_numbers_zh("零下3℉") == "零下三华氏度"
+    # An invalid month or an impossible day is not a date; the id keeps its
+    # digit-wise reading.
+    assert verbalize_numbers_zh("单号1234-56-78") == "单号一二三四五六七八"
+    assert verbalize_numbers_zh("编号2026-02-30") == "编号二零二六零二三零"
 
 
 def test_verbalize_numbers_zh_sequences():

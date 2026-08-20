@@ -23,6 +23,23 @@ def test_sanitize_strips_markdown():
     assert sanitize("# Header\n> quote\n- bullet") == "Header\nquote\nbullet"
 
 
+def test_sanitize_drops_bracketed_placeholders_with_their_content():
+    # The whitelist alone would drop only the brackets and SPEAK the words: a
+    # clock-less model answered date questions with a literal "[Current Date and
+    # Time]" (see rd REPORT-context-injection-review addendum).
+    assert sanitize("[Current Date and Time]").strip() == ""
+    assert sanitize("It is [Current Date] today.").strip() == "It is today."
+    assert sanitize("现在是【当前时间】。").strip() == "现在是 。"
+    assert sanitize("time is {current_time} now").strip() == "time is now"
+    assert sanitize("today: <date>").strip() == "today:"
+    # A parroted per-turn note is the same failure through a different door.
+    assert sanitize("[time now: 2026-08-19 (Wednesday) 21:33, UTC-07:00]").strip() == ""
+    # Markdown links resolved first keep their text; CJK quotes carry real speech.
+    assert sanitize("see [docs](http://x)").strip() == "see docs"
+    assert sanitize("他说「现在八点」了").strip() == "他说「现在八点」了"
+    assert sanitize("a < b and c > d") == "a b and c d"  # <,> whitelisted out, words kept
+
+
 def test_sanitize_smart_quotes_fold_before_whitelist():
     assert sanitize("“Hi” ‘there’") == '"Hi" \'there\''
 

@@ -55,6 +55,30 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
          "I have no idea, four thousand eight hundred twenty one is wrong"),
         ("a value of 1234", "a value of one thousand two hundred thirty four"),
         ("seat 14C", "seat fourteen C"),
+        # Dates, currency and degrees rewrite before the number passes.
+        ("released on 2026-08-19", "released on August nineteenth, twenty twenty six"),
+        ("due 2026/8/1", "due August first, twenty twenty six"),
+        ("back in 2008-05-03", "back in May third, two thousand eight"),
+        ("costs $5.99", "costs five point nine nine dollars"),
+        ("just $1", "just one dollar"),
+        ("a $1,000 grant", "a one thousand dollars grant"),
+        ("about ¥199", "about one hundred ninety nine yuan"),
+        ("it's 25°C out", "it's twenty five degrees Celsius out"),
+        ("low of 1°C", "low of one degree Celsius"),
+        ("oven to 350 ℉", "oven to three hundred fifty degrees Fahrenheit"),
+        # A scale word rides in front of the relocated unit.
+        ("about $5 million", "about five million dollars"),
+        ("a $1.5 billion round", "a one point five billion dollars round"),
+        ("$1,234.56 total", "one thousand two hundred thirty four point five six dollars total"),
+        # Shapes the currency pass cannot own fall back to the plain readings
+        # (here the pre-existing letter-glue sequence rule).
+        ("a $100k budget", "a $one zero zero k budget"),
+        ("tickets are $20-30", "tickets are $twenty-thirty"),
+        ("it costs $5 million dollars", "it costs $five million dollars"),
+        # An invalid month or impossible day is not a date; the id keeps its
+        # sequence reading.
+        ("id 1234-56-78", "id one two three four, five six, seven eight"),
+        ("meet on 2026-02-30", "meet on two zero two six, zero two, three zero"),
     ],
 )
 def test_verbalize_numbers_en(text, expected):
@@ -88,6 +112,18 @@ def test_space_digit_sequences_is_engine_native():
     assert space_digit_sequences("in 1999") == "in 19 99"
     assert space_digit_sequences("in 2008") == "in 2008"      # espeak's own reading is right
     assert space_digit_sequences("1234 items") == "1234 items"
+    # English dates render as full words: with digits left behind, a trigger word
+    # ("ticket") would make the sequence pass re-shred the date's own rendering.
+    assert space_digit_sequences("on 2026-08-19") == "on August nineteenth, twenty twenty six"
+    assert space_digit_sequences("on 2008-05-03") == "on May third, two thousand eight"
+    assert space_digit_sequences("ticket 2026-08-19") == "ticket August nineteenth, twenty twenty six"
+    assert space_digit_sequences("from 2020-2024") == "from 20 20 to 20 24"  # a range, not a date
+    # Currency and degree policy hold on this path too (espeak alone says "yen").
+    assert space_digit_sequences("about ¥199") == "about 199 yuan"
+    assert space_digit_sequences("it is 25°C") == "it is 25 degrees Celsius"
+    # Any other language keeps the language-neutral digit spacing — month names
+    # are English words a German or Japanese voice cannot say.
+    assert space_digit_sequences("Termin am 2026-08-19", "de") == "Termin am 2 0 2 6, 0 8, 1 9"
 
 
 def test_huge_digit_runs_are_read_out():

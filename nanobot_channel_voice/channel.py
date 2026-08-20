@@ -12,6 +12,7 @@ import json
 import os
 import time
 from contextlib import suppress
+from datetime import datetime
 from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -230,6 +231,20 @@ def _voice_context_blocks(
         lines.append(extra.strip())
     content = "\n".join((_VOICE_WRAP_OPEN, *lines, _VOICE_WRAP_CLOSE))
     return [RuntimeContextBlock(source="voice", content=content)]
+
+
+# English weekday names regardless of the process locale (%A localizes).
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def _time_note() -> str:
+    """The model's only clock: core injects no date or time anywhere (helpers'
+    ``current_time_str`` is dead code as of 0.3.0), and without one the model answers
+    a date/time question with an invented placeholder ("[Current Date and Time]")."""
+    now = datetime.now().astimezone()
+    offset = now.strftime("%z")
+    return (f"[time now: {now:%Y-%m-%d} ({_WEEKDAYS[now.weekday()]}) {now:%H:%M}, "
+            f"UTC{offset[:3]}:{offset[3:]}]")
 
 
 # Stamped on a delegated ask_nanobot request; the AgentLoop echoes inbound metadata onto
@@ -936,8 +951,11 @@ class VoiceChannel(BaseChannel):
     ) -> None:
         """Publish a captured utterance tagged with the turn it opens: core echoes inbound
         metadata onto that turn's final send, so ``send`` can tell the live turn's reply
-        from a barged-out one's straggler."""
-        await self._publish_user_text(text, metadata={TURN_META: turn_token}, notes=notes)
+        from a barged-out one's straggler. Every spoken turn is stamped with the current
+        time — the turn path only, so a delegated cloud request stays clean."""
+        await self._publish_user_text(
+            text, metadata={TURN_META: turn_token}, notes=(_time_note(), *notes)
+        )
 
     async def _publish_user_text(
         self,
