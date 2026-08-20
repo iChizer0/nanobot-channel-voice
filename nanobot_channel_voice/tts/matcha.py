@@ -933,13 +933,14 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
 
         token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))  # type: ignore[arg-type]
         # No graph metadata here: the exporter's sidecar declares the frontend
-        # ({"frontend": "zh_en" | "lexicon" | "espeak"}); undeclared falls back to
-        # side-file inference (lexicon exports are all zh).
+        # ({"frontend": "zh-en-lexicon" | "lexicon" | "espeak"}, the published-package
+        # spelling); undeclared falls back to side-file inference (lexicon exports
+        # are all zh).
         declared = side.get("frontend")
-        if declared not in (None, "zh_en", "lexicon", "espeak"):
+        if declared not in (None, "zh-en-lexicon", "lexicon", "espeak"):
             raise ValueError(
                 f"matcha split: meta.json frontend={declared!r} "
-                "(expected zh_en, lexicon, or espeak)"
+                "(expected zh-en-lexicon, lexicon, or espeak)"
             )
         if declared is None and is_zh_en_tokens(token2id):
             # Refusing beats synthesizing (fluent rhythm over wrong sounds): the
@@ -947,7 +948,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             raise ValueError(
                 "these look like bilingual zh-en artifacts: the split builds that "
                 'dialect only when the exporter declares it (meta.json {"frontend": '
-                '"zh_en"}); otherwise use the dynamic export '
+                '"zh-en-lexicon"}); otherwise use the dynamic export '
                 "(tts.matcha.acousticModelPath)"
             )
         if declared in ("lexicon", "espeak") and is_zh_en_tokens(token2id):
@@ -956,14 +957,14 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             raise ValueError(
                 f'matcha split: meta.json declares frontend="{declared}" but the '
                 'token table carries the bilingual zh-en signature — wrong sidecar? '
-                '(a zh-en split needs {"frontend": "zh_en"})'
+                '(a zh-en split needs {"frontend": "zh-en-lexicon"})'
             )
         if declared is None:
             declared = "lexicon" if cfg.lexicon_path else "espeak"
         interleave = True
         languages: tuple[str, ...] | None = None
         frontend: EspeakFrontend | LexiconFrontend
-        if declared == "zh_en":
+        if declared == "zh-en-lexicon":
             frontend = _zh_en_frontend(cfg, token2id)
             interleave = False
             language = "zh"

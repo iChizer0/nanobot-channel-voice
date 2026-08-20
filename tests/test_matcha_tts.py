@@ -541,7 +541,7 @@ def test_split_path_refuses_undeclared_zh_en_artifacts(tmp_path):
     """Framed like every other dialect (blank interleave, pinyin English), zh-en
     artifacts synthesize fluent rhythm over wrong sounds, so an UNDECLARED zh-en
     table must refuse — the dialect needs the exporter's word (meta.json
-    {"frontend": "zh_en"}), not a heuristic's. Both halves of the signature are
+    {"frontend": "zh-en-lexicon"}), not a heuristic's. Both halves of the signature are
     load-bearing: an espeak table carries the capitals alone, a zh-only table the
     tonal pinyin alone."""
     import string
@@ -561,12 +561,12 @@ def test_split_path_refuses_undeclared_zh_en_artifacts(tmp_path):
         "encoderPath": str(tmp_path / "enc.onnx"), "decoderPath": str(tmp_path / "dec.onnx"),
         "vocoderPath": str(tmp_path / "voc.onnx"), "tokensPath": str(tokens),
     })
-    with pytest.raises(ValueError, match="frontend.*zh_en"):
+    with pytest.raises(ValueError, match="frontend.*zh-en-lexicon"):
         SplitMatchaTtsAdapter.from_config(cfg)
     # An unknown declaration is a loud config error, not a silent fallback.
     (tmp_path / "meta.json").write_text('{"frontend": "bilingual"}', encoding="utf-8")
     cfg = cfg.model_copy(update={"meta_path": str(tmp_path / "meta.json")})
-    with pytest.raises(ValueError, match="expected zh_en"):
+    with pytest.raises(ValueError, match="expected zh-en-lexicon"):
         SplitMatchaTtsAdapter.from_config(cfg)
 
 
@@ -612,7 +612,7 @@ class _SplitFakeModel:
 
 
 def test_split_builds_declared_zh_en_dialect(monkeypatch, tmp_path):
-    """meta.json {"frontend": "zh_en"} is the exporter's word: the split builds the
+    """meta.json {"frontend": "zh-en-lexicon"} is the exporter's word: the split builds the
     bilingual frontend with the dialect's own framing — no blank interleave, espeak
     English, the Latin-run space id — instead of refusing on the token heuristic."""
     from nanobot_channel_voice.config import MatchaTtsConfig
@@ -621,7 +621,7 @@ def test_split_builds_declared_zh_en_dialect(monkeypatch, tmp_path):
     (tmp_path / "tokens.txt").write_text("1\nni3 2\nh 3\nI 4\n. 5\n", encoding="utf-8")
     (tmp_path / "lexicon.txt").write_text("你 ni3\n", encoding="utf-8")
     (tmp_path / "meta.json").write_text(
-        '{"frontend": "zh_en", "encoder_len": 200, "mel_len": 16, '
+        '{"frontend": "zh-en-lexicon", "encoder_len": 200, "mel_len": 16, '
         '"mel_scale": 1.0, "mel_bias": 0.0, "sample_rate": 16000}', encoding="utf-8"
     )
     _SplitFakeModel.made.clear()
