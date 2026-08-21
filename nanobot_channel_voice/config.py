@@ -736,17 +736,25 @@ class BargeInConfig(_VoiceBase):
 
 class OpenWakeWordConfig(OnDeviceRuntime):
     """openWakeWord-format acoustic wake word (``wake.engine="openwakeword"``,
-    ``[ondevice]`` extra; needs ``audio.sampleRate=16000``). Three ORIGINAL
-    upstream artifacts: ``melPath`` (melspectrogram.onnx) and ``embeddingPath``
-    (embedding_model.onnx) are shared by every phrase; ``modelPath`` is the
-    per-phrase classifier head. livekit-wakeword heads speak the same backbone
-    contract and load here too. NOTE: openWakeWord's official pretrained heads
-    are CC-BY-NC-SA (non-commercial); livekit-wakeword and self-trained heads
-    (either project's training pipeline) are unrestricted."""
+    ``[ondevice]`` extra; needs ``audio.sampleRate=16000``). ORIGINAL upstream
+    artifacts: a mel frontend — ``melPath`` (melspectrogram.onnx) or, for
+    hybrid NPU packages whose STFT ops don't convert, ``melFiltersPath`` (the
+    graph's frozen filterbank, run as an exact numpy port) — plus the shared
+    ``embeddingPath`` (embedding_model.onnx, ``.onnx`` or a static ``.rknn``)
+    and the per-phrase ``modelPath`` classifier head. livekit-wakeword heads
+    speak the same backbone contract and load here too. NOTE: openWakeWord's
+    official pretrained heads are CC-BY-NC-SA (non-commercial);
+    livekit-wakeword and self-trained heads (either project's training
+    pipeline) are unrestricted."""
 
-    mel_path: str | None = None        # melspectrogram.onnx (shared front end)
-    embedding_path: str | None = None  # embedding_model.onnx (Google speech_embedding re-export)
-    model_path: str | None = None      # the wake-phrase classifier head
+    mel_path: str | None = None          # melspectrogram.onnx (ONNX mel frontend)
+    mel_filters_path: str | None = None  # mel_filters.npy (numpy frontend); exactly one of the two
+    embedding_path: str | None = None    # embedding_model.onnx (Google speech_embedding re-export)
+    model_path: str | None = None        # the wake-phrase classifier head
+    # Package sidecar (meta.json) from the weights store: advisory startup
+    # checks that the head's declared phrase is in wake.phrases (a mismatch
+    # breaks wake-phrase stripping) and that an .rknn matches ``target``.
+    meta_path: str | None = None
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # sigmoid score at/above => hit
     # Minimum spacing between hits: the phrase echoing in a hard room must not
     # double-fire the gate.

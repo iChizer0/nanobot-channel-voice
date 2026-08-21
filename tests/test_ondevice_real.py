@@ -557,3 +557,53 @@ def test_matcha_real_bilingual_router():
     duration_s = len(pcm) / 2 / 22050
     assert 2.0 < duration_s < 15.0, duration_s
     tts.release()
+
+
+# ---- openWakeWord: python mel parity + the upstream fixture ------------------
+
+_OWW = _REF / "oww" / "model"
+
+
+def test_openwakeword_python_mel_matches_the_onnx_graph():
+    _need(_OWW / "melspectrogram.onnx", _OWW / "mel_filters.npy")
+    import numpy as np
+
+    from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
+    from nanobot_channel_voice.wake.openwakeword import PythonMelFrontend
+
+    fe = PythonMelFrontend(str(_OWW / "mel_filters.npy"))
+    rng = np.random.default_rng(7)
+    with OnDeviceModel(str(_OWW / "melspectrogram.onnx"), intra_op_threads=1) as ref:
+        worst = 0.0
+        for scale in (0.0, 1.0, 30.0, 3000.0, 32000.0):
+            x = (rng.standard_normal(1760) * scale).astype(np.float32).reshape(1, -1)
+            (want,) = ref.run([("input", x)])
+            (got,) = fe.run([("input", x)])
+            assert got.shape == tuple(np.asarray(want).shape) == (1, 1, 8, 32)
+            worst = max(worst, float(np.abs(np.asarray(want, dtype=np.float64) - got).max()))
+    assert worst < 1e-3  # measured ~2e-5 dB; near a dB means real drift
+
+
+def test_openwakeword_fixture_hits_with_both_frontends():
+    _need(_OWW / "melspectrogram.onnx", _OWW / "mel_filters.npy",
+          _OWW / "embedding_model.onnx", _OWW / "hey_mycroft_v0.1.onnx",
+          _OWW / "hey_mycroft_test.wav")
+    from nanobot_channel_voice.wake.openwakeword import OpenWakeWord
+
+    with wave.open(str(_OWW / "hey_mycroft_test.wav")) as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2)
+        pcm = w.readframes(w.getnframes())
+
+    def run(**mel):
+        det = OpenWakeWord(embedding_path=str(_OWW / "embedding_model.onnx"),
+                           model_path=str(_OWW / "hey_mycroft_v0.1.onnx"),
+                           sample_rate=16000, threshold=0.5, **mel)
+        try:
+            return det.push(pcm), det.last_score
+        finally:
+            det.release()
+
+    hit_a, score_a = run(mel_path=str(_OWW / "melspectrogram.onnx"))
+    hit_b, score_b = run(mel_filters_path=str(_OWW / "mel_filters.npy"))
+    assert hit_a and hit_b  # an unseeded mel window misses this fixture entirely
+    assert abs(score_a - score_b) < 1e-3

@@ -1,12 +1,14 @@
 """openWakeWord-format acoustic wake word over ONNX/RKNN (``wake.engine="openwakeword"``).
 
-Three original upstream artifacts, chained host-side exactly as the upstream
-runtime chains them: ``melspectrogram.onnx`` (raw int16-valued float samples in,
-mel frames out, then the fixed ``x/10 + 2`` transform), the shared
-``embedding_model.onnx`` (76 mel frames -> one 96-dim embedding, stride 8 = one
-embedding per 80 ms chunk), and a per-phrase classifier head (a window of
-embeddings -> one sigmoid score). livekit-wakeword heads follow the same
-backbone contract and load through the same path. 16 kHz only; scoring cadence
+Original upstream artifacts, chained host-side exactly as the upstream runtime
+chains them: a mel frontend — ``melspectrogram.onnx``, or its frozen filterbank
+``mel_filters.npy`` through :class:`PythonMelFrontend` for NPU packages — (raw
+int16-valued float samples in, mel frames out, then the fixed ``x/10 + 2``
+transform), the shared ``embedding_model.onnx`` (76 mel frames -> one 96-dim
+embedding, stride 8 = one embedding per 80 ms chunk), and a per-phrase
+classifier head (a window of embeddings -> one sigmoid score). livekit-wakeword
+heads follow the same backbone contract and load through the same path. 16 kHz
+only; scoring cadence
 is one decision per 1280-sample chunk (~12.5 Hz), cheap enough for the frame
 hop even on A55-class CPUs.
 """
@@ -31,6 +33,9 @@ _RATE = 16000
 _CHUNK = 1280
 _MEL_CONTEXT = 480
 _MEL_BINS = 32
+_N_FFT = 512            # unpadded conv-STFT: (1760 - 512)//160 + 1 = 8 frames/call
+_STFT_WIN = 400         # periodic Hann, zero-pad-centered to _N_FFT
+_STFT_HOP = 160
 _MEL_FRAMES_PER_CHUNK = 8
 _EMB_WINDOW = 76        # mel frames per embedding
 _EMB_DIM = 96
@@ -39,13 +44,50 @@ _PRIME_SECONDS = 4      # upstream prefill: the embedding window starts as REAL 
 _FAIL_LOG_EVERY_S = 30.0
 
 
+class PythonMelFrontend:
+    """Exact numpy port of ``melspectrogram.onnx``, fed by its frozen mel
+    matrix (``mel_filters.npy``): unpadded 512-point STFT, power, mel, dB with
+    the graph's dynamic ``max - 80`` per-call floor. For NPU packages, whose
+    STFT ops don't convert; parity with the ONNX graph is ~2e-5 dB. Duck-types
+    the ``OnDeviceModel`` surface the adapter touches."""
+
+    def __init__(self, filters_path: str):
+        filters = np.load(filters_path)
+        if filters.shape != (_N_FFT // 2 + 1, _MEL_BINS):
+            raise ValueError(
+                f"mel filterbank {filters_path} has shape {filters.shape}, "
+                f"need {(_N_FFT // 2 + 1, _MEL_BINS)}"
+            )
+        self._filters = filters.astype(np.float64)
+        w = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(_STFT_WIN) / _STFT_WIN)
+        self._window = np.zeros(_N_FFT)
+        self._window[(_N_FFT - _STFT_WIN) // 2:(_N_FFT - _STFT_WIN) // 2 + _STFT_WIN] = w
+
+    def run(self, inputs: list) -> list:
+        (_, arr) = inputs[0]
+        x = np.asarray(arr, dtype=np.float64).reshape(-1)
+        n = (x.size - _N_FFT) // _STFT_HOP + 1
+        idx = np.arange(_N_FFT)[None, :] + _STFT_HOP * np.arange(n)[:, None]
+        spec = np.abs(np.fft.rfft(x[idx] * self._window, axis=1)) ** 2
+        db = 10.0 * np.log10(np.maximum(spec @ self._filters, 1e-10))
+        db = np.maximum(db, db.max() - 80.0)
+        return [db.reshape(1, 1, n, _MEL_BINS).astype(np.float32)]
+
+    def input_specs(self) -> list:
+        return []
+
+    def release(self) -> None:
+        pass
+
+
 class OpenWakeWord(WakeDetector):
     def __init__(
         self,
         *,
-        mel_path: str,
+        mel_path: str | None = None,
         embedding_path: str,
         model_path: str,
+        mel_filters_path: str | None = None,
         sample_rate: int,
         threshold: float = 0.5,
         refractory_s: float = 2.0,
@@ -59,6 +101,11 @@ class OpenWakeWord(WakeDetector):
             raise ValueError(
                 f"openWakeWord requires 16 kHz audio, got {sample_rate}"
             )
+        if (mel_path is None) == (mel_filters_path is None):
+            raise ValueError(
+                "openWakeWord needs exactly one mel frontend: melPath "
+                "(melspectrogram.onnx) or melFiltersPath (mel_filters.npy)"
+            )
         # _validate() raising is the EXPECTED path make_wake_detector catches to
         # degrade to the transcript tier, so the ExitStack must release every
         # claimed session on it.
@@ -68,8 +115,15 @@ class OpenWakeWord(WakeDetector):
                 providers=providers, provider_options=provider_options,
                 intra_op_threads=1,  # runs per chunk inside the hop: never fan out
             )
-            self._mel = models.enter_context(OnDeviceModel(mel_path, **kw))
-            self._emb = models.enter_context(OnDeviceModel(embedding_path, **kw))
+            if mel_path is not None:
+                self._mel = models.enter_context(OnDeviceModel(mel_path, **kw))
+            else:
+                self._mel = PythonMelFrontend(mel_filters_path)  # type: ignore[arg-type]
+            # The TF-derived backbone imports into RKNN with a folded layout
+            # swap: the call must declare the [1,76,32,1] array's layout as-is.
+            self._emb = models.enter_context(
+                OnDeviceModel(embedding_path, rknn_data_format="nchw", **kw)
+            )
             self._head = models.enter_context(OnDeviceModel(model_path, **kw))
             self._mel_in = self._first_input(self._mel, "input")
             self._emb_in = self._first_input(self._emb, "input_1")
@@ -94,9 +148,10 @@ class OpenWakeWord(WakeDetector):
     @classmethod
     def from_config(cls, cfg: OpenWakeWordConfig, sample_rate: int) -> OpenWakeWord:
         return cls(
-            mel_path=cfg.mel_path,              # type: ignore[arg-type]
+            mel_path=cfg.mel_path,
             embedding_path=cfg.embedding_path,  # type: ignore[arg-type]
             model_path=cfg.model_path,          # type: ignore[arg-type]
+            mel_filters_path=cfg.mel_filters_path,
             sample_rate=sample_rate,
             threshold=cfg.threshold,
             refractory_s=cfg.refractory_s,
@@ -108,7 +163,7 @@ class OpenWakeWord(WakeDetector):
         )
 
     @staticmethod
-    def _first_input(model: OnDeviceModel, fallback: str) -> str:
+    def _first_input(model: OnDeviceModel | PythonMelFrontend, fallback: str) -> str:
         specs = model.input_specs()
         return specs[0][0] if specs else fallback  # RKNN: no introspection, positional anyway
 
@@ -124,7 +179,10 @@ class OpenWakeWord(WakeDetector):
         # [1, context+chunk]: uniform shapes are what a fixed-graph RKNN port
         # needs, and the edge effect is one padded analysis window.
         self._raw_tail = np.zeros(_MEL_CONTEXT, dtype=np.float32)
-        self._mels = np.empty((0, _MEL_BINS), dtype=np.float32)
+        # Upstream startup state: a full ones window (transformed-mel space),
+        # so scoring starts on the FIRST chunk — empty would leave an ~800 ms
+        # deaf window after every reset (session start, capture gaps).
+        self._mels = np.ones((_EMB_WINDOW, _MEL_BINS), dtype=np.float32)
         # Restore the primed embedding window: all-zero rows are outside the
         # embedding model's output distribution and can score arbitrarily on
         # some heads (upstream prefills with noise embeddings for the same
@@ -146,9 +204,7 @@ class OpenWakeWord(WakeDetector):
         score = None
         try:
             for i in range(0, noise.size - _CHUNK + 1, _CHUNK):
-                s = self._score_chunk(noise[i:i + _CHUNK])
-                if s is not None:
-                    score = s
+                score = self._score_chunk(noise[i:i + _CHUNK])
         except Exception as exc:  # noqa: BLE001 - re-raise as a catchable construction error
             raise RuntimeError(
                 f"openWakeWord pipeline rejected the expected shapes (mel "
@@ -181,8 +237,6 @@ class OpenWakeWord(WakeDetector):
             while self._pending.size >= _CHUNK:
                 chunk, self._pending = self._pending[:_CHUNK], self._pending[_CHUNK:]
                 score = self._score_chunk(chunk)
-                if score is None:
-                    continue
                 self.last_score = score
                 if self._debounce(score):
                     hit = True
@@ -210,17 +264,14 @@ class OpenWakeWord(WakeDetector):
         self._armed = True
         return False
 
-    def _score_chunk(self, chunk: np.ndarray) -> float | None:
-        """One 80 ms step through mel -> embedding -> head. None until the mel
-        buffer covers an embedding window (start of stream only)."""
+    def _score_chunk(self, chunk: np.ndarray) -> float:
+        """One 80 ms step through mel -> embedding -> head."""
         mel_in = np.concatenate((self._raw_tail, chunk)).reshape(1, -1)
         (mel_out,) = self._mel.run([(self._mel_in, mel_in)])
         frames = np.asarray(mel_out, dtype=np.float32).reshape(-1, _MEL_BINS)
         frames = frames[-_MEL_FRAMES_PER_CHUNK:] / 10.0 + 2.0  # upstream transform
         self._raw_tail = chunk[-_MEL_CONTEXT:]
         self._mels = np.concatenate((self._mels, frames))[-_EMB_WINDOW:]
-        if len(self._mels) < _EMB_WINDOW:
-            return None
         emb_in = np.ascontiguousarray(
             self._mels.reshape(1, _EMB_WINDOW, _MEL_BINS, 1)
         )

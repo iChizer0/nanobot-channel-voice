@@ -279,6 +279,24 @@ def test_onnx_external_data_is_a_companion_not_an_ambiguity(store, tmp_path):
     assert filled.decoder_path == str(d / "decoder.onnx")
 
 
+def test_hybrid_wake_package_resolves_without_a_mel_graph(store, tmp_path):
+    from nanobot_channel_voice.config import OpenWakeWordConfig
+
+    # The published RV1126B package shape: python-mel filterbank, no mel graph.
+    key = "wake/openwakeword/hey-mycroft/rknn.rv1126b"
+    w.fetch(key, _entry_for(_src(tmp_path, "embedding.rknn"),
+                            _src(tmp_path, "mel_filters.npy"),
+                            _src(tmp_path, "meta.json"),
+                            _src(tmp_path, "model.onnx")))
+    filled = w.fill_engine_paths(OpenWakeWordConfig.model_validate({"weights": key}))
+    d = w.store_dir(key)
+    assert filled.embedding_path == str(d / "embedding.rknn")
+    assert filled.model_path == str(d / "model.onnx")
+    assert filled.mel_filters_path == str(d / "mel_filters.npy")
+    assert filled.meta_path == str(d / "meta.json")
+    assert filled.mel_path is None  # "mel.*" must not swallow mel_filters.npy
+
+
 def test_a_dotted_variant_still_resolves(store, tmp_path):
     from nanobot_channel_voice.config import FireRedVadConfig
 

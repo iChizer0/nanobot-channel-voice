@@ -89,11 +89,15 @@ class OnDeviceModel:
         providers: list | None = None,
         provider_options: list | None = None,
         intra_op_threads: int | None = None,
+        rknn_data_format: str | None = None,
     ):
         self._rknn: Any = None
         self._sess: Any = None
         self._released = False
         self._rknn_lock = threading.Lock()  # RKNN contexts are not thread-safe
+        # RKNN input layout ("nchw"/"nhwc"; None = library default, nhwc for
+        # 4-D): set when the graph's import already folded a layout swap.
+        self._rknn_data_format = rknn_data_format
 
         if path.endswith(".rknn"):
             self._rknn = _load_rknn(path, core_mask=core_mask, target=target, device_id=device_id)
@@ -131,7 +135,10 @@ class OnDeviceModel:
             with self._rknn_lock:
                 if self._released:
                     raise RuntimeError("on-device model released")
-                return self._rknn.inference(inputs=[arr for _, arr in inputs])
+                arrs = [arr for _, arr in inputs]
+                if self._rknn_data_format is not None:
+                    return self._rknn.inference(inputs=arrs, data_format=self._rknn_data_format)
+                return self._rknn.inference(inputs=arrs)
         sess = self._sess
         if sess is None:
             raise RuntimeError("on-device model released")

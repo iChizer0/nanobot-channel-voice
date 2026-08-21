@@ -553,7 +553,7 @@ Notes:
 
 - openWakeWord's official pretrained heads are **CC-BY-NC-SA (non-commercial)** - for commercial use train your own phrase head (openWakeWord's Colab or livekit-wakeword's pipeline, both Apache toolchains).
 - `"strict"` with a *batch* STT and no acoustic engine confirms interrupts only at the endpoint decode - pair strict with the acoustic engine or a streaming STT (`zipformer`).
-- An on-device engine like any other: a `weights` key provisions all three files, `.rknn` serves from the NPU, a missing model degrades loudly to transcript-tier gating.
+- An on-device engine like any other: a `weights` key provisions everything (e.g. `wake/openwakeword/hey-jarvis/rknn.rv1126b` via `nanobot-voice fetch`), `.rknn` serves from the NPU, a missing model degrades loudly to transcript-tier gating. NPU packages are hybrid: `melFiltersPath` (an exact numpy port of the mel graph, whose STFT ops don't convert) replaces `melPath`, the head stays ONNX, and the `meta.json` sidecar's declared phrase/target are checked against the config at startup (advisory warnings).
 - Gated utterances land in the audio dump as `utt-<id>-gated.wav`, so a phrase that "doesn't work" is diagnosed by ear.
 
 ### Debugging false barge-in by ear

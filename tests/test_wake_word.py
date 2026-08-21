@@ -176,9 +176,11 @@ class FakeEmb(FakeMel):
         self.calls += 1
         (_, arr) = inputs[0]
         assert arr.shape == (1, 76, 32, 1)
-        # FakeMel emits zeros, so every frame must arrive as the x/10 + 2
-        # transform of zero: dropping or misplacing the transform fails here.
-        assert np.allclose(arr, 2.0)
+        # FakeMel emits zeros, so every REAL frame must arrive as the x/10 + 2
+        # transform of zero (2.0), newest last; rows still holding the reset
+        # seed are exactly 1.0. Anything else = transform or seed lost.
+        assert np.all((arr == 1.0) | np.isclose(arr, 2.0))
+        assert np.allclose(arr[0, -8:, :, 0], 2.0)
         return [np.zeros((1, 1, 1, 96), dtype=np.float32)]
 
 
@@ -217,21 +219,18 @@ def _detector(**kw):
     return OpenWakeWord(**kw)
 
 
-def _warm(det, chunks: int) -> bool:
+def _push_chunks(det, chunks: int) -> bool:
     hit = False
     for _ in range(chunks):
         hit = det.push(_CHUNK) or hit
     return hit
 
 
-def test_scores_start_once_the_mel_window_fills(fakes):
+def test_scores_start_on_the_first_chunk(fakes):
     det = _detector()
     head = fakes["head.onnx"]
     head.calls = 0
-    # 8 mel frames per (uniform 1760-sample) mel call: the 76-frame embedding
-    # window fills on chunk 10 after a reset.
-    assert _warm(det, 9) is False
-    assert head.calls == 0 and det.last_score is None
+    # Pre-seeded mel window (upstream parity): no post-reset deaf window.
     det.push(_CHUNK)
     assert head.calls == 1 and det.last_score == 0.0
     assert head.shapes[0] == (1, 16, 96)
@@ -250,7 +249,6 @@ def test_sub_chunk_frames_buffer_without_inference(fakes):
 def test_hit_on_threshold_with_rearm_hysteresis(fakes):
     det = _detector(threshold=0.5)
     head = fakes["head.onnx"]
-    _warm(det, 9)
     head.probs = [0.9, 0.9, 0.2, 0.9]
     assert det.push(_CHUNK) is True    # crossing: hit
     assert det.push(_CHUNK) is False   # still above: no retrigger
@@ -262,7 +260,6 @@ def test_hit_on_threshold_with_rearm_hysteresis(fakes):
 def test_refractory_blocks_a_fast_second_hit(fakes):
     det = _detector(threshold=0.5, refractory_s=1000.0)
     head = fakes["head.onnx"]
-    _warm(det, 9)
     head.probs = [0.9, 0.2, 0.9]
     assert det.push(_CHUNK) is True
     det.push(_CHUNK)
@@ -272,16 +269,17 @@ def test_refractory_blocks_a_fast_second_hit(fakes):
 def test_model_failure_returns_no_hit_not_an_exception(fakes):
     det = _detector()
     fakes["head.onnx"].run = None  # type: ignore[assignment]
-    assert _warm(det, 12) is False
+    assert _push_chunks(det, 12) is False
 
 
 def test_reset_clears_stream_state(fakes):
     det = _detector()
-    _warm(det, 10)
+    _push_chunks(det, 10)
     assert det.last_score is not None
     det.reset()
     assert det.last_score is None
-    assert _warm(det, 9) is False  # warmup starts over
+    det.push(_CHUNK)
+    assert det.last_score == 0.0  # re-seeded: scoring resumes immediately
 
 
 def test_release_releases_all_three_models(fakes):
@@ -299,9 +297,75 @@ def test_reset_restores_the_primed_embedding_window(fakes):
     det = _detector()
     prime = det._embs_prime
     assert prime.shape == (16, 96)
-    _warm(det, 12)
+    _push_chunks(det, 12)
     det.reset()
     assert np.array_equal(det._embs, prime)  # never the all-zero OOD window
+
+
+# ---- python mel frontend (hybrid NPU packages) --------------------------------
+
+
+def _filters_npy(tmp_path):
+    path = tmp_path / "mel_filters.npy"
+    rng = np.random.default_rng(3)
+    np.save(path, (rng.random((257, 32)) * 0.01).astype(np.float32))
+    return str(path)
+
+
+def test_python_mel_frontend_contract(tmp_path):
+    fe = oww_mod.PythonMelFrontend(_filters_npy(tmp_path))
+    (out,) = fe.run([("input", np.zeros((1, 1760), dtype=np.float32))])
+    assert out.shape == (1, 1, 8, 32) and out.dtype == np.float32
+    assert np.allclose(out, -100.0)  # silence: 10*log10(1e-10) everywhere
+    # A loud burst mid-window: the graph's dynamic floor pins the quiet
+    # frames at exactly max - 80 dB.
+    rng = np.random.default_rng(0)
+    x = np.zeros(1760, dtype=np.float32)
+    x[800:1000] = (rng.standard_normal(200) * 20000).astype(np.float32)
+    (out,) = fe.run([("input", x.reshape(1, -1))])
+    assert float(out.min()) == pytest.approx(float(out.max()) - 80.0)
+    assert fe.input_specs() == []
+    fe.release()  # no-op
+
+
+def test_python_mel_frontend_rejects_a_wrong_filterbank(tmp_path):
+    path = tmp_path / "mel_filters.npy"
+    np.save(path, np.zeros((80, 32), dtype=np.float32))
+    with pytest.raises(ValueError, match="shape"):
+        oww_mod.PythonMelFrontend(str(path))
+
+
+def test_mel_filters_path_selects_the_python_frontend(monkeypatch):
+    made = {"emb.onnx": FakeEmb(), "head.onnx": FakeHead()}
+    monkeypatch.setattr(oww_mod, "OnDeviceModel", lambda path, **kw: made[path])
+    monkeypatch.setattr(oww_mod, "PythonMelFrontend", lambda path: FakeMel())
+    det = OpenWakeWord(
+        mel_filters_path="mel_filters.npy", embedding_path="emb.onnx",
+        model_path="head.onnx", sample_rate=16000,
+    )
+    assert isinstance(det._mel, FakeMel)
+
+
+def test_exactly_one_mel_frontend_is_required(fakes):
+    with pytest.raises(ValueError, match="exactly one mel frontend"):
+        _detector(mel_path=None)
+    with pytest.raises(ValueError, match="exactly one mel frontend"):
+        _detector(mel_filters_path="mel_filters.npy")
+
+
+def test_rknn_layout_marker_rides_the_embedding_only(monkeypatch):
+    made = {"mel.onnx": FakeMel(), "emb.onnx": FakeEmb(), "head.onnx": FakeHead()}
+    kws: dict[str, dict] = {}
+
+    def spy(path, **kw):
+        kws[path] = kw
+        return made[path]
+
+    monkeypatch.setattr(oww_mod, "OnDeviceModel", spy)
+    _detector()
+    assert kws["emb.onnx"]["rknn_data_format"] == "nchw"
+    assert "rknn_data_format" not in kws["mel.onnx"]
+    assert "rknn_data_format" not in kws["head.onnx"]
 
 
 def test_multi_output_head_is_rejected_at_construction(monkeypatch):
@@ -358,6 +422,60 @@ def test_missing_model_paths_degrade_to_text_tier():
     assert make_wake_detector(cfg, 16000, 20) is None
 
 
+def test_missing_mel_frontend_degrades_to_text_tier(fakes):
+    cfg = _wake_cfg(openwakeword={"embeddingPath": "emb.onnx", "modelPath": "head.onnx"})
+    assert make_wake_detector(cfg, 16000, 20) is None
+
+
+def _warns_during(fn):
+    from loguru import logger as _logger
+
+    msgs: list[str] = []
+    sink = _logger.add(lambda m: msgs.append(str(m)), level="WARNING")
+    try:
+        result = fn()
+    finally:
+        _logger.remove(sink)
+    return result, msgs
+
+
+def test_meta_advisories_warn_without_blocking(fakes, tmp_path):
+    meta = tmp_path / "meta.json"
+    meta.write_text('{"phrase": "hey mycroft", "target": "rv1126b"}')
+    cfg = _wake_cfg(openwakeword={
+        "melPath": "mel.onnx", "embeddingPath": "emb.onnx",
+        "modelPath": "head.onnx", "metaPath": str(meta),
+    })
+    det, msgs = _warns_during(lambda: make_wake_detector(cfg, 16000, 20))
+    assert isinstance(det, OpenWakeWord)          # advisory only, never fatal
+    joined = "".join(msgs)
+    assert "detects 'hey mycroft'" in joined      # phrases say "hey nanobot"
+    assert "targets" not in joined                # .onnx embedding: target n/a
+
+
+def test_meta_advisories_match_is_silent_and_garbage_tolerated(fakes, tmp_path):
+    meta = tmp_path / "meta.json"
+    meta.write_text('{"phrase": "Hey Nanobot", "target": "rv1126b"}')
+    cfg = _wake_cfg(openwakeword={
+        "melPath": "mel.onnx", "embeddingPath": "emb.onnx",
+        "modelPath": "head.onnx", "metaPath": str(meta),
+    })
+    det, msgs = _warns_during(lambda: make_wake_detector(cfg, 16000, 20))
+    assert isinstance(det, OpenWakeWord) and not msgs  # casefold match, .onnx target
+    meta.write_text("{not json")
+    det, msgs = _warns_during(lambda: make_wake_detector(cfg, 16000, 20))
+    assert isinstance(det, OpenWakeWord)
+    assert any("unreadable" in m for m in msgs)
+    # Parseable but malformed: never fatal, and never a nonsense warning.
+    meta.write_text("[1, 2]")
+    det, msgs = _warns_during(lambda: make_wake_detector(cfg, 16000, 20))
+    assert isinstance(det, OpenWakeWord)
+    assert any("unreadable" in m for m in msgs)
+    meta.write_text('{"phrase": 42, "target": ["rv1126b"]}')
+    det, msgs = _warns_during(lambda: make_wake_detector(cfg, 16000, 20))
+    assert isinstance(det, OpenWakeWord) and not msgs
+
+
 def test_incompatible_rate_degrades_to_text_tier(fakes):
     assert make_wake_detector(_wake_cfg(), 8000, 20) is None
 
@@ -383,7 +501,6 @@ def test_voice_config_carries_wake_block():
 def test_hit_position_marks_the_chunk_end(fakes):
     det = _detector(threshold=0.5)
     head = fakes["head.onnx"]
-    _warm(det, 9)
     head.probs = [0.9]
     # One full chunk plus a 400-sample tail: the hit chunk ends 800 bytes back.
     assert det.push(_CHUNK + b"\x01\x00" * 400) is True

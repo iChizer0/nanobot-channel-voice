@@ -11,6 +11,9 @@ None, and gating continues on transcripts alone.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from loguru import logger
 
 from nanobot_channel_voice.config import WakeConfig
@@ -33,14 +36,53 @@ ENGINES: dict[str, EngineSpec] = {
     # and needs no model.
     "openwakeword": EngineSpec(
         required=(
-            ("openwakeword.mel_path", "openwakeword.melPath"),
             ("openwakeword.embedding_path", "openwakeword.embeddingPath"),
             ("openwakeword.model_path", "openwakeword.modelPath"),
+        ),
+        required_any=(  # the ONNX mel graph, or the filterbank for NPU packages
+            (("openwakeword.mel_path", "openwakeword.melPath"),),
+            (("openwakeword.mel_filters_path", "openwakeword.melFiltersPath"),),
         ),
         build=_build_openwakeword,
         modules=("numpy",),
     ),
 }
+
+
+def _meta_advisories(cfg: WakeConfig) -> None:
+    """Advisory package-sidecar checks (never fatal): a fetched head that
+    disagrees with the configuration still summons, but misbehaves subtly —
+    say why at startup instead."""
+    oww = cfg.openwakeword
+    if not oww.meta_path:
+        return
+    try:
+        meta = json.loads(Path(oww.meta_path).read_text(encoding="utf-8"))
+        if not isinstance(meta, dict):
+            raise ValueError("not a JSON object")
+    except Exception as exc:  # noqa: BLE001 - provenance sidecar, never fatal
+        logger.warning("voice: wake package meta '{}' unreadable ({})", oww.meta_path, exc)
+        return
+    phrase = meta.get("phrase")
+    if not isinstance(phrase, str):
+        phrase = None
+    if phrase and cfg.phrases and phrase.casefold() not in (p.casefold() for p in cfg.phrases):
+        logger.warning(
+            "voice: the fetched wake head detects '{}' but wake.phrases is {}; "
+            "hits still summon, but the transcript tier and the wake-phrase "
+            "strip listen for different words (the phrase can leak into "
+            "published text)",
+            phrase, cfg.phrases,
+        )
+    target = meta.get("target")
+    if not isinstance(target, str):
+        target = None
+    if target and (oww.embedding_path or "").endswith(".rknn") and target != oww.target:
+        logger.warning(
+            "voice: wake package targets '{}' but wake.openwakeword.target is '{}'",
+            target, oww.target,
+        )
+
 
 _DEGRADE = "wake gating continues on transcripts only"
 
@@ -62,6 +104,8 @@ def make_wake_detector(
             "voice: {} wake detector unavailable ({}); {}", cfg.engine, exc, _DEGRADE
         )
         return None
+    if cfg.engine == "openwakeword":
+        _meta_advisories(cfg)
     missing = missing_fields(cfg, spec)
     if missing:
         logger.warning(
