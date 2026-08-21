@@ -1030,7 +1030,14 @@ class VoiceChannel(BaseChannel):
                     self._pending_delegation.set_final(text)
             return
         local = self._local()
-        if local is None or not _speakable(msg):
+        if local is None:
+            return
+        if msg.chat_id == self.config.chat_id:
+            # ANY traffic for our chat — progress, tool events, trace sends — proves the
+            # core is alive on this session: feed the deadman before filtering, so it
+            # measures a silent core rather than a long tool run between segments.
+            local.note_agent_activity()
+        if not _speakable(msg):
             return
         turn = meta.get(TURN_META)
         if turn is not None and local.is_dead_turn(turn):

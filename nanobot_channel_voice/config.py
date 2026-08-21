@@ -984,11 +984,15 @@ class VoiceConfig(_VoiceBase):
     # Tail after playback drains before re-listening (local only; the cloud drain has no hangover).
     playback_hangover_ms: int = Field(default=250, ge=0)
 
-    # Stalled-agent deadman (local backend; cloud analog: realtime.turnTimeoutS): a published turn
-    # with NO activity (no delta, no segment end) for this long gets a short spoken notice + /stop
-    # instead of silent THINKING forever. Activity resets the clock, so long tool runs survive as
-    # long as the agent streams its pre-tool status line. None disables.
-    agent_timeout_s: float | None = Field(default=120.0, gt=0)
+    # Stalled-agent deadman (local backend; cloud analog: realtime.turnTimeoutS), escalating:
+    # a published turn with NO activity for one budget speaks stallPhrase and re-arms; a second
+    # silent budget /stops the run and speaks timeoutPhrase. Activity = stream deltas, segment
+    # ends, AND any bus traffic for this chat (progress/tool events — the send() tap), so the
+    # deadman measures a silent core, not a slow tool. 300 matches core's own ceilings (LLM
+    # timeout, subagent wait are 300 s): tighter kills turns core would still finish. None
+    # disables. Both phrases are spoken by the session TTS — localize them together.
+    agent_timeout_s: float | None = Field(default=300.0, gt=0)
+    stall_phrase: str = "Still working on it. Say stop if you want me to give up."
     timeout_phrase: str = "Sorry, I'm having trouble answering that. Please try again."
 
     # The WebUI's paste box (the manifest's only field; rationale on its SETUP_SPEC):

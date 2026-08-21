@@ -2924,6 +2924,12 @@ class LocalBackend(TurnEventMixin):
 
     # ---- output: streamed reply -> chunker -> TTS -> sink -------------------
 
+    def note_agent_activity(self) -> None:
+        """Non-delta bus traffic for this session (progress, tool events, any send)
+        proves the core is alive: push the deadman so it measures a silent core,
+        never a long-running tool between segments."""
+        self._cur_turn.last_activity = time.monotonic()
+
     async def on_delta(self, delta: str, stream_id: str | None = None) -> None:
         """A streamed assistant text chunk (``_stream_delta``)."""
         if not delta:
@@ -3489,12 +3495,13 @@ class LocalBackend(TurnEventMixin):
     def _arm_timeout(self) -> None:
         """Arm the stalled-agent deadman for the turn just published.
 
-        A voice channel must never end a turn in dead air: with no activity at all (no delta, no
-        segment end) for ``agentTimeoutS``, speak a notice, /stop the stuck run and settle
-        rather than sit in THINKING forever. Activity pushes ``_Turn.last_activity``, so long
-        tool runs survive as long as the agent streams its pre-tool status line. With core
-        streaming DISABLED nothing pushes it, so agentTimeoutS is a hard cap on any turn:
-        the accepted cost of recovering wedged ones (raise it if long tool runs matter)."""
+        A voice channel must never end a turn in dead air, but killing healthy work is
+        worse: one silent ``agentTimeoutS`` speaks stallPhrase and re-arms; only a SECOND
+        silent budget /stops the run and speaks timeoutPhrase. Activity pushes
+        ``_Turn.last_activity`` — deltas, segment ends, and the channel's send() tap
+        (progress/tool events) — so tool chains die only when the core itself goes
+        silent. With core streaming disabled nothing pushes it, so 2x agentTimeoutS is
+        a hard cap on any turn: the accepted cost of recovering wedged ones."""
         self._cur_turn.cancel_timeout()
         if self._closing or self._cfg.agent_timeout_s is None:
             return
@@ -3503,11 +3510,38 @@ class LocalBackend(TurnEventMixin):
     async def _timeout_watch(self, turn: _Turn) -> None:
         try:
             budget = float(self._cfg.agent_timeout_s)
-            await wait_for_stall(lambda: turn.last_activity, budget)
-            if self._closing or self._cur_turn is not turn or self._turn is not VoiceState.THINKING:
-                return  # the turn moved on (or is speaking/draining), not stalled
+            notified = False
+            while True:
+                await wait_for_stall(lambda: turn.last_activity, budget)
+                if self._closing or self._cur_turn is not turn:
+                    return
+                if self._turn is VoiceState.IDLE:
+                    return  # settled without us; nothing left to recover
+                if self._turn is not VoiceState.THINKING:
+                    # Audio in flight (reply tail, canned filler) or the user mid-
+                    # utterance: not a silent wedge. Re-arm rather than exit — a
+                    # filler playing at the deadline must not strip the turn's only
+                    # recovery (the pre-loop watch disarmed exactly there).
+                    turn.last_activity = time.monotonic()
+                    continue
+                if not notified:
+                    notified = True
+                    self._metrics.count("agent_turn_stall")
+                    self._log.warning(
+                        "agent turn stalled ({}s with no activity); speaking stall "
+                        "notice, killing after another budget", int(budget),
+                    )
+                    # Rides the prologue slot: the reply's first delta cancels it
+                    # like any filler, and its _settle never fights a live drain.
+                    self._cancel_prologue()
+                    self._cur_turn.prologue_task = asyncio.create_task(
+                        self._stall_notice(self._sink.epoch)
+                    )
+                    turn.last_activity = time.monotonic()  # a full budget to the kill
+                    continue
+                break
             self._log.warning(
-                "agent turn stalled ({}s with no activity); speaking timeout notice",
+                "agent turn silent for another {}s; giving up and /stop-ping it",
                 int(budget),
             )
             self._metrics.count("agent_turn_timeout")
@@ -3525,6 +3559,39 @@ class LocalBackend(TurnEventMixin):
             raise
         except Exception:
             self._log.exception("timeout watch failed")
+
+    async def _stall_notice(self, epoch: int) -> None:
+        """Speak stallPhrase over the silent wait (canned THINKING clip, wake-ack
+        bracket). Best-effort: any guard failing skips the speech — the escalation
+        clock keeps running either way, so the kill still lands one budget later."""
+        nonce = object()
+        try:
+            if self._closing or self._tts is None:
+                return
+            audio = await self._synth_filler(self._cfg.stall_phrase)
+            if (
+                not audio
+                or epoch != self._sink.epoch
+                or self._turn is not VoiceState.THINKING
+                or self._endpointer.in_speech  # never talk over the user
+            ):
+                return
+            self._echo.note_spoken(
+                self._cfg.stall_phrase,
+                hold_ms=self._sink.backlog_ms() + self._audio_ms(audio),
+            )
+            self._canned_base, self._canned_nonce = VoiceState.THINKING, nonce
+            await self._canned_playback(epoch, audio, VoiceState.THINKING)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a notice must never wedge the session
+            self._log.warning("stall notice failed ({})", exc)
+            if self._turn is VoiceState.SPEAKING and epoch == self._sink.epoch:
+                with suppress(Exception):
+                    await self._set_turn(VoiceState.THINKING)
+        finally:
+            if self._canned_nonce is nonce:
+                self._canned_base = None
 
     async def _canned_playback(self, epoch: int, audio: bytes, base: VoiceState) -> None:
         """The canned-audio dance every ack/filler/cue shares: SPEAKING -> emit ->

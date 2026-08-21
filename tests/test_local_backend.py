@@ -522,15 +522,106 @@ def test_timeout_notice_audio_is_not_ttfa():
         b = h.backend
         h.transcript = "hello there"
         await b._on_utterance(_utt())  # publish arms the timeout deadman
-        for _ in range(80):  # let the watch fire (0.05 s stall budget)
+        for _ in range(80):  # stall notice after one budget, kill after a second
             await asyncio.sleep(0.01)
             if b._metrics.counters.get("agent_turn_timeout"):
                 break
+        assert b._metrics.counters.get("agent_turn_stall") == 1
         assert b._metrics.counters.get("agent_turn_timeout") == 1
         assert h.interrupts == 1  # the stuck run was /stop-ped
         b._metrics.turn_first_audio()  # the notice's first chunk
         snap = b._metrics.snapshot()
         assert "ttfa_ms" not in snap["latency_ms"]  # anchor was released
         assert snap["counters"].get("ttfa_unanchored") == 1
+
+    _run(_t())
+
+
+def test_deadman_escalates_before_killing():
+    # The first silent budget must warn and re-arm, never /stop: killing at the first
+    # stall destroyed healthy tool runs (core's own LLM timeout and subagent wait are
+    # 300 s — a deadman firing earlier killed turns core would still have finished).
+    async def _t():
+        h = _build(agentTimeoutS=0.05)
+        b = h.backend
+        h.transcript = "do the thing"
+        await b._on_utterance(_utt())
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+            if b._metrics.counters.get("agent_turn_stall"):
+                break
+        assert b._metrics.counters.get("agent_turn_stall") == 1
+        assert h.interrupts == 0  # the run is still alive after the notice
+        for _ in range(60):
+            await asyncio.sleep(0.01)
+            if b._metrics.counters.get("agent_turn_timeout"):
+                break
+        assert b._metrics.counters.get("agent_turn_timeout") == 1
+        assert h.interrupts == 1
+
+    _run(_t())
+
+
+def test_deadman_rearms_through_canned_playback():
+    # The pre-loop watch RETURNED when its deadline landed during SPEAKING (a canned
+    # filler at exactly the wrong moment), stripping a wedged turn's only recovery:
+    # eternal silence. The loop re-arms through any non-THINKING window instead.
+    async def _t():
+        h = _build(agentTimeoutS=0.05)
+        b = h.backend
+        h.transcript = "do the thing"
+        await b._on_utterance(_utt())
+        b._turn = VoiceState.SPEAKING  # a canned clip owns the state at the deadline
+        await asyncio.sleep(0.16)      # several budgets pass while "audio plays"
+        assert h.interrupts == 0 and not b._metrics.counters.get("agent_turn_stall")
+        b._turn = VoiceState.THINKING  # clip over; the wedge is now visible
+        for _ in range(60):
+            await asyncio.sleep(0.01)
+            if h.interrupts:
+                break
+        assert b._metrics.counters.get("agent_turn_stall") == 1
+        assert h.interrupts == 1  # recovered instead of sitting silent forever
+
+    _run(_t())
+
+
+def test_activity_tap_defers_the_deadman():
+    async def _t():
+        h = _build(agentTimeoutS=0.06)
+        b = h.backend
+        h.transcript = "long tool run"
+        await b._on_utterance(_utt())
+        for _ in range(10):  # 0.2 s of trace traffic: 3+ budgets, never a stall
+            await asyncio.sleep(0.02)
+            b.note_agent_activity()
+        assert not b._metrics.counters.get("agent_turn_stall")
+        assert h.interrupts == 0
+
+    _run(_t())
+
+
+def test_send_traffic_feeds_the_deadman():
+    # Progress/tool-event sends are dropped as unspeakable, but they PROVE the core is
+    # alive on this session: the channel taps them into the deadman before filtering.
+    async def _t():
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+
+        h = _build()
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = h.backend
+        h.backend._cur_turn.last_activity = 0.0
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="",
+            metadata={"_tool_events": [{"name": "exec", "status": "ok"}]},
+        ))
+        assert h.backend._cur_turn.last_activity > 0.0
+        h.backend._cur_turn.last_activity = 0.0  # another chat's traffic: no push
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id="voice:other", content="", metadata={"_progress": True},
+        ))
+        assert h.backend._cur_turn.last_activity == 0.0
 
     _run(_t())
