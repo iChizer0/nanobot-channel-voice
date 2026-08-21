@@ -17,6 +17,12 @@ import time
 # ordinary ids while accepting any plausible nanosecond timestamp.
 _MIN_NS_DIGITS = 15
 
+# Inbound-metadata key carrying the token of the turn a publish opens; core echoes
+# inbound metadata onto that turn's final send, so send() can match reply to turn.
+# Everything under this key must stay JSON-plain: tools snapshot request metadata
+# (cron persists origin_metadata verbatim), so objects here corrupt their stores.
+TURN_META = "_voice_turn"
+
 _TOKEN_SEQ = itertools.count()
 
 

@@ -66,15 +66,10 @@ from .base import OnEvent, OutputAudio, ToolDef, VoiceState
 from .common import TurnEventMixin, loggable_text
 
 TranscribeFn = Callable[[bytes], Awaitable[str]]
-# (text, turn_token, event notes) — notes ride the publish as model-only metadata, so the
-# user row the channel persists stays pure speech (see channel._publish_user_text).
+# (text, turn_token, event notes) — notes ride the context bridge keyed by the token, so
+# the user row the channel persists stays pure speech (see channel._publish_turn_text).
 PublishTextFn = Callable[[str, str, tuple[str, ...]], Awaitable[None]]
 InterruptFn = Callable[[], Awaitable[None]]
-
-# Inbound-metadata key carrying the publishing turn's token; core echoes it onto that turn's
-# FINAL send, so the channel can tell a live reply from a barged-out turn's straggler — the
-# non-streamed analogue of the stream-id watermark (a final ``send`` carries no stream id).
-TURN_META = "_voice_turn"
 
 # JIT synthesis (stream mode): a call starts once the unplayed runway drains to its
 # predicted cost (per-char EMA x SAFETY + MARGIN) and shrinks to what the runway can pay
@@ -411,7 +406,7 @@ class _Turn:
 
     def __init__(self, token: str = ""):
         self.published_at = time.monotonic()
-        self.token = token  # echoed back on the turn's final send (see TURN_META)
+        self.token = token  # echoed back on the turn's final send (see streamid.TURN_META)
         self.dead = False   # abandoned by a barge-in; nothing may interrupt it twice
         # One-shot TTFA stage timers, consumed by the turn's first speakable chunk, first
         # synthesis and first delta respectively.
@@ -1010,8 +1005,8 @@ class LocalBackend(TurnEventMixin):
 
     def is_dead_turn(self, token: str) -> bool:
         """Was this token's turn killed? Its late final must stay silent (see
-        :data:`TURN_META`). Registered synchronously with ``abandon()``, so there is no
-        window in which a just-killed turn still passes."""
+        :data:`~nanobot_channel_voice.streamid.TURN_META`). Registered synchronously with
+        ``abandon()``, so there is no window in which a just-killed turn still passes."""
         return token in self._dead_tokens
 
     def _is_rejected(self, base: str | None) -> bool:

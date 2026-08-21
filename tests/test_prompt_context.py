@@ -7,12 +7,8 @@ import asyncio
 import re
 
 from nanobot.bus.queue import MessageBus
-from nanobot.runtime_context import (
-    RUNTIME_CONTEXT_INPUT_META,
-    normalize_runtime_context_blocks,
-)
+from nanobot.runtime_context import normalize_runtime_context_blocks
 
-from nanobot_channel_voice.backend.local import TURN_META
 from nanobot_channel_voice.channel import (
     _DEFAULT_PERSONA,
     _DIRECT_RULES,
@@ -23,6 +19,8 @@ from nanobot_channel_voice.channel import (
     _voice_context_blocks,
 )
 from nanobot_channel_voice.config import VoiceConfig
+from nanobot_channel_voice.context_tool import VoiceContextBridge
+from nanobot_channel_voice.streamid import TURN_META
 
 
 class _FakeTts:
@@ -249,61 +247,88 @@ def _capturing_channel() -> tuple[VoiceChannel, list[dict]]:
     return channel, seen
 
 
-def test_published_utterance_carries_the_block_alongside_its_turn_token():
+def test_published_metadata_is_json_plain_and_carries_only_the_token():
+    # Tools snapshot request metadata verbatim and cron PERSISTS that snapshot with
+    # plain json.dumps: one non-JSON value there breaks `cron add` from a voice turn.
+    # The blocks ride the context bridge instead (see test_context_tool).
+    import json
+
     channel, seen = _capturing_channel()
     channel._voice_context = _voice_context_blocks(None, _FakeTts("en"))
+    channel._context_bridge = VoiceContextBridge(channel._voice_context)
     asyncio.run(channel._publish_turn_text("what time is it", "turn-1"))
     [call] = seen
     assert call["content"] == "what time is it"
-    # The block must not displace the turn token: send() correlates the reply on it.
-    assert call["metadata"][TURN_META] == "turn-1"
-    blocks = call["metadata"][RUNTIME_CONTEXT_INPUT_META]
+    # The turn token is the only key: send() correlates the reply on it.
+    assert call["metadata"] == {TURN_META: "turn-1"}
+    json.dumps(call["metadata"])  # the cron-capture invariant, pinned forever
+
+
+def test_bridge_resolve_serves_the_block_and_the_clock():
+    channel, seen = _capturing_channel()
+    channel._voice_context = _voice_context_blocks(None, _FakeTts("en"))
+    channel._context_bridge = VoiceContextBridge(channel._voice_context)
+    asyncio.run(channel._publish_turn_text("what time is it", "turn-1"))
+    [call] = seen
+    blocks = channel._context_bridge.resolve(call["metadata"])
     assert blocks[:-1] == channel._voice_context
-    # Every spoken turn is stamped with the model's only clock: core injects no date
+    assert len(channel._voice_context) == 1  # resolve built a fresh list
+    # Every resolved turn is stamped with the model's only clock: core injects no date
     # or time anywhere, and without one the model invents a placeholder when asked.
     assert re.fullmatch(
         r"\[time now: \d{4}-\d{2}-\d{2} \((?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day\) "
         r"\d{2}:\d{2}, UTC[+-]\d{2}:\d{2}\]",
         blocks[-1].content,
     )
+    # Core accepts the resolved blocks verbatim off the provider seam.
+    assert normalize_runtime_context_blocks(blocks) == blocks
 
 
 def test_cloud_publishes_without_a_block():
-    # _voice_context is built in _build_local only, so a delegated supervisor request
+    # The bridge is registered in _build_local only, so a delegated supervisor request
     # (provider-side TTS, provider-owned persona) stays clean.
     channel, seen = _capturing_channel()
+    assert channel._context_bridge is None
     asyncio.run(channel._publish_user_text("delegated request"))
     [call] = seen
     assert call["metadata"] is None
 
 
-def test_event_notes_ride_as_their_own_block_after_the_contract():
-    # Notes are model-only metadata: they must never join the user content (the persisted
-    # row stays pure speech; display and consolidation strip runtime context), and the
-    # session-constant contract list must not be mutated by a publish.
+def test_event_notes_ride_the_bridge_never_the_user_row():
+    # Notes are model-only: they never join the user content (the persisted row stays
+    # pure speech) and never ride metadata (tools snapshot it). Stashed under the turn
+    # token, they come back once — on that turn's resolve — after the time stamp.
     channel, seen = _capturing_channel()
     channel._voice_context = _voice_context_blocks(None, _FakeTts("en"))
+    channel._context_bridge = VoiceContextBridge(channel._voice_context)
     note = '[voice event: you were interrupted mid-reply; the user heard up to: "…sunny"]'
     asyncio.run(channel._publish_turn_text("and tomorrow", "turn-2", (note,)))
     [call] = seen
     assert call["content"] == "and tomorrow"
-    blocks = call["metadata"][RUNTIME_CONTEXT_INPUT_META]
+    assert call["metadata"] == {TURN_META: "turn-2"}
+    blocks = channel._context_bridge.resolve(call["metadata"])
     assert blocks[:-1] == channel._voice_context
     assert blocks[-1].source == "voice"
     # The time stamp shares the per-turn block; the event note rides right after it.
     stamp, event = blocks[-1].content.split("\n")
     assert stamp.startswith("[time now: ")
     assert event == note
-    assert len(channel._voice_context) == 1  # publish built a fresh list
+    # Popped: a later resolve of the same token (a cron fire echoing stale creation
+    # metadata) gets the stamp only, never a replayed note.
+    again = channel._context_bridge.resolve(call["metadata"])
+    assert "\n" not in again[-1].content and again[-1].content.startswith("[time now: ")
 
 
 def test_stacked_notes_share_one_block():
     channel, seen = _capturing_channel()
+    channel._context_bridge = VoiceContextBridge([])  # no contract configured
     asyncio.run(
-        channel._publish_user_text(
-            "next question", notes=("[voice event: a]", "[voice event: b]")
+        channel._publish_turn_text(
+            "next question", "turn-3", ("[voice event: a]", "[voice event: b]")
         )
     )
     [call] = seen
-    [block] = call["metadata"][RUNTIME_CONTEXT_INPUT_META]  # no contract configured
-    assert block.content == "[voice event: a]\n[voice event: b]"
+    [block] = channel._context_bridge.resolve(call["metadata"])
+    stamp, *events = block.content.split("\n")
+    assert stamp.startswith("[time now: ")
+    assert events == ["[voice event: a]", "[voice event: b]"]

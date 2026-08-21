@@ -77,6 +77,12 @@ espeak = ["espeakng-loader>=0.2.4"]
 # extra installed (the weights commands are stdlib-only).
 nanobot-voice = "nanobot_channel_voice.cli:main"
 
+[project.entry-points."nanobot.tools"]
+# Carrier for the voice runtime-context provider (see context_tool.py): official core
+# gives plugin channels no AgentLoop handle, and context blocks must not ride inbound
+# metadata (tools persist metadata snapshots — cron's origin_metadata breaks on objects).
+voice_context = "nanobot_channel_voice.context_tool:VoiceContextTool"
+
 [dependency-groups]
 # The suite is hermetic by default — no audio hardware, model files, or network;
 # real-model regression tests skip unless reference exports are present.

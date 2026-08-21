@@ -12,23 +12,19 @@ import json
 import os
 import time
 from contextlib import suppress
-from datetime import datetime
 from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.runtime_context import (
-    RUNTIME_CONTEXT_INPUT_META,
-    RuntimeContextBlock,
-)
+from nanobot.runtime_context import RuntimeContextBlock
 
 from nanobot_channel_voice.aio import cancel_and_wait
 from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import ToolDef, VoiceState
-from nanobot_channel_voice.backend.local import TURN_META, LocalBackend
+from nanobot_channel_voice.backend.local import LocalBackend
 from nanobot_channel_voice.backend.openai_realtime import RealtimeBackend
 from nanobot_channel_voice.backend.profiles import backend_kind, resolve_profile
 from nanobot_channel_voice.config import (
@@ -36,9 +32,15 @@ from nanobot_channel_voice.config import (
     consume_import_json,
     resolve_openai_key,
 )
+from nanobot_channel_voice.context_tool import (
+    VoiceContextBridge,
+    register_bridge,
+    tool_created,
+    unregister_bridge,
+)
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
-from nanobot_channel_voice.streamid import started_ns, unique_token
+from nanobot_channel_voice.streamid import TURN_META, started_ns, unique_token
 from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, write_temp_wav
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
@@ -233,20 +235,6 @@ def _voice_context_blocks(
     return [RuntimeContextBlock(source="voice", content=content)]
 
 
-# English weekday names regardless of the process locale (%A localizes).
-_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-
-
-def _time_note() -> str:
-    """The model's only clock: core injects no date or time anywhere (helpers'
-    ``current_time_str`` is dead code as of 0.3.0), and without one the model answers
-    a date/time question with an invented placeholder ("[Current Date and Time]")."""
-    now = datetime.now().astimezone()
-    offset = now.strftime("%z")
-    return (f"[time now: {now:%Y-%m-%d} ({_WEEKDAYS[now.weekday()]}) {now:%H:%M}, "
-            f"UTC{offset[:3]}:{offset[3:]}]")
-
-
 # Stamped on a delegated ask_nanobot request; the AgentLoop echoes inbound metadata onto
 # the turn's FINAL send, so the reply carries the token back, the non-streaming analogue
 # of accepts_stream, since a /stop-ped delegation can finish minutes later with a bare
@@ -362,9 +350,12 @@ class VoiceChannel(BaseChannel):
         self._stt: SttAdapter | None = None
         self._stt_server = None             # stt.serve: local /v1/audio/transcriptions
         self._tts_adapter = None            # local mode only; kept for warmup
-        # Local mode only: speakability context stamped on every published utterance; empty
+        # Local mode only: speakability context riding every published utterance; empty
         # for cloud, where the provider both reasons and speaks under its own persona.
+        # Delivered via the context bridge (see context_tool), NEVER inbound metadata:
+        # non-JSON metadata corrupts every tool that snapshots it (cron's origin_metadata).
         self._voice_context: list[RuntimeContextBlock] = []
+        self._context_bridge: VoiceContextBridge | None = None
         self._warmup_task: asyncio.Task | None = None
         self._metrics_task: asyncio.Task | None = None  # debug.metricsIntervalS reporter
         # Supervisor mode only: the in-flight ask_nanobot delegation whose reply the bus
@@ -420,6 +411,7 @@ class VoiceChannel(BaseChannel):
                 raise RuntimeError(f"voice backend kind '{kind}' is not implemented")
             if not self._running:
                 self._backend = None
+                self._drop_bridge()
                 return  # stop() raced the build; nothing was started yet
             self.logger.info(
                 "voice channel starting (backend={}, capture={}, playback={})",
@@ -433,6 +425,7 @@ class VoiceChannel(BaseChannel):
             # shell holding devices (shell.start's first await already spawned arecord).
             self._running = False
             self._backend = None
+            self._drop_bridge()
             if shell is not None:
                 with suppress(Exception):
                     await shell.stop()
@@ -442,6 +435,7 @@ class VoiceChannel(BaseChannel):
             # only below); tear the shell down here.
             await shell.stop()
             self._backend = None
+            self._drop_bridge()
             return
         self._shell = shell
         try:
@@ -452,6 +446,7 @@ class VoiceChannel(BaseChannel):
             self._running = False
             self._shell = None
             self._backend = None
+            self._drop_bridge()
             with suppress(Exception):
                 await shell.stop()
             raise
@@ -465,6 +460,7 @@ class VoiceChannel(BaseChannel):
             self._stt_server = None
             self._shell = None
             self._backend = None
+            self._drop_bridge()
             await shell.stop()  # idempotent
             return
         # Off the critical path: the first turn then pays no cold start (ORT/RKNN/TRT).
@@ -518,11 +514,21 @@ class VoiceChannel(BaseChannel):
                 "+".join(lang for lang in langs if lang) or "language unknown",
             )
         self._voice_context = _voice_context_blocks(self._stt, tts, self.config.context)
-        # `context` is unbounded and the per-turn cost is invisible: say it once.
-        self.logger.info(
-            "voice context: {} words ride every published utterance",
-            sum(len(block.content.split()) for block in self._voice_context),
+        self._context_bridge = register_bridge(
+            self.name, self.config.chat_id, self._voice_context
         )
+        if tool_created():
+            # `context` is unbounded and the per-turn cost is invisible: say it once.
+            self.logger.info(
+                "voice context: {} words ride every published utterance (voice_context tool)",
+                sum(len(block.content.split()) for block in self._voice_context),
+            )
+        else:
+            self.logger.warning(
+                "voice_context bridge tool is not registered with the agent loop "
+                "(nanobot.tools entry point not visible?): NO voice context reaches "
+                "the model; reinstall the plugin so the gateway sees its entry points"
+            )
         # A raw-PCM TTS (MMS, openai with audioFormat=pcm) streams gaplessly through one
         # persistent player, no per-chunk aplay spawn; WAV-only adapters keep blob mode.
         pcm_capable = tts is not None and getattr(tts, "output_rate", None) is not None
@@ -906,8 +912,16 @@ class VoiceChannel(BaseChannel):
                     ),
                 )
 
+    def _drop_bridge(self) -> None:
+        """Stop serving context for this channel instance. Identity-checked, so a late
+        teardown never removes a restarted channel's fresh bridge."""
+        if self._context_bridge is not None:
+            unregister_bridge(self.name, self.config.chat_id, self._context_bridge)
+            self._context_bridge = None
+
     async def stop(self) -> None:
         self._running = False
+        self._drop_bridge()
         await cancel_and_wait(self._metrics_task)
         self._metrics_task = None
         await cancel_and_wait(self._warmup_task)
@@ -951,32 +965,24 @@ class VoiceChannel(BaseChannel):
     ) -> None:
         """Publish a captured utterance tagged with the turn it opens: core echoes inbound
         metadata onto that turn's final send, so ``send`` can tell the live turn's reply
-        from a barged-out one's straggler. Every spoken turn is stamped with the current
-        time — the turn path only, so a delegated cloud request stays clean."""
-        await self._publish_user_text(
-            text, metadata={TURN_META: turn_token}, notes=(_time_note(), *notes)
-        )
+        from a barged-out one's straggler. Event notes are stashed on the context bridge
+        under the token (the provider pops them at resolve, adding the fresh time stamp),
+        so metadata carries only JSON-plain values: tools snapshot it verbatim, and cron
+        persists that snapshot — the turn path only, so a delegated cloud request stays
+        clean. The user row stays pure speech either way; display/consolidation strip
+        runtime context."""
+        if self._context_bridge is not None:
+            self._context_bridge.stash_notes(turn_token, notes)
+        await self._publish_user_text(text, metadata={TURN_META: turn_token})
 
     async def _publish_user_text(
-        self,
-        text: str,
-        metadata: dict[str, Any] | None = None,
-        notes: tuple[str, ...] = (),
+        self, text: str, metadata: dict[str, Any] | None = None
     ) -> None:
-        meta = dict(metadata or {})
-        # Per turn, not once per session (compaction can drop an older copy, with no
-        # signal here to notice). Event notes join as their own block on a fresh list:
-        # the user row stays pure speech; display/consolidation strip runtime context.
-        blocks = list(self._voice_context)
-        if notes:
-            blocks.append(RuntimeContextBlock(source="voice", content="\n".join(notes)))
-        if blocks:
-            meta[RUNTIME_CONTEXT_INPUT_META] = blocks
         await self._handle_message(
             sender_id=self.config.sender_id,
             chat_id=self.config.chat_id,
             content=text,
-            metadata=meta or None,
+            metadata=metadata or None,
             is_dm=False,
         )
 
