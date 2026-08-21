@@ -673,3 +673,65 @@ def test_send_traffic_feeds_the_deadman():
         assert h.backend._cur_turn.last_activity == 0.0
 
     _run(_t())
+
+
+def test_agent_initiated_sends_mark_the_turn_proactive():
+    # cron/trigger turns copy their trigger stamp onto every outbound (core echoes
+    # inbound metadata); the channel must mark the playback turn before speaking so
+    # the settle re-opens attention. Ordinary finals must not.
+    async def _t():
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+
+        h = _build()
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = h.backend
+        spoken: list[str] = []
+
+        async def _speak(text: str) -> None:
+            spoken.append(text)
+
+        h.backend.speak_final = _speak  # type: ignore[method-assign]
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="Stretch now.",
+            metadata={"_cron_trigger": {"job_id": "x", "job_name": "stretch"}},
+        ))
+        assert spoken == ["Stretch now."]
+        assert h.backend._cur_turn.proactive is True
+        h.backend._cur_turn.proactive = False
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="Plain reply.",
+            metadata={},
+        ))
+        assert spoken[-1] == "Plain reply."
+        assert h.backend._cur_turn.proactive is False
+
+    _run(_t())
+
+
+def test_agent_initiated_deltas_mark_the_turn_proactive():
+    async def _t():
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+
+        h = _build()
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = h.backend
+        deltas: list[str] = []
+
+        async def _on_delta(delta: str, stream_id=None) -> None:
+            deltas.append(delta)
+
+        h.backend.on_delta = _on_delta  # type: ignore[method-assign]
+        await channel.send_delta(
+            channel.config.chat_id, "Reminder: ",
+            {"_local_trigger": {"trigger_id": "t1"}},
+            stream_id="voice:voice:local:1:0",
+        )
+        assert deltas == ["Reminder: "]
+        assert h.backend._cur_turn.proactive is True
+
+    _run(_t())

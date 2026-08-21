@@ -402,6 +402,7 @@ class _Turn:
         "segment_spoke", "prologue_task", "midturn_task", "timeout_task", "base",
         "last_activity", "dead", "token", "audible_at", "continuation_pending",
         "md_counted", "md_carry", "segment_first",
+        "spoke_text", "emitted_audio", "fallback_done", "proactive",
     )
 
     def __init__(self, token: str = ""):
@@ -429,6 +430,15 @@ class _Turn:
         # when the segment turns out to be the answer-bearing one (non-resuming end) —
         # the same opener BEFORE a tool call is a legitimate status line.
         self.segment_first: str | None = None
+        # Audibility ledger for the unvoiced-final fallback: text was enqueued, audio
+        # actually came out, the fallback already spoke. speak_final resets the trio
+        # (the IDLE placeholder is shared across unsolicited deliveries).
+        self.spoke_text = False
+        self.emitted_audio = False
+        self.fallback_done = False
+        # Agent-initiated delivery (cron/trigger metadata on its sends): its settle
+        # re-opens sentence attention so the user can answer without a re-wake.
+        self.proactive = False
 
     @classmethod
     def idle(cls) -> _Turn:
@@ -2503,8 +2513,13 @@ class LocalBackend(TurnEventMixin):
             VoiceState.SPEAKING, VoiceState.THINKING,
         )
         if settled and self._canned_base is None:
-            if self._wake_attention != "sentence" or self._reply_asked_question():
+            if (
+                self._wake_attention != "sentence"
+                or self._reply_asked_question()
+                or self._cur_turn.proactive  # the machine spoke first: invite a reply
+            ):
                 self._touch_wake()
+            self._cur_turn.proactive = False  # consumed; the placeholder is shared
         await super()._set_turn(state)
         if settled:
             # AFTER the flip: a watcher spawned here must see IDLE, or it
@@ -2961,6 +2976,12 @@ class LocalBackend(TurnEventMixin):
         never a long-running tool between segments."""
         self._cur_turn.last_activity = time.monotonic()
 
+    def note_proactive(self) -> None:
+        """This delivery is agent-initiated (cron/trigger metadata on its sends): its
+        settle re-opens sentence attention, so "snooze it" needs no re-wake after a
+        reminder speaks. Sticky until the settle consumes it (see _set_turn)."""
+        self._cur_turn.proactive = True
+
     async def on_delta(self, delta: str, stream_id: str | None = None) -> None:
         """A streamed assistant text chunk (``_stream_delta``)."""
         if not delta:
@@ -3040,9 +3061,20 @@ class LocalBackend(TurnEventMixin):
         turn.md_carry = probe[-_MD_CARRY:]
 
     async def speak_final(self, text: str) -> None:
-        """A non-streamed final assistant message (streaming disabled / fallback)."""
+        """A non-streamed final assistant message (streaming disabled / fallback /
+        an unsolicited delivery — cron reply, message-tool send)."""
         self._cancel_prologue()
         self._cancel_midturn()
+        # A final while a stream segment is open means that stream died without its
+        # end marker (core's delivery.fail sends the apology but never closes the
+        # stream) or the send is out-of-band: the buffered partial must not glue
+        # onto this text. Discard it.
+        self._chunker.flush()
+        # This send is its own delivery: the audibility ledger restarts (the IDLE
+        # placeholder is shared across unsolicited deliveries, so stale latches
+        # would swallow or double the fallback).
+        turn = self._cur_turn
+        turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
         self._note_reply_markdown(text)
         if _opens_with_wait_phrase(text):  # the whole message IS the delivery
             self._metrics.count("reply_wait_phrase")
@@ -3066,6 +3098,7 @@ class LocalBackend(TurnEventMixin):
     def _tts_enqueue(self, text: str) -> None:
         if not text:
             return
+        self._cur_turn.spoke_text = True  # text went in; the fallback checks audio came out
         if self._cur_turn.chunk_await and self._cur_turn.published_at:
             self._cur_turn.chunk_await = False
             self._metrics.observe(
@@ -3296,6 +3329,7 @@ class LocalBackend(TurnEventMixin):
         # reply's tail ages out mid-playback and reads back as user speech.
         self._echo.note_spoken(text, hold_ms=self._sink.backlog_ms() + dur_ms)
         self._reply_tail = text  # the LAST segment judges sentence-attention's "?"
+        self._cur_turn.emitted_audio = True  # the unvoiced-final fallback stands down
         await self._emit(self._audio_event(epoch, audio))
         return True
 
@@ -3927,6 +3961,26 @@ class LocalBackend(TurnEventMixin):
         try:
             if not await self._settle(epoch):
                 return  # barge-in started a new turn; it owns the state now
+            turn = self._cur_turn
+            if (
+                turn.spoke_text
+                and not turn.emitted_audio
+                and not turn.fallback_done
+                and self._tts is not None
+            ):
+                # Every chunk died before the speaker (speakability guard on an
+                # English core error over a monolingual voice, a degraded synth):
+                # the user must not read the silence as "no answer". timeoutPhrase
+                # doubles as the audible failure notice — localize them together.
+                turn.fallback_done = True
+                self._metrics.count("final_unvoiced_fallback")
+                self._log.warning(
+                    "reply text produced no audible audio (unspeakable for this "
+                    "voice?); speaking the fallback notice"
+                )
+                self._tts_enqueue(self._cfg.timeout_phrase)
+                if not await self._settle(epoch):
+                    return
             # Turn over: never carry a duck/pause (or a candidate whose target is gone) into
             # the next one. The VAD floor stays scaled, as in _do_interrupt.
             self._sink.restore_playback()

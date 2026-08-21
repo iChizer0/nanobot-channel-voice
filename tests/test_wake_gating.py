@@ -1941,3 +1941,29 @@ def test_attention_cue_fires_at_settle_with_window_zero():
             await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())
+
+
+# ---- agent-initiated deliveries (cron/trigger) re-open attention -------------
+
+
+def test_proactive_delivery_reopens_sentence_attention():
+    """A reminder speaking is the MACHINE opening the conversation: after its
+    settle the user answers ("snooze it") without a re-wake, statement or not.
+    An ordinary statement reply keeps spending the window as before."""
+
+    async def _case():
+        import time as _time
+
+        async with EvalConversation(**_wake("strict", attention="sentence")) as conv:
+            conv.backend.note_proactive()  # the channel saw _cron_trigger metadata
+            await conv.agent_replies("Time for your meeting.")  # no question mark
+            await conv.wait_state(VoiceState.IDLE)
+            assert conv.backend._wake_until > _time.monotonic()  # window open
+            # The flag was consumed at the settle: a normal statement reply spends
+            # the window again (sentence semantics unchanged for user-initiated turns).
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.agent_replies("Once upon a time, the end.")
+            await conv.wait_state(VoiceState.IDLE)
+            assert conv.backend._wake_until <= _time.monotonic()
+
+    _run(_case())

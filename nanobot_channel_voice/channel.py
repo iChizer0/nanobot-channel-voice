@@ -149,6 +149,14 @@ def _speakable(msg: OutboundMessage) -> bool:
     return not any(meta.get(k) for k in _TRACE_META)
 
 
+def _agent_initiated(metadata: dict[str, Any] | None) -> bool:
+    """An agent-initiated delivery: a cron or local-trigger turn copies its trigger
+    stamp onto every outbound (core echoes inbound metadata verbatim). The user did
+    not just speak, so its settle must re-open attention for the reply."""
+    meta = metadata or {}
+    return bool(meta.get("_cron_trigger") or meta.get("_local_trigger"))
+
+
 def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: bool) -> str:
     """The realtime session's instructions: persona (taste) then the mode's tool rules
     (contract). ONE derivation, so a ``realtime.persona`` override can restyle the voice
@@ -1044,6 +1052,8 @@ class VoiceChannel(BaseChannel):
             return  # a killed turn's late final; a superseded-but-live turn still speaks
         text = (msg.content or "").strip()
         if text:
+            if _agent_initiated(meta):
+                local.note_proactive()
             await local.speak_final(text)
 
     async def send_delta(
@@ -1075,6 +1085,11 @@ class VoiceChannel(BaseChannel):
         local = self._local()
         if local is None:
             return
+        if _agent_initiated(metadata):
+            # A cron/trigger turn streaming into this chat: mark before the delta plays
+            # so the settle re-opens attention (the fire-time turn echoes its trigger
+            # metadata on every stream event).
+            local.note_proactive()
         if stream_end:
             await local.on_stream_end(resuming=resuming, stream_id=stream_id)
         else:

@@ -235,3 +235,86 @@ def test_pause_probe_acquits_leak_and_the_reply_survives():
             assert c.texts() == ["tell me about tokyo"]  # the leak published nothing
 
     _run(_case())
+
+
+# ---- silence-proofing (P2): the user must never read silence as "no answer" --
+
+
+def test_unvoiced_final_speaks_the_fallback_notice():
+    """Every chunk of a final can die before the speaker (the speakability guard
+    on an English core error over a monolingual voice, a degraded synth): the
+    drain then speaks timeoutPhrase instead of settling silently."""
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.tts.base import TtsAdapter
+
+    fallback = VoiceConfig().timeout_phrase
+
+    class _MuteTts(TtsAdapter):
+        output_rate = 16000
+
+        def __init__(self) -> None:
+            self.requests: list[str] = []
+
+        async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
+            return b""
+
+        async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            # The fallback enqueues the WHOLE phrase (never chunked); "voiced" marks
+            # the one ordinary reply this voice can speak.
+            if text == fallback or "voiced" in text:
+                return b"\x01\x00" * 1600
+            return b""  # everything else is unspeakable for this voice
+
+    async def _case():
+        async with EvalConversation() as c:
+            mute = _MuteTts()
+            c.backend._tts = mute
+            await c.user_says("do the thing")
+            await c.agent_replies("Error calling LLM: timed out after 300s")
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("final_unvoiced_fallback") == 1
+            assert fallback in mute.requests  # the notice was actually synthesized
+            # A voiced reply must not trip it (and fallback_done never leaks over).
+            await c.user_says("and again")
+            await c.agent_replies("This is voiced content.")
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("final_unvoiced_fallback") == 1
+
+    _run(_case())
+
+
+def test_dead_stream_residue_never_glues_onto_a_final():
+    """core's delivery.fail sends the apology but never closes the stream: the
+    chunker still holds the dead segment's partial, which must be discarded, not
+    prepended to the apology."""
+
+    class _RecordingTts:
+        output_rate = 16000
+
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.requests: list[str] = []
+
+        async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            return await self.inner.synthesize(text)
+
+        async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            return await self.inner.synthesize_pcm(text)
+
+    async def _case():
+        async with EvalConversation() as c:
+            rec = _RecordingTts(c.backend._tts)
+            c.backend._tts = rec
+            await c.user_says("question")
+            # A short delta stays buffered under the first-chunk floor; the stream
+            # then dies with no end marker (the core mid-stream exception gap).
+            await c.backend.on_delta("Partial ", stream_id="s:1000000000000000000:0")
+            await c.agent_replies("Sorry, I encountered an error.")
+            await c.wait_state(VoiceState.IDLE)
+            assert rec.requests  # the apology spoke
+            assert not any("Partial" in t for t in rec.requests)
+
+    _run(_case())
