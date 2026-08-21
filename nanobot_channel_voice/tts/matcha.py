@@ -37,7 +37,15 @@ _LANG_NAMES = {"english": "en", "chinese": "zh", "german": "de", "japanese": "ja
 
 
 # CJK terminators split anywhere; ASCII only before whitespace/end ("3.14" survives)
-_SENTENCE_SPLIT_RE = re.compile(r"(?:(?<=[。！？…])(?![。！？…])|(?<=[.!?])(?=\s|$))")
+# A closer after the terminator (。」 / 。") belongs to its sentence: splitting
+# before it strands a pause token at the next utterance's head. One trailing
+# closer is covered (fixed-width lookbehind); a longer run just fuses, never blips.
+_CLOSE_AFTER_TERM = re.escape("」』”’）】〉》\"')]}»")
+_SENTENCE_SPLIT_RE = re.compile(
+    rf"(?:(?<=[。！？…])(?![。！？…{_CLOSE_AFTER_TERM}])"
+    rf"|(?<=[。！？…][{_CLOSE_AFTER_TERM}])(?![{_CLOSE_AFTER_TERM}])"
+    rf"|(?<=[.!?])(?=\s|$))"
+)
 _CLAUSE_SPLIT_RE = re.compile(r"([、，；：]|[,;:](?=\s|$))")
 _SENTENCE_PUNCT = ".!?…。！？"
 _LANG_SWITCH_RE = re.compile(r"\([a-z0-9-]+\)")  # espeak "(zh)" language-switch flags
@@ -92,6 +100,11 @@ def fold_punct_aliases(token2id: dict[str, int]) -> dict[str, int]:
         token2id.setdefault(";", token2id[","])
     if "." in token2id:
         token2id.setdefault("…", token2id["."])
+    # Corner brackets are quotes: same trained pause ids as “”, or 「你好」 pauses
+    # while “你好” does. Title marks (《》〈〉) stay OOV — a title reads continuously.
+    for corner, quote in (("「", "“"), ("」", "”"), ("『", "“"), ("』", "”")):
+        if quote in token2id:
+            token2id.setdefault(corner, token2id[quote])
     return token2id
 
 

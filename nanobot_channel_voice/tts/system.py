@@ -94,6 +94,7 @@ class SystemTtsAdapter(TtsAdapter):
         return b""
 
     async def _espeak_ng(self, exe: str, text: str, voice: str | None) -> bytes:
+        text = text.replace("・", " ")  # U+30FB: espeak names it and spells neighbors
         args = [exe, "--stdout"]  # absolute path: no second PATH scan in exec
         chosen = voice or self._language
         if chosen:

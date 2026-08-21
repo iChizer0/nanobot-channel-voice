@@ -45,6 +45,11 @@ def test_fold_punct_aliases_bridges_half_and_full_width():
     assert en["…"] == 10             # ellipsis reads as a full stop
     zh = fold_punct_aliases({"，": 2, "。": 3})
     assert zh[","] == 2 and zh["."] == 3 and zh["、"] == 2
+    # Corner brackets are quotes: 「你好」 must pause like “你好”, whichever quote
+    # spelling the table carries; title marks stay OOV (a title reads continuously).
+    q = fold_punct_aliases({'"': 5})
+    assert q["「"] == 5 and q["」"] == 5 and q["『"] == 5 and q["』"] == 5
+    assert "《" not in q and "〈" not in q
 
 
 def test_load_lexicon_first_spelling_wins_and_oov_phones_drop(tmp_path):
@@ -139,6 +144,19 @@ def test_espeak_ids_skip_unknown_phonemes_and_join_clauses():
 def test_espeak_sentences_split_on_final_punctuation():
     fe, t = _en_frontend({"hello": "h", "world": "w"})
     assert fe.sentences("hello. world.") == [[t["h"], t["."]], [t["w"], t["."]]]
+
+
+def test_sentences_keep_a_closer_with_its_terminator():
+    from nanobot_channel_voice.tts.matcha import _sentences
+
+    # Splitting before 」/" strands a pause token (post-alias-fold, a real id)
+    # at the next utterance's head; the split lands after the closer instead.
+    assert _sentences("他说「你好。」然后走了。") == [("他说「你好。」", ""), ("然后走了", "。")]
+    assert _sentences('他说"好。"继续。') == [('他说"好。"', ""), ("继续", "。")]
+    assert _sentences("他问「走吗？！」好。") == [("他问「走吗？！」", ""), ("好", "。")]
+    # A longer closer run fuses (never blips); plain sentences still split.
+    assert _sentences("问「走。」）x。") == [("问「走。」）x", "。")]
+    assert _sentences("你好。再见。") == [("你好", "。"), ("再见", "。")]
 
 
 def test_sentence_and_clause_splits_leave_numbers_intact():
@@ -766,6 +784,17 @@ def test_espeak_bundled_library_phonemizes():
     lib = espeak._load_library()
     ipa = espeak._library_phonemizer(lib, "en-us")("Hello world")
     assert "ə" in ipa or "ˈ" in ipa, ipa
+
+
+def test_espeak_phonemizer_scrubs_the_symbol_that_flips_spell_mode():
+    pytest.importorskip("espeakng_loader")
+    from nanobot_channel_voice.tts import espeak
+
+    # U+30FB makes espeak name the symbol AND letter-spell its neighbors
+    # ("t e s t japanesesymbol c a s e"); the public constructor folds it.
+    ipa = espeak.make_ipa_phonemizer("en-us")("test・case")
+    assert "sɪmbəl" not in ipa, ipa
+    assert len(ipa.split()) == 2, ipa  # two words, not nine spelled letters
 
 
 # ---- registry ---------------------------------------------------------------

@@ -63,7 +63,10 @@ def make_ipa_phonemizer(
         raise
     except Exception as exc:  # noqa: BLE001 - OSError/Timeout/ctypes: name the probe
         raise RuntimeError(f"espeak-ng probe failed ({exe or 'bundled library'}): {exc}") from exc
-    return phonemize
+    # U+30FB flips espeak into symbol naming + letter spelling ("t e s t
+    # japanesesymbol c a s e"); it is a word separator, so fold it to the one
+    # espeak understands. Line structure is preserved for batched callers.
+    return lambda text, _ph=phonemize: _ph(text.replace("・", " "))
 
 
 def _data_root(data_dir: str) -> str:

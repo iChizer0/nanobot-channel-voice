@@ -83,8 +83,30 @@ def test_terminator_at_buffer_end_waits_for_next_delta():
 
 
 def test_cjk_terminator_stands_alone():
+    # No following separator needed (unlike '.'), but at the buffer end it holds
+    # one delta: a closing 」/" may still arrive and belongs to this sentence.
     c = SentenceChunker(min_chars=60, max_chars=240)
-    assert c.feed("你好。") == ["你好。"]
+    assert c.feed("你好。") == []
+    assert c.feed("再见") == ["你好。"]
+    assert c.flush() == "再见"
+    c = SentenceChunker(min_chars=60, max_chars=240)
+    assert c.feed("你好。再见。") == ["你好。"]  # mid-buffer: cuts without waiting
+    assert c.flush() == "再见。"
+
+
+def test_closers_travel_with_their_sentence():
+    # Cutting at the terminator would orphan a silent 」/" at the next chunk's head.
+    c = SentenceChunker(min_chars=6, max_chars=240)
+    chunks = []
+    for delta in ("他说「你好", "。」", "然后走了。"):
+        chunks += c.feed(delta)
+    assert chunks == ["他说「你好。」"]
+    assert c.flush() == "然后走了。"
+    c = SentenceChunker(min_chars=6, max_chars=240)
+    assert c.feed('He said "stop." Next.') == ['He said "stop."']
+    # A CJK terminator run is one boundary, not a cut plus an orphaned "！" blip.
+    c = SentenceChunker(min_chars=4, max_chars=240)
+    assert c.feed("什么？！走吧。x") == ["什么？！", "走吧。"]
 
 
 def test_first_chunk_floor_cuts_earlier_then_steady_floor_applies():

@@ -14,7 +14,9 @@ import re
 # mid-stream tokens are not split); CJK terminators stand alone.
 _ASCII_TERM = ".!?…"
 _CJK_TERM = "。！？"
-_AFTER_TERM = "\"')]}»”’"
+# Closing punctuation after a terminator belongs to its sentence: cutting at the
+# terminator would orphan a 」/" at the head of the next chunk.
+_CLOSERS = "\"')]}»”’」』】）〉》"
 _SECONDARY = ",;:，、；："
 
 # Line-start anchored (<=3 spaces of indent), the same rule as the streaming fence
@@ -72,14 +74,23 @@ def sanitize(text: str) -> str:
 
 
 def _primary_cut(buf: str) -> int:
-    """Index of the first sentence boundary, or -1."""
+    """Index of the first sentence boundary (the terminator, extended over any
+    closer run), or -1. A terminator or closer run touching the buffer end holds
+    for the next delta to finish it; ``flush()`` covers stream end."""
     for i, ch in enumerate(buf):
-        if ch == "\n" or ch in _CJK_TERM:
+        if ch == "\n":
             return i
-        if ch in _ASCII_TERM:
-            nxt = buf[i + 1] if i + 1 < len(buf) else ""
-            if nxt and (nxt.isspace() or nxt in _AFTER_TERM):
-                return i
+        if ch not in _CJK_TERM and ch not in _ASCII_TERM:
+            continue
+        j = i + 1
+        # …over closers AND further CJK terminators: "？！" is one boundary, not
+        # a cut plus an orphaned "！" blip.
+        while j < len(buf) and (buf[j] in _CLOSERS or buf[j] in _CJK_TERM):
+            j += 1
+        if j == len(buf):
+            return -1
+        if ch in _CJK_TERM or j > i + 1 or buf[j].isspace():
+            return j - 1
     return -1
 
 
