@@ -74,27 +74,122 @@ def _clean_end(text: str, end: int) -> bool:
     return not (nxt.isalnum() or nxt == "_") or ord(nxt) >= _CJK_FLOOR
 
 
+# Skeleton alphabet: vowels/glides drop (vowel confusion dominates STT errors
+# on out-of-vocabulary names), doubles collapse, the first char survives.
+_SOFT = frozenset("aeiouyhw")
+
+
+def _skeleton(text: str) -> str:
+    # Collapse ADJACENT duplicates first ("ll"), THEN drop the soft chars:
+    # collapsing after the drop would fuse consonants that vowels separated
+    # ("nano" must stay "nn").
+    chars = [c for c in text.casefold() if "a" <= c <= "z"]
+    if not chars:
+        return ""
+    dedup = [chars[0]]
+    for c in chars[1:]:
+        if c != dedup[-1]:
+            dedup.append(c)
+    return dedup[0] + "".join(c for c in dedup[1:] if c not in _SOFT)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[-1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+class FuzzyWake:
+    """Head-of-utterance phonetic matcher for latin wake phrases the STT
+    mangles ("hey nanobot" -> "he nine obt": consonant skeletons match within
+    1 edit). STRIP-ONLY trust tier: callers consult it only for utterances
+    that already pass on other evidence — a fuzzy match must never open the
+    gate, so its worst false positive eats a name-like head from a turn that
+    was already ours. CJK phrases opt out (a zh-capable STT renders zh names
+    exactly; homophone drift is the alias layer's job), as do names whose
+    skeleton is under 4 chars (too collision-prone)."""
+
+    __slots__ = ("_keys",)
+
+    def __init__(self, phrases: Iterable[str]):
+        self._keys = []
+        for p in phrases:
+            toks = tokens_of(p)
+            if not toks or any(ord(c) >= _CJK_FLOOR for t in toks for c in t):
+                continue
+            key = _skeleton("".join(toks))
+            if len(key) >= 4:
+                self._keys.append((p, key, len(toks)))
+
+    def __bool__(self) -> bool:
+        return bool(self._keys)
+
+    def strip_head(self, text: str) -> tuple[str | None, str]:
+        """``(phrase, remainder)`` when leading words of *text* skeleton-match
+        a phrase — best distance wins, SMALLEST window on ties (a larger one
+        could absorb a soft-only content word: "...bot you"); ``(None, text)``
+        otherwise. Hesitation fillers may precede, like the exact tier ("um he
+        nine obt..."); they are consumed with the match. Runs on the raw text
+        so the remainder keeps its original spelling."""
+        words = list(re.finditer(r"\w+", text, re.UNICODE))
+        lead_max = 0
+        for m in words[:3]:
+            if m.group().casefold() in _LEAD_OK:
+                lead_max += 1
+            else:
+                break
+        best: tuple[int, int, str, int] | None = None  # (dist, k, phrase, end)
+        for lead in range(lead_max + 1):
+            for phrase, key, ptoks in self._keys:
+                collected = ""
+                for k, m in enumerate(words[lead: lead + ptoks + 2], 1):
+                    tok = m.group()
+                    if any(ord(c) >= _CJK_FLOOR for c in tok):
+                        break  # a CJK head is not a mangled latin name
+                    collected += tok
+                    skel = _skeleton(collected)
+                    d = _edit_distance(skel, key)
+                    if d == 0 or (d == 1 and min(len(skel), len(key)) >= 5):
+                        cand = (d, k, phrase, m.end())
+                        if best is None or cand < best:
+                            best = cand
+        if best is None:
+            return None, text
+        return best[2], _SEP_RE.sub("", text[best[3]:])
+
+
 class WakePhrase:
     """Compiled wake-phrase list; ``strip`` is the one hot call. Falsy when no
-    phrase survived tokenization (the gate then has no text tier)."""
+    phrase survived tokenization (the gate then has no text tier). An entry may
+    be ``(display, spelling)``: the SPELLING matches (an STT's mis-render of
+    the name), the DISPLAY is reported as ``matched`` — so an alias summons
+    still routes the ack by the phrase the user actually called."""
 
     __slots__ = ("_patterns",)
 
-    def __init__(self, phrases: Iterable[str]):
-        self._patterns = [
-            (
-                p,
-                re.compile(
-                    r"[\W_]*".join(re.escape(t) for t in toks),
-                    re.IGNORECASE | re.UNICODE,
-                ),
-            )
-            for p in phrases
+    def __init__(self, phrases: Iterable[str | tuple[str, str]]):
+        self._patterns = []
+        for entry in phrases:
+            display, spelling = (entry, entry) if isinstance(entry, str) else entry
             # casefold() folds what IGNORECASE's simple folding misses
             # (straße/STRASSE); identical variants dedupe via the set.
-            for toks in {tuple(tokens_of(p)), tuple(tokens_of(p.casefold()))}
-            if toks
-        ]
+            for toks in {
+                tuple(tokens_of(spelling)), tuple(tokens_of(spelling.casefold()))
+            }:
+                if toks:
+                    self._patterns.append((
+                        display,
+                        re.compile(
+                            r"[\W_]*".join(re.escape(t) for t in toks),
+                            re.IGNORECASE | re.UNICODE,
+                        ),
+                    ))
 
     def __bool__(self) -> bool:
         return bool(self._patterns)

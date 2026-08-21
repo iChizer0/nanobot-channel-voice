@@ -3,8 +3,8 @@
 A raw WebSocket client behind the :class:`VoiceBackend` contract. The same code drives
 every supplier speaking OpenAI's Realtime protocol (OpenAI, xAI, Azure GA sub-dialect;
 Alibaba Qwen-Omni, Zhipu GLM, StepFun beta) by reading a pure-data
-:class:`~.profiles.RealtimeProfile` for the bits that differ; see
-``DESIGN-realtime-providers.md``. The provider does ASR + reasoning + TTS in one session;
+:class:`~.profiles.RealtimeProfile` for the bits that differ.
+The provider does ASR + reasoning + TTS in one session;
 the plugin owns local mic capture + speaker playback and routes tool calls to nanobot.
 
 One rx task owns connect + receive + bounded reconnect; a separate sender task drains a
@@ -57,7 +57,7 @@ from .profiles import RealtimeProfile
 
 _SEND_Q_MAX = 64  # ~1.3s of 20ms frames; drop-oldest past this
 
-# Stop-command consume (transcript-gated; the cloud half of rd DESIGN-stop-commands.md).
+# Stop-command consume (transcript-gated; mirrors the local backend's stop consume).
 # Grace mirrors local's _KILL_GRACE_S: a second bare stop right after a consumed one is a
 # double-tap, not a new turn. The suppress window covers transcripts that land BEFORE the
 # server creates the response answering them — that response is cancelled at creation;

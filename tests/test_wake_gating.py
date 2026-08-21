@@ -881,7 +881,11 @@ def test_same_breath_command_suppresses_the_fast_ack():
     _run(_case())
 
 
-def test_half_duplex_cold_summon_acks_at_the_verdict_not_early():
+def test_half_duplex_cold_summon_acks_at_the_close_not_mid_capture():
+    """No SPEAKING flip while the summon utterance is OPEN (it would gate the
+    mic mid-capture) — but at the close that argument is void, so the ack
+    speaks during the STT wait instead of after the verdict."""
+
     async def _case():
         det = _ScriptDetector()
         async with EvalConversation(
@@ -895,10 +899,12 @@ def test_half_duplex_cold_summon_acks_at_the_verdict_not_early():
             conv.vad.flag = False
             await _push_frames(conv, 13)
             await asyncio.sleep(0.45)
-            # No early SPEAKING flip: it would gate the mic mid-capture.
+            # Utterance still open: no probe runs in half-duplex.
             assert conv.counter("wake_ack_fast") == 0
             await _close_utterance(conv)
-            await _until(lambda: conv.counter("wake_ack") == 1)
+            await _until(lambda: conv.counter("wake_ack_fast") == 1)
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_ack") == 1  # the rung did NOT double-ack
 
     _run(_case())
 
@@ -925,5 +931,863 @@ def test_fast_ack_is_not_self_paused_in_pause_mode():
             assert conv.counter("barge_in_duck") == 0  # no self-pause
             await _close_utterance(conv)
             await conv.wait_state(VoiceState.IDLE)  # the ack drained on its own
+
+    _run(_case())
+
+
+# ---- repeat summons ----------------------------------------------------------
+
+
+def test_double_call_is_a_bare_summon():
+    """The universal double-call habit ("小娜小娜"): pre-fix, the second phrase
+    leaked to the agent as content."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot hey nanobot")
+            assert conv.texts() == []
+            assert conv.counter("wake_only") == 1
+            await _until(lambda: conv.counter("wake_ack") == 1)
+
+    _run(_case())
+
+
+def test_repeated_phrase_strips_to_the_command():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot hey nanobot what time is it")
+            assert conv.texts() == ["what time is it"]
+
+    _run(_case())
+
+
+def test_repeated_zh_phrase_strips_fused():
+    async def _case():
+        async with EvalConversation(**_wake("gate", phrases=["小娜"])) as conv:
+            await conv.user_says("小娜小娜今天天气")
+            assert conv.texts() == ["今天天气"]
+            await conv.user_says("小娜，小娜")  # separated repeat, window open
+            assert conv.texts() == ["今天天气"]
+            assert conv.counter("wake_only") == 1
+
+    _run(_case())
+
+
+def test_clitic_bound_repeat_stays_content():
+    async def _case():
+        async with EvalConversation(**_wake("gate", phrases=["nanobot"])) as conv:
+            await conv.user_says("nanobot nanobot's cool")
+            assert conv.texts() == ["nanobot's cool"]
+
+    _run(_case())
+
+
+def test_resummon_during_thinking_keeps_the_query():
+    """The "are you there?" check while the agent works: pre-fix it /stopped
+    the in-flight turn and manufactured a false cut-short note."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            assert conv.texts() == ["what's the weather"]
+            await conv.user_says("hey nanobot")  # anxious re-summon, THINKING
+            assert conv.interrupts == 0
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_reassure") == 1
+            await _until(lambda: VoiceState.SPEAKING in conv.states)  # the clip
+            await conv.wait_state(VoiceState.THINKING)  # back beneath it
+            await conv.agent_replies("here is the weather")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("thanks")
+            assert conv.texts()[-1] == "thanks"
+            assert conv.notes()[-1] == ()  # no false "cut your reply" note
+
+    _run(_case())
+
+
+def test_resummon_during_thinking_prefers_the_prologue_filler():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 60000, "phrases": ["on it"]},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.user_says("hey nanobot")
+            assert conv.interrupts == 0
+            await _until(lambda: conv.counter("prologue_filler") == 1)
+            await asyncio.sleep(0.05)
+            assert conv.counter("wake_ack") == 0  # the filler IS the reassure
+
+    _run(_case())
+
+
+def test_resummon_during_thinking_without_canned_audio_is_silent_but_safe():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.user_says("hey nanobot")
+            assert conv.interrupts == 0
+            assert conv.counter("wake_reassure") == 1
+            assert VoiceState.SPEAKING not in conv.states  # nothing to say
+            await conv.agent_replies("here is the weather")  # query survived
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_acoustic_resummon_during_thinking_keeps_the_query():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=4, det=det)
+            await _close_utterance(conv)
+            assert conv.interrupts == 0
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_reassure") == 1
+            await conv.agent_replies("here is the weather")
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_resummon_during_playing_filler_lets_it_finish():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 0, "phrases": ["y" * 400]},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler, ~2.4 s
+            await conv.user_says("hey nanobot")  # over the playing filler
+            assert conv.interrupts == 0
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_reassure") == 0  # the filler speaks
+            assert conv.counter("prologue_filler") == 1
+
+    _run(_case())
+
+
+def test_half_duplex_tap_over_filler_keeps_the_query():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, aec="auto", playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 0, "phrases": ["y" * 400]},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler gates the mic
+            det.fire = True
+            await conv.backend.push_gated_audio(_FRAME)
+            assert conv.backend._turn is VoiceState.THINKING  # flushed, not killed
+            assert conv.interrupts == 0
+            assert conv.counter("wake_kill") == 0
+            await conv.agent_replies("here is the weather")
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_wake_during_reply_over_own_speech_still_kills():
+    """The floor-taking contract is untouched: a summon over an AUDIBLE reply
+    still kills it (test_wake_during_reply_kills_acks_and_still_notes covers
+    the verdict path; this pins the base-resolution refactor)."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await _speaking_reply(conv)
+            det.fire = True
+            await conv.backend.push_audio(_FRAME)  # hit, no utterance open
+            await _until(lambda: conv.interrupts == 1)
+            assert conv.counter("wake_kill") == 1
+
+    _run(_case())
+
+
+# ---- fast-ack robustness -----------------------------------------------------
+
+
+def test_fast_ack_fires_at_late_quiet():
+    """Quiet that misses the single probe instant but lands moments later:
+    pre-fix the one-shot probe fell all the way back to the verdict ack."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)
+            conv.vad.flag = False
+            await _push_frames(conv, 8)   # 160 ms: under the 240 ms quiet bar
+            await asyncio.sleep(0.4)      # the old single-shot instant passes
+            assert conv.counter("wake_ack_fast") == 0
+            await _push_frames(conv, 5)   # 260 ms total: quiet NOW
+            await _until(lambda: conv.counter("wake_ack_fast") == 1, timeout=2.0)
+            await _close_utterance(conv)
+            assert conv.counter("wake_ack") == 1
+
+    _run(_case())
+
+
+def test_close_ack_catches_the_short_hangover_summon():
+    """A hangover shorter than the probe's grace kills the claim before any
+    poll: the at-close hook is the catch."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            vad={"hangoverMs": 100},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)
+            await _close_utterance(conv)
+            await _until(lambda: conv.counter("wake_ack_fast") == 1)
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_ack") == 1
+
+    _run(_case())
+
+
+def test_close_ack_skips_the_long_command():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, **_wake("gate", ack={"enabled": True}),
+        ) as conv:
+            conv._stt.append("what time is it")
+            conv.vad.flag = True
+            await _push_frames(conv, 75, fire_at=8, det=det)  # 1.5 s of speech
+            await _close_utterance(conv)
+            assert conv.texts() == ["what time is it"]
+            await asyncio.sleep(0.05)
+            assert conv.counter("wake_ack") == 0
+
+    _run(_case())
+
+
+# ---- text-tier fast path -----------------------------------------------------
+
+
+class _ScriptedPartialHandle:
+    def __init__(self, owner):
+        self._owner = owner
+
+    def accept(self, frame: bytes) -> None:
+        pass
+
+    def partial(self) -> str:
+        return self._owner.partial_text
+
+    def finish(self) -> str:
+        return self._owner.finish_text
+
+
+class _ScriptedPartialStt:
+    streaming = True
+
+    def __init__(self):
+        self.partial_text = ""
+        self.finish_text = "hey nanobot"
+
+    def stream_start(self) -> _ScriptedPartialHandle:
+        return _ScriptedPartialHandle(self)
+
+
+def test_cold_partial_wake_latches_the_text_tier_fast_ack():
+    """No acoustic tier: the phrase leading a streaming partial is the only
+    pre-verdict wake evidence — with the ack on it must arm the fast path."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            stt = _ScriptedPartialStt()
+            conv.backend._stt_stream = stt
+            conv.backend._threaded_hop = True  # streaming implies it in real builds
+            conv.vad.flag = True
+            await _push_frames(conv, 4)
+            stt.partial_text = "hey nanobot"
+            await _push_frames(conv, 8)  # next ~100 ms partial poll latches
+            assert conv.backend._wake_claimed
+            conv.vad.flag = False
+            await _push_frames(conv, 13)
+            await _until(lambda: conv.counter("wake_ack_fast") == 1, timeout=2.0)
+            await _close_utterance(conv)
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_ack") == 1
+
+    _run(_case())
+
+
+async def _done_task(text: str) -> asyncio.Task:
+    async def _ret() -> str:
+        return text
+
+    task = asyncio.get_running_loop().create_task(_ret())
+    await task
+    return task
+
+
+def test_eager_bare_phrase_latches_the_text_tier_fast_ack():
+    """Batch STT twin: a speculation decoding to the BARE phrase latches at the
+    pause, so the ack speaks before the final decode."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            conv._stt.append("hey nanobot")  # the close's own decode
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            task = await _done_task("hey nanobot")
+            conv.backend._eager_task = task
+            conv.backend._eager_valid = True
+            conv.backend._eager_confirm_cb(task)
+            assert conv.backend._wake_claimed
+            conv.vad.flag = False
+            await _push_frames(conv, 13)
+            await _until(lambda: conv.counter("wake_ack_fast") == 1, timeout=2.0)
+            await _close_utterance(conv)
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_ack") == 1
+
+    _run(_case())
+
+
+def test_eager_command_never_latches_the_cold_claim():
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", ack={"enabled": True}),
+        ) as conv:
+            conv._stt.append("what time is it")
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            task = await _done_task("what time is it")
+            conv.backend._eager_task = task
+            conv.backend._eager_valid = True
+            conv.backend._eager_confirm_cb(task)
+            assert not conv.backend._wake_claimed  # not bare: no latch
+            await _close_utterance(conv)
+            assert conv.texts() == []  # still gated (no wake evidence)
+            assert conv.counter("wake_gated") == 1
+
+    _run(_case())
+
+
+# ---- cold echo veto ----------------------------------------------------------
+
+
+def test_cold_hit_off_the_own_reply_tail_is_vetoed():
+    """The bot just SAID the phrase and the reply drained to IDLE: a detector
+    hit off the tail/reverb must not claim, open the window, or fast-ack."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            await conv.user_says("hey nanobot tell me how to call you")
+            await conv.agent_replies("just say hey nanobot to wake me")
+            await conv.wait_state(VoiceState.IDLE)
+            wake_until = conv.backend._wake_until
+            det.fire = True
+            await conv.backend.push_audio(_FRAME)  # cold hit, echo window hot
+            assert conv.counter("wake_echo_suppressed") == 1
+            assert not conv.backend._wake_claimed
+            assert conv.backend._wake_until == wake_until  # window untouched
+            await asyncio.sleep(0.45)
+            assert conv.counter("wake_ack") == 0
+
+    _run(_case())
+
+
+# ---- STT mis-render robustness (aliases, calibration, fuzzy strip) -----------
+
+
+def test_alias_config_wakes_and_strips():
+    """Measured: the zh-en zipformer renders "hey nanobot" as 嘿难道爸 — an
+    alias is a first-class spelling of the phrase."""
+
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", aliases=["嘿难道爸"])
+        ) as conv:
+            await conv.user_says("嘿难道爸")
+            assert conv.texts() == []
+            assert conv.counter("wake_only") == 1
+            await conv.user_says("嘿难道爸今天天气")
+            assert conv.texts() == ["今天天气"]
+
+    _run(_case())
+
+
+def test_fuzzy_strip_scrubs_the_mangled_name_inside_the_window():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot hello")
+            await conv.agent_replies("hi there")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("he nine obt turn on the lights")
+            assert conv.texts()[-1] == "turn on the lights"
+            assert conv.counter("wake_fuzzy_strip") == 1
+
+    _run(_case())
+
+
+def test_fuzzy_bare_mangle_is_a_summons():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot hello")
+            await conv.agent_replies("hi there")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("he nine ought")  # mangled bare re-summon
+            assert conv.texts() == ["hello"]  # nothing new published
+            assert conv.counter("wake_only") == 1
+
+    _run(_case())
+
+
+def test_fuzzy_never_opens_the_gate():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("he nine obt turn on the lights")  # cold
+            assert conv.texts() == []
+            assert conv.counter("wake_gated") == 1
+            assert conv.counter("wake_fuzzy_strip") == 0
+
+    _run(_case())
+
+
+def test_fuzzy_never_unlocks_strict():
+    async def _case():
+        async with EvalConversation(**_wake("strict")) as conv:
+            await _speaking_reply(conv)
+            await conv.user_says("he nine obt stop it now")
+            assert conv.interrupts == 0
+            assert conv.counter("wake_gated") == 1
+
+    _run(_case())
+
+
+def test_fuzzy_strip_under_an_acoustic_claim():
+    """The trim missed (late hit) and the mangled name reached STT: the claim
+    licenses the fuzzy scrub."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            conv._stt.append("he nine obt what time is it")
+            conv.vad.flag = True
+            await _push_frames(conv, 20, fire_at=4, det=det)
+            await _close_utterance(conv)
+            assert conv.texts() == ["what time is it"]
+            assert conv.counter("wake_fuzzy_strip") == 1
+
+    _run(_case())
+
+
+def test_calibration_learns_the_stt_render():
+    async def _case():
+        async with EvalConversation(
+            stt={"provider": "zipformer"}, **_wake("gate")
+        ) as conv:
+            # calibration decodes: silence floor, then the two clip shapes
+            conv._stt.extend(["", "he nine obt", "he nine obt"])
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 1
+            # the learned alias is a full spelling: it WAKES from cold
+            await conv.user_says("he nine obt what time is it")
+            assert conv.texts() == ["what time is it"]
+
+    _run(_case())
+
+
+def test_calibration_rejects_floor_and_stop_renders():
+    async def _case():
+        async with EvalConversation(
+            stt={"provider": "zipformer"}, **_wake("gate")
+        ) as conv:
+            # a decode equal to the silence floor is hallucination, not a render
+            conv._stt.extend(["thank you", "thank you", "thank you"])
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 0
+            # a stop-shaped render must never become a wake alias
+            conv._stt.extend(["", "stop", "stop"])
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 0
+            # a floor VARIANT (prefix cousin) is still hallucination
+            conv._stt.extend(
+                ["thank you", "thank you for watching", "thank you for watching"]
+            )
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 0
+            # a short common latin word must never become a wake
+            conv._stt.extend(["", "you", "you"])
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 0
+
+    _run(_case())
+
+
+def test_calibration_skips_the_delegated_transcriber():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:  # provider "nanobot"
+            conv._stt.extend(["", "he nine obt", "he nine obt"])
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 0  # may bill: never probed
+            assert list(conv._stt)  # nothing was consumed
+
+    _run(_case())
+
+
+# ---- sentence attention (wake.attention="sentence") --------------------------
+
+
+def test_sentence_attention_spends_the_window_on_publish():
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", attention="sentence")
+        ) as conv:
+            await conv.user_says("hey nanobot what time is it")
+            await conv.agent_replies("It is noon.")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("and in tokyo")  # cold: the summon was spent
+            assert conv.texts() == ["what time is it"]
+            assert conv.counter("wake_gated") == 1
+            await conv.user_says("hey nanobot and in tokyo")
+            assert conv.texts()[-1] == "and in tokyo"
+
+    _run(_case())
+
+
+def test_sentence_attention_bare_summon_grants_one_sentence():
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", attention="sentence")
+        ) as conv:
+            await conv.user_says("hey nanobot")
+            await conv.user_says("turn on the lights")  # the granted sentence
+            assert conv.texts() == ["turn on the lights"]
+            await conv.agent_replies("Done.")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("and the fan")  # needs a fresh summon
+            assert conv.texts() == ["turn on the lights"]
+            assert conv.counter("wake_gated") == 1
+
+    _run(_case())
+
+
+def test_sentence_attention_reopens_for_the_agents_question():
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", attention="sentence")
+        ) as conv:
+            await conv.user_says("hey nanobot book a flight")
+            await conv.agent_replies("Which city do you mean?")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("beijing")  # the answer must pass cold
+            assert conv.texts()[-1] == "beijing"
+            await conv.agent_replies("Booked for Beijing.")
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("thanks a lot")  # statement reply: re-gated
+            assert conv.texts()[-1] == "beijing"
+            assert conv.counter("wake_gated") == 1
+
+    _run(_case())
+
+
+def test_learned_alias_summon_acks_in_the_called_language():
+    """The user said the ENGLISH name; the STT wrote 嘿难道爸. The ack must
+    follow the called name (canonical phrase), not the mis-render's script."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, stt={"provider": "zipformer"},
+            **_wake("gate", ack={"enabled": True}),
+        ) as conv:
+            conv._stt.extend(["", "嘿难道爸", "嘿难道爸"])
+            await conv.backend.learn_wake_aliases()
+            assert conv.counter("wake_alias_learned") == 1
+            await conv.user_says("嘿难道爸")
+            assert conv.counter("wake_only") == 1
+            await _until(lambda: conv.counter("wake_ack") == 1)
+            assert not any("在" in t for t in conv.backend._fillers)
+
+    _run(_case())
+
+
+# ---- ack pre-compute / cache coverage ----------------------------------------
+
+
+def test_prewarm_covers_the_crossover_ack():
+    """A mixed-script phrase set can route a summon to a builtin pool OUTSIDE
+    the resolved ack list; the first such ack must not pay synthesis inside
+    the very moment it masks."""
+
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", phrases=["hey nanobot", "小娜"], ack={"enabled": True}),
+        ) as conv:
+            await conv.backend.prewarm_canned()
+            cached = set(conv.backend._fillers)
+            assert "在呢。" in cached  # the zh crossover row, hot
+            assert any(t and ord(t[0]) < 0x2E80 for t in cached)  # the base list too
+
+    _run(_case())
+
+
+def test_synth_filler_bakes_the_blob_duck_once():
+    """Blob mode + duckDb: trims and the static attenuation live IN the cache,
+    so a cache-hit ack pays a dict lookup, not per-play thread hops."""
+
+    async def _case():
+        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes, wav_pcm
+        from nanobot_channel_voice.backend.audio_sink import (
+            scale_pcm, trim_lead_silence, trim_tail_silence,
+        )
+
+        async with EvalConversation(**_wake("gate", ack={"enabled": True})) as conv:
+            b = conv.backend
+            b._pcm_out = False  # blob mode: no mid-chunk gain control
+            raw = await b._tts.synthesize("hello there")
+            pcm, rate = wav_pcm(raw)
+            expect = pcm_to_wav_bytes(
+                scale_pcm(
+                    trim_tail_silence(
+                        trim_lead_silence(pcm, rate, cap_ms=20.0), rate, cap_ms=120.0
+                    ),
+                    b._duck_gain,
+                ),
+                rate,
+            )
+            baked = await b._synth_filler("hello there")
+            assert baked == expect
+            assert b._fillers["hello there"] == baked  # cached PLAYABLE
+
+    _run(_case())
+
+
+def test_canned_cache_trims_the_edge_silence():
+    """Model padding around a canned clip delays the audible ack and holds the
+    half-duplex mic gated after it (measured ~150 ms lead / 580-790 ms tail on
+    matcha): the cache stores the clip edge-trimmed to 20/120 ms caps."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate", ack={"enabled": True})) as conv:
+            b = conv.backend
+
+            def silence(ms: int) -> bytes:
+                return b"\x00\x00" * (16 * ms)
+
+            class _PaddedTts:
+                output_rate = 16000
+                spoken_language = None
+
+                async def synthesize_pcm(self, text, *, voice=None):
+                    return silence(500) + b"\x00\x40" * (16 * 200) + silence(700)
+
+            b._tts = _PaddedTts()
+            audio = await b._synth_filler("hi")
+            assert len(audio) == 2 * 16 * (20 + 200 + 120)
+
+    _run(_case())
+
+
+# ---- earcons: the "captured" receipt cue -------------------------------------
+
+
+def test_captured_earcon_dings_at_publish():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"captured": True},
+        ) as conv:
+            assert conv.backend._earcon_audio  # synthesized at init, no TTS call
+            await conv.user_says("hello there")
+            await _until(lambda: conv.counter("earcon_captured") == 1)
+            await _until(lambda: VoiceState.SPEAKING in conv.states)  # it played
+            await conv.wait_state(VoiceState.THINKING)  # and yielded back
+            await conv.agent_replies("hi")
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_earcon_stays_silent_for_gated_and_stop():
+    """Only ACCEPTED turns ding: a gated bystander must not learn the device
+    is live, and a consumed stop's acknowledgment IS the silence."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"captured": True}, **_wake("gate"),
+        ) as conv:
+            await conv.user_says("what time is it")  # cold: gated
+            await asyncio.sleep(0.05)
+            assert conv.counter("earcon_captured") == 0
+            await _speaking_reply(conv)  # publish (dings) + reply underway
+            assert conv.counter("earcon_captured") == 1
+            await conv.user_says("stop")  # consumed: silence is the ack
+            await asyncio.sleep(0.05)
+            assert conv.counter("earcon_captured") == 1
+
+    _run(_case())
+
+
+def test_earcon_skips_when_the_user_already_resumed():
+    async def _case():
+        async with EvalConversation(earcons={"captured": True}) as conv:
+            conv.vad.flag = True
+            for _ in range(6):
+                await conv.backend.push_audio(_FRAME)  # mid-utterance
+            await conv.backend._play_earcon(conv.backend._sink.epoch)
+            assert conv.counter("earcon_captured") == 0
+
+    _run(_case())
+
+
+def test_custom_earcon_file_loads_resamples_and_truncates(tmp_path):
+    async def _case():
+        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
+
+        short = tmp_path / "cue.wav"
+        short.write_bytes(pcm_to_wav_bytes(b"\x00\x40" * int(22050 * 0.3), 22050))
+        long_ = tmp_path / "long.wav"
+        long_.write_bytes(pcm_to_wav_bytes(b"\x00\x40" * (22050 * 2), 22050))
+
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(short)},
+        ) as conv:
+            audio = conv.backend._earcon_audio  # resampled 22.05k -> 16k
+            assert audio and abs(len(audio) - int(0.3 * 16000) * 2) <= 200
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(long_)},
+        ) as conv:
+            # a receipt cue must stay short: truncated to the 600 ms cap
+            assert len(conv.backend._earcon_audio) == 16000 * 2 * 600 // 1000
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(tmp_path / "missing.wav")},
+        ) as broken, EvalConversation(earcons={"captured": True}) as ref:
+            # unreadable file degrades loudly to the built-in
+            assert broken.backend._earcon_audio == ref.backend._earcon_audio
+
+    _run(_case())
+
+
+def test_earcon_gain_applies_at_build():
+    async def _case():
+        import array as _array
+
+        async with EvalConversation(
+            earcons={"captured": True, "gainDb": -12.0},
+        ) as quiet_conv, EvalConversation(earcons={"captured": True}) as ref:
+            quiet = max(abs(x) for x in _array.array("h", quiet_conv.backend._earcon_audio))
+            loud = max(abs(x) for x in _array.array("h", ref.backend._earcon_audio))
+            assert 0.22 <= quiet / loud <= 0.28  # -12 dB ~ 0.251
+
+    _run(_case())
+
+
+def test_custom_earcon_pad_trims_before_the_length_cap(tmp_path):
+    """A padded export (silence + tone + silence) must not spend the 600 ms
+    budget on the pads while the cut eats the tone: edge-trim runs first."""
+
+    async def _case():
+        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
+
+        rate = 16000
+        padded = tmp_path / "padded.wav"
+        padded.write_bytes(pcm_to_wav_bytes(
+            b"\x00\x00" * int(rate * 0.5)      # 500 ms lead pad
+            + b"\x00\x40" * int(rate * 0.3)    # 300 ms tone
+            + b"\x00\x00" * int(rate * 0.4),   # 400 ms tail pad
+            rate,
+        ))
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(padded)},
+        ) as conv:
+            audio = conv.backend._earcon_audio
+            # kept: 20 ms lead cap + the FULL tone + 120 ms tail cap
+            assert len(audio) == 2 * int(rate * (0.02 + 0.3 + 0.12))
+
+    _run(_case())
+
+
+def test_earcon_truncation_fades_the_cut(tmp_path):
+    """A >600 ms sound is cut mid-waveform: the cut must fade, not click."""
+
+    async def _case():
+        import array as _array
+
+        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
+
+        long_ = tmp_path / "long.wav"
+        long_.write_bytes(pcm_to_wav_bytes(b"\x00\x40" * (16000 * 2), 16000))
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(long_)},
+        ) as conv:
+            samples = _array.array("h", conv.backend._earcon_audio)
+            assert len(samples) == 16000 * 600 // 1000
+            assert samples[-160] > 8000  # 10 ms before the cut: still loud
+            assert abs(samples[-1]) < 200  # the cut itself lands at ~zero
+
+    _run(_case())
+
+
+def test_blob_mode_earcon_keeps_the_source_rate(tmp_path):
+    """Blob playback follows the WAV header, so a custom cue skips the lossy
+    linear resample and plays at its own rate."""
+
+    async def _case():
+        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes, wav_pcm
+
+        cue = tmp_path / "cue.wav"
+        cue.write_bytes(pcm_to_wav_bytes(b"\x00\x40" * 4410, 44100))
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(cue)},
+        ) as conv:
+            b = conv.backend
+            b._pcm_out = False
+            _, rate = wav_pcm(b._build_earcon())
+            assert rate == 44100
+
+    _run(_case())
+
+
+def test_oversized_earcon_file_degrades_to_the_builtin(tmp_path):
+    async def _case():
+        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
+
+        big = tmp_path / "big.wav"
+        big.write_bytes(pcm_to_wav_bytes(b"\x00\x40" * (16000 * 70), 16000))  # ~2.2 MB
+        async with EvalConversation(
+            earcons={"captured": True, "path": str(big)},
+        ) as conv, EvalConversation(earcons={"captured": True}) as ref:
+            assert conv.backend._earcon_audio == ref.backend._earcon_audio
 
     _run(_case())

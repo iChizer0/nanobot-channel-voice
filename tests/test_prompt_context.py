@@ -104,7 +104,7 @@ def test_context_permits_thinking_and_nudges_pre_tool_narration():
     assert "after the results" in block.content                # no premature answer
     assert "wait-phrases" in block.content                     # none in the delivery
     # The old suppressors must stay gone: they banned the intermediate tokens small
-    # non-reasoning models think with (REPORT-context-injection-review F4).
+    # non-reasoning models think with.
     assert "NOTHING else" not in block.content
     assert "pure answer" not in block.content
 

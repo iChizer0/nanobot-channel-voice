@@ -26,7 +26,7 @@ def test_sanitize_strips_markdown():
 def test_sanitize_drops_bracketed_placeholders_with_their_content():
     # The whitelist alone would drop only the brackets and SPEAK the words: a
     # clock-less model answered date questions with a literal "[Current Date and
-    # Time]" (see rd REPORT-context-injection-review addendum).
+    # Time]".
     assert sanitize("[Current Date and Time]").strip() == ""
     assert sanitize("It is [Current Date] today.").strip() == "It is today."
     assert sanitize("现在是【当前时间】。").strip() == "现在是 。"

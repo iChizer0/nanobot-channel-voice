@@ -521,7 +521,7 @@ def fold_degree_marks(text: str) -> str:
 #
 # A digit run reads as a SEQUENCE, not a quantity, when the surface form carries evidence
 # a cardinal cannot produce or a trigger word names it. Held out, the pair never read a
-# quantity as a sequence; a miss is just the cardinal reading. See rd REPORT-digit-reading.md.
+# quantity as a sequence; a miss is just the cardinal reading.
 
 _SEQ_MIN_BARE = 7  # conversational text does not state a 7-digit quantity ungrouped
 _SEQ_MIN_GLUE = 3  # shorter and letter-glued is a model name: COVID-19, gate B12

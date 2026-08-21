@@ -81,19 +81,56 @@ def trim_lead_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float 
     return pcm[(first - cap_samples) * 2:]
 
 
+def trim_tail_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float = 0.01) -> bytes:
+    """Cap the TRAILING silence of raw S16_LE PCM at ``cap_ms``.
+
+    The tail twin of ``trim_lead_silence``, for CANNED clips (acks, fillers):
+    playback holds the turn in SPEAKING — and the half-duplex mic gated — until
+    the padding drains too (measured 580-790 ms of model tail on matcha ack
+    phrases). Replies never take this: their chunk boundaries carry deliberate
+    pauses. An all-silent scan returns unchanged.
+    """
+    n = len(pcm) & ~1
+    if n == 0 or rate <= 0:
+        return pcm
+    thresh = threshold * 32767.0
+    if _np is not None:
+        x = _np.frombuffer(pcm[:n], dtype=_np.int16)
+        idx = _np.flatnonzero(_np.abs(x.astype(_np.int32)) > thresh)
+        last = int(idx[-1]) if idx.size else None
+    else:
+        samples = array.array("h")
+        samples.frombytes(pcm[:n])
+        last = None
+        for i in range(len(samples) - 1, max(-1, len(samples) - rate * 2 - 1), -1):
+            if abs(samples[i]) > thresh:
+                last = i
+                break
+    if last is None:
+        return pcm
+    end = last + 1 + int(rate * cap_ms / 1000.0)
+    if end * 2 >= n:
+        return pcm
+    return pcm[: end * 2]
+
+
 def scale_pcm(pcm: bytes, gain: float) -> bytes:
-    """Attenuate raw S16_LE PCM by linear ``gain`` (0..1)."""
-    if gain >= 1.0 or len(pcm) < 2:
+    """Scale raw S16_LE PCM by linear ``gain``; boosts saturate at full scale."""
+    if gain == 1.0 or len(pcm) < 2:
         return pcm
     if len(pcm) % 2:
         pcm = pcm[:-1]
     if _np is not None:
         # Per 20 ms block on the loop; the python loop is ~100x costlier on RK-class SoCs.
-        return (_np.frombuffer(pcm, dtype=_np.int16) * gain).astype(_np.int16).tobytes()
+        return (
+            _np.clip(_np.frombuffer(pcm, dtype=_np.int16) * gain, -32768.0, 32767.0)
+            .astype(_np.int16)
+            .tobytes()
+        )
     samples = array.array("h")
     samples.frombytes(pcm)
     for i in range(len(samples)):
-        samples[i] = int(samples[i] * gain)  # gain < 1 -> no clipping
+        samples[i] = max(-32768, min(32767, int(samples[i] * gain)))
     return samples.tobytes()
 
 

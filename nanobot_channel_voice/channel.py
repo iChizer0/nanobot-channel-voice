@@ -178,7 +178,7 @@ def _voice_context_blocks(
     into EVERY user row, so every word is paid on every turn's prefill for the whole
     session — keep the longest variant (unverified decoder + bilingual voice) under ~145
     words, byte-stable, and permission-shaped ("thinking aloud is fine" is the small
-    non-reasoning model's only scratchpad); see REPORT-context-injection-review."""
+    non-reasoning model's only scratchpad)."""
     lines: list[str] = []
     if tts is not None:
         lines.append(
@@ -683,7 +683,7 @@ class VoiceChannel(BaseChannel):
         tools, each call a guarded ``execute_tool`` slice with the realtime model planning
         the sequence; ``"supervisor"`` declares ONE tool (``ask_nanobot``) delegating the
         whole request to nanobot's AgentLoop over the bus, so multi-step planning leaves
-        the weak model. See ``REPORT-realtime-reasoning-latency.md`` section 6.1."""
+        the weak model."""
         gw = self._tool_gateway
         if gw is None or not supported:
             if gw is not None and not supported:
@@ -829,6 +829,7 @@ class VoiceChannel(BaseChannel):
                     )
             if local is not None:
                 await local.prewarm_canned()  # gated internally on probe_ok + IDLE
+                await local.learn_wake_aliases()  # gated on on-device STT + probe_ok
         finally:
             if local is not None:
                 local.hold_hop_accounting(False)
@@ -836,9 +837,8 @@ class VoiceChannel(BaseChannel):
             await self._calibrate()
 
     async def _calibrate(self) -> None:
-        """Measure warm STT/TTS on THIS device and hand the numbers to the local backend
-        (see DESIGN-local-latency-and-engines.md Part E). Runs only after warmup, keeping
-        cold-start noise out of the measurements."""
+        """Measure warm STT/TTS on THIS device and hand the numbers to the local backend.
+        Runs only after warmup, keeping cold-start noise out of the measurements."""
         local = self._local()
         if local is None:
             return  # cloud paces itself; nothing to derive

@@ -282,8 +282,8 @@ class VadConfig(_VoiceBase):
 class SenseVoiceSttConfig(OnDeviceRuntime):
     """On-device SenseVoice-Small (``stt.provider="sensevoice"``): non-autoregressive CTC,
     one model for zh/yue/en/ja/ko, ~5-15x faster than Whisper on CPU. Consumes the
-    ORIGINAL FunASR export — the dynamic `.onnx` (CPU; int8 recommended, faster AND
-    smaller for ASR: REPORT-asr-tts-model-survey.md section 6.1) or the static
+    ORIGINAL FunASR export — the dynamic `.onnx` (CPU; int8 recommended — faster
+    AND smaller for ASR) or the static
     mask-input `.rknn` port (NPU, fp16 — int8 collapses this model) — plus the
     exporter's ``frontend.json`` sidecar and ``tokens.txt``."""
 
@@ -561,8 +561,8 @@ class ChunkerConfig(_VoiceBase):
 
 class PerfConfig(_VoiceBase):
     """Device-performance adaptation (local mode): tune pacing WITHIN the chosen engine set
-    from measurements taken on the device at session start. Invariants
-    (DESIGN-local-latency-and-engines.md Part E): only PACING values are derived, never a
+    from measurements taken on the device at session start. Invariants: only
+    PACING values are derived, never a
     behavior change; an explicit config value always wins; every derived value is logged at
     INFO with its measurement."""
 
@@ -593,7 +593,7 @@ class RealtimeConfig(_VoiceBase):
 
     Cloud-only. The provider does ASR + reasoning + TTS in one WebSocket session; the plugin
     owns local mic capture + speaker playback and routes tool calls to nanobot where the
-    provider supports it (``DESIGN-realtime-providers.md``). Audio rate is provider-fixed
+    provider supports it. Audio rate is provider-fixed
     (24 kHz mostly, 16 kHz input for Qwen/GLM) and comes from the profile, NOT from
     ``AudioConfig.sample_rate``.
     """
@@ -611,8 +611,7 @@ class RealtimeConfig(_VoiceBase):
     # answering from the small realtime model alone. Say nothing about tools here.
     persona: str | None = None
 
-    # A realtime model is small and non-reasoning, so it plans multi-step tool sequences badly
-    # (REPORT-realtime-reasoning-latency.md).
+    # A realtime model is small and non-reasoning, so it plans multi-step tool sequences badly.
     #   "direct"     = declare nanobot's tools to it; it plans and calls them itself. Fine for
     #                  light, single-step tool use.
     #   "supervisor" = declare ONE tool (ask_nanobot): it owns the conversation but delegates
@@ -644,7 +643,7 @@ class TelemetryConfig(_VoiceBase):
     ``gen_ai.tool.*``), portable across Langfuse / Phoenix / Braintrust / LangSmith. Voice latency
     has NO convention: the semconv covers no audio, realtime, endpointing or barge-in signal
     (semconv issue #304 is open), so it stays in ``VoiceMetrics`` in-process and is not
-    exported. See ``REPORT-eval-methodology.md`` section 3.7.
+    exported.
     """
 
     enabled: bool = False
@@ -723,7 +722,7 @@ class BargeInConfig(_VoiceBase):
     # politeness fillers may ride along) aimed at a live reply kills it and is CONSUMED —
     # nothing is published, silence is the acknowledgment. Mixed utterances ("stop, use
     # Tokyo instead") still publish as normal interruptions, and a cold stop with nothing
-    # live forwards to the agent. Empty list = off. See rd DESIGN-stop-commands.md.
+    # live forwards to the agent. Empty list = off.
     stop_phrases: list[str] = Field(
         default=[
             "stop", "stop it", "shut up", "be quiet", "quiet", "enough",
@@ -754,6 +753,36 @@ class OpenWakeWordConfig(OnDeviceRuntime):
     refractory_s: float = Field(default=2.0, ge=0.0)
 
 
+class EarconsConfig(_VoiceBase):
+    """Non-verbal notification cues (local backend only): a synthesized struck
+    rising two-note, ~¼ s — no asset, no TTS call, no language. ``captured``
+    plays it at every ACCEPTED turn (the publish), the Gemini-Live-style receipt
+    that the sentence was heard and the agent is working; it lands ~1-3 s before
+    any spoken feedback (prologue filler, reply). Verdicts that must stay silent
+    stay silent: gated/echo (never reveal liveness to bystanders), consumed
+    stops (silence IS the acknowledgment), bare summons (the wake ack owns
+    those). A per-turn cue fires far too often for speech: hence a tone."""
+
+    captured: bool = False
+    # Custom cue: a short S16 WAV (stereo downmixes; blob playback keeps its
+    # rate, pcm sinks resample). Edge-trimmed like every canned clip, then
+    # capped at 600 ms with a faded cut — a receipt cue must stay short; files
+    # over 2 MB refuse to load. None => the built-in; an unreadable file
+    # degrades loudly to the built-in.
+    path: str | None = None
+    # Level adjust for the cue (built-in or file); boosts saturate at full
+    # scale. The built-in peaks ~-15 dBFS.
+    gain_db: float = Field(default=0.0, ge=-30.0, le=12.0)
+
+    @model_validator(mode="after")
+    def _path_needs_a_cue(self) -> EarconsConfig:
+        if self.path is not None and not self.path.strip():
+            raise ValueError("earcons.path must be a file path (omit it for the built-in cue)")
+        if self.path and not self.captured:
+            raise ValueError("earcons.path is set but no cue is enabled: set earcons.captured")
+        return self
+
+
 class WakeAckConfig(_VoiceBase):
     """Spoken acknowledgment at every bare-wake settle ("hey nanobot" → "I'm here.").
 
@@ -781,24 +810,49 @@ class WakeConfig(_VoiceBase):
     the transcript prefix (``phrases``, any language the STT covers) always
     counts, and ``engine="openwakeword"`` adds an acoustic detector that hears
     through the bot's own playback. A leading wake phrase is stripped from the
-    published text; an utterance that is ONLY the phrase publishes nothing and
-    just opens the attention window — silently, unless ``ack`` speaks a short
-    acknowledgment ("hey nanobot" → "I'm here."). Half-duplex contract:
-    detection trails the phrase and the mic-reopen flush discards audio up to
-    it, so the command belongs AFTER the reply stops (phrase, beat, command) —
-    same-breath content survives only in the open-mic modes. With the ack on,
-    the ack IS the beat: wait for it, then speak."""
+    published text, repeats included ("小娜小娜" is one summon — saying the
+    name when it was not needed is free); an utterance that is ONLY the phrase
+    publishes nothing and just opens the attention window — silently, unless
+    ``ack`` speaks a short acknowledgment ("hey nanobot" → "I'm here."). A bare
+    summon while the agent is still WORKING never cancels the query: it is
+    answered (prologue filler, else the ack) and the reply still comes.
+    Half-duplex contract: detection trails the phrase and the mic-reopen flush
+    discards audio up to it, so the command belongs AFTER the reply stops
+    (phrase, beat, command) — same-breath content survives only in the open-mic
+    modes. With the ack on, the ack IS the beat: wait for it, then speak."""
 
     mode: Literal["off", "gate", "strict"] = "off"
     # The spoken wake phrases, matched at utterance START (hesitation fillers may
     # precede). Also what the transcript tier strips from published turns.
     phrases: list[str] = Field(default_factory=list)
+    # Extra transcript spellings treated as the phrase (wake + strip): the renders
+    # YOUR STT actually produces for the name (e.g. "hey nanobot" back as 嘿难道爸
+    # on a zh-en zipformer). Warmup learning (learnAliases) seeds these and logs
+    # them; pin the renders it shows you here.
+    aliases: list[str] = Field(default_factory=list)
+    # Warmup calibration: synthesize each phrase with the session TTS, decode it
+    # with the session STT, and register mis-renders as aliases (logged loudly).
+    # Runs only for on-device STT (stt.provider != "nanobot") and a probe-safe
+    # TTS — nothing at startup may be billed.
+    learn_aliases: bool = True
+    # What one wake buys. "conversation": attention re-opens for windowS after
+    # every turn — natural follow-ups, at the cost of an invisible open window.
+    # "sentence": the window opens ONLY on wake evidence and the next published
+    # turn SPENDS it — a predictable one-name-one-sentence contract for public
+    # rooms; a reply ENDING with a question re-opens it so the agent's own
+    # clarifying question gets its answer (any other question re-gates — the
+    # user re-summons, which the ack makes cheap).
+    attention: Literal["conversation", "sentence"] = "conversation"
     # Attention window: seconds after a wake/turn during which cold starts need
-    # no wake phrase. 0 = every cold start needs the phrase.
-    window_s: float = Field(default=45.0, ge=0.0)
+    # no wake phrase. 0 = every cold start needs the phrase. Default sized to
+    # industry follow-up windows (~8 s) plus slack: re-summoning is cheap
+    # (stripped and acked wherever it lands), while a long stale window
+    # publishes bystander speech.
+    window_s: float = Field(default=15.0, ge=0.0)
     engine: Literal["text", "openwakeword"] = "text"
     openwakeword: OpenWakeWordConfig = Field(default_factory=OpenWakeWordConfig)
     ack: WakeAckConfig = Field(default_factory=WakeAckConfig)
+    # (earcons live at the top level — they work with the gate off too.)
 
     @model_validator(mode="after")
     def _phrases_required(self) -> WakeConfig:
@@ -807,6 +861,13 @@ class WakeConfig(_VoiceBase):
                 f'wake.mode="{self.mode}" requires wake.phrases: the transcript tier '
                 "is the always-available fallback (the acoustic engine is "
                 "best-effort and may degrade), and phrases drive wake stripping"
+            )
+        if any(not a.strip() for a in self.aliases):
+            raise ValueError("wake.aliases entries must be non-empty")
+        if self.attention == "sentence" and self.window_s <= 0:
+            raise ValueError(
+                'wake.attention="sentence" requires wake.windowS > 0: the window '
+                "IS the grace to start the summoned sentence"
             )
         return self
 
@@ -829,7 +890,7 @@ class WakeConfig(_VoiceBase):
         # Import here: wake/__init__ imports this module (top level would cycle).
         from nanobot_channel_voice.wake.phrase import WakePhrase
 
-        contains = WakePhrase(self.phrases)
+        contains = WakePhrase(self.phrases + self.aliases)
         offender = next(
             (p for p in self.ack.phrases or [] if contains.present(p)), None
         )
@@ -854,7 +915,7 @@ class VoiceConfig(_VoiceBase):
     # Reasoning brain / supplier. "local" = on-box VAD/STT/TTS + nanobot over the text bus (full
     # brain, no cloud). The rest are e2e speech-to-speech over a provider's OpenAI-Realtime-dialect
     # WebSocket ([realtime] extra; "qwen" is Alibaba, "glm" Zhipu) sharing the ``realtime.*`` block;
-    # their model/endpoint/rates come from backend/profiles.py. See DESIGN-realtime-providers.md.
+    # their model/endpoint/rates come from backend/profiles.py.
     backend: Literal[
         "local", "openai", "xai", "azure", "qwen", "glm", "stepfun"
     ] = "local"
@@ -922,6 +983,7 @@ class VoiceConfig(_VoiceBase):
     tts: TtsConfig = Field(default_factory=TtsConfig)
     chunker: ChunkerConfig = Field(default_factory=ChunkerConfig)
     prologue: PrologueConfig = Field(default_factory=PrologueConfig)
+    earcons: EarconsConfig = Field(default_factory=EarconsConfig)
     perf: PerfConfig = Field(default_factory=PerfConfig)
     realtime: RealtimeConfig = Field(default_factory=RealtimeConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)

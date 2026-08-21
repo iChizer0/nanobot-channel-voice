@@ -328,7 +328,7 @@ def test_session_update_payload_shapes(key):
         assert session["beta_fields"] == {"chat_mode": "audio"}  # session_extras merged
 
 
-# ---- stop-command consume (transcript-gated; DESIGN-stop-commands.md P1) ----
+# ---- stop-command consume (transcript-gated) --------------------------------
 
 
 def make_stop_backend(cfg: VoiceConfig | None = None):

@@ -470,3 +470,38 @@ def test_ack_pool_routes_by_the_called_name():
             return b._ack_pool("hey nanobot")
 
     asyncio.run(_t())
+
+
+def test_skeleton_and_fuzzy_wake():
+    from nanobot_channel_voice.wake.phrase import FuzzyWake, _skeleton
+
+    assert _skeleton("heynanobot") == "hnnbt"
+    assert _skeleton("henineobt") == "hnnbt"   # measured render, in-command
+    assert _skeleton("henineought") == "hnngt"  # measured render, punctuated
+    fz = FuzzyWake(["hey nanobot"])
+    assert fz.strip_head("he nine obt what time is it") == ("hey nanobot", "what time is it")
+    assert fz.strip_head("he nine ought") == ("hey nanobot", "")
+    assert fz.strip_head("hey nano bot you should go") == ("hey nanobot", "you should go")
+    # real speech with a name-like head stays content
+    assert fz.strip_head("hey no but seriously listen")[0] is None
+    assert fz.strip_head("he never got the memo")[0] is None
+    assert fz.strip_head("turn on the lights")[0] is None
+    # hesitation fillers may precede, like the exact tier
+    assert fz.strip_head("um he nine obt turn on the lights") == ("hey nanobot", "turn on the lights")
+    assert fz.strip_head("so hey nano bot come here") == ("hey nanobot", "come here")
+    assert fz.strip_head("no but he can go")[0] is None
+    # cross-script renders are the alias layer's job, not fuzzy's
+    assert fz.strip_head("嘿难道爸")[0] is None
+    # zh and too-short names opt out entirely
+    assert not FuzzyWake(["小娜"])
+    assert not FuzzyWake(["nova"])
+
+
+def test_wake_phrase_pair_entries_report_the_display():
+    """An alias entry matches its spelling but reports the CANONICAL phrase,
+    so an alias summon routes the ack by the name the user called."""
+    wp = WakePhrase(["hey nanobot", ("hey nanobot", "嘿难道爸")])
+    assert wp.strip("嘿难道爸") == ("hey nanobot", "")
+    assert wp.strip("嘿难道爸今天天气") == ("hey nanobot", "今天天气")
+    assert wp.present("嘿难道爸")
+    assert wp.strip("hey nanobot hello") == ("hey nanobot", "hello")

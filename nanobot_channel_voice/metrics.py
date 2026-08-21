@@ -5,7 +5,7 @@ callers stay on the event loop except the threaded hop path's counter bumps,
 whose worst-case race loses an increment (never corrupts); hot paths a
 ``monotonic()`` read and a deque append.
 
-Methodology (sourced in ``REPORT-eval-methodology.md``):
+Methodology:
 
 * **Anchor at end-of-speech**, not at an API call: the cloud anchor is
   ``input_audio_buffer.speech_stopped``, local uses ``turn_anchor(offset_ms=...)``

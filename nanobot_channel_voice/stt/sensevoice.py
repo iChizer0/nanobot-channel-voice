@@ -1,7 +1,7 @@
 """On-device SenseVoice-Small ASR over the ORIGINAL FunASR export (ONNX / RKNN).
 
 Non-autoregressive CTC (one encoder pass, greedy per-frame argmax): ~5-15x faster than
-Whisper on CPU and immune to hallucination loops (REPORT-asr-tts-model-survey.md 2.2);
+Whisper on CPU and immune to hallucination loops;
 one model covers zh / yue / en / ja / ko plus emotion/event tags.
 
 Both artifacts are converted from the upstream weights by the project's exporter, which

@@ -84,9 +84,9 @@ def test_wait_phrase_and_markdown_probes():
 
 
 def test_reply_contract_counters_markdown_and_wait_phrase():
-    """The P3 observability pair: turns whose reply carried markdown, and answer-bearing
-    segments that opened on a wait-phrase (REPORT-context-injection-review). Wait-phrases
-    are judged only where they are false — a status line before a tool call is allowed."""
+    """The observability pair: turns whose reply carried markdown, and answer-bearing
+    segments that opened on a wait-phrase. Wait-phrases are judged only where they are
+    false — a status line before a tool call is allowed."""
     async def _case():
         async with EvalConversation() as c:
             await c.user_says("format something for me")

@@ -102,3 +102,90 @@ def pcm_to_wav_bytes(
         wav.setframerate(sample_rate)
         wav.writeframes(pcm)
     return buf.getvalue()
+
+
+def wav_pcm(blob: bytes) -> tuple[bytes, int]:
+    """S16 PCM + rate from a WAV blob, downmixed to mono; ``(b"", 0)`` on
+    anything unreadable (calibration-grade tolerance, not a decoder)."""
+    try:
+        with wave.open(io.BytesIO(blob), "rb") as w:
+            if w.getsampwidth() != 2:
+                return b"", 0
+            rate, channels = w.getframerate(), w.getnchannels()
+            pcm = w.readframes(w.getnframes())
+    except Exception:  # noqa: BLE001 - malformed input reads as no audio
+        return b"", 0
+    if channels > 1:
+        samples = array.array("h", pcm)
+        mono = array.array(
+            "h",
+            (
+                sum(samples[i : i + channels]) // channels
+                for i in range(0, len(samples) - channels + 1, channels)
+            ),
+        )
+        pcm = mono.tobytes()
+    return pcm, rate
+
+
+def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Linear-interpolation resample of S16_LE mono (no low-pass filter): fine
+    for STT front ends and short cues, not for program audio."""
+    if src_rate == dst_rate or src_rate <= 0 or dst_rate <= 0 or len(pcm) < 4:
+        return pcm
+    src = array.array("h", pcm[: len(pcm) & ~1])
+    n_out = int(len(src) * dst_rate / src_rate)
+    if _np is not None:
+        x = _np.arange(n_out, dtype=_np.float64) * (src_rate / dst_rate)
+        i = _np.minimum(x.astype(_np.int64), len(src) - 2)
+        frac = x - i
+        s = _np.frombuffer(src, dtype=_np.int16).astype(_np.float64)
+        out = s[i] * (1.0 - frac) + s[i + 1] * frac
+        return out.astype(_np.int16).tobytes()
+    out = array.array("h", bytes(2 * n_out))
+    step = src_rate / dst_rate
+    for j in range(n_out):
+        x = j * step
+        i = min(int(x), len(src) - 2)
+        frac = x - i
+        out[j] = int(src[i] * (1.0 - frac) + src[i + 1] * frac)
+    return out.tobytes()
+
+
+def fade_tail_pcm(pcm: bytes, rate: int, *, ms: float = 10.0) -> bytes:
+    """Linear fade-out over the last ``ms`` of S16_LE mono: a length-capped
+    cut would otherwise end mid-waveform in an audible click."""
+    n = len(pcm) & ~1
+    k = min(n // 2, int(rate * ms / 1000.0))
+    if k <= 0:
+        return pcm
+    samples = array.array("h", pcm[:n])
+    base = len(samples) - k
+    for j in range(k):
+        samples[base + j] = int(samples[base + j] * (k - 1 - j) / k)
+    return samples.tobytes()
+
+
+def ding_pcm(rate: int, *, peak: float = 0.18) -> bytes:
+    """The "captured" receipt cue (~230 ms, S16 mono): a STRUCK rising fifth
+    (A5 -> E6) — 3 ms attack, overlapping exponential decays, warm harmonics.
+    The struck envelope is the point: it reads "ding" not "beep" and measured
+    least speech-like of the audition set; ``peak`` ~-15 dBFS sits under speech."""
+    notes = ((880.0, 0.0, 140.0, 45.0), (1318.5, 60.0, 170.0, 60.0))
+    mix = [0.0] * max(int(rate * (s + d) / 1000) for _, s, d, _ in notes)
+    attack = max(1, int(rate * 0.003))
+    for freq, start_ms, dur_ms, tau_ms in notes:
+        off = int(rate * start_ms / 1000)
+        tau = rate * tau_ms / 1000.0
+        w = 2 * math.pi * freq / rate
+        for i in range(int(rate * dur_ms / 1000)):
+            env = (0.5 - 0.5 * math.cos(math.pi * min(i, attack) / attack)) * math.exp(
+                -max(0, i - attack) / tau
+            )
+            mix[off + i] += env * (
+                math.sin(w * i)
+                + 0.30 * math.sin(2 * w * i)
+                + 0.12 * math.sin(3 * w * i)
+            )
+    scale = peak * 32767.0 / (max(abs(v) for v in mix) or 1.0)
+    return array.array("h", (int(v * scale) for v in mix)).tobytes()

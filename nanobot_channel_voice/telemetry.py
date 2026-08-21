@@ -3,7 +3,7 @@
 Active only when ``channels.voice.telemetry.enabled`` is set and the [otel] extra
 is installed; a no-op otherwise.
 
-What crosses the process boundary (see ``REPORT-eval-methodology.md`` section 3.7):
+What crosses the process boundary:
 
 * **Tool calls: exported, portably.** OTel GenAI semconv defines the span name
   ``execute_tool {gen_ai.tool.name}``, kind INTERNAL, with ``gen_ai.tool.name``,

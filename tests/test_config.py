@@ -384,3 +384,34 @@ def test_wake_ack_validators():
     VoiceConfig.model_validate(
         {"wake": {**base, "ack": {"enabled": True, "phrases": ["they say I am here"]}}}
     )
+
+
+def test_wake_alias_and_attention_validators():
+    base = {"mode": "gate", "phrases": ["hey nanobot"]}
+    with pytest.raises(ValidationError, match="non-empty"):
+        VoiceConfig.model_validate({"wake": {**base, "aliases": [" "]}})
+    with pytest.raises(ValidationError, match="windowS"):
+        VoiceConfig.model_validate(
+            {"wake": {**base, "attention": "sentence", "windowS": 0}}
+        )
+    # an ack phrase containing an ALIAS causes the same echo-veto lockout
+    with pytest.raises(ValidationError, match="contains a wake phrase"):
+        VoiceConfig.model_validate({"wake": {
+            **base,
+            "aliases": ["嘿难道爸"],
+            "ack": {"enabled": True, "phrases": ["好的嘿难道爸"]},
+        }})
+    # aliases alone are legal and inert richness
+    cfg = VoiceConfig.model_validate({"wake": {**base, "aliases": ["he nine obt"]}})
+    assert cfg.wake.aliases == ["he nine obt"]
+    assert cfg.wake.attention == "conversation"
+
+
+def test_earcons_path_validators():
+    # a path with no cue enabled is inert config: reject it loudly at load
+    with pytest.raises(ValidationError, match="no cue is enabled"):
+        VoiceConfig.model_validate({"earcons": {"path": "/x/cue.wav"}})
+    with pytest.raises(ValidationError, match="file path"):
+        VoiceConfig.model_validate({"earcons": {"captured": True, "path": "  "}})
+    cfg = VoiceConfig.model_validate({"earcons": {"captured": True, "path": "/x/cue.wav"}})
+    assert cfg.earcons.path == "/x/cue.wav"
