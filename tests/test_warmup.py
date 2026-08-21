@@ -161,6 +161,7 @@ def test_sink_prewarm_fails_loudly_but_never_raises():
 
 def test_backend_prewarm_playback_uses_the_tts_rate_and_skips_tts_off():
     from nanobot_channel_voice.audio.null import NullPlayback
+    from nanobot_channel_voice.backend.base import VoiceState
     from nanobot_channel_voice.backend.local import LocalBackend
     from nanobot_channel_voice.config import VoiceConfig
     from nanobot_channel_voice.vad.base import Vad
@@ -187,6 +188,11 @@ def test_backend_prewarm_playback_uses_the_tts_rate_and_skips_tts_off():
         await b.prewarm_playback()
         assert called == []  # tts off: nothing will ever play
         b._tts = SimpleNamespace(output_rate=22050)
+        await b.prewarm_playback()
+        assert called == [22050]
+        # The warmup task runs with the mic live: a fast first reply may already
+        # hold the device (warm by definition) — a second open collides on hw:.
+        b._turn = VoiceState.SPEAKING
         await b.prewarm_playback()
         assert called == [22050]
 

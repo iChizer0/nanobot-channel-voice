@@ -304,6 +304,51 @@ def test_thinking_content_injects_instead_of_killing():
     _run(_case())
 
 
+def test_thinking_content_injects_even_during_a_canned_clip():
+    """A filler/stall notice playing at verdict time reads as SPEAKING, but canned
+    audio is not the reply: the verdict joins the state beneath it — inject, never
+    a kill of the very run the clip said was still working."""
+    async def _case():
+        h = _build()
+        h.backend._turn = VoiceState.IDLE
+        h.transcript = "first"
+        await h.backend._on_utterance(_utt())
+        _, first = h.published[0]
+        h.backend._turn = VoiceState.SPEAKING          # the stall notice is playing...
+        h.backend._canned_base = VoiceState.THINKING   # ...over a live THINKING run
+        h.transcript = "keep going please"
+        verdict = await h.backend._on_utterance(_utt())
+        assert verdict == "inject"
+        assert h.interrupts == 0
+        assert not h.backend.is_dead_turn(first)
+
+    _run(_case())
+
+
+def test_early_confirm_spares_a_canned_clip_run():
+    # The min-words early confirm must not /stop the run when the audio being
+    # talked over is a canned clip (filler/stall notice): the steer must reach
+    # the inject rung at the verdict instead. A real reply still dies early.
+    frame = b"\x01\x00" * (16000 // 1000 * 20)
+
+    async def _t():
+        h = _build()
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._canned_base = VoiceState.THINKING  # a clip over a live run
+        b._endpointer._in_speech = True
+        b._early_confirm = True               # the min-words gate already hit
+        await b.push_audio(frame)
+        assert h.interrupts == 0
+        b._canned_base = None                 # a REAL reply: the confirm kills
+        b._endpointer._in_speech = True
+        b._early_confirm = True
+        await b.push_audio(frame)
+        assert h.interrupts == 1
+
+    _run(_t())
+
+
 def test_talk_over_audio_kills_even_if_audio_ended_by_the_verdict():
     """onset_speaking pins the barge-in contract to when the user STARTED talking:
     a reply whose audio finished during the utterance's own STT window was still
@@ -610,6 +655,38 @@ def test_deadman_escalates_before_killing():
     _run(_t())
 
 
+def test_deadman_renotices_a_fresh_wedge_after_recovery():
+    # `notified` was sticky for the turn's life: after a first stall the core could
+    # recover (deltas/sends for minutes), wedge AGAIN, and be killed after ONE
+    # silent budget with no fresh warning. The kill must always follow its own
+    # notice — intervening activity resets the escalation.
+    async def _t():
+        h = _build(agentTimeoutS=0.08)
+        b = h.backend
+        h.transcript = "do the thing"
+        await b._on_utterance(_utt())
+        for _ in range(60):
+            await asyncio.sleep(0.01)
+            if b._metrics.counters.get("agent_turn_stall"):
+                break
+        assert b._metrics.counters.get("agent_turn_stall") == 1
+        b.note_agent_activity()  # the core comes back (a send/delta)...
+        for _ in range(80):      # ...then goes silent for another full budget
+            await asyncio.sleep(0.01)
+            if b._metrics.counters.get("agent_turn_stall", 0) >= 2:
+                break
+        assert b._metrics.counters.get("agent_turn_stall") == 2  # warned again
+        assert not b._metrics.counters.get("agent_turn_timeout")
+        for _ in range(80):
+            await asyncio.sleep(0.01)
+            if b._metrics.counters.get("agent_turn_timeout"):
+                break
+        assert b._metrics.counters.get("agent_turn_timeout") == 1
+        assert h.interrupts == 1
+
+    _run(_t())
+
+
 def test_deadman_rearms_through_canned_playback():
     # The pre-loop watch RETURNED when its deadline landed during SPEAKING (a canned
     # filler at exactly the wrong moment), stripping a wedged turn's only recovery:
@@ -733,5 +810,49 @@ def test_agent_initiated_deltas_mark_the_turn_proactive():
         )
         assert deltas == ["Reminder: "]
         assert h.backend._cur_turn.proactive is True
+        h.backend._cur_turn.proactive = False  # another chat's trigger: no mark
+        await channel.send_delta(
+            "voice:other", "Elsewhere: ",
+            {"_local_trigger": {"trigger_id": "t2"}},
+            stream_id="voice:voice:other:2:0",
+        )
+        assert h.backend._cur_turn.proactive is False
+
+    _run(_t())
+
+
+def test_agent_initiated_final_bypasses_the_dead_token_gate():
+    # A cron job snapshots its CREATION turn's token into origin_metadata and every
+    # fire echoes it. If that turn was ever barged out, the gate would eat the
+    # reminder itself — the trigger stamp proves this send is a fire, not the
+    # creation turn's straggler.
+    async def _t():
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+        from nanobot_channel_voice.streamid import TURN_META
+
+        h = _build()
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = h.backend
+        spoken: list[str] = []
+
+        async def _speak(text: str) -> None:
+            spoken.append(text)
+
+        h.backend.speak_final = _speak  # type: ignore[method-assign]
+        h.backend._dead_tokens.append("turn-x")  # the creation turn was barged out
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="Time to stretch.",
+            metadata={TURN_META: "turn-x", "_cron_trigger": {"job_id": "j1"}},
+        ))
+        assert spoken == ["Time to stretch."]
+        # Without the trigger stamp the same token still gates (straggler silence).
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="Stale straggler.",
+            metadata={TURN_META: "turn-x"},
+        ))
+        assert spoken == ["Time to stretch."]
 
     _run(_t())

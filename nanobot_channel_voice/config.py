@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -988,12 +989,36 @@ class VoiceConfig(_VoiceBase):
     # a published turn with NO activity for one budget speaks stallPhrase and re-arms; a second
     # silent budget /stops the run and speaks timeoutPhrase. Activity = stream deltas, segment
     # ends, AND any bus traffic for this chat (progress/tool events — the send() tap), so the
-    # deadman measures a silent core, not a slow tool. 300 matches core's own ceilings (LLM
+    # deadman measures a silent core, not a slow tool; that tap needs core's
+    # channels.sendProgress left on (its default). 300 matches core's own ceilings (LLM
     # timeout, subagent wait are 300 s): tighter kills turns core would still finish. None
-    # disables. Both phrases are spoken by the session TTS — localize them together.
+    # disables. Both phrases are spoken by the session TTS — localize them together, and
+    # never put a stop phrase inside one (validated): a just-spoken word is self-echo,
+    # so the invited command would be swallowed.
     agent_timeout_s: float | None = Field(default=300.0, gt=0)
-    stall_phrase: str = "Still working on it. Say stop if you want me to give up."
+    stall_phrase: str = "Still working on it. This is taking longer than usual."
     timeout_phrase: str = "Sorry, I'm having trouble answering that. Please try again."
+
+    @model_validator(mode="after")
+    def _no_stop_phrase_inside_notices(self) -> "VoiceConfig":
+        for field in ("stall_phrase", "timeout_phrase"):
+            text = getattr(self, field).lower()
+            for phrase in self.barge_in.stop_phrases:
+                p = phrase.lower().strip()
+                if not p:
+                    continue
+                hit = (
+                    re.search(rf"(?<!\w){re.escape(p)}(?!\w)", text)
+                    if p.isascii()
+                    else p in text
+                )
+                if hit:
+                    raise ValueError(
+                        f"{field} contains the stop phrase '{phrase}': the notice "
+                        "would taint it as self-echo and swallow the command — "
+                        "reword one of them"
+                    )
+        return self
 
     # The WebUI's paste box (the manifest's only field; rationale on its SETUP_SPEC):
     # the WHOLE channels.voice section as one JSON object, deep-merged at parse time

@@ -88,10 +88,13 @@ class OpenAITtsAdapter(TtsAdapter):
         return self._client
 
     async def warmup(self) -> None:
-        """Open the connection early: DNS + TCP + TLS otherwise land in the first
-        reply's TTFA. A bare HEAD to the endpoint's origin — never a synthesis, so
-        nothing is billed whatever ``probe_ok`` says; any response (404 included)
-        means the pooled connection is warm."""
+        """A bare HEAD to the endpoint's origin — never a synthesis, so nothing is
+        billed whatever ``probe_ok`` says; any response (404 included) counts. The
+        durable wins are the SSL-context build (certifi load — slow on SBCs), the
+        OS DNS cache, and client init; the pooled connection itself expires after
+        httpx's 5 s keepalive, so a first turn minutes later still pays TCP+TLS
+        (deliberately not extended: a long-idle pooled connection would instead
+        fail mid-session)."""
         origin = str(httpx.URL(self._url).copy_with(path="/", query=None, fragment=None))
         with suppress(Exception):
             await self._get_client().head(origin, timeout=min(self._timeout, 5.0))

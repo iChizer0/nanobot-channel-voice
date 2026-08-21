@@ -633,7 +633,7 @@ def test_strict_stop_during_filler_is_consumed_not_gated():
     _run(_case())
 
 
-def test_strict_interrupt_during_filler_passes_the_gate():
+def test_strict_steer_during_filler_passes_the_gate_and_injects():
     async def _case():
         async with EvalConversation(
             **_wake("strict"),
@@ -643,11 +643,12 @@ def test_strict_interrupt_during_filler_passes_the_gate():
             await conv.wait_state(VoiceState.SPEAKING)
             await conv.user_says("actually make that in celsius please")
             assert conv.counter("wake_gated") == 0
-            assert conv.interrupts == 1
+            # The filler is canned audio over a THINKING run: the verdict joins the
+            # state beneath it, so the steer INJECTS into the live turn — never a
+            # kill of the very run the filler masks.
+            assert conv.interrupts == 0
             assert conv.texts()[-1] == "actually make that in celsius please"
-            # The filler was canned audio, so the marker's claim stays true: the
-            # agent's reply itself was never heard.
-            assert any("before your reply was heard" in n for n in conv.notes()[-1])
+            assert not any("interrupted" in n for n in conv.notes()[-1])
 
     _run(_case())
 

@@ -1218,7 +1218,9 @@ class LocalBackend(TurnEventMixin):
             if (
                 (self._endpointer.in_speech or utterance is not None)
                 and self._turn in (VoiceState.SPEAKING, VoiceState.THINKING)
-                and self._canned_base is not VoiceState.IDLE  # an ack has no turn to /stop
+                # Canned audio is not the reply: an ack has no turn to /stop, and a
+                # THINKING-base clip's steer must reach the inject rung, never a kill.
+                and self._canned_base is None
             ):
                 self._preempted = True
                 self._metrics.count("barge_in_early_confirm")
@@ -2358,13 +2360,17 @@ class LocalBackend(TurnEventMixin):
 
         # Steering, not barge-in: onset AND verdict in THINKING with a healthy run means
         # nothing was audible to talk over — inject instead of kill. Decided before the
-        # metrics anchor: an injection extends the RUNNING turn, so anchoring a new one
-        # would mislabel the continuation's latency.
+        # metrics anchor (an injection extends the RUNNING turn). Like the onset, the
+        # verdict joins the state beneath a canned clip: a filler or stall notice
+        # playing at verdict time must not turn a steer into a kill.
+        verdict_state = self._turn
+        if verdict_state is VoiceState.SPEAKING and self._canned_base is not None:
+            verdict_state = self._canned_base
         inject = (
             interrupting
             and not preempted
             and not pending.onset_speaking
-            and self._turn is VoiceState.THINKING
+            and verdict_state is VoiceState.THINKING
             and not self._cur_turn.dead
         )
 
@@ -2390,12 +2396,9 @@ class LocalBackend(TurnEventMixin):
                 )
 
         if inject:
-            # Publish WITHOUT /stop and WITHOUT a fresh _Turn: core routes a message for
-            # a busy session into the live turn's pending queue and injects it at the
-            # next iteration boundary, so the work continues with the new input, where
-            # cancel-then-send destroyed a whole tool chain on any interjection (or on
-            # open-mic noise). The fresh token matters only if the turn ends before core
-            # consumes the message — it then opens a normal turn whose final speaks.
+            # No /stop, no fresh _Turn: core injects a busy session's message into the
+            # live run's pending queue. The fresh token matters only if the run ends
+            # first — the message then opens a normal turn whose final speaks.
             # Attention/wake bookkeeping is untouched: the same turn is still running.
             self._clear_duck()
             self._metrics.count("midturn_injection")
@@ -2405,6 +2408,7 @@ class LocalBackend(TurnEventMixin):
                 notes.append(self._pending_note)
                 self._pending_note = None
             await self._publish_text(text, unique_token(), tuple(notes))
+            self._arm_earcon()  # the steer gets the same capture receipt as a publish
             return _summary("inject")
 
         killed, heard = await self._kill_live_reply(
@@ -2999,6 +3003,13 @@ class LocalBackend(TurnEventMixin):
             return
         if base is not None:
             self._cur_turn.base = base
+        if self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
+            # No published turn is live, so this stream IS an unsolicited delivery
+            # (cron fire with streaming on) riding the recycled turn object: its
+            # audibility ledger restarts here, as speak_final does for non-streamed
+            # ones — a stale emitted_audio latch would swallow the silence fallback.
+            turn = self._cur_turn
+            turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
         self._cancel_prologue()  # the reply is arriving; no more filler
         self._cancel_midturn()   # a new segment began; the old boundary watch is stale
         self._cur_turn.last_activity = time.monotonic()
@@ -3073,10 +3084,10 @@ class LocalBackend(TurnEventMixin):
         an unsolicited delivery — cron reply, message-tool send)."""
         self._cancel_prologue()
         self._cancel_midturn()
-        # A final while a stream segment is open means that stream died without its
-        # end marker (core's delivery.fail sends the apology but never closes the
-        # stream) or the send is out-of-band: the buffered partial must not glue
-        # onto this text. Discard it.
+        # A final while a segment is open: the stream died without its end marker
+        # (core's delivery.fail never closes it), or this send is out-of-band mid-
+        # turn. Discard the buffered partial — the rare live collision loses a
+        # fragment's words, which beats gluing them onto this text.
         self._chunker.flush()
         # This send is its own delivery: the audibility ledger restarts (the IDLE
         # placeholder is shared across unsolicited deliveries, so stale latches
@@ -3573,8 +3584,8 @@ class LocalBackend(TurnEventMixin):
         silent budget /stops the run and speaks timeoutPhrase. Activity pushes
         ``_Turn.last_activity`` — deltas, segment ends, and the channel's send() tap
         (progress/tool events) — so tool chains die only when the core itself goes
-        silent. With core streaming disabled nothing pushes it, so 2x agentTimeoutS is
-        a hard cap on any turn: the accepted cost of recovering wedged ones."""
+        silent. With streaming AND progress traffic both off nothing pushes it, so 2x
+        agentTimeoutS caps any turn: the accepted cost of recovering wedged ones."""
         self._cur_turn.cancel_timeout()
         if self._closing or self._cfg.agent_timeout_s is None:
             return
@@ -3584,6 +3595,7 @@ class LocalBackend(TurnEventMixin):
         try:
             budget = float(self._cfg.agent_timeout_s)
             notified = False
+            stamp = turn.last_activity
             while True:
                 await wait_for_stall(lambda: turn.last_activity, budget)
                 if self._closing or self._cur_turn is not turn:
@@ -3595,8 +3607,13 @@ class LocalBackend(TurnEventMixin):
                     # utterance: not a silent wedge. Re-arm rather than exit — a
                     # filler playing at the deadline must not strip the turn's only
                     # recovery (the pre-loop watch disarmed exactly there).
-                    turn.last_activity = time.monotonic()
+                    stamp = turn.last_activity = time.monotonic()
                     continue
+                if notified and turn.last_activity != stamp:
+                    # The core came back after the notice (deltas, sends), then went
+                    # silent for a fresh budget: a NEW escalation, not the second
+                    # half of the old one — the kill always follows its own warning.
+                    notified = False
                 if not notified:
                     notified = True
                     self._metrics.count("agent_turn_stall")
@@ -3610,7 +3627,7 @@ class LocalBackend(TurnEventMixin):
                     self._cur_turn.prologue_task = asyncio.create_task(
                         self._stall_notice(self._sink.epoch)
                     )
-                    turn.last_activity = time.monotonic()  # a full budget to the kill
+                    stamp = turn.last_activity = time.monotonic()  # a full budget to the kill
                     continue
                 break
             self._log.warning(
@@ -3904,8 +3921,12 @@ class LocalBackend(TurnEventMixin):
         """One silent play through the real device at warmup (see AudioSink.prewarm):
         dmix spin-up / binary page-in / PCM negotiation move off the first reply's
         TTFA, and a wrong playbackDevice fails loudly at startup. Skipped when
-        nothing will ever play (tts off)."""
+        nothing will ever play (tts off) — and when a turn is already live: the
+        warmup task runs with the mic open, so a fast first reply may hold the
+        device (already warm), and a second open collides on exclusive hw: PCMs."""
         if self._closing or self._tts is None:
+            return
+        if self._turn is not VoiceState.IDLE:
             return
         await self._sink.prewarm(getattr(self._tts, "output_rate", None) or 16000)
 
@@ -3989,12 +4010,18 @@ class LocalBackend(TurnEventMixin):
                 # English core error over a monolingual voice, a degraded synth):
                 # the user must not read the silence as "no answer". timeoutPhrase
                 # doubles as the audible failure notice — localize them together.
+                # Turn-scoped on purpose: one audible chunk anywhere (a status
+                # line) stands it down — per-segment scoping would race the
+                # worker's emit ordering for a marginal case.
                 turn.fallback_done = True
-                self._metrics.count("final_unvoiced_fallback")
+                self._metrics.count("reply_unvoiced_fallback")
                 self._log.warning(
                     "reply text produced no audible audio (unspeakable for this "
                     "voice?); speaking the fallback notice"
                 )
+                # Released first, as the timeout path does: the notice's emit must
+                # not read back as the turn's (drain-inflated) first audio.
+                self._metrics.turn_end()
                 self._tts_enqueue(self._cfg.timeout_phrase)
                 if not await self._settle(epoch):
                     return

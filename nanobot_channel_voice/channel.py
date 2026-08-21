@@ -344,9 +344,11 @@ class _DelegationCollector:
 class VoiceChannel(BaseChannel):
     name = "voice"
     display_name = "Voice"
-    # Defaults only: the ChannelManager overwrites all three; `send()` gates traces.
-    send_progress = False
-    send_tool_hints = False
+    # Defaults only: the ChannelManager overwrites all three from channels.* config.
+    # Progress/tool-event traffic is WANTED here — it feeds the deadman's liveness
+    # tap in send() (never spoken; _speakable drops it) — so mirror core's defaults.
+    send_progress = True
+    send_tool_hints = True
     show_reasoning = False
     # Core tool-gateway seam: when the ChannelManager injects the gateway, the cloud
     # backend routes the model's tool calls through nanobot's guarded ToolRegistry.
@@ -984,12 +986,9 @@ class VoiceChannel(BaseChannel):
     ) -> None:
         """Publish a captured utterance tagged with the turn it opens: core echoes inbound
         metadata onto that turn's final send, so ``send`` can tell the live turn's reply
-        from a barged-out one's straggler. Event notes are stashed on the context bridge
-        under the token (the provider pops them at resolve, adding the fresh time stamp),
-        so metadata carries only JSON-plain values: tools snapshot it verbatim, and cron
-        persists that snapshot — the turn path only, so a delegated cloud request stays
-        clean. The user row stays pure speech either way; display/consolidation strip
-        runtime context."""
+        from a barged-out one's straggler. Notes ride the context bridge keyed by the
+        token — metadata stays JSON-plain (tools snapshot it; cron persists the snapshot)
+        and the user row stays pure speech. See context_tool for the seam."""
         if self._context_bridge is not None:
             self._context_bridge.stash_notes(turn_token, notes)
         await self._publish_user_text(text, metadata={TURN_META: turn_token})
@@ -1053,8 +1052,12 @@ class VoiceChannel(BaseChannel):
         if not _speakable(msg):
             return
         turn = meta.get(TURN_META)
-        if turn is not None and local.is_dead_turn(turn):
-            return  # a killed turn's late final; a superseded-but-live turn still speaks
+        if turn is not None and local.is_dead_turn(turn) and not _agent_initiated(meta):
+            # A killed turn's late final; a superseded-but-live turn still speaks.
+            # Trigger-stamped sends are exempt: a cron job snapshots its CREATION
+            # turn's token and every fire echoes it — if that turn was ever barged
+            # out, the gate would silently eat the reminder itself.
+            return
         text = (msg.content or "").strip()
         if text:
             if _agent_initiated(meta):
@@ -1090,7 +1093,7 @@ class VoiceChannel(BaseChannel):
         local = self._local()
         if local is None:
             return
-        if _agent_initiated(metadata):
+        if _agent_initiated(metadata) and chat_id == self.config.chat_id:
             # A cron/trigger turn streaming into this chat: mark before the delta plays
             # so the settle re-opens attention (the fire-time turn echoes its trigger
             # metadata on every stream event).

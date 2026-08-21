@@ -81,6 +81,9 @@ def register_bridge(
     channel: str, chat_id: str, blocks: list[RuntimeContextBlock]
 ) -> VoiceContextBridge:
     bridge = VoiceContextBridge(blocks)
+    if _BRIDGES.get((channel, chat_id)) is not None:
+        # Normal on a channel restart; anything else is two instances fighting.
+        logger.info("voice context bridge replaced for {}:{}", channel, chat_id)
     _BRIDGES[(channel, chat_id)] = bridge
     return bridge
 
@@ -139,10 +142,9 @@ class VoiceContextTool(Tool):
         return cls()
 
     async def execute(self, **kwargs: Any) -> str:
-        return (
-            f"Voice context bridge: {len(_BRIDGES)} active voice session(s). "
-            "This tool only supplies runtime context and performs no action."
-        )
+        # No session count: the tool is visible to EVERY channel's sessions, and a
+        # non-voice chat has no business learning whether voice is live.
+        return "This tool only supplies runtime context and performs no action."
 
     def runtime_context_provider(self):
         return _provide

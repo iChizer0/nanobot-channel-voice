@@ -185,15 +185,11 @@ class AudioSink:
         return self._mode == "stream"
 
     async def prewarm(self, rate: int) -> None:
-        """Play ~40 ms of silence through the real device path once, at warmup.
-
-        The first playback otherwise pays device open inside the first reply's
-        TTFA: dmix/dsnoop daemon spin-up, aplay binary page-in (SD-card boards),
-        PCM negotiation. Bypasses the worker/epoch machinery (its own short-lived
-        handle; the worker's ``_stream`` slot is untouched — safe because warmup
-        runs strictly before any reply audio), and a wrong playbackDevice now
-        fails LOUDLY at startup instead of at the first answer. Never raises;
-        the failure log is the point."""
+        """Play ~40 ms of silence through the real device path once, at warmup,
+        so device open (dmix spin-up, aplay page-in, PCM negotiation) is off the
+        first reply's TTFA and a wrong playbackDevice fails loudly at startup.
+        Own short-lived handle, worker ``_stream`` slot untouched — the backend
+        gates the call on an idle turn. Never raises."""
         silence = b"\x00" * (int(rate / 1000 * 40) * 2)
         try:
             if self._mode == "stream":

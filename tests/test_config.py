@@ -421,3 +421,15 @@ def test_earcons_path_validators():
     }})
     assert cfg.earcons.path == "/x/cue.wav"
     assert cfg.earcons.attention_path == "/x/close.wav"
+
+
+def test_notice_phrases_must_not_contain_stop_phrases():
+    # A notice that SPEAKS a stop phrase taints it as self-echo (exactly-spoken
+    # words are never fresh): the invited command would be swallowed. Word-bounded
+    # for Latin so "unstoppable" stays legal; substring for CJK.
+    with pytest.raises(ValidationError, match="stop phrase"):
+        VoiceConfig(stallPhrase="Still working. Say stop if you want me to give up.")
+    with pytest.raises(ValidationError, match="stop phrase"):
+        VoiceConfig(timeoutPhrase="出错了，说停止可以取消。")
+    VoiceConfig(stallPhrase="An unstoppable effort continues.")  # word-bounded
+    VoiceConfig()  # the shipped defaults are self-consistent

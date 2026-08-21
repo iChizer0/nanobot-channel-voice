@@ -273,13 +273,102 @@ def test_unvoiced_final_speaks_the_fallback_notice():
             await c.user_says("do the thing")
             await c.agent_replies("Error calling LLM: timed out after 300s")
             await c.wait_state(VoiceState.IDLE)
-            assert c.counter("final_unvoiced_fallback") == 1
+            assert c.counter("reply_unvoiced_fallback") == 1
             assert fallback in mute.requests  # the notice was actually synthesized
             # A voiced reply must not trip it (and fallback_done never leaks over).
             await c.user_says("and again")
             await c.agent_replies("This is voiced content.")
             await c.wait_state(VoiceState.IDLE)
-            assert c.counter("final_unvoiced_fallback") == 1
+            assert c.counter("reply_unvoiced_fallback") == 1
+
+    _run(_case())
+
+
+def test_stall_notice_speaks_and_the_run_survives():
+    """First silent budget: the canned stall notice actually synthesizes and plays
+    (the deadman unit tests run tts=None and skip it), the run is NOT /stop-ped,
+    and a late reply still lands."""
+    from nanobot_channel_voice.config import VoiceConfig
+
+    class _RecordingTts:
+        output_rate = 16000
+
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.requests: list[str] = []
+
+        async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            return await self.inner.synthesize(text)
+
+        async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            return await self.inner.synthesize_pcm(text)
+
+    async def _case():
+        async with EvalConversation(agentTimeoutS=0.15) as c:
+            rec = _RecordingTts(c.backend._tts)
+            c.backend._tts = rec
+            stall = VoiceConfig().stall_phrase
+            await c.user_says("do the slow thing")
+            for _ in range(150):  # one silent budget, then the notice synthesizes
+                await asyncio.sleep(0.01)
+                if stall in rec.requests:
+                    break
+            assert c.counter("agent_turn_stall") == 1
+            assert stall in rec.requests
+            assert c.interrupts == 0  # the run survived its first stall
+            await c.agent_replies("Done at last.")  # arrives inside the second budget
+            await c.wait_state(VoiceState.IDLE)
+            assert c.interrupts == 0
+            assert not c.counter("agent_turn_timeout")
+
+    _run(_case())
+
+
+def test_streamed_placeholder_delivery_resets_the_audibility_ledger():
+    """Unsolicited deliveries share the recycled turn object, and STREAMED ones
+    (a cron fire with streaming on) never pass through speak_final's reset: a
+    stale emitted_audio latch from an earlier audible delivery must not swallow
+    the silence fallback for the next one."""
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.tts.base import TtsAdapter
+
+    fallback = VoiceConfig().timeout_phrase
+
+    class _MuteTts(TtsAdapter):
+        output_rate = 16000
+
+        async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
+            return b""
+
+        async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+            if text == fallback or "voiced" in text:
+                return b"\x01\x00" * 1600
+            return b""  # everything else is unspeakable for this voice
+
+    async def _case():
+        async with EvalConversation() as c:
+            c.backend._tts = _MuteTts()
+            # Delivery 1 streams and is audible: the ledger latches emitted_audio.
+            await c.backend.on_delta(
+                "This is voiced content.", stream_id="s:1000000000000000000:0"
+            )
+            await c.backend.on_stream_end(
+                resuming=False, stream_id="s:1000000000000000000:0"
+            )
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_unvoiced_fallback") == 0
+            # Delivery 2 streams entirely unspeakable text: without the reset the
+            # stale latch reads as "audio came out" and the user hears nothing.
+            await c.backend.on_delta(
+                "Unspeakable reminder text.", stream_id="s:1000000000000000001:0"
+            )
+            await c.backend.on_stream_end(
+                resuming=False, stream_id="s:1000000000000000001:0"
+            )
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_unvoiced_fallback") == 1
 
     _run(_case())
 
