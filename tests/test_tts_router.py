@@ -179,7 +179,7 @@ def test_context_line_names_both_languages():
     assert "'zh' and 'en'" in block.content
     assert "mixing is fine" in block.content
     (single,) = _voice_context_blocks(None, _Eng("zh", "a"))
-    assert "only pronounces ISO 639-1 language 'zh'" in single.content
+    assert "pronounces only ISO 639-1 'zh'" in single.content
 
 
 def test_router_requires_declared_languages():

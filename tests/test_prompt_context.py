@@ -107,6 +107,27 @@ def test_context_permits_thinking_and_nudges_pre_tool_narration():
     assert "pure answer" not in block.content
 
 
+def test_capability_affirmation_rides_spoken_sessions():
+    # "Spoken conversation" framing alone collapses small models into a can't-do-
+    # anything voice-assistant persona; the affirmation sits right next to it. A
+    # listen-only session (tts off) keeps the input facts without the reply framing.
+    [block] = _voice_context_blocks(None, _FakeTts("en"))
+    assert "full tools and skills" in block.content
+    assert block.content.index("spoken conversation") < block.content.index("full tools")
+    [listen_only] = _voice_context_blocks(_FakeStt("ctc"), None)
+    assert "tools and skills" not in listen_only.content
+
+
+def test_confirmation_is_scoped_to_hard_to_undo_actions():
+    # Blanket confirm-before-acting made the model ask instead of act on benign
+    # requests — the observed voice-mode tool collapse. Both decoder variants scope it.
+    for stt in (None, _FakeStt("ctc")):
+        [block] = _voice_context_blocks(stt, _FakeTts("en"))
+        assert "hard-to-undo" in block.content
+        assert "act on the likeliest reading" in block.content
+        assert "before acting on them" not in block.content
+
+
 def test_every_stt_gets_the_mishear_line():
     # ALL ASR substitutes similar sounds — and stt=None (the cloud-transcription path)
     # is still a transcript, so the line rides even without an on-device adapter.

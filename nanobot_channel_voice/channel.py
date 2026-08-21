@@ -179,29 +179,36 @@ def _voice_context_blocks(
     suspect (core's transcription defaults are all whisper-*). Budget: core persists this
     into EVERY user row, so every word is paid on every turn's prefill for the whole
     session — keep the longest variant (unverified decoder + bilingual voice) under ~145
-    words, byte-stable, and permission-shaped ("thinking aloud is fine" is the small
-    non-reasoning model's only scratchpad)."""
+    words, byte-stable, and capability-affirming: "spoken conversation" framing alone
+    collapses small models into a can't-do-anything assistant persona, so the block must
+    say the toolset is intact, and permission-shaped ("thinking aloud is fine" is the
+    small non-reasoning model's only scratchpad)."""
     lines: list[str] = []
     if tts is not None:
         lines.append(
-            "This is a spoken conversation: the user's words arrive via speech "
-            "recognition and your reply is spoken by a text-to-speech voice, never "
-            "displayed."
+            "A spoken conversation: the user's words arrive via speech recognition "
+            "and your reply is spoken by text-to-speech, never displayed."
+        )
+        # The persona corrector, adjacent to the persona line: without it, "voice
+        # assistant" framing suppresses tool and skill use entirely.
+        lines.append(
+            "You have your full tools and skills — use them; speech changes only "
+            "the reply's style."
         )
     else:
         lines.append("The user's words arrive via speech recognition.")
-    # Read-by-sound licenses charitable decoding (homophones); confirm-before-ACTING
-    # keeps ordinary answers free of verification questions.
+    # Read-by-sound licenses charitable decoding (homophones); act-then-confirm scoping
+    # keeps benign requests acted on (ask-first only where a wrong reading costs).
     if getattr(stt, "decoder_family", "") in ("ctc", "transducer"):
         lines.append(
-            "The transcript may mis-hear words — read it by sound and context, and "
-            "confirm surprising names or numbers before acting on them."
+            "The transcript may mis-hear words — read it by sound and context; act "
+            "on the likeliest reading, confirming first only for hard-to-undo actions."
         )
     else:
         lines.append(
             "The transcript may mis-hear words or occasionally include a phrase that "
-            "was never said — read it by sound and context, and confirm surprising "
-            "names or numbers before acting on them."
+            "was never said — read it by sound and context; act on the likeliest "
+            "reading, confirming first only for hard-to-undo actions."
         )
     if tts is not None:
         lines.append(
@@ -212,22 +219,21 @@ def _voice_context_blocks(
         if langs:
             named = " and ".join(f"'{code}'" for code in langs)
             lines.append(
-                f"The voice pronounces ISO 639-1 languages {named}; reply in "
-                "whichever the user speaks — mixing is fine; words in other "
-                "scripts are dropped or voiced as noise."
+                f"The voice pronounces ISO 639-1 {named}; reply in whichever the "
+                "user speaks — mixing is fine; other scripts are dropped or voiced "
+                "as noise."
             )
         elif lang:
             lines.append(
-                f"The voice only pronounces ISO 639-1 language '{lang}'; reply in "
-                f"'{lang}' only — words in other scripts are dropped or voiced as noise."
+                f"The voice pronounces only ISO 639-1 '{lang}'; reply in '{lang}' "
+                "only — other scripts are dropped or voiced as noise."
             )
         lines.append(
             # The backend detects the spoken status line (agent_prologue) and defers
             # the canned filler behind it.
             "Thinking aloud briefly is fine. Before a slow tool call, say one short "
-            "sentence about what you are doing; keep the answer itself for after the "
-            "results. Never say wait-phrases (\"One moment\") when delivering an "
-            "answer — by then the wait is over."
+            "sentence about what you are doing; keep the answer for after the "
+            "results — no wait-phrases (\"One moment\") when delivering it."
         )
     if extra and extra.strip():
         lines.append(extra.strip())
