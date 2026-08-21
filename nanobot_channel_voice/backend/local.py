@@ -2047,8 +2047,8 @@ class LocalBackend(TurnEventMixin):
 
     async def _on_utterance(self, pending: _PendingUtterance) -> str:
         """Run the verdict ladder over one closed utterance. Returns the verdict token
-        (``empty``/``echo``/``stop``/``ack``/``interrupt``/``publish``) - the audio
-        dump names the segment's file with it."""
+        (``empty``/``echo``/``stop``/``ack``/``inject``/``interrupt``/``publish``) -
+        the audio dump names the segment's file with it."""
         pcm = pending.pcm
         interrupting = self._turn in (VoiceState.THINKING, VoiceState.SPEAKING)
         preempted, heard = pending.preempted, pending.heard
@@ -2338,12 +2338,25 @@ class LocalBackend(TurnEventMixin):
                 await self._orphaned_confirm("ack")
             return _summary("ack")
 
+        # Steering, not barge-in: onset AND verdict in THINKING with a healthy run means
+        # nothing was audible to talk over — inject instead of kill. Decided before the
+        # metrics anchor: an injection extends the RUNNING turn, so anchoring a new one
+        # would mislabel the continuation's latency.
+        inject = (
+            interrupting
+            and not preempted
+            and not pending.onset_speaking
+            and self._turn is VoiceState.THINKING
+            and not self._cur_turn.dead
+        )
+
         # Anchor at the TRUE end of speech, only for ACCEPTED utterances (a rejected echo/empty
         # must not corrupt a live turn's clock): back-date past STT time and queue wait to the
         # endpoint close, plus silence_ms — the frame-quantized trailing silence the close
         # consumed (the full hangover, or less when the turn model closed early).
         offset = (time.monotonic() - pending.closed_at) * 1000.0 + float(pending.silence_ms)
-        self._metrics.turn_anchor(offset_ms=offset)
+        if not inject:
+            self._metrics.turn_anchor(offset_ms=offset)
         self._metrics.observe("stt_ms", float(stt_ms))
         if self._adaptive is not None:
             # Commit false-endpoint evidence, if any; the resume anchor was set at close time.
@@ -2357,6 +2370,24 @@ class LocalBackend(TurnEventMixin):
                     "adaptive hangover: cut pause ~{} ms -> hangover {} ms",
                     int(pending.learn_ms), hangover,
                 )
+
+        if inject:
+            # Publish WITHOUT /stop and WITHOUT a fresh _Turn: core routes a message for
+            # a busy session into the live turn's pending queue and injects it at the
+            # next iteration boundary, so the work continues with the new input, where
+            # cancel-then-send destroyed a whole tool chain on any interjection (or on
+            # open-mic noise). The fresh token matters only if the turn ends before core
+            # consumes the message — it then opens a normal turn whose final speaks.
+            # Attention/wake bookkeeping is untouched: the same turn is still running.
+            self._clear_duck()
+            self._metrics.count("midturn_injection")
+            self._cur_turn.last_activity = time.monotonic()  # a full budget to react
+            notes: list[str] = []
+            if self._pending_note is not None:
+                notes.append(self._pending_note)
+                self._pending_note = None
+            await self._publish_text(text, unique_token(), tuple(notes))
+            return _summary("inject")
 
         killed, heard = await self._kill_live_reply(
             interrupting=interrupting, preempted=preempted, heard=heard

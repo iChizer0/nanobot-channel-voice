@@ -90,6 +90,7 @@ def _utt(
     heard: str | None = None,
     onset_interrupting: bool = False,
     onset_at: float = 0.0,
+    onset_speaking: bool = False,
 ) -> _PendingUtterance:
     return _PendingUtterance(
         pcm=b"\x00" * 3200,
@@ -100,6 +101,7 @@ def _utt(
         heard=heard,
         onset_interrupting=onset_interrupting,
         onset_at=onset_at,
+        onset_speaking=onset_speaking,
     )
 
 
@@ -261,18 +263,64 @@ def test_interrupt_kills_the_old_token_but_not_a_superseded_one():
         h.transcript = "and also"
         await h.backend._on_utterance(_utt(preempted=True))
         assert not h.backend.is_dead_turn(first)
-        # A genuine interrupt kills the CURRENT token, before any await can race it.
-        # (Content words: a bare stop command would consume via the stop rung instead.)
+        # A genuine interrupt (talking over AUDIBLE speech) kills the CURRENT token,
+        # before any await can race it. (Content words: a bare stop command would
+        # consume via the stop rung; THINKING content would inject instead.)
         _, second = h.published[1]
-        h.backend._turn = VoiceState.THINKING
+        h.backend._turn = VoiceState.SPEAKING
         h.transcript = "no not tokyo"
-        await h.backend._on_utterance(_utt())
+        await h.backend._on_utterance(_utt(onset_speaking=True))
         assert h.backend.is_dead_turn(second)
         assert not h.backend.is_dead_turn(first)
         return h
 
     h = _run(_case())
     assert h.interrupts == 1  # only the genuine interrupt sent /stop
+
+
+def test_thinking_content_injects_instead_of_killing():
+    """Steering during a tool run must not destroy it: no /stop, no dead token, no
+    fresh _Turn — the utterance publishes into the LIVE turn (core routes a busy
+    session's message into its pending queue and injects it mid-turn)."""
+    async def _case():
+        h = _build()
+        h.backend._turn = VoiceState.IDLE
+        h.transcript = "first"
+        await h.backend._on_utterance(_utt())
+        _, first = h.published[0]
+        turn_obj = h.backend._cur_turn
+        h.backend._turn = VoiceState.THINKING
+        h.transcript = "make it blue instead"
+        verdict = await h.backend._on_utterance(_utt())
+        assert verdict == "inject"
+        assert h.interrupts == 0  # the run was never /stop-ped
+        assert not h.backend.is_dead_turn(first)
+        assert h.backend._cur_turn is turn_obj  # same live turn, same deadman
+        text, tok = h.published[1]
+        assert text == "make it blue instead"
+        assert tok != first  # its own token: opens a normal turn if the run ended
+        assert h.backend._metrics.counters.get("midturn_injection") == 1
+
+    _run(_case())
+
+
+def test_talk_over_audio_kills_even_if_audio_ended_by_the_verdict():
+    """onset_speaking pins the barge-in contract to when the user STARTED talking:
+    a reply whose audio finished during the utterance's own STT window was still
+    talked over, so it dies — never injects."""
+    async def _case():
+        h = _build()
+        h.backend._turn = VoiceState.IDLE
+        h.transcript = "first"
+        await h.backend._on_utterance(_utt())
+        _, first = h.published[0]
+        h.backend._turn = VoiceState.THINKING  # audio done; tools still running
+        h.transcript = "make it red instead"
+        await h.backend._on_utterance(_utt(onset_speaking=True))
+        assert h.backend.is_dead_turn(first)
+        assert h.interrupts == 1
+
+    _run(_case())
 
 
 def test_dead_turn_verdict_still_flushes_late_audio():

@@ -1798,7 +1798,8 @@ def test_oversized_earcon_file_degrades_to_the_builtin(tmp_path):
 
 def test_strict_thinking_in_window_steers_freely():
     """Conversation attention: the publish touches the window, so a follow-up
-    while the agent works steers (kill + republish) without the name."""
+    while the agent works steers without the name — by mid-turn injection now
+    (published into the LIVE run, never a /stop)."""
 
     async def _case():
         async with EvalConversation(**_wake("strict")) as conv:
@@ -1806,7 +1807,7 @@ def test_strict_thinking_in_window_steers_freely():
             assert conv.backend._turn is VoiceState.THINKING
             await conv.user_says("actually make it short")
             assert conv.texts()[-1] == "actually make it short"
-            assert conv.interrupts == 1
+            assert conv.interrupts == 0  # injected; the story run survives
 
     _run(_case())
 
@@ -1834,7 +1835,7 @@ def test_strict_thinking_cold_window_wake_steers():
             await conv.user_says("hey nanobot tell me a story")
             await conv.user_says("hey nanobot make it a joke instead")
             assert conv.texts()[-1] == "make it a joke instead"
-            assert conv.interrupts == 1
+            assert conv.interrupts == 0  # injected into the live run, not killed
 
     _run(_case())
 
