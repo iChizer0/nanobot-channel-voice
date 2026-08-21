@@ -171,7 +171,17 @@ def ding_pcm(rate: int, *, peak: float = 0.18) -> bytes:
     (A5 -> E6) — 3 ms attack, overlapping exponential decays, warm harmonics.
     The struck envelope is the point: it reads "ding" not "beep" and measured
     least speech-like of the audition set; ``peak`` ~-15 dBFS sits under speech."""
-    notes = ((880.0, 0.0, 140.0, 45.0), (1318.5, 60.0, 170.0, 60.0))
+    return _struck_pcm(rate, ((880.0, 0.0, 140.0, 45.0), (1318.5, 60.0, 170.0, 60.0)), peak)
+
+
+def dong_pcm(rate: int, *, peak: float = 0.18) -> bytes:
+    """The attention-close cue: the receipt pair reversed (E6 -> A5), the
+    falling contour reading "closing" against ``ding_pcm``'s rising "heard";
+    the long ring lands on the LOW note, so the tail reads settled."""
+    return _struck_pcm(rate, ((1318.5, 0.0, 140.0, 45.0), (880.0, 60.0, 170.0, 60.0)), peak)
+
+
+def _struck_pcm(rate: int, notes: tuple, peak: float) -> bytes:
     mix = [0.0] * max(int(rate * (s + d) / 1000) for _, s, d, _ in notes)
     attack = max(1, int(rate * 0.003))
     for freq, start_ms, dur_ms, tau_ms in notes:

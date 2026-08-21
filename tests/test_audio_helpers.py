@@ -305,3 +305,21 @@ def test_duck_targets_configured_floor_only_in_range():
     assert sink._gain_target == 1.0
     sink.configure_duck(2.0)  # clamped into [0, 1]
     assert sink._duck_floor == 1.0
+
+
+def test_close_cue_is_the_receipt_pair_reversed():
+    import array
+
+    from nanobot_channel_voice.audio.pcm import ding_pcm, dong_pcm
+
+    ding, dong = ding_pcm(16000), dong_pcm(16000)
+    assert len(ding) == len(dong) and ding != dong
+
+    def sign_changes(pcm: bytes) -> int:
+        s = array.array("h", pcm)
+        return sum(1 for a, b in zip(s, s[1:]) if (a >= 0) != (b >= 0))
+
+    # Falling contour: the close cue OPENS on the high note (E6 vs A5), so its
+    # first 50 ms oscillates ~1.5x faster than the receipt's.
+    head = 16000 * 50 // 1000 * 2
+    assert sign_changes(dong[:head]) > sign_changes(ding[:head]) * 1.2

@@ -45,11 +45,6 @@ def test_fold_punct_aliases_bridges_half_and_full_width():
     assert en["…"] == 10             # ellipsis reads as a full stop
     zh = fold_punct_aliases({"，": 2, "。": 3})
     assert zh[","] == 2 and zh["."] == 3 and zh["、"] == 2
-    # Corner brackets are quotes: 「你好」 must pause like “你好”, whichever quote
-    # spelling the table carries; title marks stay OOV (a title reads continuously).
-    q = fold_punct_aliases({'"': 5})
-    assert q["「"] == 5 and q["」"] == 5 and q["『"] == 5 and q["』"] == 5
-    assert "《" not in q and "〈" not in q
 
 
 def test_load_lexicon_first_spelling_wins_and_oov_phones_drop(tmp_path):
@@ -110,6 +105,21 @@ def test_lexicon_keeps_punctuation_and_splits_sentences():
     assert seqs == [[10, 11, 12, 13, 2, 14, 15, 3], [10, 11, 12, 13, 3]]
 
 
+def test_lexicon_emits_only_the_pause_punctuation_class():
+    # Measured on matcha-icefall-zh-en: wrapping marks in the token table ("“”()…：)
+    # synthesize ~0.2s of VOICED audio — the "zhang" after every quoted word — so
+    # even table-carried ids outside the pause class must not reach the model.
+    tokens = fold_punct_aliases({"，": 2, "。": 3, "n": 10, "i2": 11, "h": 12, "ao3": 13,
+                                 '"': 7, "“": 8, "”": 9, "(": 6, ":": 5, "…": 4})
+    fe = LexiconFrontend({"你好": [10, 11, 12, 13]}, tokens)
+    (seq,) = fe.sentences('“你好”、"你好"(你好)。')
+    assert seq == [10, 11, 12, 13, 2, 10, 11, 12, 13, 10, 11, 12, 13, 3]
+    # Pause-bearing outliers fold to a trained pause instead of vocalizing
+    # (each … folds alone: a doubled stop suits the ellipsis).
+    (seq,) = fe.sentences("你好：你好……")
+    assert seq == [10, 11, 12, 13, 2, 10, 11, 12, 13, 3, 3]
+
+
 def test_lexicon_drops_oov_and_reports_via_can_speak():
     fe = _zh_frontend()
     (seq,) = fe.sentences("你x好")
@@ -149,8 +159,8 @@ def test_espeak_sentences_split_on_final_punctuation():
 def test_sentences_keep_a_closer_with_its_terminator():
     from nanobot_channel_voice.tts.matcha import _sentences
 
-    # Splitting before 」/" strands a pause token (post-alias-fold, a real id)
-    # at the next utterance's head; the split lands after the closer instead.
+    # A split before 」/" would strand the closer at the next piece's head;
+    # the split lands after the closer, keeping pieces semantically whole.
     assert _sentences("他说「你好。」然后走了。") == [("他说「你好。」", ""), ("然后走了", "。")]
     assert _sentences('他说"好。"继续。') == [('他说"好。"', ""), ("继续", "。")]
     assert _sentences("他问「走吗？！」好。") == [("他问「走吗？！」", ""), ("好", "。")]

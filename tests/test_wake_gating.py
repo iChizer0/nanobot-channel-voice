@@ -1764,7 +1764,7 @@ def test_blob_mode_earcon_keeps_the_source_rate(tmp_path):
     linear resample and plays at its own rate."""
 
     async def _case():
-        from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes, wav_pcm
+        from nanobot_channel_voice.audio.pcm import ding_pcm, pcm_to_wav_bytes, wav_pcm
 
         cue = tmp_path / "cue.wav"
         cue.write_bytes(pcm_to_wav_bytes(b"\x00\x40" * 4410, 44100))
@@ -1773,7 +1773,7 @@ def test_blob_mode_earcon_keeps_the_source_rate(tmp_path):
         ) as conv:
             b = conv.backend
             b._pcm_out = False
-            _, rate = wav_pcm(b._build_earcon())
+            _, rate = wav_pcm(b._build_earcon(str(cue), ding_pcm))
             assert rate == 44100
 
     _run(_case())
@@ -1789,5 +1789,154 @@ def test_oversized_earcon_file_degrades_to_the_builtin(tmp_path):
             earcons={"captured": True, "path": str(big)},
         ) as conv, EvalConversation(earcons={"captured": True}) as ref:
             assert conv.backend._earcon_audio == ref.backend._earcon_audio
+
+    _run(_case())
+
+
+# ---- strict mode: THINKING continuations ------------------------------------
+
+
+def test_strict_thinking_in_window_steers_freely():
+    """Conversation attention: the publish touches the window, so a follow-up
+    while the agent works steers (kill + republish) without the name."""
+
+    async def _case():
+        async with EvalConversation(**_wake("strict")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            assert conv.backend._turn is VoiceState.THINKING
+            await conv.user_says("actually make it short")
+            assert conv.texts()[-1] == "actually make it short"
+            assert conv.interrupts == 1
+
+    _run(_case())
+
+
+def test_strict_thinking_cold_window_gates_bystanders():
+    """Sentence attention: the publish SPENDS the window, so unwoken speech
+    during a long tool run must not steer (kill) the pending query."""
+
+    async def _case():
+        async with EvalConversation(**_wake("strict", attention="sentence")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            assert conv.backend._turn is VoiceState.THINKING
+            await conv.user_says("bystander chatter meanwhile")
+            assert conv.texts() == ["tell me a story"]
+            assert conv.counter("wake_gated") == 1
+            assert conv.interrupts == 0
+            assert conv.backend._turn is VoiceState.THINKING  # the query survives
+
+    _run(_case())
+
+
+def test_strict_thinking_cold_window_wake_steers():
+    async def _case():
+        async with EvalConversation(**_wake("strict", attention="sentence")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.user_says("hey nanobot make it a joke instead")
+            assert conv.texts()[-1] == "make it a joke instead"
+            assert conv.interrupts == 1
+
+    _run(_case())
+
+
+def test_gate_thinking_cold_window_stays_free():
+    """Gate mode trusts the room: sentence-spent THINKING amendments pass bare."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate", attention="sentence")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.user_says("actually make it short")
+            assert conv.texts()[-1] == "actually make it short"
+
+    _run(_case())
+
+
+# ---- earcons: the attention-close cue ---------------------------------------
+
+
+def test_attention_cue_plays_when_the_window_lapses():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"attention": True},
+            **_wake("gate", windowS=0.3),
+        ) as conv:
+            assert conv.backend._attention_audio  # built at init, no TTS call
+            await conv.user_says("hey nanobot what time is it")
+            await conv.agent_replies("It is noon.")
+            await conv.wait_state(VoiceState.IDLE)
+            assert conv.counter("earcon_attention") == 0  # window still open
+            await _until(lambda: conv.counter("earcon_attention") == 1)
+            await conv.wait_state(VoiceState.IDLE)  # the cue settles back
+            # The cue's own tail must not re-open the window: cold speech is
+            # now gated, and the episode's cue fired exactly once.
+            await conv.user_says("and in tokyo")
+            assert conv.texts() == ["what time is it"]
+            assert conv.counter("wake_gated") == 1
+            await asyncio.sleep(0.45)
+            assert conv.counter("earcon_attention") == 1
+
+    _run(_case())
+
+
+def test_attention_cue_fires_at_settle_when_the_window_is_spent():
+    """Sentence attention: a non-question reply settles with the window spent,
+    so the cue plays right there (the End-of-Request position)."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"attention": True},
+            **_wake("gate", attention="sentence"),
+        ) as conv:
+            await conv.user_says("hey nanobot what time is it")
+            await conv.agent_replies("It is noon.")
+            await _until(lambda: conv.counter("earcon_attention") == 1)
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_attention_cue_waits_out_a_question_window():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"attention": True},
+            **_wake("gate", attention="sentence", windowS=0.3),
+        ) as conv:
+            await conv.user_says("hey nanobot book a table")
+            await conv.agent_replies("For how many people?")
+            await conv.wait_state(VoiceState.IDLE)
+            assert conv.counter("earcon_attention") == 0  # the "?" re-opened it
+            await _until(lambda: conv.counter("earcon_attention") == 1)
+
+    _run(_case())
+
+
+def test_attention_cue_needs_the_gate():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"attention": True},
+        ) as conv:  # wake.mode="off": disabled loudly at init
+            assert conv.backend._attention_audio is None
+            await conv.user_says("hello there")
+            await conv.agent_replies("hi")
+            await conv.wait_state(VoiceState.IDLE)
+            await asyncio.sleep(0.05)
+            assert conv.counter("earcon_attention") == 0
+
+    _run(_case())
+
+
+def test_attention_cue_fires_at_settle_with_window_zero():
+    """windowS=0 keeps the gate always cold: every conversation ends with the
+    cue at its settle (the publish resets the episode; the touch no-ops)."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"attention": True},
+            **_wake("gate", windowS=0),
+        ) as conv:
+            await conv.user_says("hey nanobot what time is it")
+            await conv.agent_replies("It is noon.")
+            await _until(lambda: conv.counter("earcon_attention") == 1)
+            await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())

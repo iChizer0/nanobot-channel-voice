@@ -762,32 +762,48 @@ class OpenWakeWordConfig(OnDeviceRuntime):
 
 
 class EarconsConfig(_VoiceBase):
-    """Non-verbal notification cues (local backend only): a synthesized struck
-    rising two-note, ~¼ s — no asset, no TTS call, no language. ``captured``
-    plays it at every ACCEPTED turn (the publish), the Gemini-Live-style receipt
-    that the sentence was heard and the agent is working; it lands ~1-3 s before
-    any spoken feedback (prologue filler, reply). Verdicts that must stay silent
-    stay silent: gated/echo (never reveal liveness to bystanders), consumed
-    stops (silence IS the acknowledgment), bare summons (the wake ack owns
-    those). A per-turn cue fires far too often for speech: hence a tone."""
+    """Non-verbal notification cues (local backend only): synthesized struck
+    two-note tones, ~¼ s — no asset, no TTS call, no language. ``captured``
+    (rising, A5→E6) plays at every ACCEPTED turn (the publish), the
+    Gemini-Live-style receipt that the sentence was heard and the agent is
+    working; it lands ~1-3 s before any spoken feedback (prologue filler,
+    reply). ``attention`` (falling, E6→A5) plays when the wake attention
+    window closes — the audible "the name is needed again": at the deadline
+    lapse under ``attention="conversation"``, right at the reply's settle when
+    the window is already spent (``"sentence"``, or ``windowS=0``); it needs
+    wake gating and stays silent forever with ``wake.mode="off"``. Verdicts
+    that must stay silent stay silent: gated/echo (never reveal liveness to
+    bystanders), consumed stops (silence IS the acknowledgment), bare summons
+    (the wake ack owns those). Frequent cues fire far too often for speech:
+    hence tones."""
 
     captured: bool = False
-    # Custom cue: a short S16 WAV (stereo downmixes; blob playback keeps its
-    # rate, pcm sinks resample). Edge-trimmed like every canned clip, then
-    # capped at 600 ms with a faded cut — a receipt cue must stay short; files
-    # over 2 MB refuse to load. None => the built-in; an unreadable file
-    # degrades loudly to the built-in.
+    attention: bool = False
+    # Custom cues: a short S16 WAV per cue (stereo downmixes; blob playback
+    # keeps its rate, pcm sinks resample). Edge-trimmed like every canned
+    # clip, then capped at 600 ms with a faded cut — a cue must stay short;
+    # files over 2 MB refuse to load. None => the built-in; an unreadable
+    # file degrades loudly to the built-in.
     path: str | None = None
-    # Level adjust for the cue (built-in or file); boosts saturate at full
-    # scale. The built-in peaks ~-15 dBFS.
+    attention_path: str | None = None
+    # Level adjust for the cues (built-in or file); boosts saturate at full
+    # scale. The built-ins peak ~-15 dBFS.
     gain_db: float = Field(default=0.0, ge=-30.0, le=12.0)
 
     @model_validator(mode="after")
     def _path_needs_a_cue(self) -> EarconsConfig:
-        if self.path is not None and not self.path.strip():
-            raise ValueError("earcons.path must be a file path (omit it for the built-in cue)")
-        if self.path and not self.captured:
-            raise ValueError("earcons.path is set but no cue is enabled: set earcons.captured")
+        for path, enabled, name in (
+            (self.path, self.captured, "captured"),
+            (self.attention_path, self.attention, "attention"),
+        ):
+            if path is not None and not path.strip():
+                raise ValueError(
+                    "earcons paths must be file paths (omit for the built-in cues)"
+                )
+            if path and not enabled:
+                raise ValueError(
+                    f"a custom cue file is set but earcons.{name} is not enabled"
+                )
         return self
 
 
@@ -814,7 +830,9 @@ class WakeConfig(_VoiceBase):
     turn. ``mode="strict"`` additionally requires the phrase to interrupt a live
     reply — while the bot speaks, non-wake speech neither ducks nor stops it,
     which is the robust posture for public/multi-speaker spaces (and what makes
-    barge-in SIMPLE there: a hit is the whole verdict). Detection is two-tier:
+    barge-in SIMPLE there: a hit is the whole verdict); it also gates speech
+    while the agent is still WORKING once the attention window is shut (a long
+    tool run must not be steerable by bystanders). Detection is two-tier:
     the transcript prefix (``phrases``, any language the STT covers) always
     counts, and ``engine="openwakeword"`` adds an acoustic detector that hears
     through the bot's own playback. A leading wake phrase is stripped from the
@@ -860,7 +878,7 @@ class WakeConfig(_VoiceBase):
     engine: Literal["text", "openwakeword"] = "text"
     openwakeword: OpenWakeWordConfig = Field(default_factory=OpenWakeWordConfig)
     ack: WakeAckConfig = Field(default_factory=WakeAckConfig)
-    # (earcons live at the top level — they work with the gate off too.)
+    # (earcons live at the top level — the receipt cue works with the gate off.)
 
     @model_validator(mode="after")
     def _phrases_required(self) -> WakeConfig:

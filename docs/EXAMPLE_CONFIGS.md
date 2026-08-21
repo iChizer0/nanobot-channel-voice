@@ -523,6 +523,8 @@ In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays ho
 
 **Turn-receipt earcon** (`earcons.captured`, works with the gate off): a synthesized struck two-note (~¼ s, no asset, no TTS, language-free) right at every *accepted* turn's publish - the Gemini-Live-style receipt that the sentence was heard and the agent is working, landing ~1-3 s before any spoken feedback. Verdict-honest by design: gated/echo utterances and consumed stops stay silent (a ding at the raw VAD close would also fire for bystanders, revealing a live device), and bare summons belong to the wake ack. `earcons.path` swaps in any short WAV (edge-trimmed, truncated to 600 ms with a faded cut; unreadable or oversized files fall back loudly to the built-in), `earcons.gainDb` adjusts its level.
 
+**Attention-close earcon** (`earcons.attention`, needs the gate on): the receipt's descending counterpart, played when the free-talk window ends - the audible "the name is needed again" that Echo devices signal with the light ring going dark (their optional End-of-Request tone is this exact cue). Under `attention: "conversation"` it fires once when `windowS` lapses after the last settle; under `"sentence"` (or `windowS: 0`) the window is already spent, so it fires right at the reply's settle. Waits out any speech in progress, and a summon mid-cue simply flushes it. `earcons.attentionPath` swaps the sound, same rules as `path`.
+
 ```json
 {
   "channels": {
@@ -530,7 +532,7 @@ In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays ho
       "enabled": true,
       "aec": "webrtc",
       "bargeIn": { "mode": "pause" },
-      "earcons": { "captured": true },
+      "earcons": { "captured": true, "attention": true },
       "wake": {
         "mode": "strict",
         "phrases": ["hey jarvis"],
@@ -553,6 +555,7 @@ Notes:
 
 - openWakeWord's official pretrained heads are **CC-BY-NC-SA (non-commercial)** - for commercial use train your own phrase head (openWakeWord's Colab or livekit-wakeword's pipeline, both Apache toolchains).
 - `"strict"` with a *batch* STT and no acoustic engine confirms interrupts only at the endpoint decode - pair strict with the acoustic engine or a streaming STT (`zipformer`).
+- `"strict"` also gates speech while the agent is still *working* once the attention window is shut (long tool runs must not be steerable by bystanders); in-window follow-ups during thinking stay free, and in `"gate"` mode they always are.
 - An on-device engine like any other: a `weights` key provisions everything (e.g. `wake/openwakeword/hey-jarvis/rknn.rv1126b` via `nanobot-voice fetch`), `.rknn` serves from the NPU, a missing model degrades loudly to transcript-tier gating. NPU packages are hybrid: `melFiltersPath` (an exact numpy port of the mel graph, whose STFT ops don't convert) replaces `melPath`, the head stays ONNX, and the `meta.json` sidecar's declared phrase/target are checked against the config at startup (advisory warnings).
 - Gated utterances land in the audio dump as `utt-<id>-gated.wav`, so a phrase that "doesn't work" is diagnosed by ear.
 

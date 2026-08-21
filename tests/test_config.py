@@ -408,10 +408,16 @@ def test_wake_alias_and_attention_validators():
 
 
 def test_earcons_path_validators():
-    # a path with no cue enabled is inert config: reject it loudly at load
-    with pytest.raises(ValidationError, match="no cue is enabled"):
+    # a path with its cue not enabled is inert config: reject it loudly at load
+    with pytest.raises(ValidationError, match="earcons.captured is not enabled"):
         VoiceConfig.model_validate({"earcons": {"path": "/x/cue.wav"}})
+    with pytest.raises(ValidationError, match="earcons.attention is not enabled"):
+        VoiceConfig.model_validate({"earcons": {"attentionPath": "/x/close.wav"}})
     with pytest.raises(ValidationError, match="file path"):
         VoiceConfig.model_validate({"earcons": {"captured": True, "path": "  "}})
-    cfg = VoiceConfig.model_validate({"earcons": {"captured": True, "path": "/x/cue.wav"}})
+    cfg = VoiceConfig.model_validate({"earcons": {
+        "captured": True, "path": "/x/cue.wav",
+        "attention": True, "attentionPath": "/x/close.wav",
+    }})
     assert cfg.earcons.path == "/x/cue.wav"
+    assert cfg.earcons.attention_path == "/x/close.wav"

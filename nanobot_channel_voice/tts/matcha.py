@@ -100,11 +100,6 @@ def fold_punct_aliases(token2id: dict[str, int]) -> dict[str, int]:
         token2id.setdefault(";", token2id[","])
     if "." in token2id:
         token2id.setdefault("…", token2id["."])
-    # Corner brackets are quotes: same trained pause ids as “”, or 「你好」 pauses
-    # while “你好” does. Title marks (《》〈〉) stay OOV — a title reads continuously.
-    for corner, quote in (("「", "“"), ("」", "”"), ("『", "“"), ("』", "”")):
-        if quote in token2id:
-            token2id.setdefault(corner, token2id[quote])
     return token2id
 
 
@@ -384,9 +379,20 @@ class EnglishToIpa:
         return ids
 
 
+# Punctuation policy for lexicon models, measured on matcha-icefall-zh-en: the
+# pause class synthesizes trained silence, but wrapping/structural marks in the
+# token table ("“”()：…—) each synthesize ~0.2s of VOICED audio — a phantom
+# syllable ("zhang") after every quoted word. Only the pause class may reach the
+# model; pause-bearing outliers fold to a trained pause first, the rest drop.
+_PAUSE_PUNCT = frozenset("，,。.！!？?；;、")
+_PAUSE_FOLD = {"：": "，", ":": "，", "—": "，", "–": "，", "…": "。"}
+
+
 class LexiconFrontend:
     """Text -> per-sentence token ids by greedy longest lexicon match, single chars
     falling back to the token table; OOV drops, the speakability guard reports.
+    Punctuation passes only as the ``_PAUSE_PUNCT`` class (folded first) — a
+    deliberate deviation from sherpa, which feeds every table id.
     With an ``english`` resolver, Latin word runs voice through it instead of
     dropping: pinyin transliteration (see pinyin_english) or the zh-en model's
     real espeak English. ``latin_space_id`` mirrors sherpa's zh-en frontend: the
@@ -451,8 +457,10 @@ class LexiconFrontend:
                     i += ln
                     break
             else:
-                ch = low[i]
-                if ch in self._token2id and not ch.isspace():
+                ch = _PAUSE_FOLD.get(low[i], low[i])
+                if ch in self._token2id and not ch.isspace() and (
+                    ch.isalnum() or ch in _PAUSE_PUNCT
+                ):
                     emit([self._token2id[ch]])
                 i += 1
         return ids
