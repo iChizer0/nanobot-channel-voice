@@ -89,15 +89,23 @@ class OnDeviceModel:
         providers: list | None = None,
         provider_options: list | None = None,
         intra_op_threads: int | None = None,
-        rknn_data_format: str | None = None,
+        rknn_input_permutation: tuple[int, ...] | None = None,
     ):
         self._rknn: Any = None
         self._sess: Any = None
         self._released = False
         self._rknn_lock = threading.Lock()  # RKNN contexts are not thread-safe
-        # RKNN input layout ("nchw"/"nhwc"; None = library default, nhwc for
-        # 4-D): set when the graph's import already folded a layout swap.
-        self._rknn_data_format = rknn_data_format
+        # Pre-transpose RKNN inputs of matching rank into the import's
+        # reported layout (an import can fold a layout swap into the graph);
+        # declaring data_format per call instead makes Lite repair-and-WARN
+        # at every inference.
+        if rknn_input_permutation is not None:
+            if sorted(rknn_input_permutation) != list(range(len(rknn_input_permutation))):
+                raise ValueError("rknn_input_permutation must be a permutation of input axes")
+            import numpy
+
+            self._np = numpy
+        self._rknn_input_permutation = rknn_input_permutation
 
         if path.endswith(".rknn"):
             self._rknn = _load_rknn(path, core_mask=core_mask, target=target, device_id=device_id)
@@ -136,8 +144,13 @@ class OnDeviceModel:
                 if self._released:
                     raise RuntimeError("on-device model released")
                 arrs = [arr for _, arr in inputs]
-                if self._rknn_data_format is not None:
-                    return self._rknn.inference(inputs=arrs, data_format=self._rknn_data_format)
+                perm = self._rknn_input_permutation
+                if perm is not None:
+                    arrs = [
+                        self._np.ascontiguousarray(self._np.transpose(arr, perm))
+                        if getattr(arr, "ndim", None) == len(perm) else arr
+                        for arr in arrs
+                    ]
                 return self._rknn.inference(inputs=arrs)
         sess = self._sess
         if sess is None:

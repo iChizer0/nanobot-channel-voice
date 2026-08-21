@@ -353,7 +353,7 @@ def test_exactly_one_mel_frontend_is_required(fakes):
         _detector(mel_filters_path="mel_filters.npy")
 
 
-def test_rknn_layout_marker_rides_the_embedding_only(monkeypatch):
+def test_rknn_embedding_input_is_pretransposed(monkeypatch):
     made = {"mel.onnx": FakeMel(), "emb.onnx": FakeEmb(), "head.onnx": FakeHead()}
     kws: dict[str, dict] = {}
 
@@ -363,9 +363,45 @@ def test_rknn_layout_marker_rides_the_embedding_only(monkeypatch):
 
     monkeypatch.setattr(oww_mod, "OnDeviceModel", spy)
     _detector()
-    assert kws["emb.onnx"]["rknn_data_format"] == "nchw"
-    assert "rknn_data_format" not in kws["mel.onnx"]
-    assert "rknn_data_format" not in kws["head.onnx"]
+    assert kws["emb.onnx"]["rknn_input_permutation"] == (0, 2, 3, 1)
+    assert "rknn_input_permutation" not in kws["mel.onnx"]
+    assert "rknn_input_permutation" not in kws["head.onnx"]
+
+
+def test_rknn_input_permutation_validates_at_construction():
+    from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
+
+    with pytest.raises(ValueError, match="permutation"):
+        OnDeviceModel("x.rknn", rknn_input_permutation=(1, 1, 0))
+
+
+def test_rknn_run_permutes_matching_rank_inputs_only():
+    import threading
+
+    from nanobot_channel_voice.ondevice import runtime as rt
+
+    m = rt.OnDeviceModel.__new__(rt.OnDeviceModel)
+    m._released = False
+    m._rknn_lock = threading.Lock()
+    m._sess = None
+    m._np = np
+    m._rknn_input_permutation = (0, 2, 3, 1)
+    seen = {}
+
+    class Stub:
+        def inference(self, inputs):
+            seen["arrs"] = inputs
+            return [np.zeros(1, dtype=np.float32)]
+
+    m._rknn = Stub()
+    x4 = np.arange(60, dtype=np.float32).reshape(1, 3, 4, 5)
+    x2 = np.zeros((1, 7), dtype=np.float32)
+    m.run([("a", x4), ("b", x2)])
+    sent = seen["arrs"][0]
+    assert sent.shape == (1, 4, 5, 3) and sent.flags["C_CONTIGUOUS"]
+    # Lite's standard NHWC->NCHW transpose must restore the original tensor.
+    assert np.array_equal(np.transpose(sent, (0, 3, 1, 2)), x4)
+    assert seen["arrs"][1] is x2  # rank-mismatched sibling untouched
 
 
 def test_multi_output_head_is_rejected_at_construction(monkeypatch):

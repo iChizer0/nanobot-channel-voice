@@ -119,10 +119,11 @@ class OpenWakeWord(WakeDetector):
                 self._mel = models.enter_context(OnDeviceModel(mel_path, **kw))
             else:
                 self._mel = PythonMelFrontend(mel_filters_path)  # type: ignore[arg-type]
-            # The TF-derived backbone imports into RKNN with a folded layout
-            # swap: the call must declare the [1,76,32,1] array's layout as-is.
+            # The TF-derived import reports an NHWC [N,32,1,76] input while
+            # the graph computes on [N,76,32,1]; (0,2,3,1) hands Lite its
+            # expected buffer (see OnDeviceModel.rknn_input_permutation).
             self._emb = models.enter_context(
-                OnDeviceModel(embedding_path, rknn_data_format="nchw", **kw)
+                OnDeviceModel(embedding_path, rknn_input_permutation=(0, 2, 3, 1), **kw)
             )
             self._head = models.enter_context(OnDeviceModel(model_path, **kw))
             self._mel_in = self._first_input(self._mel, "input")
