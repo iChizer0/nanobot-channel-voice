@@ -87,6 +87,15 @@ class OpenAITtsAdapter(TtsAdapter):
             self._client = httpx.AsyncClient(timeout=self._timeout)
         return self._client
 
+    async def warmup(self) -> None:
+        """Open the connection early: DNS + TCP + TLS otherwise land in the first
+        reply's TTFA. A bare HEAD to the endpoint's origin — never a synthesis, so
+        nothing is billed whatever ``probe_ok`` says; any response (404 included)
+        means the pooled connection is warm."""
+        origin = str(httpx.URL(self._url).copy_with(path="/", query=None, fragment=None))
+        with suppress(Exception):
+            await self._get_client().head(origin, timeout=min(self._timeout, 5.0))
+
     async def aclose(self) -> None:
         client, self._client = self._client, None
         if client is not None:

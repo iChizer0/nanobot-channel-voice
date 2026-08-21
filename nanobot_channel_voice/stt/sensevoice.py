@@ -205,6 +205,11 @@ class SenseVoiceOnDeviceStt(SttAdapter):
     def release(self) -> None:
         self._model.release()
 
+    async def warmup(self) -> None:
+        """One dummy decode so the first real utterance pays no cold-start (ORT
+        arena allocation, RKNN core spin-up)."""
+        await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
+
     async def transcribe(self, pcm: bytes, sample_rate: int) -> str:
         if not pcm:
             return ""

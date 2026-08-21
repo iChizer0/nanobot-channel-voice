@@ -982,6 +982,7 @@ class LocalBackend(TurnEventMixin):
         *,
         stt_cost_ms: float | None,
         tts_rtf: float | None,
+        tts_ms_per_char: float | None = None,
         chunk_floor_pinned: bool,
     ) -> None:
         """Feed warm steady-state measurements into the PACING knobs (perf.calibrate).
@@ -990,6 +991,13 @@ class LocalBackend(TurnEventMixin):
         Correctness knobs (hangover, thresholds, duplex, echo) stay put; auto-tuning them makes
         behavior unreproducible. An explicitly configured value wins (``chunk_floor_pinned``)."""
         parts: list[str] = []
+        if tts_ms_per_char is not None and tts_ms_per_char > 0 and self._synth_mpc is None:
+            # Seed the JIT cost model: unseeded, the WHOLE first reply is synthesized
+            # as unscheduled whole-candidates (see _jit_pipeline) — the mid-reply
+            # call-sizing race the scheduler exists to prevent, live on turn 1.
+            # Real observations then take over via the ordinary EMA update.
+            self._synth_mpc = max(tts_ms_per_char, _MPC_MIN)
+            parts.append(f"jit_mpc={self._synth_mpc:.1f}ms/ch")
         if tts_rtf is not None and tts_rtf > 0:
             parts.append(f"tts_rtf={tts_rtf:.2f}")
             if not chunk_floor_pinned:
@@ -3891,6 +3899,15 @@ class LocalBackend(TurnEventMixin):
                 "wake.learnAliases=false)",
                 [a for _, a in learned],
             )
+
+    async def prewarm_playback(self) -> None:
+        """One silent play through the real device at warmup (see AudioSink.prewarm):
+        dmix spin-up / binary page-in / PCM negotiation move off the first reply's
+        TTFA, and a wrong playbackDevice fails loudly at startup. Skipped when
+        nothing will ever play (tts off)."""
+        if self._closing or self._tts is None:
+            return
+        await self._sink.prewarm(getattr(self._tts, "output_rate", None) or 16000)
 
     async def prewarm_canned(self) -> None:
         """Pre-synthesize the canned phrases (prologue fillers, wake acks) at channel

@@ -483,6 +483,7 @@ def test_zipformer_onnx_real_streaming_matches_batch():
         },
     }))
     assert isinstance(stt, ZipformerOnDeviceStt)  # no silent delegate fallback
+    asyncio.run(stt.warmup())  # the silent warmup decode must not disturb real decodes
     with wave.open(str(_ZIPFORMER_WAV), "rb") as w:
         assert w.getframerate() == 16000
         pcm = w.readframes(w.getnframes())

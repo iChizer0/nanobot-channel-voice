@@ -45,8 +45,9 @@ class TtsAdapter(abc.ABC):
 
     async def warmup(self) -> None:
         """Prime caches/arenas so the first real chunk pays no cold-start. No-op by
-        default; nothing at startup may be billed, so cloud-backed adapters keep it a
-        no-op and clear ``probe_ok``."""
+        default. The contract is NO BILLABLE CALLS: cloud-backed adapters clear
+        ``probe_ok`` (no startup synthesis) but may still warm connections —
+        DNS/TCP/TLS are free and otherwise land in the first reply's TTFA."""
 
 
 # Startup texts keyed by spoken_language (None = the default/unknown row): a

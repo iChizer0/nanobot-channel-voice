@@ -222,6 +222,13 @@ class ZipformerOnDeviceStt(SttAdapter):
     def stream_start(self) -> _ZipformerStream:
         return _ZipformerStream(self)
 
+    async def warmup(self) -> None:
+        """One dummy decode so the first real utterance pays no cold-start (ORT
+        arena allocation, RKNN core spin-up). The batch path builds its own
+        stream handle, so this warms the exact per-frame graphs the live capture
+        uses — measured negligible on CPU, insurance on the NPU."""
+        await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
+
     def release(self) -> None:
         for model in (self._encoder, self._decoder, self._joiner):
             model.release()

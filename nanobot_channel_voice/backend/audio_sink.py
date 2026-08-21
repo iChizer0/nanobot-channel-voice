@@ -24,7 +24,7 @@ from typing import Literal
 from loguru import logger
 
 from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
-from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
+from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_to_wav_bytes, wav_duration_ms
 
 from .base import OutputAudio
 
@@ -183,6 +183,36 @@ class AudioSink:
     @property
     def stream_mode(self) -> bool:
         return self._mode == "stream"
+
+    async def prewarm(self, rate: int) -> None:
+        """Play ~40 ms of silence through the real device path once, at warmup.
+
+        The first playback otherwise pays device open inside the first reply's
+        TTFA: dmix/dsnoop daemon spin-up, aplay binary page-in (SD-card boards),
+        PCM negotiation. Bypasses the worker/epoch machinery (its own short-lived
+        handle; the worker's ``_stream`` slot is untouched — safe because warmup
+        runs strictly before any reply audio), and a wrong playbackDevice now
+        fails LOUDLY at startup instead of at the first answer. Never raises;
+        the failure log is the point."""
+        silence = b"\x00" * (int(rate / 1000 * 40) * 2)
+        try:
+            if self._mode == "stream":
+                stream = await self._sink.open_stream(rate)
+                try:
+                    await stream.write(silence)
+                    await stream.drain()
+                except BaseException:
+                    await stream.kill()
+                    raise
+            else:
+                await self._sink.play_wav(pcm_to_wav_bytes(silence, rate))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - warmup must never take the channel down
+            logger.warning(
+                "voice: playback prewarm failed ({}); the first reply will retry "
+                "the device open — check audio.playbackDevice if this repeats", exc,
+            )
 
     def configure_duck(self, floor: float) -> None:
         """Set the duck depth as a linear gain floor (e.g. -12 dB -> 0.25)."""

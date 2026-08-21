@@ -848,6 +848,7 @@ class VoiceChannel(BaseChannel):
                         "voice warmup failed for {}: {}", type(target).__name__, exc
                     )
             if local is not None:
+                await local.prewarm_playback()  # device open off the first reply's TTFA
                 await local.prewarm_canned()  # gated internally on probe_ok + IDLE
                 await local.learn_wake_aliases()  # gated on on-device STT + probe_ok
         finally:
@@ -871,6 +872,7 @@ class VoiceChannel(BaseChannel):
             await asyncio.sleep(1.0)
         stt_ms: float | None = None
         tts_rtf: float | None = None
+        tts_ms_per_char: float | None = None
         local.hold_hop_accounting(True)  # probes only: the IDLE wait above stays accounted
         try:
             if self._stt is not None:
@@ -896,7 +898,9 @@ class VoiceChannel(BaseChannel):
                 else:
                     audio_s = wav_duration_ms(await tts.synthesize(text)) / 1000.0
                 if audio_s > 0.2:  # a failed/empty synth must not calibrate anything
-                    tts_rtf = (time.monotonic() - t0) / audio_s
+                    synth_s = time.monotonic() - t0
+                    tts_rtf = synth_s / audio_s
+                    tts_ms_per_char = synth_s * 1000.0 / max(1, len(text))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -907,6 +911,7 @@ class VoiceChannel(BaseChannel):
         local.apply_calibration(
             stt_cost_ms=stt_ms,
             tts_rtf=tts_rtf,
+            tts_ms_per_char=tts_ms_per_char,
             # Pydantic tracks fields the user SET; an explicit minCharsFirst always wins.
             chunk_floor_pinned="min_chars_first"
             in getattr(self.config.chunker, "model_fields_set", set()),

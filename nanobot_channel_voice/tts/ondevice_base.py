@@ -107,7 +107,13 @@ class OnDeviceTtsAdapter(TtsAdapter):
         return await asyncio.to_thread(self._synthesize_pcm_sync, text)
 
     async def warmup(self) -> None:
-        await self.synthesize(startup_text(WARMUP_TEXT, self.spoken_language))
+        # Every declared language once: a bilingual model routes scripts through
+        # DIFFERENT sub-frontends (matcha zh-en folds English via espeak), and a
+        # single-language warmup leaves the other path cold until the first real
+        # word in that script.
+        langs = getattr(self, "spoken_languages", None) or (self.spoken_language,)
+        for lang in dict.fromkeys(langs):
+            await self.synthesize(startup_text(WARMUP_TEXT, lang))
 
     def _synthesize_sync(self, text: str) -> bytes:
         try:
