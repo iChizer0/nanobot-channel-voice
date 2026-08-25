@@ -77,9 +77,10 @@ def trim_lead_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float 
 def trim_tail_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float = 0.01) -> bytes:
     """Cap the TRAILING silence of raw S16_LE PCM at ``cap_ms``.
 
-    For CANNED clips only (acks, fillers): the padding holds the turn SPEAKING with the
-    half-duplex mic gated (measured 580-790 ms of tail on matcha acks). Replies never
-    take this — their chunk boundaries carry deliberate pauses. All-silent: unchanged.
+    TTS pads every utterance with the same tail whatever the text ends with (measured
+    580-790 ms on matcha), so it is padding, never a rendered pause: on a canned clip it
+    holds the turn SPEAKING with the half-duplex mic gated, and on a reply chunk it becomes
+    a seam the words did not ask for. All-silent: unchanged.
     """
     n = len(pcm) & ~1
     if n == 0 or rate <= 0:

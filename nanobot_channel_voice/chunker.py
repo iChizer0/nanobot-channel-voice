@@ -42,6 +42,9 @@ _RE_WS = re.compile(r"[ \t]+")
 
 # Curly quotes -> ASCII BEFORE the whitelist below, which would drop them.
 _SMART_PUNCT = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+# Between digits a tilde is the hyphen's twin ("5~10分钟"); as itself it is unspeakable
+# (espeak names it "tilde") and the whitelist would drop it, fusing 5 and 10 into 五十.
+_RE_TILDE_RANGE = re.compile(r"(?<=\d)\s*[~～]\s*(?=\d)")
 # Speakable whitelist: Unicode word chars, whitespace, punctuation TTS can voice or
 # pause on. Everything else -> space (never glue neighbours), collapsed by _RE_WS;
 # espeak and MMS VITS read raw codepoint names aloud.
@@ -63,6 +66,7 @@ def sanitize(text: str) -> str:
     text = _RE_QUOTE.sub("", text)
     text = text.replace("|", " ")
     text = text.translate(_SMART_PUNCT)
+    text = _RE_TILDE_RANGE.sub("-", text)
     text = _RE_UNSPEAKABLE.sub(" ", text)
     text = _RE_WS.sub(" ", text)
     return text

@@ -517,6 +517,26 @@ _CUT_LOOKAHEAD = 16
 _CUT_SENT = set(".!?…。！？")
 _CUT_CLAUSE = set(",;:，、；：")
 
+# Seam silence, ms. The model pads EVERY utterance with the same tail whatever it ends with
+# (matcha: 590 ms after "。", after "，" and after a bare cut alike), so only the text can
+# size a seam. Targets are what it renders for that punctuation INSIDE one utterance.
+_SEAM_LEAD_MS = 20.0
+_SEAM_SENT_MS = 140.0    # + the lead ~= the 164 ms it renders for an internal "。"
+_SEAM_CLAUSE_MS = 280.0  # + the lead ~= the 308 ms it renders for an internal "，"
+_SEAM_OPEN_MS = 40.0     # a budget cut mid-phrase: no boundary here to pause on
+# Closers ride with their sentence, in any order and spacing: the punctuation that sizes
+# the seam is underneath them.
+_SEAM_CLOSERS = "\"')]}»”’」』】）〉》 \t\r\n"
+
+
+def _seam_tail_ms(text: str) -> float:
+    """Trailing silence to keep after a piece, from what it ends with."""
+    end = text.rstrip(_SEAM_CLOSERS)
+    ch = end[-1] if end else ""
+    if ch in _CUT_SENT:
+        return _SEAM_SENT_MS
+    return _SEAM_CLAUSE_MS if ch in _CUT_CLAUSE else _SEAM_OPEN_MS
+
 
 def _cut_index(text: str, budget: int, floor: int) -> int:
     """Cut for an over-budget chunk: last sentence end in [floor, budget], else clause
@@ -3241,11 +3261,11 @@ class LocalBackend(TurnEventMixin):
         elif self._sink.starved():
             self._metrics.count("tts_gap")  # blob mode: the queue ran idle
         if self._pcm_out:
-            # A turn's first chunk keeps only 20 ms of lead silence (the rest is pure
-            # TTFA); later chunks keep 120 ms, so inter-sentence pauses stay natural.
-            audio = trim_lead_silence(
-                audio, self._tts.output_rate, cap_ms=20.0 if was_first else 120.0
-            )
+            # The seam belongs to the piece that ENDS it, so the lead stays tight always and
+            # the tail carries the pause the words earned.
+            rate = self._tts.output_rate
+            audio = trim_lead_silence(audio, rate, cap_ms=_SEAM_LEAD_MS)
+            audio = trim_tail_silence(audio, rate, cap_ms=_seam_tail_ms(text))
         if self._duck_gain < 1.0 and not self._pcm_out:
             # Blob fallback: no mid-chunk gain control, so bake the static duck in.
             audio = await asyncio.to_thread(_scale_wav, audio, self._duck_gain)

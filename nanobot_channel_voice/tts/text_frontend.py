@@ -186,6 +186,7 @@ def verbalize_numbers_en(text: str) -> str:
     text = _sub_dates(text, _en_date_words)
     text = _sub_month_dates(text)
     text = _RE_EN_DECADE.sub(_en_decade, text)
+    text = _fractions(_ranges(text, "en"), "en")
     text = _sub_padded(_RE_CURRENCY, text, _en_currency)
     text = _RE_DEGREES.sub(_en_degrees, text)
     text = _sub_padded(
@@ -265,16 +266,20 @@ def _zh_number(number: str) -> str:
 
 
 def _zh_time_words(m: re.Match) -> str:
-    hour, minute = int(m.group(1)), int(m.group(2))
+    hour, minute, sec = int(m.group(1)), int(m.group(2)), m.group(3)
+    pad = "零" if minute < 10 else ""
+    if sec is not None:
+        # Clock wording for a duration too: it stays intelligible, and the alternative
+        # left the ":" to reach the model as a mid-number pause.
+        return f"{_zh_int(hour)}点{pad}{_zh_int(minute)}分{_zh_int(int(sec))}秒"
     if minute == 0:
         return f"{_zh_int(hour)}点"
-    pad = "零" if minute < 10 else ""
     return f"{_zh_int(hour)}点{pad}{_zh_int(minute)}分"
 
 
 # \b never fires beside CJK (both \w): anchor on digit lookarounds instead. Percent
 # is decimal-aware and runs BEFORE decimal or "3.5%" loses its integer part.
-_RE_TIME_ZH = re.compile(r"(?<!\d)(\d{1,2})[:：]([0-5]\d)(?!\d)")
+_RE_TIME_ZH = re.compile(r"(?<!\d)(\d{1,2})[:：]([0-5]\d)(?:[:：]([0-5]\d))?(?!\d)")
 _RE_GROUPED_ZH = re.compile(rf"(?<!\d){_GROUPED}(?!\d)")
 _RE_PERCENT_ZH = re.compile(rf"(?<!\d)((?:{_GROUPED}|\d+)(?:\.\d+)?)\s*[%％]")
 _RE_DECIMAL_ZH = re.compile(rf"(?<!\d)({_GROUPED}|\d+)\.(\d+)(?!\d)")
@@ -325,6 +330,7 @@ def verbalize_numbers_zh(text: str) -> str:
     text = _RE_ISO_T.sub(" ", text)
     text = _sub_dates(text, _zh_date)
     text = _RE_ZH_PADDED_DATE.sub(r"\1", text)
+    text = _fractions(_ranges(text, "zh"), "zh")
     text = _sub_padded(_RE_CURRENCY, text, _zh_currency)
     text = _RE_DEGREES.sub(_zh_degrees, text)
     text = _sub_padded(
@@ -559,8 +565,60 @@ _ZH_UNITS = ("元 块 角 美元 欧元 个 只 条 张 台 部 件 份 位 人 
              "天 小时 分钟 秒 周 度 米 公里 千米 厘米 毫米 里 克 千克 公斤 吨 升 毫升 斤 两 "
              "倍 成 折 分 平方米 亿 万 种 款 层 楼 步").split()
 _RE_ZH_TRIGGER = re.compile("(?:" + "|".join(_ZH_TRIGGERS) + r")[^0-9]{0,6}$")
-# Longest-first, or 公里 loses its first character to 里.
-_RE_ZH_UNIT = re.compile(r"^\s*(?:" + "|".join(sorted(_ZH_UNITS, key=len, reverse=True)) + ")")
+# Longest-first, or 公里 loses its first character to 里. The Latin branch mirrors what
+# _RE_EN_UNIT already lists: zh text writes "512MB" and "100km" too, and without it the
+# glue rule in _is_sequence reads those digit-wise. Two letters minimum, so an identifier
+# suffix (1080p, 4K, 5G) still reads as a sequence.
+_RE_ZH_UNIT = re.compile(
+    r"^\s*(?:(?:" + "|".join(sorted(_ZH_UNITS, key=len, reverse=True)) + r")"
+    r"|(?:[kmg]?hz|[kmgt]b|fps|dpi|bpm|km|cm|mm|kg|mg|ml|ms|kw)(?![a-z]))",
+    re.I,
+)
+
+# Neither separator is silent: espeak NAMES them ("5-10" -> "five dash ten", "1/2" ->
+# "one slash two") and the zh lexicon drops them, fusing "5-10分钟" into 五十分钟.
+# "\s*%" as one optional unit, never a bare "\s*": a trailing "\s*" swallows the space
+# before the unit ("5-10 minutes" -> "5 to 10minutes").
+_RE_RANGE = re.compile(
+    rf"(?<![\d{_HYPHENS}.])(\d+(?:\.\d+)?(?:\s*%)?)\s*[{_HYPHENS}~～]\s*"
+    rf"(\d+(?:\.\d+)?(?:\s*%)?)(?![\d.])"
+)
+# Denominators a reader says as a fraction. Anything else (24/7, 16/9, 8/25) keeps its
+# literal reading rather than inventing "twenty fifths" -- and this is the guard that
+# keeps a bare M/D date out, which a spoken reply writes as "January 2" anyway.
+_FRACTION_DENOMS = frozenset((2, 3, 4, 5, 6, 8, 10, 16))
+_RE_FRACTION = re.compile(r"(?<![\d./])(\d{1,2})/(\d{1,2})(?![\d/])")
+
+
+def _ranges(text: str, lang: str) -> str:
+    """Give a quantity range its connective, unit-anchored exactly as the sequence pass
+    is: with nothing behind it a hyphen run is as often an id."""
+    unit = _RE_ZH_UNIT if lang == "zh" else _RE_EN_UNIT
+    to = "到" if lang == "zh" else " to "
+
+    def connect(m: re.Match[str]) -> str:
+        lo, hi = m.group(1), m.group(2)
+        if not (lo.endswith("%") or unit.match(text[m.end():m.end() + _CTX_RIGHT])):
+            return m.group()
+        if lo.isdigit() and len(lo) == 4 and hi.isdigit() and len(hi) <= 2:
+            return m.group()  # "2026-8月": a date shape the date pass did not claim
+        return f"{lo}{to}{hi}"
+
+    return _RE_RANGE.sub(connect, text)
+
+
+def _fractions(text: str, lang: str) -> str:
+    """Common fractions to words; a proper fraction only, so "16/9" stays an aspect ratio."""
+    def read(m: re.Match[str]) -> str:
+        num, den = int(m.group(1)), int(m.group(2))
+        if den not in _FRACTION_DENOMS or not 0 < num < den:
+            return m.group()
+        if lang == "zh":
+            return f"{_zh_int(den)}分之{_zh_int(num)}"
+        name = {2: "half", 4: "quarter"}.get(den) or _ordinal_words(den)
+        return f"{_int_words(num)} {name}{'s' if num > 1 else ''}"
+
+    return _RE_FRACTION.sub(read, text)
 
 
 def _en_triggered(left: str) -> bool:
@@ -673,6 +731,7 @@ def space_digit_sequences(text: str, language: str | None = "en") -> str:
         text = _sub_dates(text, _en_date_words)
         text = _sub_month_dates(text)
         text = _RE_EN_DECADE.sub(_en_decade, text)
+        text = _fractions(_ranges(text, "en"), "en")
         text = _sub_padded(_RE_CURRENCY, text, _en_currency)
         text = _RE_DEGREES.sub(_en_degrees, text)
     return _read_sequences(

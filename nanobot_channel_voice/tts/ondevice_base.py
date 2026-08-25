@@ -27,6 +27,23 @@ from nanobot_channel_voice.tts.base import (
 # ids to noise, MMS drops them (word salad) — a skip + WARNING names the misconfig.
 _MIN_SPEAKABLE = 0.5
 
+# Padding to leave on an interior edge: enough for the engine's fade, too little to hear.
+_EDGE_KEEP_MS = 10.0
+
+
+def _edge_trim(
+    wav: np.ndarray, rate: int, *, lead: bool = False, tail: bool = False
+) -> np.ndarray:
+    """Drop the model's utterance padding from an INTERIOR budget-split edge, so that
+    ``_join_gap_s`` is the seam rather than a garnish on ~700 ms of it."""
+    idx = np.flatnonzero(np.abs(wav) > 0.01)
+    if idx.size == 0:
+        return wav
+    keep = int(rate * _EDGE_KEEP_MS / 1000.0)
+    lo = max(0, int(idx[0]) - keep) if lead else 0
+    hi = min(wav.size, int(idx[-1]) + 1 + keep) if tail else wav.size
+    return wav[lo:hi]
+
 
 class OnDeviceTtsAdapter(TtsAdapter):
     # Subclasses set (class- or instance-level): output_rate = sample rate of
@@ -142,6 +159,10 @@ class OnDeviceTtsAdapter(TtsAdapter):
             ) if p.size
         ]
         if len(parts) == 2:
+            # Interior seam, as in _synthesize_floats: the halves' own padding would
+            # otherwise bury _join_gap_s under ~700 ms of it.
+            parts[0] = _edge_trim(parts[0], self.output_rate, tail=True)
+            parts[1] = _edge_trim(parts[1], self.output_rate, lead=True)
             parts.insert(1, self._join_gap())
         return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
@@ -173,7 +194,10 @@ class OnDeviceTtsAdapter(TtsAdapter):
                 continue
             if samples.size:
                 if waves:
+                    # A budget cut is not a boundary: both sides' padding is dead air.
+                    waves[-1] = _edge_trim(waves[-1], self.output_rate, tail=True)
                     waves.append(gap)
+                    samples = _edge_trim(samples, self.output_rate, lead=True)
                 waves.append(samples)
         if skipped:
             self._log.warning(

@@ -46,7 +46,16 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
         ("that's flight UA837", "that's flight UA eight three seven"),
         # …and the guards that keep quantities quantities.
         ("1000000 residents", "one million residents"),   # unit beats the length rule
-        ("it takes 10-15 minutes", "it takes ten-fifteen minutes"),  # a range, not an id
+        # A range, not an id -- and it keeps a connective: espeak names a bare hyphen
+        # ("five dash ten") and the char-vocab engines drop it, fusing the two numbers.
+        ("it takes 10-15 minutes", "it takes ten to fifteen minutes"),
+        ("3-5 days", "three to five days"),
+        ("order 3-5", "order three-five"),               # no unit behind it: left alone
+        ("about 1/2 cup", "about one half cup"),
+        ("2/3 of users", "two thirds of users"),
+        # Not proper fractions: the numbers still read, but never as "twenty fourths".
+        ("open 24/7", "open twenty four/seven"),
+        ("a 16/9 screen", "a sixteen/nine screen"),
         ("COVID-19 spread", "COVID-nineteen spread"),     # too short to be glue
         ("the account ending in 1234",
          "the account ending in one two three four"),     # trigger outranks the year cue

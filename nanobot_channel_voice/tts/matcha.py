@@ -47,7 +47,13 @@ _SENTENCE_SPLIT_RE = re.compile(
 _CLAUSE_SPLIT_RE = re.compile(r"([、，；：]|[,;:](?=\s|$))")
 _SENTENCE_PUNCT = ".!?…。！？"
 _LANG_SWITCH_RE = re.compile(r"\([a-z0-9-]+\)")  # espeak "(zh)" language-switch flags
-_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z']*")  # = LexiconFrontend's Latin runs
+# Latin-1 Supplement + Extended-A/B, minus the two maths signs inside them: an a-z run
+# stops at the accent, so "naïve" would reach the resolver as "na" and "ve".
+_LATIN_LETTERS = "A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f"
+_RE_LATIN_CHAR = re.compile(f"[{_LATIN_LETTERS}]")
+_LATIN_WORD_RE = re.compile(  # = LexiconFrontend's Latin runs, by construction
+    rf"[{_LATIN_LETTERS}][{_LATIN_LETTERS}']*"
+)
 
 # Verbatim official symbol table; list position IS the embedding id
 _OFFICIAL_PUNCTUATION = ';:,.!?¡¿—…"«»“” '
@@ -408,7 +414,7 @@ class LexiconFrontend:
 
     def can_speak(self, ch: str) -> bool:
         ch = ch.lower()
-        if self._english is not None and "a" <= ch <= "z":
+        if self._english is not None and _RE_LATIN_CHAR.match(ch):
             return True
         return ch in self._word2ids or ch in self._token2id
 
@@ -430,11 +436,11 @@ class LexiconFrontend:
 
         i = 0
         while i < len(low):
-            if self._english is not None and "a" <= low[i] <= "z":
+            if self._english is not None and _RE_LATIN_CHAR.match(low[i]):
                 # Whole Latin run at once, ORIGINAL case (all-caps = acronym): a per-char
                 # walk leaks letters that coincide with pinyin syllables ("o" -> 哦).
                 j = i + 1
-                while j < len(low) and ("a" <= low[j] <= "z" or low[j] == "'"):
+                while j < len(low) and (_RE_LATIN_CHAR.match(low[j]) or low[j] == "'"):
                     j += 1
                 emit(self._english.word_ids(text[i:j]), latin=True)
                 i = j

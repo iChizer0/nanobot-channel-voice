@@ -276,6 +276,52 @@ def test_cut_index_spares_numbers_and_prefers_sentence_ends():
     assert cjk[: local_mod._cut_index(cjk, 12, 3)].endswith("。")
 
 
+class _PaddedTts:
+    """Model padding: 100 ms of tone then 600 ms of silence, whatever the text says."""
+
+    output_rate = 16000
+
+    async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+        return b"\x00\x40" * 1600 + b"\x00\x00" * 9600
+
+
+def _tail_ms(pcm: bytes, rate: int = 16000) -> float:
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(pcm)
+    last = max(i for i, v in enumerate(samples) if abs(v) > 0.01 * 32767)
+    return (len(samples) - 1 - last) / rate * 1000.0
+
+
+def test_seam_silence_is_sized_by_what_the_piece_ends_with():
+    backend, _, sink = _build(_PaddedTts())  # type: ignore[arg-type]
+    seen: list[bytes] = []
+
+    async def capture(event) -> None:
+        seen.append(event.pcm)
+
+    backend._on_event = capture
+
+    async def scenario():
+        backend._cur_turn = _Turn("t")
+        for text in ("我已经保存好了。", "我已经保存好了，", "然后再"):
+            await backend._synth_and_emit(sink.epoch, text)
+
+    asyncio.run(scenario())
+    sent, clause, cut = (_tail_ms(pcm) for pcm in seen)
+    assert (sent, clause, cut) == (140.0, 280.0, 40.0)
+    # A budget cut is not a boundary: it must not out-pause a sentence end.
+    assert cut < sent < clause
+
+
+def test_seam_tail_reads_through_closing_punctuation():
+    assert local_mod._seam_tail_ms('He said "stop."') == local_mod._SEAM_SENT_MS
+    assert local_mod._seam_tail_ms("「知道了」，") == local_mod._SEAM_CLAUSE_MS
+    assert local_mod._seam_tail_ms("然后再") == local_mod._SEAM_OPEN_MS
+    assert local_mod._seam_tail_ms("") == local_mod._SEAM_OPEN_MS
+
+
 def test_runway_prefers_the_span_ledger():
     backend, tts, sink = _build()
     sink.backlog_ms = lambda: 7000.0  # type: ignore[method-assign]

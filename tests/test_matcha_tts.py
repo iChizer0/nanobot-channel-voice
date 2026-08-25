@@ -10,7 +10,9 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
+from nanobot_channel_voice.chunker import sanitize  # noqa: E402
 from nanobot_channel_voice.tts.matcha import (  # noqa: E402
+    EnglishToIpa,
     EspeakFrontend,
     LexiconFrontend,
     MatchaTtsAdapter,
@@ -518,6 +520,64 @@ def test_verbalize_numbers_zh_dates_currency_degrees():
     # digit-wise reading.
     assert verbalize_numbers_zh("单号1234-56-78") == "单号一二三四五六七八"
     assert verbalize_numbers_zh("编号2026-02-30") == "编号二零二六零二三零"
+
+
+def test_verbalize_numbers_zh_ranges_keep_a_connective():
+    # The separator has no zh glyph, so the lexicon frontend drops it: without 到 the two
+    # numbers fuse and "5~10分钟" speaks as 五十分钟 -- fifty.
+    assert verbalize_numbers_zh("大概需要10-15分钟") == "大概需要十到十五分钟"
+    assert verbalize_numbers_zh("5~10分钟") == "五到十分钟"
+    # …though in the real pipeline sanitize() has already folded that tilde to a hyphen.
+    assert sanitize("5~10分钟") == "5-10分钟"
+    assert sanitize("about ~5 degrees") == "about 5 degrees"  # not a range: still dropped
+    assert verbalize_numbers_zh("3-5天") == "三到五天"
+    assert verbalize_numbers_zh("第3-5章") == "第三到五章"
+    assert verbalize_numbers_zh("电量50%-60%") == "电量百分之五十到百分之六十"
+    assert verbalize_numbers_zh("重2.5-3.5公斤") == "重二点五到三点五公斤"
+    assert verbalize_numbers_zh("从2020-2024年") == "从二零二零到二零二四年"
+    # Unit-anchored, exactly as the sequence pass is: with nothing behind it a hyphen run
+    # is as often an id, and phone/order shapes must keep reading digit-wise.
+    assert verbalize_numbers_zh("型号3-5") == "型号三-五"
+    assert verbalize_numbers_zh("订单号400-820-8820") == "订单号四零零八二零八八二零"
+    assert verbalize_numbers_zh("2026-08") == "二零二六零八"  # a date shape, never a range
+
+
+def test_latin_runs_carry_their_accents():
+    tokens = fold_punct_aliases({"。": 8, "k": 1, "a": 2, "f": 3, "ei": 4})
+    seen: list[str] = []
+
+    def phonemize(text: str) -> str:
+        seen.append(text)
+        return "k a f ei"
+
+    fe = LexiconFrontend({}, tokens, english=EnglishToIpa(tokens, phonemize))
+    fe.sentences("café。")
+    # One word: an a-z-only run stops at the accent and voices "caf" plus fragments.
+    assert seen == ["café"]
+    assert fe.can_speak("é") and fe.can_speak("ñ") and not fe.can_speak("中")
+
+
+def test_verbalize_numbers_zh_fractions_and_clock_seconds():
+    assert verbalize_numbers_zh("大约1/2杯水") == "大约二分之一杯水"
+    assert verbalize_numbers_zh("2/3的人同意") == "三分之二的人同意"
+    # Not proper fractions: the numbers still read, but never as 二十四分之七.
+    assert verbalize_numbers_zh("全年无休24/7") == "全年无休二十四/七"
+    assert verbalize_numbers_zh("屏幕16/9") == "屏幕十六/九"
+    # A third field used to strand its ":" as a mid-number pause token.
+    assert verbalize_numbers_zh("用时1:23:45") == "用时一点二十三分四十五秒"
+    assert verbalize_numbers_zh("会议14:30") == "会议十四点三十分"
+
+
+def test_verbalize_numbers_zh_latin_units_pin_a_quantity():
+    # Glued digits+letters are identifier glue to _is_sequence; a UNIT behind them is not.
+    assert verbalize_numbers_zh("文件512MB") == "文件五百一十二MB"
+    assert verbalize_numbers_zh("跑了100km") == "跑了一百km"
+    assert verbalize_numbers_zh("内存16GB和512GB") == "内存十六GB和五百一十二GB"
+    assert verbalize_numbers_zh("延迟20ms") == "延迟二十ms"
+    assert verbalize_numbers_zh("频率2.4GHz") == "频率二点四GHz"
+    # Two letters minimum, so identifier suffixes still read digit-wise.
+    assert verbalize_numbers_zh("分辨率1080p") == "分辨率一零八零p"
+    assert verbalize_numbers_zh("显卡RTX4090") == "显卡RTX四零九零"
 
 
 def test_verbalize_numbers_zh_sequences():

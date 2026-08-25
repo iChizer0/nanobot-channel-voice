@@ -43,6 +43,17 @@ class _AsciiEngine(OnDeviceTtsAdapter):
         return np.ones(len(text), dtype=np.float32)
 
 
+class _PaddedEngine(_AsciiEngine):
+    """One loud sample per character, wrapped in the model's silent utterance padding."""
+
+    _join_gap_s = 0.1
+
+    def _synthesize_piece(self, text: str) -> np.ndarray:
+        self.spoken.append(text)
+        pad = np.zeros(int(0.6 * self.output_rate), dtype=np.float32)
+        return np.concatenate([pad, np.ones(len(text), dtype=np.float32), pad])
+
+
 def _warnings(fn) -> list[str]:
     messages: list[str] = []
     sink = loguru_logger.add(lambda m: messages.append(str(m)), level="WARNING")
@@ -150,3 +161,15 @@ def test_supertonic_can_speak_follows_its_indexer():
     assert not adapter._can_speak("z")      # in range, but unmapped => gathered as noise
     assert not adapter._can_speak("好")
     assert not adapter._can_speak("😀")     # non-BMP decomposes to nothing => silence
+
+
+def test_an_interior_budget_seam_drops_the_model_padding():
+    engine = _PaddedEngine(budget=4)
+    wav = engine._synthesize_floats("aaaa bbbb")
+    assert engine.spoken == ["aaaa", "bbbb"]
+    loud = np.flatnonzero(wav > 0.5)
+    interior = int(loud[-1] - loud[0] + 1 - loud.size)
+    # 10 ms kept per side plus the engine's own 100 ms join gap -- not 2x600 ms of padding.
+    assert 115 <= interior / engine.output_rate * 1000 <= 125
+    # Outer edges are left alone: the backend sizes those against the NEXT chunk.
+    assert loud[0] >= int(0.5 * engine.output_rate)
