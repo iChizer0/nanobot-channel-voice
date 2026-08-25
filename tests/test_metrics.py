@@ -96,6 +96,29 @@ def test_calls_dropped_counts_only_still_open_calls():
     assert m.counters["tool_dropped.session_lost"] == 1
 
 
+def test_a_dropped_calls_late_result_does_not_double_count_its_outcome():
+    m = VoiceMetrics()
+    m.call_seen("dropped", "t")
+    m.calls_dropped({"dropped"}, "session_lost")
+    m.call_finished("dropped", outcome="ok", mode="direct")
+    # tool_dropped was its terminal; a second would outnumber the tool_calls it divides.
+    assert m.counters["tool_late_result"] == 1
+    assert "tool_ok" not in m.counters
+    # A call the backend never announced (the shell's own) still counts normally.
+    m.call_finished("unseen", outcome="ok", mode="direct")
+    assert m.counters["tool_ok"] == 1
+
+
+def test_a_reannounced_call_id_is_no_longer_void():
+    m = VoiceMetrics()
+    m.call_seen("c1", "t")
+    m.calls_dropped({"c1"}, "session_lost")
+    m.call_seen("c1", "t")  # fresh record, tool_calls counted again
+    m.call_finished("c1", outcome="ok", mode="direct")
+    assert m.counters["tool_ok"] == 1
+    assert "tool_late_result" not in m.counters
+
+
 def test_calls_abandoned_spares_already_dispatched():
     m = VoiceMetrics()
     m.call_seen("undispatched", "t")

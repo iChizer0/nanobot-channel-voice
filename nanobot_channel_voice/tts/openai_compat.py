@@ -1,8 +1,8 @@
 """OpenAI-compatible ``/audio/speech`` TTS adapter (httpx only).
 
-Drives both OpenAI cloud TTS and any OpenAI-compatible local server (e.g.
-Kokoro-FastAPI): point ``apiBase`` at it. Mirrors nanobot's transcription adapters:
-base-vs-full-URL resolution, Bearer auth, retry/backoff on transient failures.
+Drives OpenAI cloud TTS and any compatible local server (point ``apiBase`` at it).
+Mirrors nanobot's transcription adapters: base-vs-full-URL resolution, Bearer auth,
+retry/backoff on transient failures.
 """
 
 from __future__ import annotations
@@ -51,8 +51,7 @@ def _body_text(resp: httpx.Response) -> str:
 
 def _is_text_payload(content_type: str) -> bool:
     ct = content_type.split(";", 1)[0].strip().lower()
-    # Deny-list, not allow-list: raw PCM legitimately arrives as
-    # application/octet-stream or with no content-type at all.
+    # Deny-list, not allow-list: raw PCM arrives as octet-stream or no content-type.
     return ct.startswith("application/json") or ct.startswith("text/") or "+json" in ct
 
 
@@ -77,8 +76,7 @@ class OpenAITtsAdapter(TtsAdapter):
         self._pcm_sample_rate = pcm_sample_rate
         self.output_rate = pcm_sample_rate if audio_format == "pcm" else None
         self.probe_ok = self._url != _DEFAULT_URL  # only the cloud endpoint bills
-        # Reused across calls: a per-chunk client would put a TCP+TLS handshake in the
-        # first-audio path.
+        # Reused: a per-chunk client would put a TCP+TLS handshake in the first-audio path.
         self._client: httpx.AsyncClient | None = None
         self._log = logger.bind(component="tts-openai")
 
@@ -88,13 +86,11 @@ class OpenAITtsAdapter(TtsAdapter):
         return self._client
 
     async def warmup(self) -> None:
-        """A bare HEAD to the endpoint's origin — never a synthesis, so nothing is
-        billed whatever ``probe_ok`` says; any response (404 included) counts. The
-        durable wins are the SSL-context build (certifi load — slow on SBCs), the
-        OS DNS cache, and client init; the pooled connection itself expires after
-        httpx's 5 s keepalive, so a first turn minutes later still pays TCP+TLS
-        (deliberately not extended: a long-idle pooled connection would instead
-        fail mid-session)."""
+        """A bare HEAD to the endpoint's origin — never a synthesis, so nothing is billed;
+        any response (404 included) counts. Wins are the SSL-context build (certifi load,
+        slow on SBCs), the OS DNS cache and client init; the pooled connection expires
+        after httpx's 5 s keepalive, deliberately not extended (a long-idle pooled
+        connection fails mid-session instead)."""
         origin = str(httpx.URL(self._url).copy_with(path="/", query=None, fragment=None))
         with suppress(Exception):
             await self._get_client().head(origin, timeout=min(self._timeout, 5.0))
@@ -181,10 +177,9 @@ class OpenAITtsAdapter(TtsAdapter):
 
     async def _post(self, body: dict, headers: dict) -> bytes:
         client = self._get_client()
-        # httpx's read timeout resets on every socket read, so a server trickling one
-        # byte at a time never trips it and wedges the turn in SPEAKING. Bound each
-        # attempt AND the ladder: the ladder alone lets one stalled attempt eat the
-        # whole budget with no retry left; per-attempt alone lets retries stack past it.
+        # httpx's read timeout resets on every socket read, so a trickling server never
+        # trips it and wedges the turn in SPEAKING. Bound each attempt AND the ladder:
+        # ladder-only lets one stall eat the budget, per-attempt-only stacks past it.
         deadline = time.monotonic() + _TOTAL_BUDGET_MULT * self._timeout
         for attempt in range(_RETRIES + 1):
             left = deadline - time.monotonic()

@@ -1,15 +1,13 @@
 """Local OpenAI-compatible transcription endpoint over the SINGLETON STT adapter.
 
 ``POST /v1/audio/transcriptions`` (multipart, the OpenAI shape) -> ``{"text": ...}``.
-Core's transcription consumers (WebUI mic dictation, channel voice notes) reach the
-plugin's on-device STT through this: core's provider registry is closed, but its OpenAI
-adapter honors a per-provider ``apiBase``. The channel passes the SAME adapter object
-the voice pipeline decodes with (real targets cannot fit a duplicate in RAM/NPU);
-requests serialize on a lock. Zero new dependencies: HTTP/1.1 over
-``asyncio.start_server``, multipart by boundary split, browser audio (webm/opus, m4a,
-mp3, ...) transcoded by the ``ffmpeg`` BINARY; S16 WAV needs nothing. Loopback by
-default; an optional bearer key (core sends the provider entry's ``apiKey``) guards
-wider exposure.
+Core's transcription consumers reach the plugin's on-device STT through this: core's
+provider registry is closed, but its OpenAI adapter honors a per-provider ``apiBase``.
+The channel passes the SAME adapter object the voice pipeline decodes with (a duplicate
+does not fit in RAM/NPU); requests serialize on a lock. Zero new dependencies: HTTP/1.1
+over ``asyncio.start_server``, multipart by boundary split, browser containers
+transcoded by the ``ffmpeg`` BINARY; S16 WAV needs nothing. Loopback by default; an
+optional bearer key guards wider exposure.
 """
 
 from __future__ import annotations
@@ -43,8 +41,8 @@ _MAX_INFLIGHT = 4
 _MAX_HEAD_LINES = 100
 _MAX_HEAD_BYTES = 64 * 1024
 # Decode-duration ceiling on BOTH ingest branches (ffmpeg -t, and a frame cap on the
-# WAV fast path): a small compressed upload can expand to hours of PCM. Core's WebUI
-# caps dictation at 120 s; 300 s of 16 kHz mono is ~9.6 MB.
+# WAV fast path): a small compressed upload can expand to hours of PCM. 300 s clears
+# core's 120 s WebUI dictation cap, at ~9.6 MB of 16 kHz mono.
 _MAX_DECODE_S = 300
 # ``; key=value`` / ``; key="value"`` params of one header line.
 _HEADER_PARAM = re.compile(r';\s*([\w*-]+)\s*=\s*(?:"([^"]*)"|([^;\s]*))')
@@ -90,10 +88,9 @@ class SttHttpServer:
         if self._server is None:
             return
         self._server.close()
-        # wait_closed() returns only once every handler released its transport, and a
-        # stalled upload holds that for the header + body + ffmpeg timeouts, hence the
-        # cap-then-cancel; the GRACE, not the cancel, is what lets an in-flight decode
-        # land, since one already inside to_thread runs on regardless.
+        # wait_closed() returns only once every handler released its transport, which a
+        # stalled upload holds for the full timeouts: hence cap-then-cancel. The GRACE
+        # is what lets an in-flight decode land.
         try:
             await asyncio.wait_for(asyncio.shield(self._server.wait_closed()), _STOP_GRACE_S)
         except asyncio.TimeoutError:
@@ -133,8 +130,7 @@ class SttHttpServer:
                 audio, filename = _multipart_file(headers.get("content-type", ""), body)
                 pcm, rate = await self._ingest(audio, filename)
                 async with self._lock:
-                    # Chunked: uploads (WebUI dictation runs to 120 s, the ingest cap to
-                    # 300 s) routinely outrun a fixed decode window.
+                    # Chunked: uploads routinely outrun a fixed decode window.
                     text = await transcribe_chunked(self._adapter, pcm, rate)
                 payload = json.dumps({"text": text}, ensure_ascii=False).encode()
                 self._respond(writer, 200, "OK", payload)
@@ -144,8 +140,8 @@ class SttHttpServer:
                     writer, exc.status, exc.reason,
                     json.dumps({"error": {"message": exc.detail}}).encode(),
                 )
-                # 401/413 decide before the upload finishes, and closing mid-send resets
-                # the client (it reports a connection error, not our status): drain first.
+                # 401/413 decide before the upload finishes; closing mid-send resets the
+                # client (it reports a connection error, not our status): drain first.
                 with suppress(Exception):  # gone peer: the finally closes anyway
                     await writer.drain()
                     await asyncio.wait_for(self._discard(reader), timeout=2.0)
@@ -241,8 +237,8 @@ class SttHttpServer:
                 f"'{filename}' is not S16 WAV and ffmpeg is not installed; "
                 "install ffmpeg to accept browser audio (webm/opus, m4a, mp3, ...)",
             )
-        # A temp FILE, not a pipe: mp4/m4a keep their index at the END, which a
-        # non-seekable stdin cannot serve.
+        # A temp FILE, not a pipe: mp4/m4a keep their index at the END, unreachable
+        # through a non-seekable stdin.
         fd, path = await asyncio.to_thread(tempfile.mkstemp, "-stt-serve")
         try:
             await asyncio.to_thread(_write_fd, fd, audio)  # closes fd
@@ -299,11 +295,9 @@ def _disposition(head: bytes) -> str:
 def _multipart_file(content_type: str, body: bytes) -> tuple[bytes, str]:
     """The ``file`` part of an OpenAI-shape multipart upload -> (bytes, filename).
 
-    Boundary split over a memoryview, NOT the stdlib ``email`` parser: that regex-splits
-    the payload into per-line fragments and rebuilds it (seconds of CPU, ~11x transient
-    RSS for a 30 MB upload) on the loop that also runs capture, sink pacing and barge-in;
-    nor can it take a ``BytesIO``, whose TextIOWrapper newline-translates the bytes and
-    corrupts every container."""
+    Boundary split over a memoryview, NOT the stdlib ``email`` parser: measured at
+    seconds of CPU and ~11x transient RSS for a 30 MB upload, on the loop that also runs
+    capture and barge-in; and its ``BytesIO`` path newline-translates the bytes."""
     if "multipart/form-data" not in content_type.lower():
         raise _HttpError(
             400, "Bad Request", "expected multipart/form-data (the OpenAI transcription shape)"
@@ -347,8 +341,7 @@ def _plain_wav_pcm(data: bytes) -> tuple[bytes, int] | None:
             if w.getsampwidth() != 2 or channels not in (1, 2):
                 return None  # exotic widths/layouts: let ffmpeg do it properly
             rate = w.getframerate()
-            # Capped at READ time, on frames: the bound holds for any claimed rate, and
-            # neither the buffer nor the downmix below sees the tail.
+            # Capped at READ time, on frames: the bound holds for any claimed rate.
             frames = w.readframes(min(w.getnframes(), _MAX_DECODE_S * rate))
     except Exception:  # noqa: BLE001 - not a readable WAV after all
         return None

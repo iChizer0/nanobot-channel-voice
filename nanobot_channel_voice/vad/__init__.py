@@ -1,8 +1,5 @@
-"""VAD backend selection.
-
-``make_vad`` picks a per-frame detector by ``vad.engine``: ``energy`` (zero-dep default),
-``webrtc`` (``[webrtc]`` extra), ``firered`` (neural DFSMN over ONNX/RKNN, ``[ondevice]``
-extra), or ``silero`` (Silero VAD over ONNX/RKNN, same extra), via the declarative
+"""VAD backend selection: ``make_vad`` picks a per-frame detector by ``vad.engine``
+(``energy`` zero-dep default, ``webrtc``, ``firered``, ``silero``) via the declarative
 engine table the STT/TTS registries also use (:mod:`..engines`)."""
 
 from __future__ import annotations
@@ -22,9 +19,9 @@ __all__ = [
     "flag_lag_ms", "make_vad", "make_turn_analyzer", "resolve_preroll_ms",
 ]
 
-# Onset lag = time from true speech onset to the first speech-flagged frame, the only
-# thing pre-roll must recover. Algorithmic (frame-counted), NOT compute time: slow
-# inference delays decisions but never clips audio (the arecord pipe buffers in order).
+# Onset lag = true onset -> first speech-flagged frame, what pre-roll must recover.
+# Algorithmic (frame-counted), NOT compute time: slow inference delays decisions but
+# never clips audio (the capture pipe buffers in order).
 _FBANK_WARMUP_MS = 25       # analysis window before the first fbank frame
 _MODEL_RISE_MARGIN_MS = 80  # sigmoid rise to threshold + safety
 _FIRERED_FRAME_MS = 10      # the model's own frame period (vad.firered.smoothFrames unit)
@@ -32,9 +29,9 @@ _SILERO_WINDOW_MS = 32      # decision period: 512 samples @ 16 kHz (256 @ 8 kHz
 
 
 def flag_lag_ms(cfg: VadConfig, frame_ms: int) -> int:
-    """Algorithmic decision lag between the acoustic edge and the flag following it
-    (analysis window + smoothing settle + rise margin). Bounds both edges: pre-roll
-    recovers the onset side, the pause-probe's leak-death window covers release."""
+    """Algorithmic lag between an acoustic edge and the flag following it (analysis
+    window + smoothing settle + rise margin). Bounds both edges: pre-roll recovers
+    onset, the pause-probe's leak-death window covers release."""
     if cfg.engine == "firered":
         return (
             _FBANK_WARMUP_MS
@@ -48,9 +45,8 @@ def flag_lag_ms(cfg: VadConfig, frame_ms: int) -> int:
 
 
 def resolve_preroll_ms(cfg: VadConfig, frame_ms: int) -> int:
-    """The configured pre-roll, floored at the VAD's algorithmic onset lag, so a large
-    ``vad.firered.smoothFrames`` (or an under-set ``prerollMs``) cannot clip the first
-    word."""
+    """Configured pre-roll, floored at the VAD's onset lag, so a large
+    ``smoothFrames`` (or an under-set ``prerollMs``) cannot clip the first word."""
     return max(cfg.preroll_ms, flag_lag_ms(cfg, frame_ms))
 
 
@@ -78,7 +74,7 @@ ENGINES: dict[str, EngineSpec] = {
             ("firered.cmvn_path", "firered.cmvnPath"),
         ),
         build=_build_firered,
-        modules=("numpy",),
+        modules=("numpy", "kaldi_native_fbank"),  # FbankCmvn, same front-end the STTs use
     ),
     "silero": EngineSpec(
         required=(("silero.model_path", "silero.modelPath"),),
@@ -104,8 +100,8 @@ TURN_ENGINES: dict[str, EngineSpec] = {
 
 
 def make_turn_analyzer(cfg: VadConfig, sample_rate: int, frame_ms: int):
-    """Build the configured end-of-turn analyzer (``vad.turn.engine``), or None:
-    unavailable means endpointing stays silence-only, never a startup failure."""
+    """The configured end-of-turn analyzer (``vad.turn.engine``), or None: unavailable
+    means endpointing stays silence-only, never a startup failure."""
     spec = TURN_ENGINES.get(cfg.turn.engine)
     if spec is None:
         return None

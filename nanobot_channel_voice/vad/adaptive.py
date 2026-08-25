@@ -1,19 +1,12 @@
 """Adaptive hangover: learn the user's own pause lengths.
 
-Opt-in via ``vad.hangoverMinMs``: the effective hangover starts there (snappy)
-and grows toward ``vad.hangoverMs`` (the ceiling) only on evidence that the
-endpointer cut a real pause short. Two signals, both borrowed from LiveKit
-Agents' DynamicEndpointing:
-
-- the user resumed while the reply was still THINKING (their utterance was
-  split: the pause between the two pieces is a real intra-turn pause), or
-- a genuine barge-in landed within a short grace of the reply turning AUDIBLE
-  (they were still talking; the endpoint that triggered the reply was false).
-
-Pauses shorter than the current hangover never produce an endpoint, so the
-signal is inherently one-sided: the value tracks the pauses that were cut, not
-some decayed average. Samples are committed only when the resuming utterance is
-ACCEPTED (published): rejected blips/echo must not teach anything.
+Opt-in via ``vad.hangoverMinMs``: the hangover starts there and grows toward
+``vad.hangoverMs`` (the ceiling) only on evidence that the endpointer cut a real pause
+short — the user resumed while the reply was still THINKING, or barged in within a
+short grace of it turning AUDIBLE. Pauses shorter than the current hangover never
+endpoint, so the signal is one-sided: the value tracks cut pauses, not an average.
+Samples commit only when the resuming utterance is ACCEPTED: rejected blips/echo must
+teach nothing.
 """
 
 from __future__ import annotations
@@ -40,14 +33,13 @@ class AdaptiveHangover:
         return round(self._value)
 
     def note_close(self, close_mono: float, silence_ms: float) -> None:
-        """Anchor the next resume-gap measurement at close time: the fast resume this
-        learner exists to catch arrives well before STT finishes, so a publish-time
-        anchor is stale for exactly the pauses that matter."""
+        """Anchor the next resume-gap measurement at close time: the fast resumes this
+        learner exists to catch arrive before STT finishes."""
         self._close_anchor = (close_mono, silence_ms)
 
     def drop_anchor(self) -> None:
-        """The anchored close was rejected (echo/empty/backchannel): a resume gap
-        measured against it would teach from audio that was not the user's turn."""
+        """The anchored close was rejected: a gap measured against it would teach from
+        audio that was not the user's turn."""
         self._close_anchor = None
 
     def on_onset(
@@ -58,10 +50,9 @@ class AdaptiveHangover:
         audible_at: float | None,
         now: float | None = None,
     ) -> None:
-        """Latch a candidate pause when this onset suggests the previous close split
-        the user's turn: reply not yet audible (``awaiting_reply``), or audible for
-        under the grace. Every onset supersedes any unconsumed candidate; a candidate
-        commits only if its utterance is later published."""
+        """Latch a candidate pause when this onset suggests the previous close split the
+        user's turn: reply not yet audible, or audible for under the grace. Every onset
+        supersedes an unconsumed candidate; commit happens only at publish."""
         self._pending = None  # a candidate not consumed by its own close is dead
         if self._close_anchor is None:
             return
@@ -74,10 +65,10 @@ class AdaptiveHangover:
             speaking and audible_at is not None and (now - audible_at) <= _AUDIBLE_GRACE_S
         ):
             self._pending = pause_ms
-        # else: an onset well into the audible reply is a real barge-in; the endpoint was correct.
+        # else: an onset well into the audible reply is a real barge-in, not a cut pause.
 
     def take_pending(self) -> float | None:
-        """Bind the latched candidate to the closing utterance, so a queued earlier
+        """Bind the latched candidate to the closing utterance, so an earlier queued
         utterance cannot consume it."""
         pending, self._pending = self._pending, None
         return pending

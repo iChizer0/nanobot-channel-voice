@@ -24,11 +24,9 @@ _TTS_TIMEOUT_S = 30.0  # cap for one speakable chunk; a wedged child is killed, 
 
 
 def _rewrap_stdout_wav(blob: bytes) -> bytes:
-    """Re-emit a piped WAV with REAL sizes in the header: espeak-ng cannot seek stdout,
-    so ``--stdout`` blobs carry placeholder chunk sizes (data = 0x7ffff000; its
-    ``CloseWavFile`` returns early for stdout, never backpatching), and anything trusting
-    the header (``wav_duration_ms`` -> echo-rejection holds, sink backlog, calibration)
-    would read ~13.5 hours per chunk."""
+    """Re-emit a piped WAV with REAL sizes in the header: espeak-ng cannot seek stdout, so
+    ``--stdout`` blobs keep placeholder chunk sizes (data = 0x7ffff000) and anything
+    trusting the header (echo-rejection holds, sink backlog, calibration) reads ~13.5h."""
     try:
         with wave.open(io.BytesIO(blob), "rb") as w:
             rate, channels, sampwidth = w.getframerate(), w.getnchannels(), w.getsampwidth()
@@ -44,9 +42,8 @@ def _read_file(path: str) -> bytes:
 
 
 async def _communicate(proc: asyncio.subprocess.Process, *, timeout: float) -> tuple[bytes, bytes]:
-    """``communicate()`` with a hard timeout: kill and reap the child on timeout or
-    cancellation, so a wedged ``espeak-ng``/``say`` neither wedges the TTS worker
-    (channel stuck in SPEAKING) nor is orphaned."""
+    """``communicate()`` with a hard timeout: kill AND reap on timeout or cancellation, so
+    a wedged binary neither wedges the TTS worker (stuck SPEAKING) nor is orphaned."""
     try:
         return await asyncio.wait_for(proc.communicate(), timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -60,17 +57,15 @@ async def _communicate(proc: asyncio.subprocess.Process, *, timeout: float) -> t
 class SystemTtsAdapter(TtsAdapter):
     def __init__(self, *, language: str | None = None, espeak_path: str = "espeak-ng"):
         self._language = language
-        self.spoken_language = language  # None => the espeak/say default voice
+        self.spoken_language = language  # espeak voice only; `say` keeps the host default
         self._espeak = espeak_path
         self._resolved: tuple[str | None, str | None] | None = None
         self._log = logger.bind(component="tts-system")
 
     def _resolve(self) -> tuple[str | None, str | None]:
         """(kind, absolute path) of the available binary, resolved once: ``shutil.which``
-        stats every PATH entry and this runs on the event loop per speakable chunk, yet
-        make_tts builds the fallback even for sessions that never speak. The negative
-        result is cached too, so installing espeak-ng mid-session needs a channel
-        restart."""
+        stats every PATH entry and this runs on the loop per speakable chunk. The negative
+        result is cached too, so installing espeak-ng mid-session needs a restart."""
         if self._resolved is None:
             path = shutil.which(self._espeak)
             if path:
@@ -116,7 +111,6 @@ class SystemTtsAdapter(TtsAdapter):
 
     async def _macos_say(self, exe: str, text: str, voice: str | None) -> bytes:
         # `say` writes AIFF/CAF natively: ask for a WAVE file and read it back.
-        # mkstemp for a secure temp path; `say -o` overwrites the empty file.
         fd, path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         args = [exe, "-o", path, "--file-format=WAVE", "--data-format=LEI16@22050"]

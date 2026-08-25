@@ -1,11 +1,11 @@
 """Kaldi fbank + global CMVN front-end for the FireRedVAD backend.
 
-Reproduces FireRedVAD's feature pipeline exactly: 80-bin Kaldi fbank (25 ms / 10 ms,
-``snip_edges``, ``dither=0``) on the **int16-scale** waveform (sample values, not
-normalized), then global CMVN ``(x - mean) * istd``. CMVN stats are read from the
-configured ``cmvn.ark`` (a Kaldi binary ``DM ``/``FM `` matrix) with a tiny struct
-reader, so no ``kaldiio`` dependency. One persistent ``OnlineFbank`` is kept across
-calls, so arbitrary PCM chunks yield the same 10 ms frames as one continuous pass.
+FireRedVAD's pipeline exactly: 80-bin Kaldi fbank (25/10 ms, ``snip_edges``,
+``dither=0``) on the **int16-scale** waveform (sample values, NOT normalized), then
+global CMVN ``(x - mean) * istd``. Stats come from ``cmvn.ark`` (a Kaldi binary
+``DM ``/``FM `` matrix) via a tiny struct reader, so no ``kaldiio`` dependency. One
+persistent ``OnlineFbank`` spans calls, so arbitrary PCM chunks yield the same 10 ms
+frames as one continuous pass.
 """
 
 from __future__ import annotations
@@ -95,12 +95,12 @@ class FbankCmvn:
             return np.zeros((0, self._num_bins), dtype=np.float32)
         frames = [self._fbank.get_frame(i) for i in range(self._consumed, ready)]
         feat = np.asarray(np.vstack(frames), dtype=np.float32)  # copies out of knf storage
-        # Release consumed frames NOW, only after the copy (get_frame returns views into
-        # knf's deque): knf retains every frame until popped and reset() only runs when
-        # an utterance closes, so idle listening grows unbounded (~115 MB/h at 80 bins).
-        # pop() keeps num_frames_ready/get_frame indices ABSOLUTE (sherpa-onnx pattern).
+        # Release consumed frames NOW, and only after the copy (get_frame returns views
+        # into knf's deque): knf retains every frame until popped and reset() runs only
+        # at utterance close, so idle listening grows ~115 MB/h at 80 bins. pop() keeps
+        # num_frames_ready/get_frame indices ABSOLUTE.
         self._fbank.pop(ready - self._consumed)
         self._consumed = ready
-        # copy=False: already float32, so this is a free check that a widened CMVN
-        # dtype cannot silently reach the ONNX/RKNN feed.
+        # copy=False: already float32, so this is a free guard that a widened CMVN
+        # dtype cannot reach the ONNX/RKNN feed.
         return ((feat - self._means) * self._istd).astype(np.float32, copy=False)

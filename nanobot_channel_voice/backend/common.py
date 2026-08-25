@@ -7,19 +7,18 @@ from .base import OnEvent, StateHint, VoiceState
 
 
 def loggable_text(text: str, enabled: bool, cap: int = 80) -> str:
-    """Transcript text for log lines, honoring ``voice.logTranscripts``. Off (the default)
-    the line still fires, with a word count in place of content: user speech is personal
-    data and gateway logs get persisted. Whitespace runs (newlines included) collapse to
-    one space: an embedded ``\\n`` would split the record and break line-oriented logs."""
+    """Transcript text for log lines, honoring ``voice.logTranscripts``; off (the default)
+    a word count rides instead — user speech is personal data and gateway logs persist.
+    Whitespace collapses to one space: an embedded ``\\n`` would split the log record."""
     words = text.split()
     return " ".join(words)[:cap] if enabled else f"<{len(words)} words>"
 
 
 class TurnEventMixin:
-    """The concrete backend defines ``_on_event`` (set at ``start()``), ``_closing``
-    and ``_turn``. ``_emit`` drops events once closing: a late worker callback (a
-    TTS thread finishing after ``close()``, a final rx frame) must not reach a
-    stopped shell. ``_set_turn`` is the ONE place turn state changes."""
+    """The concrete backend defines ``_on_event`` (set at ``start()``), ``_closing`` and
+    ``_turn``. ``_emit`` drops events once closing: a late worker callback (a TTS thread
+    finishing after ``close()``) must not reach a stopped shell. ``_set_turn`` is the ONE
+    place turn state changes."""
 
     _on_event: OnEvent | None
     _closing: bool

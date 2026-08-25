@@ -1,25 +1,23 @@
 """On-device SenseVoice-Small ASR over the ORIGINAL FunASR export (ONNX / RKNN).
 
-Non-autoregressive CTC (one encoder pass, greedy per-frame argmax): ~5-15x faster than
-Whisper on CPU and immune to hallucination loops;
-one model covers zh / yue / en / ja / ko plus emotion/event tags.
+Non-autoregressive CTC (one encoder pass, greedy per-frame argmax); one model covers
+zh / yue / en / ja / ko plus emotion/event tags.
 
-Both artifacts are converted from the upstream weights by the project's exporter, which
-writes a ``frontend.json`` sidecar (560-dim CMVN, LFR window/shift, the language / itn
-id tables — FunASR runtime constants living in NO model artifact — and the .rknn's
-``feats_len``) plus a ``<token> <id>`` ``tokens.txt`` (columns reversed vs the Whisper
-vocab files). Dispatch is on the file extension:
+Both artifacts carry a ``frontend.json`` sidecar from the project's exporter (560-dim
+CMVN, LFR window/shift, the language / itn id tables — FunASR runtime constants living
+in NO model artifact — and the .rknn's ``feats_len``) plus a ``<token> <id>``
+``tokens.txt`` (columns reversed vs the Whisper vocab files). Dispatch is on the file
+extension:
 
-- ``.onnx`` — the official dynamic export (upstream ``export_meta.py``): inputs
-  ``speech [N,T,560]`` float32 (80-mel fbank x LFR window 7, int16-scale waveform)
-  plus int32 ``speech_lengths`` / ``language`` / ``textnorm``; outputs
-  ``ctc_logits [N,4+T,25055]`` + ``encoder_out_lens``.
-- ``.rknn`` — the static mask-input port: ``speech [1,L,560]`` zero-padded to the
-  export window, a multiplicative ``mask [1,1,1,L+4]`` (1 = 4 query + valid frames),
+- ``.onnx`` — the official dynamic export: ``speech [N,T,560]`` float32 (80-mel fbank x
+  LFR window 7, int16-scale waveform) + int32 ``speech_lengths``/``language``/
+  ``textnorm``; outputs ``ctc_logits [N,4+T,25055]`` + ``encoder_out_lens``.
+- ``.rknn`` — the static mask-input port: ``speech [1,L,560]`` zero-padded to the export
+  window, a multiplicative ``mask [1,1,1,L+4]`` (1 = 4 query + valid frames),
   ``language``, ``textnorm``; ``ctc_logits [1,L+4,25055]`` decoded over frames
   ``0..4+n_valid`` (the padded tail's logits are meaningless).
 
-The model prepends its 4 query embeddings INSIDE the graph (those frames yield the
+The model prepends its 4 query embeddings INSIDE the graph (those frames carry the
 rich-transcription tags), so this side supplies only real audio frames.
 """
 
@@ -41,14 +39,14 @@ from nanobot_channel_voice.stt.base import SttAdapter, pcm_to_float_mono, read_t
 SAMPLE_RATE = 16000
 _NUM_MEL_BINS = 80
 _BLANK_ID = 0
-# Rich-transcription tags (<|zh|><|NEUTRAL|><|Speech|><|woitn|>) arrive as ordinary CTC
-# tokens: stripped from the transcript, surfaced on .last_tags.
+# Rich-transcription tags (<|zh|><|NEUTRAL|>...) arrive as ordinary CTC tokens:
+# stripped from the transcript, surfaced on .last_tags.
 _TAG_RE = re.compile(r"<\|[^|]*\|>")
 
 
 def _apply_lfr(feats: np.ndarray, m: int, n: int) -> np.ndarray:
-    """FunASR low-frame-rate stacking, (T, 80) -> (T', 80*m): window ``m`` frames,
-    shift ``n``, first-frame left padding, last-frame right padding."""
+    """FunASR low-frame-rate stacking, (T, 80) -> (T', 80*m): window ``m``, shift
+    ``n``, first-frame left padding, last-frame right padding."""
     t = feats.shape[0]
     t_lfr = int(np.ceil(t / n))
     left = np.tile(feats[0], ((m - 1) // 2, 1))
@@ -67,7 +65,7 @@ def _apply_lfr(feats: np.ndarray, m: int, n: int) -> np.ndarray:
 
 class _Frontend:
     """FunASR's WavFrontend: fbank (hamming, 25/10 ms, int16-scale waveform) + LFR +
-    CMVN, the CMVN stats taken from the frontend.json sidecar."""
+    CMVN, stats from the frontend.json sidecar."""
 
     def __init__(self, neg_mean: np.ndarray, inv_stddev: np.ndarray, lfr_m: int, lfr_n: int):
         dim = _NUM_MEL_BINS * lfr_m
@@ -120,8 +118,8 @@ def ctc_greedy(ids) -> list[int]:
 
 class SenseVoiceOnDeviceStt(SttAdapter):
     decoder_family = "ctc"
-    # Dynamic-.onnx policy bound (O(T^2) SAN-M activations, short-form training audio:
-    # past ~30 s memory and accuracy slide); a static .rknn window tightens it per instance.
+    # Dynamic-.onnx bound: O(T^2) SAN-M activations and short-form training audio make
+    # memory/accuracy slide past ~30 s. A static .rknn window tightens it per instance.
     max_decode_ms = 30_000
 
     def __init__(
@@ -195,9 +193,7 @@ class SenseVoiceOnDeviceStt(SttAdapter):
                 text_norm_id=norms["withitn" if sv.use_itn else "woitn"],
                 feats_len=feats_len,
             )
-            # Contract probe doubling as warmup: a stale artifact (sherpa input names,
-            # wrong feats_len) raises here, where the registry degrades loudly — via
-            # _decode, not _transcribe_sync, whose blanket except would swallow it.
+            # Contract probe + warmup, via _decode: _transcribe_sync would swallow it.
             adapter._decode(adapter._frontend.compute(np.zeros(SAMPLE_RATE, dtype=np.float32)))
             models.pop_all()  # success: the adapter owns the model now
             return adapter
@@ -206,8 +202,7 @@ class SenseVoiceOnDeviceStt(SttAdapter):
         self._model.release()
 
     async def warmup(self) -> None:
-        """One dummy decode so the first real utterance pays no cold-start (ORT
-        arena allocation, RKNN core spin-up)."""
+        """One dummy decode so the first real utterance pays no cold-start."""
         await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
 
     async def transcribe(self, pcm: bytes, sample_rate: int) -> str:
@@ -243,9 +238,8 @@ class SenseVoiceOnDeviceStt(SttAdapter):
         return ctc_greedy(np.asarray(logits)[0].argmax(axis=-1))
 
     def _decode_static(self, feats: np.ndarray) -> list[int]:
-        """The .rknn static contract: zero-pad to the export window, multiplicative
-        mask over the 4 query + valid frames, decode only those frames (the padded
-        tail's logits are meaningless)."""
+        """The .rknn static contract: zero-pad to the export window, mask the 4 query +
+        valid frames, decode only those (the padded tail's logits are meaningless)."""
         window = self._feats_len
         assert window is not None
         n_valid = feats.shape[0]

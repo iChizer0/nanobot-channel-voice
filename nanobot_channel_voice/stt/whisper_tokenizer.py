@@ -1,22 +1,19 @@
 """Pure-Python Whisper tokenizer helpers: language tokens, detection, detokenization.
 
 Carries **no numpy**, unlike :mod:`.whisper`. The language is the special token at
-decoder-prompt position 1; the export is the multilingual ``base`` checkpoint (not
-``base.en``), confirmed by the 51865-entry vocabulary (English-only is 51864) carrying
-all 99 ``<|xx|>`` tokens at 50259..50357, so adding a language needs NO re-export.
+decoder-prompt position 1; the export is the multilingual ``base`` checkpoint (51865
+vocabulary entries; English-only is 51864) carrying all 99 ``<|xx|>`` tokens at
+50259..50357, so adding a language needs NO re-export.
 
-**Language ID is free.** Our decoder is causal with no KV cache and pins SOT at window
-position 0, so ``logits[0][0]`` is already the distribution Whisper's
-``detect_language`` argmaxes on every decode step; :func:`detect_language` restricts
-that argmax to the caller's candidates, which is what makes it accurate on a small
-model.
+Language ID is free: the decoder is causal with no KV cache and pins SOT at window
+position 0, so ``logits[0][0]`` is already the distribution :func:`detect_language`
+argmaxes — restricted to the caller's candidates, which is what makes it accurate here.
 
-**Detokenization is the byte-level BPE inverse mapping** and nothing else: concatenate
-the per-id strings over the GPT-2 reversible byte<->unicode alphabet (space -> ``Ġ``),
-map each char back to its byte, UTF-8-decode once at the end, so a CJK char split
-across merges reassembles by construction. :func:`read_vocab` never re-encodes; it
-normalizes ORIGINAL artifacts to that alphabet, rejecting the Rockchip demo's
-per-group-base64 ``vocab_zh.txt``, which modified the encoding instead of inverting it.
+Detokenization is the byte-level BPE inverse mapping and nothing else: concatenate the
+per-id strings over the GPT-2 byte<->unicode alphabet (space -> ``Ġ``), map each char
+back to its byte, UTF-8-decode ONCE at the end, so a CJK char split across merges
+reassembles by construction. :func:`read_vocab` normalizes ORIGINAL artifacts to that
+alphabet and never re-encodes.
 """
 
 from __future__ import annotations
@@ -60,22 +57,17 @@ def language_token(code: str) -> int:
 
 
 def language_tokens(codes: Sequence[str]) -> dict[int, str]:
-    """``{token_id: code}`` for the enabled languages (order-preserving, deduped);
-    an unknown code raises so a typo in ``stt.languages`` fails at construction (a
-    clean registry fallback) instead of silently narrowing detection."""
+    """``{token_id: code}`` for the enabled languages (order-preserving, deduped). An
+    unknown code raises, so a typo fails at construction, not by narrowing detection."""
     return {language_token(c): c for c in dict.fromkeys(c.lower() for c in codes)}
 
 
 def detect_language(
     logits: Sequence[float], candidates: dict[int, str], *, min_confidence: float = 0.0
 ) -> int | None:
-    """Whisper language ID: the highest-scoring language token among ``candidates``.
-
-    ``logits`` is the decoder row at window position 0 (the one holding SOT).
-    ``min_confidence`` (0..1) is a softmax over the CANDIDATE SET only, meaningful
-    with 2-4 candidates where one over all 51865 logits would not be; below it,
-    return ``None`` and the caller keeps its configured default.
-    """
+    """Highest-scoring language token among ``candidates``; ``logits`` is the decoder
+    row at window position 0 (holding SOT). ``min_confidence`` (0..1) is a softmax over
+    the CANDIDATE SET only; below it, ``None`` and the caller keeps its default."""
     if not candidates:
         return None
     top_id, top_score = None, 0.0
@@ -94,14 +86,12 @@ def detect_language(
 
 
 # ---- decodable-language vocabulary mask -------------------------------------
-# The DECODABLE set (``stt.languages``) is a guarantee on what may be EMITTED,
-# enforced by suppressing tokens whose script no enabled language uses. Latin is
-# allowed unconditionally: it carries the digits, names and loanwords that appear in
-# every language's real transcripts, and is ~80% of the vocabulary.
+# The DECODABLE set (``stt.languages``) bounds what may be EMITTED: tokens whose script
+# no enabled language uses are suppressed. Latin is allowed unconditionally — digits,
+# names and loanwords appear in every language, and it is ~80% of the vocabulary.
 _ALWAYS_ALLOWED_SCRIPTS = frozenset({"latin"})
 
-# Scripts per Whisper language, non-Latin ones only; every other code defaults to
-# Latin. Languages written in two scripts list both.
+# Non-Latin scripts per language; every other code defaults to Latin.
 _LANGUAGE_SCRIPTS: dict[str, frozenset[str]] = {
     "zh": frozenset({"han"}),
     "ja": frozenset({"han", "hiragana", "katakana"}),
@@ -130,9 +120,9 @@ _LANGUAGE_SCRIPTS: dict[str, frozenset[str]] = {
     "ka": frozenset({"georgian"}), "am": frozenset({"ethiopic"}),
 }
 
-# Contiguous Unicode ranges -> script bucket, ordered by first code point; only the
-# scripts Whisper's vocabulary contains. Allowed to be incomplete: an unmapped letter
-# is script-neutral, so a gap costs a missed suppression, never a blocked token.
+# Contiguous Unicode ranges -> script bucket, ordered by first code point. Allowed to
+# be incomplete: an unmapped letter is script-neutral, so a gap costs a missed
+# suppression, never a blocked token.
 _SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = (
     (0x0000, 0x007F, "latin"), (0x0080, 0x024F, "latin"),
     (0x0370, 0x03FF, "greek"), (0x0400, 0x052F, "cyrillic"),
@@ -159,10 +149,8 @@ _SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = (
 
 
 def _char_script(ch: str) -> str | None:
-    """Script bucket for one char, or ``None`` when script-NEUTRAL: digits,
-    whitespace, punctuation, symbols (incl. CJK punctuation) and combining marks occur
-    in every language, and a letter outside :data:`_SCRIPT_RANGES` fails open: a
-    table gap must not block the token for EVERY multi-language set."""
+    """Script bucket for one char, or ``None`` when script-NEUTRAL (digits, spaces,
+    punctuation, symbols, marks). A letter outside :data:`_SCRIPT_RANGES` fails open."""
     if ch.isspace() or ch.isdigit():
         return None
     if unicodedata.category(ch)[0] in ("M", "P", "S", "C", "Z"):
@@ -175,23 +163,19 @@ def _char_script(ch: str) -> str | None:
 
 
 def token_scripts(text: str) -> frozenset[str]:
-    """The scripts a decoded token draws on (empty = script-neutral). A token that
-    does not decode to valid UTF-8 is a **partial byte-level fragment** (a multi-byte
-    char split across merges) and returns empty: suppressing fragments would break
-    the encoding of legitimate text."""
+    """Scripts a decoded token draws on (empty = script-neutral). Invalid UTF-8 means a
+    partial byte-level fragment -> empty: suppressing fragments would break legitimate
+    text."""
     if "�" in text:  # U+FFFD from byte_level_decode(errors="replace")
         return frozenset()
     return frozenset(s for s in (_char_script(c) for c in text) if s)
 
 
 def suppressed_token_ids(vocab: dict[str, str], codes: Sequence[str]) -> tuple[int, ...]:
-    """Token ids to block so output stays inside the DECODABLE language set.
-
-    ``()`` when ``codes`` is empty (feature off): the caller keeps the plain
-    full-vocabulary argmax and pays nothing. Never suppresses specials
-    (``>= <|endoftext|>``, including EOT and the timestamps the decode loop relies on),
-    script-neutral tokens, byte-level fragments or Latin; ``["en","zh","ja"]`` blocks a
-    few thousand of the 51865, mostly Cyrillic/Hangul/Arabic/Greek/Hebrew/Thai."""
+    """Token ids to block so output stays inside the DECODABLE language set. ``()``
+    when ``codes`` is empty (feature off). Never suppresses specials (``>= _EOT``,
+    including EOT and the timestamps the decode loop relies on), script-neutral tokens,
+    byte-level fragments or Latin."""
     if not codes:
         return ()
     allowed = set(_ALWAYS_ALLOWED_SCRIPTS)
@@ -218,14 +202,11 @@ def resolve_languages(
 ) -> tuple[str, tuple[str, ...]]:
     """Resolve ``(preferred_language, decodable_languages)`` from config.
 
-    ``language`` (**preferred**, exactly one) selects the decoder prompt token and is
-    the fallback for a low-confidence detection. ``languages`` (**decodable**) bounds
-    what may be OUTPUT and supplies the detection candidates: the prompt carries
-    exactly ONE language token, so a list can never mean "decode all at once". A list
-    of one is just a fixed language, so both effects switch off (zero cost). Preferring
-    a non-decodable language is contradictory, so preferred is pulled back into the set
-    (the caller warns when the preference was explicit) rather than widening the decodable
-    guarantee.
+    ``language`` picks the decoder prompt token and is the fallback for a low-confidence
+    detection; ``languages`` bounds what may be OUTPUT and supplies detection
+    candidates. A single-entry list is just a fixed language, so both effects switch
+    off. A preferred language outside the decodable set is pulled INTO it (the caller
+    warns) rather than widening the decodable guarantee.
     """
     preferred = (language or "en").lower()
     codes = tuple(dict.fromkeys(c.lower() for c in (languages or []) if c))
@@ -236,10 +217,9 @@ def resolve_languages(
     return preferred, codes
 
 
-# The 64 base64 symbols plus padding, used only to REJECT the legacy re-encoded vocab.
-# A byte-level token can coincidentally be drawn from this alphabet ("abcd"), so the
-# check also demands the 4-char grouping the re-encoding forced on every subword ("!"
-# would have become "IQ==").
+# Used only to REJECT the legacy per-subword-base64 vocab. A byte-level token can
+# coincidentally be drawn from this alphabet ("abcd"), so the check also demands the
+# 4-char grouping that re-encoding forced on every subword ("!" -> "IQ==").
 _B64_ALPHABET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
 )
@@ -265,11 +245,9 @@ def _reject_reencoded_vocab(vocab: dict[str, str], path: str) -> None:
 
 
 def read_vocab(vocab_path: str) -> dict[str, str]:
-    """Load ``{id: byte_level_token}`` from an ORIGINAL tokenizer artifact, normalized
-    to the byte-level alphabet: ``*.tiktoken`` (OpenAI's whisper assets,
-    ``base64(token_bytes) rank`` per line), HF ``vocab.json`` (``{token_string: id}``,
-    already byte-level), or flat byte-level ``<id> <token>`` text (the Rockchip demo's
-    ``vocab_en.txt``: despite the name, the full multilingual vocabulary)."""
+    """Load ``{id: byte_level_token}`` from an ORIGINAL tokenizer artifact: ``*.tiktoken``
+    (``base64(token_bytes) rank`` per line), HF ``vocab.json`` (``{token_string: id}``,
+    already byte-level), or flat byte-level ``<id> <token>`` text."""
     if vocab_path.endswith(".tiktoken"):
         vocab: dict[str, str] = {}
         with open(vocab_path, encoding="utf-8") as f:
@@ -317,14 +295,13 @@ _BYTE_DECODER = {ch: b for b, ch in _BYTE_ENCODER.items()}
 
 
 def byte_level_encode(text: str) -> str:
-    """Encode text to its byte-level representation (inverse of the decoder; for tests)."""
+    """Encode text to its byte-level representation (inverse of the decoder)."""
     return "".join(_BYTE_ENCODER[b] for b in text.encode("utf-8"))
 
 
 def byte_level_decode(s: str) -> str:
-    """Byte-level string back to real text (``Ġthe`` -> `` the``); transcript callers
-    concatenate all per-token strings first so multi-byte chars split across merges
-    reassemble before the single UTF-8 decode, while ``errors="replace"`` lets script
-    analysis decode a LONE token and detect fragments by the U+FFFD."""
+    """Byte-level string back to real text (``Ġthe`` -> `` the``). Transcript callers
+    MUST concatenate all per-token strings first, so chars split across merges reassemble
+    before this single UTF-8 decode; ``errors="replace"`` marks fragments with U+FFFD."""
     buf = bytes(_BYTE_DECODER[ch] for ch in s if ch in _BYTE_DECODER)
     return buf.decode("utf-8", errors="replace")

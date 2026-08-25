@@ -1,12 +1,11 @@
 """VoiceShell: the shared audio shell around a swappable :class:`VoiceBackend`.
 
-Owns the *edge*: the capture pump (mic frames -> ``backend.push_audio``), the
-shared :class:`AudioSink` fed from ``OutputAudio``, the coarse ``VoiceState``
-mirror (driven only by ``StateHint``; the backend is the single source of truth
-for turn state), mic gating and lifecycle. Turn logic, barge-in, the echo
-filter and drain live in the backend. For cloud the shell also routes
-``ToolCall`` -> nanobot and performs the generic barge-in (flush on
-``UserSpeechStarted``, played-ms to ``backend.barge_in``); local emits neither
+Owns the edge: the capture pump (mic frames -> ``backend.push_audio``), the shared
+:class:`AudioSink` fed from ``OutputAudio``, the coarse ``VoiceState`` mirror (driven only
+by ``StateHint`` — the backend is the single source of truth for turn state), mic gating
+and lifecycle. Turn logic, barge-in, the echo filter and drain live in the backend. For
+cloud the shell also routes ``ToolCall`` -> nanobot and performs the generic barge-in
+(flush on ``UserSpeechStarted``, played-ms to ``backend.barge_in``); local emits neither
 event, so those paths stay dormant.
 """
 
@@ -45,12 +44,11 @@ from .backend.common import loggable_text
 
 # (name, arguments_json) -> tool result (str or JSON-encodable). Cloud tool seam.
 ExecToolFn = Callable[[str, str], Awaitable[Any]]
-# Notified after a cloud barge-in (sink flushed, backend told), so the channel can
-# abandon an in-flight ask_nanobot delegation the user just talked over.
+# After a cloud barge-in (sink flushed, backend told): the channel abandons an in-flight
+# ask_nanobot delegation the user talked over.
 BargeInFn = Callable[[], Awaitable[None]]
-# Notified AFTER the shell tore itself down on a fatal backend error; without it the
-# channel's start() blocks forever on a stop event nobody sets, presenting a healthy
-# channel around a dead shell.
+# After the shell tore itself down on a fatal backend error; without it the channel's
+# start() blocks forever on a stop event nobody sets, presenting a healthy dead shell.
 FatalFn = Callable[[], Awaitable[None]]
 
 __all__ = ["VoiceShell", "VoiceState"]  # VoiceState re-exported beside its mirror
@@ -75,17 +73,16 @@ class VoiceShell:
         # Label only; execution latency is bucketed by it (direct vs supervisor).
         self._tool_mode = tool_mode
         self._metrics = metrics if metrics is not None else VoiceMetrics()
-        # Resolved once: a disabled/absent tracer yields no-op spans, so no branching.
+        # A disabled/absent tracer yields no-op spans, so no branching at call sites.
         self._tracer = tracer if tracer is not None else VoiceTracer(config.telemetry)
         self._capture = capture
         self._sink = sink
         self._backend = backend
-        # Half-duplex wake tap: a backend exposing push_gated_audio still hears
-        # gated frames (wake detector only), so the wake word can barge in even
-        # with the mic otherwise muted. Absent on cloud backends.
+        # Half-duplex wake tap: a backend exposing push_gated_audio still hears gated
+        # frames (wake detector only), so the wake word can barge in. Absent on cloud.
         self._gated_push = getattr(backend, "push_gated_audio", None)
-        # Mic policy comes from the channel: local = config.open_mic (full|soft|webrtc);
-        # cloud = realtime.bargeIn ("aec" => open, "gated" => gated while SPEAKING).
+        # From the channel: local = config.open_mic (full|soft|webrtc); cloud =
+        # realtime.bargeIn ("aec" => open, "gated" => gated while SPEAKING).
         self._open_mic = open_mic
         self._exec_tool = exec_tool
         self._on_barge_in = on_barge_in
@@ -131,9 +128,8 @@ class VoiceShell:
         )
 
     async def stop(self) -> None:
-        """Idempotent AND joinable: every caller awaits the same teardown task,
-        shielded so a caller cancelled mid-stop (the manager can cancel
-        ``channel.stop()``) aborts its own wait, not the teardown."""
+        """Idempotent AND joinable: every caller awaits the same teardown task, shielded so
+        a caller cancelled mid-stop aborts its own wait, not the teardown."""
         self._running = False
         if self._stop_task is None:
             self._stopped = True
@@ -146,16 +142,15 @@ class VoiceShell:
         for task in list(self._tool_tasks):  # results are moot once tearing down
             await cancel_and_wait(task)
         self._tool_tasks.clear()
-        # Tasks down before devices, each step guarded: _stopped is latched above, so
-        # a raise would skip the rest forever (later stop()s return at the latch),
-        # leaving devices running behind a stopped channel.
+        # Tasks down before devices, each step guarded: _stopped is latched above, so a
+        # raise would skip the rest forever, leaving devices behind a stopped channel.
         for step in (self._backend.close, self._sink.stop, self._capture.stop):
             try:
                 await step()
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("shell teardown step {} failed: {}",
                                   getattr(step, "__qualname__", step), exc)
-        # The session's only readout, emitted where the sample set is final.
+        # The session's only readout, where the sample set is final.
         if self._metrics.has_data:
             self._log.info("voice session metrics: {}", self._metrics.summary_line())
 
@@ -183,17 +178,16 @@ class VoiceShell:
                     # Device gone (USB mic unplugged, arecord died). Bounded restart;
                     # a mic that comes back re-arms the budget on the first good frame.
                     if restarts >= 3:
-                        # Permanent deafness is fatal, not degraded: otherwise the
-                        # session plays on while presenting healthy.
+                        # Permanent deafness is fatal, not degraded: else the session
+                        # plays on while presenting healthy.
                         self._log.error("capture ended permanently; tearing the session down")
                         self._spawn_fatal_stop()
                         return
                     restarts += 1
                     self._log.warning("capture ended; restarting capture ({}/3)", restarts)
-                    # An utterance open at mic death must not bridge the outage
-                    # (the endpointer's clock is frame-counted: no frames, no
-                    # silence run). A failing hook must not stop the restart, but
-                    # it must be SEEN: silence here is utterances merging quietly.
+                    # An utterance open at mic death must not bridge the outage (the
+                    # endpointer clock is frame-counted: no frames, no silence run). A
+                    # failing hook must not stop the restart, but must be SEEN.
                     try:
                         await self._backend.on_capture_gap()
                     except asyncio.CancelledError:
@@ -223,19 +217,16 @@ class VoiceShell:
                         self._log.warning("gated wake push error: {}", exc)
                 continue
             if was_gated:
-                # Gate-reopen edge: the gate is applied at READ time, but under lag
-                # frames captured while it was closed (the bot audible) can still be
-                # buffered: released now, they would reach the VAD as fresh speech
-                # and endpoint as unintelligible echo blobs (an empty verdict every
-                # turn).
-                # Realign with the wall clock: drop the in-hand frame (it predates or
-                # spans the edge) and the source's backlog with it.
+                # Gate-reopen edge: the gate applies at READ time, so frames buffered
+                # while it was closed (the bot audible) would reach the VAD as fresh
+                # speech and endpoint as echo blobs (an empty verdict every turn).
+                # Realign with the wall clock: drop the in-hand frame and the backlog.
                 was_gated = False
                 try:
                     if await self._capture.flush():
                         self._metrics.count("capture_gate_flush")
-                    # The pipe is empty now; a local backend's capture-debt accounting
-                    # must not keep describing the backlog this just discarded.
+                    # The pipe is empty: a local backend's capture-debt accounting must
+                    # not keep describing the backlog this just discarded.
                     note = getattr(self._backend, "note_capture_flush", None)
                     if note is not None:
                         note()
@@ -253,7 +244,7 @@ class VoiceShell:
 
     def _mic_gated(self) -> bool:
         # Half-duplex mutes while the bot speaks so it never hears itself; full/soft
-        # duplex and the cloud AEC path keep the mic open for barge-in.
+        # duplex and cloud AEC keep the mic open for barge-in.
         if self._open_mic:
             return False
         return self._state is VoiceState.SPEAKING
@@ -262,9 +253,8 @@ class VoiceShell:
 
     async def _on_event(self, event) -> None:
         if self._stopped:
-            # The backend's rx loop can still deliver events between the tool-task
-            # cancel sweep and backend.close(); acting on them would spawn work (a
-            # ToolCall -> a full delegation) that nothing will ever cancel.
+            # The rx loop still delivers between the tool-task cancel sweep and
+            # backend.close(); acting would spawn work nothing will ever cancel.
             return
         if isinstance(event, StateHint):
             self._apply_state(event.state)
@@ -294,8 +284,8 @@ class VoiceShell:
         self._fatal_task = asyncio.create_task(self._fatal_stop())
 
     async def _fatal_stop(self) -> None:
-        """Tear the shell down on a fatal backend error, then tell the owner:
-        the callback runs even if teardown raises."""
+        """Tear the shell down on a fatal backend error, then tell the owner — the
+        callback runs even if teardown raises."""
         try:
             await self.stop()
         finally:
@@ -309,33 +299,31 @@ class VoiceShell:
             self._state = state
 
     async def _cloud_barge_in(self) -> None:
-        # Cloud only. State is already CAPTURING (the backend emits StateHint before
-        # UserSpeechStarted); flush, then hand played-ms on for item.truncate.
+        # Cloud only. State is already CAPTURING (StateHint precedes UserSpeechStarted);
+        # flush, then hand played-ms on for item.truncate.
         played_ms = await self._sink.flush()
         try:
             await self._backend.barge_in(played_ms)
         finally:
-            # Abandoning the delegation must not depend on the wire step: a dead
-            # socket would otherwise keep paying for a turn nobody will hear.
+            # Not gated on the wire step: a dead socket would otherwise keep paying
+            # for a turn nobody will hear.
             if self._on_barge_in is not None:
                 await self._on_barge_in()
 
     def _spawn_tool_task(self, ev: ToolCall) -> None:
-        """Run a tool call OFF the event-dispatch path: ``_on_event`` is awaited on
-        the backend's receive loop, so awaiting a slow tool here would stall EVERY
-        other event: audio deltas, and crucially a barge-in ``UserSpeechStarted``
-        (a supervisor delegation takes ~1-2 s at minimum). Safe because the backend's
-        tool state machine keys on ``call_id`` and tolerates any result order."""
+        """Run a tool call OFF the event-dispatch path: ``_on_event`` is awaited on the
+        backend's rx loop, so a slow tool (a supervisor delegation is ~1-2 s at minimum)
+        would stall every other event, including a barge-in ``UserSpeechStarted``. Safe:
+        the backend's tool state machine keys on ``call_id`` and tolerates any order."""
         self._metrics.call_spawned(ev.call_id)
         task = asyncio.create_task(self._on_tool_call(ev))
         self._tool_tasks.add(task)
         task.add_done_callback(self._tool_tasks.discard)
 
     async def _on_tool_call(self, ev: ToolCall) -> None:
-        # Cloud only. Route through nanobot's ToolRegistry (security parity); degrade to
-        # an error string the model can recover from when the seam is absent. ToolRegistry
-        # NEVER raises for a tool failure: ToolResult.error(...) is a str subclass, so
-        # `is_error` is the only signal; relying on exceptions would report ~0% failures.
+        # Cloud only. Route through nanobot's ToolRegistry (security parity); no seam =>
+        # an error string the model can recover from. ToolRegistry NEVER raises for a tool
+        # failure: ToolResult.error(...) is a str subclass, so `is_error` is the signal.
         outcome = "ok"
         with self._tracer.tool_span(ev.name, ev.call_id, ev.arguments) as span:
             if self._exec_tool is None:
@@ -348,8 +336,7 @@ class VoiceShell:
                         outcome = "error"
                     output = result if isinstance(result, str) else json.dumps(result)
                 except asyncio.CancelledError:
-                    # Teardown: drop the call rather than submit a bogus result; the
-                    # unanswered obligation is counted as its own outcome.
+                    # Teardown: drop the call rather than submit a bogus result.
                     self._metrics.call_finished(
                         ev.call_id, outcome="cancelled", mode=self._tool_mode
                     )
@@ -361,11 +348,10 @@ class VoiceShell:
                 except Exception as exc:  # noqa: BLE001 - report the failure to the model
                     outcome = "exception"
                     output = json.dumps({"error": str(exc)})
-                    # Recorded here, not by the span CM: we swallow the exception, so
-                    # the tracer would otherwise see a clean exit.
+                    # Recorded here, not by the span CM: we swallow the exception.
                     span.record_exception(exc)
-            # Did the user barge in while this ran? Counted only for visibility: the
-            # backend's own stale guard keeps the result from reviving a dead turn.
+            # Barged in while this ran? Visibility only: the backend's stale guard is
+            # what keeps the result from reviving a dead turn.
             stale = self._metrics.call_stale(ev.call_id, self._sink.epoch)
             self._metrics.call_finished(ev.call_id, outcome=outcome, mode=self._tool_mode)
             self._tracer.tool_outcome(

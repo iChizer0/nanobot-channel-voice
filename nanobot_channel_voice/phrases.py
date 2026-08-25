@@ -1,9 +1,8 @@
 """Lexicon matching for spoken command/backchannel classification.
 
-The alphabet is NFKC-folded, lower-cased ``\\w+`` runs. Spaced scripts tokenize per word;
-unspaced CJK comes out as fused runs ("好的好的", "止めてください"), so
-single-token phrases also match as greedy longest-prefix segments inside a
-run — the one extra rule CJK needs, a no-op for spaced scripts.
+The alphabet is NFKC-folded, lower-cased ``\\w+`` runs. Spaced scripts tokenize per
+word; unspaced CJK comes out as fused runs ("好的好的"), so single-token phrases also
+match as greedy longest-prefix segments inside a run — a no-op for spaced scripts.
 """
 
 from __future__ import annotations
@@ -14,9 +13,8 @@ from collections.abc import Iterable
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
-# Politeness/emphasis tokens allowed to accompany a command without making it
-# "content" ("please stop", "no no stop", "止めてください"). Never sufficient on
-# their own: pure() still demands a full command phrase.
+# Politeness/emphasis tokens allowed to accompany a command without making it "content"
+# ("please stop"). Never sufficient alone: pure() still demands a full command phrase.
 FILLER_WORDS = frozenset({
     "please", "now", "just", "no",
     "请", "麻烦",
@@ -35,9 +33,9 @@ def words_of(text: str) -> set[str]:
 
 
 class PhraseLexicon:
-    """A normalized phrase list: ``phrases`` as token tuples, ``singles`` the
-    one-token phrases (the only ones that can match inside a fused CJK run),
-    ``words`` the flat alphabet."""
+    """A normalized phrase list: ``phrases`` as token tuples, ``singles`` the one-token
+    phrases (the only ones that can match inside a fused CJK run), ``words`` the flat
+    alphabet."""
 
     __slots__ = ("phrases", "singles", "words")
 
@@ -49,8 +47,8 @@ class PhraseLexicon:
 
 
 def _segments(token: str, singles: frozenset[str]) -> list[str] | None:
-    """Greedy longest-prefix decomposition of a fused run into single-token
-    phrases; None when any position fails to match."""
+    """Greedy longest-prefix decomposition of a fused run into single-token phrases;
+    None when any position fails to match."""
     out: list[str] = []
     i = 0
     while i < len(token):
@@ -71,7 +69,7 @@ def _contiguous(phrase: tuple[str, ...], tokens: list[str]) -> bool:
 
 class PhraseMatcher:
     """A command lexicon fused with its companion vocabularies, unions built ONCE:
-    per-call union construction would land on the frame-hop poll path."""
+    per-call construction would land on the frame-hop poll path."""
 
     __slots__ = ("_command", "_singles", "_words")
 
@@ -91,17 +89,16 @@ class PhraseMatcher:
         self._singles = frozenset(singles)
 
     def covers(self, tokens: Iterable[str]) -> bool:
-        """Every token is known vocabulary (word, extra, or a decomposable fused
-        run). Empty input is NOT covered."""
+        """Every token is known vocabulary (word, extra, or a decomposable fused run).
+        Empty input is NOT covered."""
         tokens = list(tokens)
         return bool(tokens) and all(
             t in self._words or _segments(t, self._singles) is not None for t in tokens
         )
 
     def present(self, tokens: list[str]) -> bool:
-        """A full command phrase occurs: contiguous for multi-word phrases, direct
-        or as a segment of a fused run for single-token ones. Tokens must be in
-        utterance order for multi-word phrases to count."""
+        """A full command phrase occurs: contiguous for multi-word phrases (tokens must be
+        in utterance order), direct or as a fused-run segment for single-token ones."""
         cmd = self._command
         if any(_contiguous(p, tokens) for p in cmd.phrases if len(p) > 1):
             return True
@@ -115,10 +112,9 @@ class PhraseMatcher:
         return False
 
     def pure(self, tokens: list[str]) -> bool:
-        """The utterance is ENTIRELY command/companion/filler material AND contains
-        at least one full command phrase. The entirety rule is what keeps a lexicon
-        safe here: "stop the music" has non-lexicon words, so it is content, not a
-        command."""
+        """The utterance is ENTIRELY command/companion/filler material AND contains at
+        least one full command phrase. The entirety rule is what keeps a lexicon safe:
+        "stop the music" has non-lexicon words, so it is content, not a command."""
         if not tokens:
             return False
         cmd = self._command
@@ -136,33 +132,14 @@ class PhraseMatcher:
         return hit
 
 
-def covered(
-    tokens: Iterable[str], *lexicons: PhraseLexicon, extra: frozenset[str] = frozenset()
-) -> bool:
-    """One-shot :meth:`PhraseMatcher.covers` (hot paths hold a matcher instead)."""
-    first, rest = lexicons[0], lexicons[1:]
-    return PhraseMatcher(first, *rest, extra=extra).covers(tokens)
-
-
-def pure_command(
-    tokens: list[str],
-    command: PhraseLexicon,
-    *companions: PhraseLexicon,
-    extra: frozenset[str] = FILLER_WORDS,
-) -> bool:
-    """One-shot :meth:`PhraseMatcher.pure` (hot paths hold a matcher instead)."""
-    return PhraseMatcher(command, *companions, extra=extra).pure(tokens)
-
-
 def phrase_within(text: str, lexicon: PhraseLexicon) -> bool:
     """A full phrase occurs anywhere in an utterance that is otherwise free content.
 
-    ``PhraseMatcher.present`` cannot serve here: its fused-run rule decomposes a CJK
-    token ENTIRELY into lexicon singles, so a trigger buried in a real zh/ja sentence
-    never matches. An all-unspaced phrase is compared against the fused transcript,
-    where its own spacing is meaningless too ("持续 处理" must still find 持续处理…);
-    anything with a spaced-script token keeps its boundaries, so "stop" is never
-    "stopwatch".
+    Not ``PhraseMatcher.present``: its fused-run rule needs the CJK token to decompose
+    ENTIRELY into lexicon singles, so a trigger buried in a real zh/ja sentence never
+    matches. An all-unspaced phrase is matched against the fused transcript ("持续 处理"
+    still finds 持续处理); anything with a spaced-script token keeps its boundaries, so
+    "stop" is never "stopwatch".
     """
     tokens = tokens_of(text)
     spaced = " " + " ".join(tokens) + " "

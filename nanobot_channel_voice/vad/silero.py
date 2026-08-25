@@ -1,16 +1,13 @@
-"""Silero VAD: on-device neural VAD backend (ONNX / RKNN); v5 and v6 exports share
-the I/O contract this adapter speaks.
+"""Silero VAD: on-device neural VAD backend (ONNX / RKNN); v5 and v6 exports share the
+I/O contract this adapter speaks.
 
-Raw waveform in — the STFT lives inside the graph, so no fbank/CMVN front end — one
-sigmoid probability per 32 ms window. ``is_speech(frame)`` buffers samples into
-512-sample windows (256 @ 8 kHz), prepends the past context the model requires
-(64/32 samples, carried host-side; omitting it pins every probability near 0.001),
-runs the model with the carried ``state[2,1,128]``, and maps the probability through
-an enter/exit hysteresis pair; frames completing no window hold the last decision.
-Every tensor is a fixed shape, so the path ports to fixed-graph runtimes: the scalar
-int64 ``sr`` is passed only when the session declares it — every upstream export does,
-a stripped ``.rknn`` port won't — and outputs are read as ``(output, stateN)``, in
-that order.
+Raw waveform in (the STFT lives inside the graph), one sigmoid per 32 ms window.
+``is_speech(frame)`` buffers samples into 512-sample windows (256 @ 8 kHz), prepends
+the model's required past context (64/32 samples, carried host-side — omitting it pins
+every probability near 0.001), runs with the carried ``state[2,1,128]``, and applies an
+enter/exit hysteresis; frames completing no window hold the last decision. The scalar
+int64 ``sr`` is passed only when the session declares it (a stripped ``.rknn`` port
+won't), and outputs are read as ``(output, stateN)``, in that order.
 """
 
 from __future__ import annotations
@@ -21,13 +18,12 @@ import numpy as np
 from loguru import logger
 
 from nanobot_channel_voice.aio import Throttle
-from nanobot_channel_voice.audio.pcm import pcm_rms
 from nanobot_channel_voice.config import SileroVadConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
 from nanobot_channel_voice.vad.base import Vad
 
 # Upstream contract: 32 ms windows, 1/8 window of past context, LSTM state (2,1,128).
-# State shape is read from the session (ONNX); the constant covers RKNN.
+# Shape is read from the session (ONNX); the constant covers RKNN.
 _WINDOW_BY_RATE = {16000: 512, 8000: 256}
 _STATE_SHAPE = (2, 1, 128)
 _INPUT_NAME = "input"
@@ -57,8 +53,8 @@ class SileroVad(Vad):
         window = _WINDOW_BY_RATE.get(sample_rate)
         if window is None:
             raise ValueError(f"Silero VAD requires 8 or 16 kHz audio, got {sample_rate}")
-        # _validate() raising is the EXPECTED path make_vad catches to fall back to
-        # energy, so the ExitStack must release the claimed NPU/ORT session on it.
+        # _validate() raising is the EXPECTED make_vad fallback path, so the ExitStack
+        # must release the claimed NPU/ORT session on it.
         with ExitStack() as models:
             self._model = models.enter_context(OnDeviceModel(
                 model_path, core_mask=core_mask, target=target, device_id=device_id,
@@ -99,9 +95,7 @@ class SileroVad(Vad):
         )
 
     def release(self) -> None:
-        """Give the NPU context / ORT session back. Idempotent; refcount-GC does NOT
-        free an RKNN context, so an in-process channel restart would otherwise exhaust
-        the NPU cores."""
+        """Idempotent; refcount-GC does NOT free an RKNN context."""
         self._model.release()
 
     def reset(self) -> None:
@@ -112,11 +106,8 @@ class SileroVad(Vad):
         self.last_prob = None
 
     def _validate(self) -> None:
-        """Prove the model's I/O contract once, at construction, on a zeroed window, so
-        that a loadable-but-incompatible export (wrong input/output name, shape or
-        order) fails HERE and ``make_vad`` falls back to energy, rather than failing
-        per-frame in :meth:`is_speech`, flooding the log and leaving the channel deaf.
-        """
+        """Prove the I/O contract HERE, so an incompatible export degrades to energy
+        instead of failing per-frame in :meth:`is_speech` (a deaf channel)."""
         try:
             prob = self._infer_one(np.zeros(self._window, dtype=np.float32))
         except Exception as exc:  # noqa: BLE001 - re-raise as a catchable construction error
@@ -133,8 +124,8 @@ class SileroVad(Vad):
                 f"Silero VAD state output shape {state_shape} != expected {expected} "
                 "-- check the model export (output name/order)."
             )
-        # Loose band: int8 dequantization may jitter a real sigmoid slightly outside
-        # [0, 1]; a swapped/logit output lands far outside it. NaN fails the compare.
+        # Loose band: int8 dequantization jitters a real sigmoid slightly outside
+        # [0, 1]; a swapped/logit output lands far outside. NaN fails the compare.
         if not (-0.05 <= prob <= 1.05):
             raise RuntimeError(
                 f"Silero VAD probability {prob} is not sigmoid-like "
@@ -142,14 +133,6 @@ class SileroVad(Vad):
             )
         self.reset()  # the probe must not leave warm-up state behind
 
-    def _gated(self, speech: bool, frame: bytes) -> bool:
-        """Loudness AND'd with the model (Pipecat's gate): distant TV speech is real
-        speech to the model but too quiet to be the user. Applied to EVERY returned
-        decision (including held state on sub-window frames), never to the model run
-        itself, so the LSTM state stays coherent."""
-        if speech and self._min_volume > 0.0:
-            return pcm_rms(frame) >= self._min_volume
-        return speech
 
     def is_speech(self, frame: bytes) -> bool:
         try:
@@ -162,8 +145,8 @@ class SileroVad(Vad):
                 )
                 prob = self._infer_one(window)
                 self.last_prob = prob
-                # Hysteresis (upstream VADIterator): between the thresholds the
-                # decision holds, so a mid-word dip never flickers the flag.
+                # Hysteresis: between the thresholds the decision holds, so a mid-word
+                # dip never flickers the flag.
                 if prob >= self._threshold:
                     self._last_speech = True
                 elif prob < self._neg_threshold:

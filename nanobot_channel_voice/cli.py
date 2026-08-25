@@ -1,8 +1,7 @@
 """``nanobot-voice``: manage on-device model weights, export the effective config.
 
-Thin argparse front-end over :mod:`.weights`. ``config`` is the export
-counterpart of the WebUI "Import Json" box: the effective ``channels.voice``
-section as paste-ready canonical JSON.
+Thin argparse front-end over :mod:`.weights`. ``config`` is the export counterpart of
+the WebUI "Import Json" box: the effective ``channels.voice`` section as canonical JSON.
 """
 
 from __future__ import annotations
@@ -18,9 +17,8 @@ from nanobot_channel_voice import weights as w
 
 
 def _resolve_key(token: str, candidates: dict[str, Any], what: str) -> str:
-    """Exact key, or a unique SEGMENT prefix of one (``stt/whisper/base`` picks the
-    sole platform variant; several -> error listing them). Segment-aware, or
-    ``tts/mms/en`` would string-match a sibling family like ``tts/mms/eng/...``."""
+    """Exact key, or a unique SEGMENT prefix of one. Segment-aware, or ``tts/mms/en``
+    would string-match a sibling family like ``tts/mms/eng/...``."""
     if token in candidates:
         return token
     prefix = token.rstrip("/") + "/"
@@ -63,8 +61,8 @@ def _fetch(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
 
 
 def _config_weights_keys(node: Any) -> set[str]:
-    """Every ``"weights": "<key>"`` string anywhere under a config node: the
-    scan is structural, so new engine blocks need no CLI change."""
+    """Every ``"weights": "<key>"`` string anywhere under a config node: structural, so
+    new engine blocks need no CLI change."""
     found: set[str] = set()
     if isinstance(node, dict):
         for name, value in node.items():
@@ -85,7 +83,18 @@ def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     except (OSError, ValueError) as exc:
         raise w.WeightsError(f"cannot read nanobot config {path}: {exc}") from None
     section = (data.get("channels") or {}).get("voice") or {}
-    wanted = sorted(_config_weights_keys(section))
+    keys = _config_weights_keys(section)
+    paste = section.get("importJson") or section.get("import_json")
+    if isinstance(paste, str) and paste.strip():
+        # A not-yet-consumed WebUI paste holds the whole section as ONE string, which
+        # the structural scan cannot see into.
+        from nanobot_channel_voice.config import parse_import_blob
+
+        try:
+            keys |= _config_weights_keys(parse_import_blob(paste))
+        except ValueError as exc:
+            raise w.WeightsError(f"{path}: channels.voice importJson is unusable: {exc}") from None
+    wanted = sorted(keys)
     for key in wanted:
         w.validate_key(key)
     unknown = [k for k in wanted if k not in index]
@@ -113,10 +122,9 @@ def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
 
 
 def _config(args: argparse.Namespace) -> int:
-    """Print the EFFECTIVE ``channels.voice`` section: the file's section run through
-    the plugin schema (spelling twins folded, a pending importJson merge applied),
-    canonical camelCase keys — paste-ready for the WebUI "Import Json" box on another
-    install. Doubles as a linter: an invalid section prints the schema error instead."""
+    """Print the EFFECTIVE ``channels.voice`` section: the file's section run through the
+    plugin schema (spelling twins folded, a pending importJson merge applied), canonical
+    camelCase. Doubles as a linter: an invalid section prints the schema error."""
     from pydantic import ValidationError
 
     from nanobot_channel_voice.config import VoiceConfig
@@ -149,10 +157,9 @@ def _config(args: argparse.Namespace) -> int:
 
 
 def _scrub_secrets(node: Any) -> int:
-    """Drop every ``apiKey`` in place, returning how many held a value. Dropping (not
-    masking) keeps the output import-safe: a mask pasted back would overwrite the real
-    key. Completeness is pinned by test_cli_config: every credential-shaped schema
-    field has the ``api_key`` leaf."""
+    """Drop every ``apiKey`` in place, returning how many held a value. Dropping, not
+    masking: a mask pasted back would overwrite the real key. test_cli_config pins that
+    every credential-shaped schema field has the ``api_key`` leaf."""
     omitted = 0
     if isinstance(node, dict):
         if node.pop("apiKey", None):
@@ -286,9 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             index = w.load_index(sources)
         except w.WeightsError:
-            # The default index is remote, so an offline box must still SEE its own
-            # store: `list` degrades to the installed keys. A source the user NAMED
-            # stays a hard error, and fetch/sync cannot do their job without an index.
+            # Offline: `list` degrades to the installed keys. A source the user NAMED
+            # stays a hard error, and fetch/sync need an index.
             if sources or args.cmd != "list":
                 raise
             print("warning: no reachable weights index; listing the local store only",

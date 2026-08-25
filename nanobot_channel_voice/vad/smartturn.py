@@ -1,12 +1,10 @@
 """Smart Turn v3: audio-native end-of-turn scoring (ONNX / RKNN).
 
-A Whisper-Tiny-encoder classifier (BSD-2 open weights, ~8 MB int8) answering one
-question about a VAD-detected pause: "was that pause terminal?". The endpointer
-consults it once per silence run at ``vad.turn.consultMs``; a COMPLETE verdict
-closes the utterance immediately, INCOMPLETE lets the silence timer run to
-``hangoverMs``: the timer is the hard bound, the model the decision. One
-inference per PAUSE (not per frame), so unlike a streaming VAD the per-dispatch
-overhead of an NPU artifact is negligible here.
+A Whisper-Tiny-encoder classifier (BSD-2 weights, ~8 MB int8) answering "was that pause
+terminal?". The endpointer consults it once per silence run at ``vad.turn.consultMs``;
+COMPLETE closes the utterance immediately, INCOMPLETE lets the silence timer run to
+``hangoverMs`` — the timer is the hard bound, the model only the decision. One
+inference per PAUSE, not per frame.
 """
 
 from __future__ import annotations
@@ -47,8 +45,8 @@ class SmartTurnAnalyzer:
             self.window_bytes = 2 * WINDOW_SAMPLES  # consult-snapshot cap for the endpointer
             self.last_probability = 0.0
             self._log = logger.bind(component="vad-smartturn")
-            # Contract probe doubling as warmup: an incompatible export raises here (the
-            # factory falls back to silence-only), and the first live consult pays no cold-start.
+            # Contract probe + warmup: an incompatible export raises here and the
+            # factory falls back to silence-only.
             self._score(np.zeros(WINDOW_SAMPLES, dtype=np.float32))
             models.pop_all()  # success: the adapter owns the model now
 
@@ -72,9 +70,9 @@ class SmartTurnAnalyzer:
         return float(np.asarray(out[0]).reshape(-1)[0])  # sigmoid probability
 
     def assess(self, pcm: bytes) -> bool:
-        """Score the utterance-so-far (its trailing pause included). Keeps the last
-        8 s; shorter audio is padded at the START so speech sits at the window end,
-        matching training."""
+        """Score the utterance-so-far (trailing pause included). Keeps the last 8 s;
+        shorter audio is padded at the START so speech sits at the window end, as
+        trained."""
         if len(pcm) % 2:
             pcm = pcm[:-1]  # tail-trim, like every other S16 helper: keep alignment
         if len(pcm) > 2 * WINDOW_SAMPLES:

@@ -1,25 +1,21 @@
 """VoiceMetrics: the measurement seam for tool-call success and turn latency.
 
-One collector shared by the backend / shell / channel; in-process, no locks:
-callers stay on the event loop except the threaded hop path's counter bumps,
-whose worst-case race loses an increment (never corrupts); hot paths a
-``monotonic()`` read and a deque append.
+One collector shared by the backend / shell / channel; in-process, no locks: callers
+stay on the event loop except the threaded hop path's counter bumps, whose worst-case
+race loses an increment (never corrupts).
 
 Methodology:
 
-* **Anchor at end-of-speech**, not at an API call: the cloud anchor is
-  ``input_audio_buffer.speech_stopped``, local uses ``turn_anchor(offset_ms=...)``
-  back-dated past the hangover. With no anchor, record NOTHING and count
-  ``ttfa_unanchored``: an un-anchored number looks comparable and isn't. The
-  counter also absorbs audio after a DELIBERATE release (``turn_end`` on agent
-  timeout / session loss): recovery speech is real audio outside any measured turn.
-* **Keep raw samples; never average or add percentiles** (the p99 of a pipeline
-  is not the sum of its stages'), so quantiles are computed at read time.
-* **Refuse percentiles the sample size cannot support**: ``p90`` needs n >= 10,
-  ``p99`` n >= 1000; below that the field is ``None``. ``n`` is ALWAYS reported.
+* **Anchor at end-of-speech**, not at an API call: cloud uses
+  ``input_audio_buffer.speech_stopped``, local ``turn_anchor(offset_ms=...)`` back-dated
+  past the hangover. With no anchor, record NOTHING and count ``ttfa_unanchored`` (which
+  also absorbs audio after a deliberate ``turn_end``: agent timeout, session loss).
+* **Keep raw samples; never average or add percentiles** (the p99 of a pipeline is not
+  the sum of its stages'), so quantiles are computed at read time.
+* **Refuse percentiles the sample size cannot support**: ``p90`` needs n >= 10, ``p99``
+  n >= 1000; below that the field is ``None``. ``n`` is ALWAYS reported.
 * **Enqueue-side, not ear-side**: "first audio" is when a frame reaches the
-  ``AudioSink`` (true voice-to-voice latency needs a mic in the room), and the
-  snapshot's ``_enqueue_side`` marker says so.
+  ``AudioSink``; the snapshot's ``_enqueue_side`` marker says so.
 """
 
 from __future__ import annotations
@@ -79,8 +75,8 @@ class _Samples:
 
 @dataclass(slots=True)
 class _CallRecord:
-    """One tool call's timeline, joined by ``call_id``, the only identity that
-    crosses the backend -> shell boundary."""
+    """One tool call's timeline, joined by ``call_id``: the only identity that crosses
+    the backend -> shell boundary."""
 
     name: str
     seen_at: float                      # function_call item observed (backend)
@@ -91,13 +87,15 @@ class _CallRecord:
 
 @dataclass(slots=True)
 class VoiceMetrics:
-    """One session's metrics: backends record the turn timeline and call
-    sightings, the shell tool execution, the channel supervisor delegation
-    segments."""
+    """One session's metrics: backends record the turn timeline and call sightings, the
+    shell tool execution, the channel supervisor delegation segments."""
 
     counters: dict[str, int] = field(default_factory=dict)
     _latency: dict[str, _Samples] = field(default_factory=dict)
     _calls: dict[str, _CallRecord] = field(default_factory=dict)
+    # Calls already given a terminal by a void path: a late result must not add a second.
+    # Insertion-ordered so the bound evicts the OLDEST, as _cancelled_responses does.
+    _voided: dict[str, None] = field(default_factory=dict)
     # End-of-speech anchor; None between turns and without an end-of-speech signal,
     # reset per turn so a stale anchor cannot leak into the next TTFA.
     _anchor: float | None = None
@@ -122,11 +120,9 @@ class VoiceMetrics:
     # ---- turn timeline ------------------------------------------------------
 
     def turn_anchor(self, offset_ms: float = 0.0) -> None:
-        """End of user speech: the clock every turn metric is measured from.
-        ``offset_ms`` back-dates it for callers that learn of end-of-speech late
-        (the local endpointer confirms ``hangoverMs`` + any STT after the last
-        speech frame), keeping local numbers comparable with the cloud's
-        ``speech_stopped``."""
+        """End of user speech: the clock every turn metric is measured from. ``offset_ms``
+        back-dates it for callers that learn of end-of-speech late (the local endpointer
+        confirms after ``hangoverMs`` + STT), keeping local comparable with cloud."""
         self._anchor = _now_ms() - max(0.0, offset_ms)
         self._ttfa_done = False
         self._in_continuation = False
@@ -144,8 +140,8 @@ class VoiceMetrics:
         self._in_continuation = True
 
     def turn_first_audio(self) -> None:
-        """First output frame enqueued. TTFA: the headline number. Latched, or
-        every frame in the turn would record a sample against the one anchor."""
+        """First output frame enqueued (TTFA). Latched, or every frame in the turn would
+        record a sample against the one anchor."""
         if self._ttfa_done:
             return
         self._ttfa_done = True
@@ -163,13 +159,16 @@ class VoiceMetrics:
     # ---- tool call timeline -------------------------------------------------
 
     def call_seen(self, call_id: str, name: str) -> None:
-        # Idempotent: `tool_calls` is the denominator of every success rate, and a
-        # re-announced item would double-count it and reset seen_at.
+        # Idempotent: `tool_calls` is every success rate's denominator; a re-announced
+        # item would double-count it and reset seen_at.
         if call_id in self._calls:
             return
+        # A re-announced id opens a FRESH record that tool_calls counts again: its terminal
+        # belongs to this record, not to the dropped one.
+        self._voided.pop(call_id, None)
         if len(self._calls) >= _MAX_INFLIGHT:
-            # One eviction suffices; prefer a record that never reached the shell,
-            # since evicting a spawned one forfeits its latency sample and staleness verdict.
+            # Prefer a record that never reached the shell: evicting a spawned one
+            # forfeits its latency sample and staleness verdict.
             victim = next(
                 (cid for cid, r in self._calls.items() if r.spawned_at is None),
                 next(iter(self._calls)),
@@ -193,9 +192,15 @@ class VoiceMetrics:
             rec.spawned_at = _now_ms()
 
     def call_finished(self, call_id: str, *, outcome: str, mode: str) -> None:
-        """Close a call out. ``outcome`` is the success classification (see
-        ``VoiceShell._on_tool_call``); ``mode`` is ``direct`` | ``supervisor``, and
-        execution latency is bucketed BY MODE so the two stay comparable."""
+        """Close a call out. ``outcome`` = success classification (see
+        ``VoiceShell._on_tool_call``); ``mode`` = ``direct`` | ``supervisor``, and exec
+        latency is bucketed BY MODE so the two stay comparable."""
+        if call_id in self._voided:
+            # Already given a terminal; a second would make outcomes outnumber the
+            # tool_calls they divide.
+            del self._voided[call_id]
+            self.count("tool_late_result")
+            return
         self.count(f"tool_{outcome}")
         rec = self._calls.pop(call_id, None)
         if rec is None or rec.spawned_at is None:
@@ -203,9 +208,8 @@ class VoiceMetrics:
         self.observe(f"tool_exec_ms.{mode}", _now_ms() - rec.spawned_at)
 
     def call_stale(self, call_id: str, sink_epoch: int) -> bool:
-        """True if the call was dispatched under a superseded sink epoch: the user
-        barged in while it ran, so its result is for a dead turn. Counted, never
-        acted on; the backend's stale guard owns correctness."""
+        """True if the call was dispatched under a superseded sink epoch (barge-in while it
+        ran). Counted, never acted on; the backend's stale guard owns correctness."""
         rec = self._calls.get(call_id)
         if rec is None or rec.epoch == sink_epoch:
             return False
@@ -213,30 +217,38 @@ class VoiceMetrics:
         return True
 
     def calls_dropped(self, call_ids: set[str], reason: str) -> int:
-        """Void obligations that will never be answered (session loss, teardown).
-        Only still-open calls count, so the caller should log the RETURNED count:
-        the provider's pending set can include calls the shell already finished."""
+        """Void obligations that will never be answered (session loss, teardown). Only
+        still-open calls count, so log the RETURNED count: the provider's pending set can
+        include calls the shell already finished."""
         dropped = [cid for cid in call_ids if self._calls.pop(cid, None) is not None]
         if dropped:
             self.count(f"tool_dropped.{reason}", len(dropped))
+            self._void(dropped)
         return len(dropped)
 
     def calls_abandoned(self, call_ids: set[str]) -> None:
-        """A cancelled response's obligations. Only those never DISPATCHED to the
-        shell are dropped: one that reached the shell is still answered
-        (``submit_tool_result`` is sent), it just won't resume the dead turn."""
+        """A cancelled response's obligations. Only those never DISPATCHED are dropped: one
+        that reached the shell is still answered, it just won't resume the dead turn."""
         for cid in call_ids:
             rec = self._calls.get(cid)
             if rec is not None and rec.dispatched_at is None:
                 del self._calls[cid]
                 self.count("tool_dropped.cancelled")
+                self._void([cid])
+
+    def _void(self, call_ids: list[str]) -> None:
+        """Remember a terminal already counted. Bounded like ``_calls``: a late result past
+        the cap simply counts its outcome."""
+        self._voided.update(dict.fromkeys(call_ids))
+        while len(self._voided) > _MAX_INFLIGHT:
+            del self._voided[next(iter(self._voided))]
 
     # ---- readout ------------------------------------------------------------
 
     @property
     def has_data(self) -> bool:
-        """Anything worth reporting? Latency counts too: a pure-conversation session
-        has no counters, and keying on those alone would drop its TTFA."""
+        """Anything worth reporting? Latency counts too: a pure-conversation session has no
+        counters, and keying on those alone would drop its TTFA."""
         return bool(self.counters or self._latency)
 
     def snapshot(self) -> dict:

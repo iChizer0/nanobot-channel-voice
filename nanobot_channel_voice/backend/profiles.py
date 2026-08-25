@@ -1,19 +1,13 @@
 """Provider profiles for the OpenAI-Realtime **dialect family**.
 
-Most "realtime speech-to-speech" SDKs are the *same* WebSocket protocol as OpenAI
-with cosmetic differences, so one adapter (:mod:`.openai_realtime`) covers them all
-from a pure-data :class:`RealtimeProfile`. Providers whose wire protocol is NOT this
-dialect (Gemini Live, AWS Nova Sonic, ...) are separate backends, not profiles.
-
-A profile parameterizes only what genuinely differs between vendors (per-field notes
-below): the ``session.update`` shape, the audio rates and format strings, the endpoint /
-auth / header transport, and the interrupt + tool capabilities. Every ``default_*`` is
-overridable via ``realtime.{baseUrl,model,voice}``.
+One adapter (:mod:`.openai_realtime`) covers every vendor speaking the protocol, reading
+a pure-data :class:`RealtimeProfile` for what differs. Providers whose wire protocol is
+NOT this dialect (Gemini Live, AWS Nova Sonic, ...) are separate backends, not profiles.
+Every ``default_*`` is overridable via ``realtime.{baseUrl,model,voice}``.
 
 ``dialect`` drives only what we SEND: ``"ga"`` nests ``session.audio.*``, ``"beta"`` is
-flat. The receive path matches both delta names (``response.output_audio.delta`` and
-``response.audio.delta``) unconditionally, since they never collide. Capability flags are
-conservative: off where a vendor's tool flow is unvalidated.
+flat; the receive path matches both delta names unconditionally (they never collide).
+Capability flags stay conservative: off where a vendor's tool flow is unvalidated.
 """
 
 from __future__ import annotations
@@ -25,19 +19,15 @@ _V = TypeVar("_V")
 
 Dialect = Literal["ga", "beta"]
 
-# How a barge-in stops the in-flight response. Every vendor needs SOMETHING sent:
-#   "truncate" = GA: send ``conversation.item.truncate`` to align the model's memory with
-#                the audio the user actually HEARD. Server-VAD auto-cancel (the GA-only
-#                ``interrupt_response`` flag, on by default) stops the response itself and
-#                a second response.cancel would race; with ``realtime.interruptResponse``
-#                off the adapter cancels explicitly too.
-#   "cancel"   = beta: no truncate event AND no auto-cancel, so the client must send
-#                ``response.cancel`` itself. The server keeps whatever it already
-#                streamed: playback-aligned memory is simply not offered here.
+# How a barge-in stops the in-flight response; every vendor needs SOMETHING sent.
+#   "truncate" = GA: conversation.item.truncate aligns the model's memory with the audio
+#                actually HEARD. Server-VAD auto-cancel (``interrupt_response``, on by
+#                default) stops the response, so cancel only when interruptResponse is off.
+#   "cancel"   = beta: no truncate event AND no auto-cancel, so the client must cancel.
+#                The server keeps what it streamed: no playback-aligned memory here.
 InterruptKind = Literal["truncate", "cancel"]
 
-# What a ``channels.voice.backend`` value selects; the channel dispatches on this
-# instead of on a hardcoded provider string.
+# What a ``channels.voice.backend`` value selects; the channel dispatches on this.
 BackendKind = Literal["local", "openai_dialect", "gemini"]
 
 
@@ -52,9 +42,8 @@ class RealtimeProfile:
     input_rate: int   # mic capture rate fed to the API, S16_LE mono; the channel
                       # builds capture at this rate, never at a hardcoded constant
     output_rate: int  # rate of the PCM the API streams back (~always 24k)
-    # beta dialect only: three mutually incompatible per-vendor vocabularies, never
-    # interchangeable (see the table). GA ignores both and sends a
-    # {type: "audio/pcm", rate} object built from *_rate instead.
+    # beta only: three mutually incompatible per-vendor vocabularies (see the table). GA
+    # ignores both and sends {type: "audio/pcm", rate} built from *_rate instead.
     input_format: str = "pcm16"
     output_format: str = "pcm16"
     default_base_url: str | None = None  # None => realtime.baseUrl is REQUIRED (Azure)
@@ -67,23 +56,19 @@ class RealtimeProfile:
     interrupt: InterruptKind = "truncate"
     supports_tools: bool = True
     needs_response_create_after_tools: bool = True
-    # Flatten tool JSON Schemas (drop nullable-type unions and anyOf/allOf/oneOf) for
-    # providers that reject those constructs: Qwen-Omni-Realtime does. OFF by default
-    # so the GA family keeps full schemas; see ``_normalize_schema``.
+    # Flatten tool JSON Schemas (nullable unions, anyOf/allOf/oneOf) for providers that
+    # reject them (Qwen-Omni). OFF by default: the GA family keeps full schemas.
     flatten_tool_schema: bool = False
-    # Max characters in one function_call_output. Realtime providers inject the whole
-    # output into the model context; large payloads (e.g. base64 images) blow the
-    # context window. 0 means unlimited (the provider enforces its own limit).
+    # Max chars in one function_call_output: the whole output enters the model context, so
+    # large payloads (base64 images) blow the window. 0 = unlimited (provider enforces).
     max_tool_output_chars: int = 0
-    # Per-model default voice overrides: vendors change the supported voice set between
-    # generations. Keys match by startswith against the resolved model, longest prefix
-    # wins; realtime.voice still overrides the result.
+    # Per-model voice overrides: keys match by startswith on the resolved model, longest
+    # prefix wins; realtime.voice still overrides the result.
     model_voice_overrides: dict[str, str] = field(default_factory=dict)
-    # Per-model capability overrides, matched the same way: capabilities shift between
-    # generations within one vendor (Qwen-Omni qwen3 is persona-only, qwen3.5 has tools).
+    # Per-model capability overrides, matched the same way (qwen3 is persona-only,
+    # qwen3.5 has tools).
     model_capability_overrides: dict[str, dict[str, bool | int]] = field(default_factory=dict)
-    # Vendor-required session keys that do not fit the common schema (e.g. GLM's
-    # beta_fields.chat_mode), merged into the beta-dialect session object.
+    # Vendor-required session keys outside the common schema, merged into the beta session.
     session_extras: dict = field(default_factory=dict)
 
     @staticmethod
@@ -164,8 +149,8 @@ PROFILES: dict[str, RealtimeProfile] = {
         output_rate=24000,
         voice_in_session_root=True,  # session.voice, not session.audio.output.voice
     ),
-    # Azure OpenAI Realtime (GA endpoint): set realtime.baseUrl to your resource URL and
-    # realtime.model to the deployment name. Preview (?api-version=) endpoints are NOT
+    # Azure OpenAI Realtime (GA endpoint): realtime.baseUrl = your resource URL,
+    # realtime.model = the deployment name. Preview (?api-version=) endpoints are NOT
     # covered by this profile.
     "azure": RealtimeProfile(
         key="azure",
@@ -180,8 +165,8 @@ PROFILES: dict[str, RealtimeProfile] = {
     ),
     # ---- beta dialect (flat input_audio_format, response.audio.delta) -------
     # Alibaba DashScope. Outside mainland China use the -intl endpoint (workspace-scoped
-    # *.maas.aliyuncs.com is now recommended; the legacy domain still works). Per-session
-    # turn caps apply: expect clean server closes.
+    # *.maas.aliyuncs.com recommended, legacy domain still works). Per-session turn caps
+    # apply: expect clean server closes.
     "qwen": RealtimeProfile(
         key="qwen",
         dialect="beta",
@@ -193,30 +178,26 @@ PROFILES: dict[str, RealtimeProfile] = {
             "qwen3.5-omni-flash-realtime": "Tina",
         },
         model_capability_overrides={
-            # qwen3.5 adds tool calling and, unlike some beta dialects, requires an
-            # explicit response.create after the function_call_output to produce the
-            # final answer ("Qwen-Omni-Realtime Function Calling" docs).
+            # qwen3.5 adds tool calling and requires an explicit response.create after
+            # the function_call_output to produce the final answer.
             "qwen3.5-omni-flash-realtime": {
                 "supports_tools": True,
                 "needs_response_create_after_tools": True,
-                # Big outputs (base64 images, long listings) push the realtime context
-                # over its limit and the server truncates.
+                # Big outputs push the realtime context over its limit; the server
+                # truncates.
                 "max_tool_output_chars": 8000,
             },
         },
         input_rate=16000,   # DashScope Qwen-Omni takes 16k in, streams 24k out
         output_rate=24000,
-        # DashScope documents "only pcm is supported";
-        # "pcm16" is the OpenAI value and is not accepted here.
+        # DashScope: "only pcm is supported"; the OpenAI "pcm16" is rejected here.
         input_format="pcm",
         output_format="pcm",
-        # NB: no OpenAI-Beta header. Qwen-*ASR*-Realtime does require it and shares the
-        # /api-ws/v1/realtime path (how it gets cargo-culted onto Omni), but the Omni
-        # docs (zh/en/tc all agree) document Authorization as the only header.
+        # NB: no OpenAI-Beta header — Qwen-*ASR*-Realtime needs it and shares the
+        # /api-ws/v1/realtime path, but Omni documents Authorization as its only header.
         interrupt="cancel",
-        # The default model is PERSONA-ONLY: tools are a qwen3.5 capability enabled by
-        # model_capability_overrides above, so the base must stay False or the default
-        # model would be handed tools it can't drive.
+        # The default model is PERSONA-ONLY: the base must stay False or it gets tools it
+        # can't drive (qwen3.5 re-enables via the override above).
         supports_tools=False,
         needs_response_create_after_tools=True,
         flatten_tool_schema=True,  # Qwen-Omni rejects nullable-union types + combinators
@@ -232,9 +213,9 @@ PROFILES: dict[str, RealtimeProfile] = {
         default_voice="tongtong",
         input_rate=16000,
         output_rate=24000,
-        # ASYMMETRIC vocabularies. Input takes wav/pcm16/pcm24 where the suffix is the
-        # SAMPLE RATE, not the bit depth ("pcm16" = 16 kHz, matching input_rate). Output
-        # takes only "pcm", its 24 kHz implicit: there is no "pcm24" on this side.
+        # ASYMMETRIC vocabularies: input takes wav/pcm16/pcm24 where the suffix is the
+        # SAMPLE RATE, not the bit depth ("pcm16" = 16 kHz, matching input_rate); output
+        # takes only "pcm", its 24 kHz implicit.
         input_format="pcm16",
         output_format="pcm",
         interrupt="cancel",

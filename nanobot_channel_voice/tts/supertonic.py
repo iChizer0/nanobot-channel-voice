@@ -2,14 +2,13 @@
 
 Four graphs from the ORIGINAL release (huggingface.co/Supertone/supertonic-3, MIT):
 duration_predictor -> text_encoder -> vector_estimator (Euler flow loop) -> vocoder.
-One 44.1 kHz model covers 31 languages (en/ko/ja/de/..., NO zh), selected by wrapping
-the text in ``<lang>...</lang>`` tags indexed like any other characters. The front-end
-is a per-codepoint lookup into ``unicode_indexer.json`` (65536 entries) after NFKD
-decomposition: no G2P, no tokenizer, and only decomposed characters are known
-(precomposed ă/č/한 map to -1). The math mirrors the reference (supertone-inc/supertonic
-py/helper.py and sherpa-onnx's C++ port); side files keep the original JSON formats so
-the fp32 graphs double as the int8/RKNN conversion source. Imported lazily by
-:func:`make_tts`, so the plugin imports without numpy.
+One 44.1 kHz model covers 31 languages (NO zh), selected by wrapping the text in
+``<lang>...</lang>`` tags indexed like any other characters. The front-end is a
+per-codepoint lookup into ``unicode_indexer.json`` (65536 entries) after NFKD
+decomposition — only decomposed characters are known (precomposed ă/č/한 map to -1).
+Math mirrors the reference (supertone-inc/supertonic py/helper.py, sherpa-onnx's C++
+port); side files keep the original JSON formats so the fp32 graphs double as the
+int8/RKNN conversion source. Imported lazily, so the plugin imports without numpy.
 """
 
 from __future__ import annotations
@@ -89,9 +88,9 @@ def preprocess_text(text: str, lang: str) -> str:
 
 
 def decompose(text: str) -> list[int]:
-    """Per-codepoint NFKD decomposition to BMP values (reference
-    ``TextToUnicodeValues``). Exactly as the reference: no cross-character reordering,
-    decompositions leaving the BMP keep the original codepoint, non-BMP is dropped."""
+    """Per-codepoint NFKD decomposition to BMP values (reference ``TextToUnicodeValues``):
+    no cross-character reordering, decompositions leaving the BMP keep the original
+    codepoint, non-BMP is dropped."""
     values: list[int] = []
     for ch in text:
         cp = ord(ch)
@@ -105,14 +104,13 @@ def decompose(text: str) -> list[int]:
     return values
 
 
-
 def load_indexer(path: str) -> np.ndarray:
     """``unicode_indexer.json``: a JSON array of 65536 codepoint->id int32s."""
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, list) or len(raw) != 65536:
-        # BMP-complete or bust: a truncated file would silently map out-of-range
-        # codepoints to a real character id — garbage AUDIO, not a load-time error.
+        # BMP-complete or bust: a truncated file maps out-of-range codepoints to a real
+        # character id — garbage AUDIO, not a load-time error.
         got = len(raw) if isinstance(raw, list) else type(raw).__name__
         raise ValueError(f"unicode indexer must be a JSON array of 65536 ids, got {got}: {path}")
     return np.asarray(raw, dtype=np.int32)
@@ -240,12 +238,10 @@ class SupertonicTtsAdapter(OnDeviceTtsAdapter):
     def _can_speak(self, ch: str) -> bool:
         """Does every value ``ch`` decomposes to index into the embedding table?
 
-        The indexer is the front-end in full, so a ``-1`` is exactly what would be
-        gathered from the end of the table as noise. NFKD is what keeps precomposed
-        letters and Hangul speakable (bases, combining marks and Jamo are mapped; the
-        precomposed forms are not), so a ``-1`` after decomposition is a genuinely
-        unmapped codepoint — most CJK ideographs (only ~7.5k of 21k are mapped), for
-        one. Non-BMP decomposes to nothing, which is silence."""
+        The indexer IS the front-end, so a ``-1`` gathers noise from the end of the
+        table. NFKD is what keeps precomposed letters and Hangul speakable, so a ``-1``
+        after decomposition is genuinely unmapped (most CJK ideographs: ~7.5k of 21k
+        are mapped). Non-BMP decomposes to nothing, which is silence."""
         values = decompose(ch)
         return bool(values) and all(self._indexer[v] >= 0 for v in values)
 
@@ -254,9 +250,9 @@ class SupertonicTtsAdapter(OnDeviceTtsAdapter):
         if not processed:
             return np.zeros(0, dtype=np.float32)
         values = decompose(processed)
-        # Unknown codepoints map to -1, which the embedding Gather resolves from the
-        # end of the table: the reference passes them through too. Indexing is total:
-        # decompose emits only BMP, load_indexer guarantees all 65536 entries.
+        # Unknown codepoints map to -1, which the embedding Gather resolves from the end
+        # of the table (reference does too). Indexing is total: decompose emits only BMP
+        # and load_indexer guarantees all 65536 entries.
         ids = self._indexer[np.asarray(values, dtype=np.int64)].astype(np.int64)[None, :]
         text_mask = np.ones((1, 1, ids.shape[1]), dtype=np.float32)
 
@@ -284,8 +280,7 @@ class SupertonicTtsAdapter(OnDeviceTtsAdapter):
         latent_mask = np.ones((1, 1, latent_len), dtype=np.float32)
         total_step = np.array([self._num_steps], dtype=np.float32)
 
-        # The graph performs the Euler update internally, so each output IS the next
-        # latent (current_step is the step index).
+        # The graph does the Euler update internally: each output IS the next latent.
         for step in range(self._num_steps):
             latent = np.asarray(
                 self._vector_estimator.run(

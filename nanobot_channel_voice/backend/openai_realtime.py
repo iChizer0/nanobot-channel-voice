@@ -1,20 +1,17 @@
 """RealtimeBackend: e2e speech-to-speech over the OpenAI Realtime API **dialect**.
 
-A raw WebSocket client behind the :class:`VoiceBackend` contract. The same code drives
-every supplier speaking OpenAI's Realtime protocol (OpenAI, xAI, Azure GA sub-dialect;
-Alibaba Qwen-Omni, Zhipu GLM, StepFun beta) by reading a pure-data
-:class:`~.profiles.RealtimeProfile` for the bits that differ.
-The provider does ASR + reasoning + TTS in one session;
-the plugin owns local mic capture + speaker playback and routes tool calls to nanobot.
+A raw WebSocket client behind :class:`VoiceBackend`, driving every supplier that speaks
+the protocol (GA: OpenAI/xAI/Azure; beta: Qwen-Omni/GLM/StepFun) off a pure-data
+:class:`~.profiles.RealtimeProfile`. The provider does ASR + reasoning + TTS; the plugin
+owns mic capture, playback and tool routing.
 
-One rx task owns connect + receive + bounded reconnect; a separate sender task drains a
-bounded drop-oldest audio queue so a slow socket never stalls capture; every frame goes
-through one lock-guarded ``_send``. A tool turn spans >= 2 responses: each
-``function_call`` registers an obligation, the continuation fires exactly once — after
-the triggering response is done, all its outputs are submitted, and only if it was not
-cancelled — and ``TurnDone`` comes only from the turn's final ``response.done``.
-``_handle_event`` emits normalized events and mutates state; the only frame it can send
-is the tool continuation, so it is unit-testable against canned server frames.
+One rx task owns connect + receive + bounded reconnect; a sender task drains a bounded
+drop-oldest audio queue so a slow socket never stalls capture; every frame goes through
+one lock-guarded ``_send``. A tool turn spans >= 2 responses: each ``function_call``
+registers an obligation, the continuation fires exactly once (triggering response done,
+all outputs submitted, not cancelled), and ``TurnDone`` comes only from the turn's final
+``response.done``. ``_handle_event``'s only send is that continuation, so it is testable
+against canned server frames.
 """
 
 from __future__ import annotations
@@ -57,25 +54,21 @@ from .profiles import RealtimeProfile
 
 _SEND_Q_MAX = 64  # ~1.3s of 20ms frames; drop-oldest past this
 
-# Stop-command consume (transcript-gated; mirrors the local backend's stop consume).
-# Grace mirrors local's _KILL_GRACE_S: a second bare stop right after a consumed one is a
-# double-tap, not a new turn. The suppress window covers transcripts that land BEFORE the
-# server creates the response answering them — that response is cancelled at creation;
-# new user speech ends the window (whatever follows answers the NEW utterance).
+# Grace (mirrors local's _KILL_GRACE_S): a bare stop right after a consumed one is a
+# double-tap, not a new turn. Suppress covers a stop transcript landing before the server
+# creates the response answering it; new user speech ends the window.
 _STOP_GRACE_S = 3.0
 _STOP_SUPPRESS_S = 2.0
 _BACKOFF = (0.5, 1.0, 2.0)
-# A session this long counts as healthy and resets the backoff budget: separates "the
-# endpoint recycles long sessions" (Qwen turn caps) from "it rejects us", which alone
-# should reach "reconnect exhausted".
+# Healthy session: resets the backoff budget, so an endpoint that recycles long sessions
+# (Qwen turn caps) never reaches "reconnect exhausted".
 _HEALTHY_SESSION_S = 30.0
 
 
 def _status_detail(resp: dict) -> str:
-    """Best-effort human detail from ``response.status_details``. Shape-defensive: GA puts
-    failures under ``.error.message`` and caps under ``.reason``, the beta dialects are
-    unvalidated, and a raise here would abort ``response.done`` handling with the watchdog
-    already cancelled, skipping the turn's end (TurnDone, drain)."""
+    """Best-effort detail from ``response.status_details`` (GA: ``.error.message`` /
+    ``.reason``; beta unvalidated). Must not raise: ``response.done`` handling would abort
+    with the watchdog already cancelled, skipping the turn's end (TurnDone, drain)."""
     details = resp.get("status_details")
     if isinstance(details, str):
         return details
@@ -101,11 +94,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _normalize_schema(schema: dict) -> dict:
-    """Lossily flatten a JSON Schema for providers that accept neither a list ``type``
-    (nullable unions) nor the ``anyOf``/``allOf``/``oneOf`` combinators — opt-in via
-    ``RealtimeProfile.flatten_tool_schema``, i.e. only Qwen-Omni-Realtime. A union narrows
-    to its first non-null member and a combinator to its first ``type``-bearing branch:
-    the goal is acceptance, not a round-trip."""
+    """Lossily flatten a JSON Schema for providers rejecting list ``type`` (nullable
+    unions) and ``anyOf``/``allOf``/``oneOf`` — opt-in via
+    ``RealtimeProfile.flatten_tool_schema``. Union -> first non-null member, combinator ->
+    first ``type``-bearing branch: the goal is acceptance, not a round-trip."""
     if not isinstance(schema, dict):
         return schema
     result: dict = {}
@@ -162,8 +154,7 @@ class RealtimeBackend(TurnEventMixin):
         metrics: VoiceMetrics | None = None,
         aec=None,
     ):
-        # Shared with the shell/channel so one call's segments (seen -> dispatched ->
-        # executed -> continuation) land in one place.
+        # Shared with the shell/channel: one call's segments land in one collector.
         self._metrics = metrics if metrics is not None else VoiceMetrics()
         self._rt = config.realtime
         self._profile = profile
@@ -197,8 +188,7 @@ class RealtimeBackend(TurnEventMixin):
         self._last_error: str | None = None
 
         self._turn = VoiceState.IDLE
-        # Stop-command consume: active only with input transcription on — without
-        # transcripts the matcher is None and the persona rule is the only (soft) cover.
+        # Needs input transcription; without it the persona rule is the only (soft) cover.
         self._log_transcripts = config.log_transcripts
         self._stop_match = (
             PhraseMatcher(
@@ -209,22 +199,18 @@ class RealtimeBackend(TurnEventMixin):
             if config.barge_in.stop_phrases and self._rt.input_transcription_model
             else None
         )
-        # The stop targeting latch and its clocks live in _reset_turn_state: the local
-        # onset latch's cloud twin, per LATEST onset (the transcript event carries no
-        # item->onset mapping to be more precise with).
+        # The stop latch + clocks live in _reset_turn_state, per LATEST onset.
         self._log = logger.bind(component="voice")  # before _reset_turn_state: it logs
         self._reset_turn_state()
 
     # ---- turn/session bookkeeping -------------------------------------------
 
     def _reset_turn_state(self, *, reason: str = "init") -> None:
-        # Pending call_ids are obligations the model will never see answered — invisible
-        # unless logged here. getattr: also runs from __init__, before the maps exist.
+        # getattr: also runs from __init__, before the maps exist.
         pending: set[str] = set()
         for cids in getattr(self, "_tools_pending", {}).values():
             pending |= cids
-        # The collector decides the real count: a call the shell already answered is no
-        # longer open, though it can linger in _tools_pending.
+        # The collector decides the real count: an answered call can linger in the map.
         dropped = self._metrics.calls_dropped(pending, reason)
         if dropped:
             self._log.warning("dropping {} unanswered tool obligation(s) on {}", dropped, reason)
@@ -234,12 +220,12 @@ class RealtimeBackend(TurnEventMixin):
         self._item_base_played = 0
         # Never carry a dead session's fault into the next one's failure detail.
         self._last_error = None
-        # Every call_id THIS session announced: a result finishing after a reconnect must
-        # be dropped, since the new session rejects unknown call_ids. Cancelled responses
-        # KEEP their entries: still answered, they just resume nothing.
+        # call_ids THIS session announced: a result finishing after a reconnect must drop
+        # (the new session rejects unknown call_ids). Cancelled responses KEEP entries:
+        # still answered, they just resume nothing.
         self._session_calls: set[str] = set()
-        # Insertion-ordered so the size bound evicts the OLDEST rid; set.pop() is
-        # hash-arbitrary and could evict the one rid whose late deltas still stream.
+        # Insertion-ordered: the size bound must evict the OLDEST rid, not a
+        # hash-arbitrary one whose late deltas still stream.
         self._cancelled_responses: dict[str, None] = {}
         self._response_done: set[str] = set()
         self._response_had_tools: dict[str, bool] = {}
@@ -247,17 +233,15 @@ class RealtimeBackend(TurnEventMixin):
         self._call_to_response: dict[str, str] = {}
         self._fn_names: dict[str, str] = {}
         self._fn_args: dict[str, str] = {}
-        # Stop-consume state is session-scoped: a suppress window or onset latch carried
-        # across a reconnect would cancel the NEW session's first response at birth (a
-        # dropped socket can reconnect well inside the 2 s window).
+        # Session-scoped: a suppress window or latch carried across a reconnect (well
+        # inside the 2 s window) would cancel the NEW session's first response at birth.
         self._onset_interrupting = False
         self._last_stop_consume = float("-inf")
         self._stop_suppress_until = 0.0
-        # Barge-in latency clock (monotonic ms): set at server-VAD onset, consumed by
-        # the next barge-in. Session-scoped, or a reconnect inherits a stale onset.
+        # Barge-in latency clock (monotonic ms): set at server-VAD onset, eaten by the
+        # next barge-in; session-scoped, or a reconnect inherits a stale onset.
         self._speech_started_at: float | None = None
-        # speech_started..speech_stopped: the only span in which uplink frames may
-        # feed the turn deadman (see the sender loop). Session-scoped.
+        # The only span in which uplink frames may feed the deadman (see the sender loop).
         self._user_speaking = False
 
     @property
@@ -286,9 +270,8 @@ class RealtimeBackend(TurnEventMixin):
         self._sender_task = asyncio.create_task(self._sender_loop())
 
     async def push_audio(self, pcm: bytes) -> None:
-        # AEC before the ready-gate: the adaptive filter wants a continuous capture timeline
-        # (and this drains due reference blocks even while frames are dropped). Loop-side is
-        # fine: AEC3 measures ~0.05 ms per 10 ms frame pair.
+        # AEC before the ready-gate: the filter needs a continuous capture timeline (and
+        # this drains due reference blocks). Loop-side: ~0.05 ms per 10 ms frame pair.
         if self._aec is not None:
             pcm = self._aec.process(pcm)
         # Session-ready barrier: drop until the format/VAD config is applied.
@@ -300,12 +283,11 @@ class RealtimeBackend(TurnEventMixin):
     async def barge_in(self, played_ms: int) -> None:
         try:
             if self._profile.interrupt == "cancel":
-                # Beta: WE must stop the response (see InterruptKind) or the model keeps
-                # generating (and billing) audio nobody will hear.
+                # Beta: WE must stop the response or the model keeps generating audio.
                 await self._cancel_active()
                 return
-            # GA (see InterruptKind): truncate only — a second response.cancel would race
-            # the server's auto-cancel, unless interruptResponse is off (no auto-cancel).
+            # GA: truncate only — a second response.cancel would race the server's
+            # auto-cancel, which interruptResponse=off disables.
             if not self._rt.interrupt_response:
                 await self._cancel_active()
             else:
@@ -314,13 +296,12 @@ class RealtimeBackend(TurnEventMixin):
             if item is None:
                 return  # nothing audible to truncate (already marked cancelled above)
             # One truncate per item: a second barge-in before the next output_item.added
-            # would re-truncate the same item at audio_end_ms=0 (the sink was flushed, so
-            # played_ms restarts), wiping the model's memory of audio the user DID hear.
+            # would re-truncate at audio_end_ms=0 (a flushed sink restarts played_ms),
+            # wiping the model's memory of audio the user DID hear.
             self._audio_item_id = None
             audio_end = max(0, played_ms - self._item_base_played)
             try:
-                # A dead socket must not escape barge_in: the shell's post-barge-in
-                # callback (abandon the in-flight delegation) must still run.
+                # A dead socket must not escape: the shell's post-barge-in callback runs.
                 await self._send({
                     "type": "conversation.item.truncate",
                     "item_id": item, "content_index": 0, "audio_end_ms": audio_end,
@@ -330,13 +311,12 @@ class RealtimeBackend(TurnEventMixin):
             except Exception as exc:  # noqa: BLE001
                 self._log.debug("truncate failed: {}", exc)
         finally:
-            # On the way OUT so the measured latency includes the shell's sink flush and the
-            # frame send; bucketed by mechanism, since truncate and cancel differ structurally.
+            # On the way OUT: the latency includes the sink flush + send. Per mechanism.
             self._record_barge_in()
 
     def _record_barge_in(self) -> None:
-        # The shell routes EVERY onset here; only one that interrupted a live turn
-        # (_onset_interrupting) is a barge-in sample. The stamp clears either way.
+        # Every onset routes here; only an interrupting one is a sample (stamp clears
+        # regardless).
         stamp, self._speech_started_at = self._speech_started_at, None
         if stamp is None or not self._onset_interrupting:
             return
@@ -346,8 +326,7 @@ class RealtimeBackend(TurnEventMixin):
         )
 
     def _note_cancelled(self, rid: str) -> None:
-        """Record a dead response so late deltas drop (the cloud analog of the local
-        ``_rejected_base``); bounded, since the set lives for the whole session."""
+        """Record a dead response so late deltas drop; bounded (it lives a whole session)."""
         self._cancelled_responses[rid] = None
         while len(self._cancelled_responses) > 256:  # rids are only checked while recent
             del self._cancelled_responses[next(iter(self._cancelled_responses))]
@@ -357,8 +336,7 @@ class RealtimeBackend(TurnEventMixin):
             self._note_cancelled(self._active_response_id)
 
     async def _cancel_active(self) -> None:
-        """Send ``response.cancel`` for the live response, at most once. Shared by the beta
-        barge-in path and the GA path with ``realtime.interruptResponse`` off."""
+        """Send ``response.cancel`` for the live response, at most once."""
         rid = self._active_response_id
         if not rid or rid in self._cancelled_responses:
             return
@@ -367,11 +345,10 @@ class RealtimeBackend(TurnEventMixin):
         self._note_cancelled(rid)
 
     async def _consume_stop(self, text: str) -> None:
-        """A pure stop command (transcript-gated): the response answering it dies unspoken
-        — cancelled now if live, at birth via the suppress window if not — and queued ack
-        audio is flushed. Deliberately NO conversation.item.truncate: the tracked audio
-        item may still be the PREVIOUS reply's (the ack often has no item yet), and
-        truncating a fully-heard item corrupts the model's memory of it."""
+        """A pure stop command: the response answering it dies unspoken (cancelled now if
+        live, at birth via the suppress window if not) and queued audio is flushed.
+        Deliberately NO conversation.item.truncate: the tracked item may still be the
+        PREVIOUS reply's, and truncating a fully-heard item corrupts the model's memory."""
         self._metrics.count("barge_in_stop")
         self._log.info(
             "stop command consumed (cloud): '{}'",
@@ -383,18 +360,12 @@ class RealtimeBackend(TurnEventMixin):
         if rid is not None and rid not in self._cancelled_responses:
             await self._cancel_active()
         else:
-            # Nothing live to cancel (or only a corpse awaiting its done): the response
-            # answering THIS stop is still unborn — arm the at-birth suppression.
+            # Nothing live to cancel: the response answering THIS stop is still unborn.
             self._stop_suppress_until = time.monotonic() + _STOP_SUPPRESS_S
         await self._sink.flush()
-        # The tracked item dies with the flush: played_ms() restarts at 0, so a LATER
-        # barge-in computing audio_end against the old base would truncate the
-        # partially-heard pre-stop item at 0 — wiping the model's memory of audio the
-        # user DID hear, the exact corruption skipping the truncate above avoids.
-        # Cleared, the next barge-in finds no item and sends nothing: the model
-        # over-remembers (the docstring's chosen direction) instead. An item announced
-        # after this point cannot re-arm the slot: the stop's cancel/suppress marks its
-        # response dead and _on_item_added drops non-live items.
+        # The item dies with the flush: played_ms() restarts at 0, so a later barge-in
+        # against the old base would truncate a partially-heard item at 0. Cleared, the
+        # next barge-in sends nothing and the model over-remembers instead.
         self._audio_item_id = None
         self._item_base_played = 0
         if self._turn is not VoiceState.IDLE:
@@ -402,7 +373,7 @@ class RealtimeBackend(TurnEventMixin):
 
     def _clamp_tool_output(self, output: str) -> str:
         """Clamp an oversized tool output to protect the realtime context window; the
-        marker keeps the model aware the tool ran, so it can ask for a smaller slice."""
+        marker keeps the model aware the tool ran."""
         limit = self._max_tool_output_chars
         if limit <= 0 or len(output) <= limit:
             return output
@@ -426,8 +397,7 @@ class RealtimeBackend(TurnEventMixin):
             "type": "conversation.item.create",
             "item": {"type": "function_call_output", "call_id": call_id, "output": output},
         }
-        # call_id/size only: serializing the (unbounded on GA) payload for a usually
-        # disabled debug line would double every tool result's JSON cost.
+        # call_id/size only: serializing the payload would double every result's JSON cost.
         self._log.debug("submit_tool_result call_id={} ({} chars)", call_id, len(output))
         await self._send(payload)
         # Answered exactly once: drop the bookkeeping, incl. the duplicate-submit guard.
@@ -469,18 +439,17 @@ class RealtimeBackend(TurnEventMixin):
             started = time.monotonic()
             try:
                 await self._connect_and_run()
-                # A CLEAN server close lands here, not in `except` (e.g. Qwen's per-session
-                # turn cap); still a disconnect, so it takes the same teardown + backoff.
+                # A CLEAN server close lands here, not in `except` (Qwen's per-session turn
+                # cap); still a disconnect: same teardown + backoff.
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - reconnect on any transport failure
                 if self._closing:
                     break
-                # A rejected HANDSHAKE with an auth status is a credential problem, not a
-                # transport blip: fatal at once when the key has NEVER worked, but after a
-                # healthy session one transient 401/403 (proxy blip, key rotation) gets one
-                # ladder retry first. (.response.status_code = modern websockets
-                # InvalidStatus; .status_code = legacy InvalidStatusCode.)
+                # An auth-rejected HANDSHAKE is credentials, not a blip: fatal at once if
+                # the key NEVER worked, else one ladder retry (proxy blip, key rotation).
+                # .response.status_code = modern websockets InvalidStatus; .status_code =
+                # legacy InvalidStatusCode.
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status is None:
                     status = getattr(exc, "status_code", None)
@@ -497,8 +466,7 @@ class RealtimeBackend(TurnEventMixin):
             if self._closing:
                 break
             await self._on_session_lost()
-            # Only back-to-back FAST failures (bad key, wrong URL) walk the ladder to the
-            # fatal rung; a session that stayed up proves the endpoint healthy.
+            # Only back-to-back FAST failures walk the ladder to the fatal rung.
             if time.monotonic() - started >= _HEALTHY_SESSION_S:
                 attempt = 0
             if attempt >= len(_BACKOFF):
@@ -510,17 +478,14 @@ class RealtimeBackend(TurnEventMixin):
     async def _on_session_lost(self) -> None:
         """Teardown shared by every way a session can end, clean or not."""
         self._ready.clear()
-        # The dead session's timers must die with it: a surviving watchdog would fire
-        # (with real side effects now) minutes into the RECONNECTED session.
+        # A surviving watchdog would fire, with real side effects, into the next session.
         self._cancel_watchdog()
         self._cancel_drain()
         self._reset_turn_state(reason="session_lost")
-        # An anchor surviving the outage would measure the reconnected session's
-        # first audio against a turn that no longer exists.
+        # A surviving anchor would measure new audio against a turn that no longer exists.
         self._metrics.turn_end()
-        # Reset the coarse state too: the shell's half-duplex mic gate keys on SPEAKING, so
-        # dropping while SPEAKING would wedge forever (mic gated -> no audio to the server
-        # -> no speech_started to move off SPEAKING).
+        # The half-duplex mic gate keys on SPEAKING: dropping while SPEAKING wedges forever
+        # (mic gated -> no audio out -> no speech_started to move off SPEAKING).
         await self._set_turn(VoiceState.IDLE)
 
     async def _connect_and_run(self) -> None:
@@ -545,12 +510,12 @@ class RealtimeBackend(TurnEventMixin):
                     except asyncio.CancelledError:
                         raise
                     except Exception:  # noqa: BLE001
-                        # A handler bug must not tear down a HEALTHY connection: a
-                        # reconnect loses the server-side conversation state.
+                        # A handler bug must not kill a HEALTHY connection:
+                        # a reconnect loses the server-side conversation state.
                         self._log.exception("event handler failed for {}", evt.get("type"))
             finally:
-                # _ws must not outlive the socket: submit_tool_result has to see None and
-                # drop the frame, not raise ConnectionClosed and skip its bookkeeping.
+                # _ws must not outlive the socket: submit_tool_result must see None and
+                # drop the frame, not raise and skip its bookkeeping.
                 self._ws = None
 
     async def _sender_loop(self) -> None:
@@ -567,14 +532,10 @@ class RealtimeBackend(TurnEventMixin):
                     "audio": base64.b64encode(pcm).decode("ascii"),
                 })
                 if self._user_speaking and self._turn is VoiceState.CAPTURING:
-                    # A monologue longer than turn_timeout_s emits no server events until
-                    # speech_stopped, so the watchdog armed at speech_started would fire
-                    # mid-sentence. Only while the user is AUDIBLY speaking: the silence
-                    # frames that keep flowing after speech_stopped (the state stays
-                    # CAPTURING until response.created) must not feed the deadman, or a
-                    # server that acks the speech and never answers wedges CAPTURING
-                    # forever — the exact hang the speech_started arming exists to catch.
-                    # Idle mic frames feeding it in THINKING would likewise mask a hang.
+                    # A monologue longer than turn_timeout_s emits no server events, so the
+                    # watchdog armed at speech_started would fire mid-sentence. AUDIBLY
+                    # speaking only: post-speech_stopped silence (still CAPTURING) or idle
+                    # frames in THINKING would mask a server that never answers.
                     self._progress_t = time.monotonic()
             except asyncio.CancelledError:
                 raise
@@ -640,8 +601,7 @@ class RealtimeBackend(TurnEventMixin):
             session["tools"] = [_tool_to_wire(t, flatten=self._profile.flatten_tool_schema)
                                 for t in self._tools]
         if self._profile.session_extras:
-            # Deep-copy: session_extras lives on the PROFILES singleton, and _deep_merge
-            # would alias its nested dicts into this payload.
+            # Deep-copy: session_extras lives on the PROFILES singleton; _deep_merge aliases.
             _deep_merge(session, copy.deepcopy(self._profile.session_extras))
         payload = {"type": "session.update", "session": session}
         self._log.debug("session.update payload: {}", json.dumps(payload, ensure_ascii=False))
@@ -668,9 +628,8 @@ class RealtimeBackend(TurnEventMixin):
             self._arm_watchdog()  # recover if the server never turns this into a response
             self._user_speaking = True
             self._speech_started_at = time.monotonic() * 1000.0
-            # Stop targeting latch, read BEFORE the CAPTURING transition overwrites it.
-            # New speech also ends any pending created-response suppression: whatever
-            # response follows answers the NEW utterance, not a consumed stop.
+            # Read BEFORE the CAPTURING transition overwrites it. New speech also ends the
+            # suppression: whatever follows answers the NEW utterance, not a consumed stop.
             self._onset_interrupting = self._turn in (
                 VoiceState.THINKING, VoiceState.SPEAKING,
             )
@@ -678,17 +637,15 @@ class RealtimeBackend(TurnEventMixin):
             await self._set_turn(VoiceState.CAPTURING)
             await self._emit(UserSpeechStarted())
         elif t == "input_audio_buffer.speech_stopped":
-            # MEASUREMENT ONLY, no state change or event: the anchor every turn-latency
-            # number is measured from (end of user speech); absent without server_vad,
-            # and then turn latency simply goes unrecorded.
+            # MEASUREMENT ONLY: the anchor turn latency is measured from (end of user
+            # speech); absent without server_vad, and then it goes unrecorded.
             self._metrics.turn_anchor()
             self._user_speaking = False  # uplink frames stop feeding the deadman here
             self._progress_t = time.monotonic()  # end of speech IS turn progress
         elif t == "response.created":
             rid = (evt.get("response") or {}).get("id")
             if time.monotonic() < self._stop_suppress_until:
-                # The response answering a consumed stop: kill it at birth, before any
-                # audio exists, and stay out of THINKING — silence is the acknowledgment.
+                # Kill the consumed stop's response at birth; silence is the acknowledgment.
                 self._stop_suppress_until = 0.0
                 self._active_response_id = rid
                 await self._cancel_active()
@@ -714,9 +671,8 @@ class RealtimeBackend(TurnEventMixin):
         elif t == "response.function_call_arguments.delta":
             self._adopt_response(evt)
             cid = evt.get("call_id")
-            # Liveness-gated like every other delta: a cancelled response's argument stream
-            # otherwise accumulates scratch nothing cleans — the cancel can race ahead of
-            # output_item.added, so the cid never maps to a rid the discard path can reach.
+            # Liveness-gated: a cancelled response's args accumulate scratch nothing cleans
+            # (the cancel can race ahead of output_item.added, so the cid maps to no rid).
             if cid is not None and self._is_live(evt):
                 self._fn_args[cid] = self._fn_args.get(cid, "") + evt.get("delta", "")
         elif t == "response.function_call_arguments.done":
@@ -741,16 +697,15 @@ class RealtimeBackend(TurnEventMixin):
             await self._on_error(evt)
 
     def _adopt_response(self, evt: dict) -> None:
-        """Create-on-first-sight: a dialect may emit its first ``response.*`` event before
-        (or without) ``response.created`` — the s2s reference server emits it lazily — and
-        ``_is_live`` fails closed with no active id. Never adopts over a live, cancelled,
-        or finished id."""
+        """Create-on-first-sight: a dialect may emit ``response.*`` before (or without)
+        ``response.created``, and ``_is_live`` fails closed with no active id. Never adopts
+        over a live id, nor over a cancelled/completed one (both sit in
+        ``_cancelled_responses``, which outlives ``_cleanup_response``)."""
         rid = evt.get("response_id")
         if (
             rid
             and self._active_response_id is None
             and rid not in self._cancelled_responses
-            and rid not in self._response_done
         ):
             self._cancel_drain()
             self._active_response_id = rid
@@ -762,8 +717,8 @@ class RealtimeBackend(TurnEventMixin):
         """True if the event belongs to the active, non-cancelled response."""
         rid = evt.get("response_id") or self._active_response_id
         if rid is None:
-            # Fail CLOSED: the active id is cleared at turn end, so `None == None` would
-            # let a rid-less straggler play audio or re-run a tool for a dead turn.
+            # Fail CLOSED: the active id clears at turn end, so `None == None` would let a
+            # rid-less straggler play audio or re-run a tool for a dead turn.
             return False
         return rid == self._active_response_id and rid not in self._cancelled_responses
 
@@ -777,13 +732,11 @@ class RealtimeBackend(TurnEventMixin):
         rid = evt.get("response_id") or self._active_response_id
         if item.get("type") == "message":
             self._audio_item_id = item.get("id")
-            # Truncate baseline: where this item's audio STARTS on the stream. played +
-            # backlog, not played alone, else a continuation item added while the previous
-            # tail is still buffered over-counts audio_end_ms past the item's real length
-            # (GA rejects that); backlog_ms() over-counts by design, so audio_end
-            # under-counts — the safe direction for the model's memory. Valid only against
-            # played_ms() from the SAME sink stream generation: a republished stream
-            # restarts played_ms() at 0 and voids the base.
+            # Truncate baseline: where this item's audio STARTS. played + backlog, not
+            # played alone, or an item added over a buffered tail over-counts audio_end_ms
+            # past the item's real length (GA rejects that); backlog over-counts, so
+            # audio_end under-counts — the safe way. Valid only within one sink stream
+            # generation: a republish restarts played_ms() at 0.
             self._item_base_played = self._sink.played_ms() + self._sink.backlog_ms()
         elif item.get("type") == "function_call":
             cid = item.get("call_id")
@@ -815,8 +768,7 @@ class RealtimeBackend(TurnEventMixin):
         if self._turn is not VoiceState.SPEAKING:
             await self._set_turn(VoiceState.SPEAKING)
         self._progress_t = time.monotonic()  # feed the deadman: the turn is alive
-        # TTFA, latched to the turn's first frame; recorded at ENQUEUE, so device playout
-        # is excluded (VoiceMetrics marks snapshots `_enqueue_side`).
+        # TTFA, latched to the turn's first frame at ENQUEUE: device playout is excluded.
         self._metrics.turn_first_audio()
         await self._emit(OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._profile.output_rate))
 
@@ -832,10 +784,8 @@ class RealtimeBackend(TurnEventMixin):
         if cid is None:
             return
         self._progress_t = time.monotonic()  # tool activity is turn progress too
-        # PRIMARY obligation registration: output_item.added usually got here first, but a
-        # dialect may skip it entirely (the s2s reference server emits ONLY this event for
-        # a tool call, its response.done carrying no output[] to mine), which would leave
-        # the call invisible to the continuation logic. Set-based; the double-add is a no-op.
+        # PRIMARY obligation registration: a dialect may skip output_item.added entirely,
+        # leaving the call invisible to the continuation logic. Double-add is a no-op.
         rid = evt.get("response_id") or self._active_response_id
         if rid:
             self._response_had_tools[rid] = True
@@ -859,13 +809,16 @@ class RealtimeBackend(TurnEventMixin):
         self._log.debug("response.done rid={} status={}", rid, status)
         self._cancel_watchdog()
         if rid and rid in self._cancelled_responses:
-            # WE already declared this response dead (barge-in / watchdog), so the server's
-            # status is moot. Falling through to the completed branch would fire a second
-            # TurnDone + turn_end (wiping the interrupting utterance's fresh anchor) and
-            # force CAPTURING -> IDLE mid-speech via the drain.
+            # Already declared dead (barge-in/watchdog): falling through to completed would
+            # fire a second TurnDone + turn_end (wiping the new utterance's anchor) and
+            # drain CAPTURING -> IDLE mid-speech.
             self._discard_response_tools(rid)
             if rid == self._active_response_id:
                 self._active_response_id = None
+            # The deadman's ONLY re-arm point on the GA path: without it one interruption
+            # disarms the watchdog for the session. IDLE = the stop already settled the turn.
+            if self._turn is not VoiceState.IDLE:
+                self._arm_watchdog()
             return
         if status == "cancelled":
             if rid:
@@ -873,24 +826,23 @@ class RealtimeBackend(TurnEventMixin):
                 self._discard_response_tools(rid)
                 if rid == self._active_response_id:
                     self._active_response_id = None
-            # SERVER-initiated cancel (turn_detected): the paired speech_started usually
-            # follows and re-arms everything, but it may arrive AFTER this event (the s2s
-            # reference server emits done-then-started) or never, wedging a gated-mic
-            # session in SPEAKING forever. A later speech_started just re-arms again.
-            if self._turn in (VoiceState.THINKING, VoiceState.SPEAKING):
+            # SERVER-initiated cancel (turn_detected): the paired speech_started may arrive
+            # AFTER this event or never, wedging a gated-mic session in SPEAKING forever (a
+            # later one just re-arms again). CAPTURING counts too: the cancel can land while
+            # the user is still speaking.
+            if self._turn is not VoiceState.IDLE:
                 self._arm_watchdog()
             return
         if status in ("failed", "incomplete"):
-            # A failed response can end with announced function calls whose arguments.done
-            # never arrives, and those obligations would wedge _maybe_respond forever. Drop
-            # them like a cancellation, but still end the turn cleanly.
+            # Announced calls whose arguments.done never arrives would wedge _maybe_respond
+            # forever: drop them like a cancellation, but still end the turn cleanly.
             if rid:
                 self._note_cancelled(rid)
                 self._discard_response_tools(rid)
                 if rid == self._active_response_id:
                     self._active_response_id = None
             # Providers may put the reason in a top-level `error` event just BEFORE the
-            # failed done, leaving status_details bare (the s2s reference server does).
+            # failed done, leaving status_details bare.
             detail = _status_detail(resp) or self._last_error
             self._last_error = None
             if status == "failed":
@@ -904,17 +856,19 @@ class RealtimeBackend(TurnEventMixin):
             return
         # completed
         if rid:
-            self._response_done.add(rid)
+            self._response_done.add(rid)  # _maybe_respond's "trigger finished" gate
         if rid and self._response_had_tools.get(rid):
-            # Tool wait: the turn is still LIVE, so the response stays "active"; a barge-in
-            # during the (possibly long) tool run must be able to mark it cancelled, or the
-            # abandoned results re-trigger response.create over the user's new speech. The
-            # continuation's response.created replaces the id.
+            # Turn still LIVE, so the response stays "active": a barge-in during the tool
+            # run must be able to cancel it, or the abandoned results re-trigger
+            # response.create over the user's new speech.
             await self._maybe_respond(rid)
         else:
             if rid == self._active_response_id:
                 self._active_response_id = None  # finished turn: nothing left to cancel
             if rid:
+                # Outlives _cleanup_response: a late event for this finished response must
+                # not be adopted as a new live one.
+                self._note_cancelled(rid)
                 self._cleanup_response(rid)
             self._metrics.turn_end()  # release the anchor; the next turn re-arms it
             await self._emit(TurnDone())  # informational; drain owns the -> IDLE
@@ -931,8 +885,7 @@ class RealtimeBackend(TurnEventMixin):
         if rid in self._cancelled_responses:
             self._cleanup_response(rid)  # barged out: outputs submitted, no new response
             return
-        # Re-anchor before the frame goes out: however the dialect resumes, the audio that
-        # follows is continuation latency, not TTFA.
+        # Re-anchor before the frame: what follows is continuation latency, not TTFA.
         self._metrics.turn_continuation()
         if self._needs_response_create_after_tools:
             self._log.debug("firing response.create for rid={}", rid)
@@ -940,9 +893,9 @@ class RealtimeBackend(TurnEventMixin):
         else:
             # Auto-continuing dialects resume on the function_call_output alone.
             self._log.debug("auto-continuing dialect; no response.create for rid={}", rid)
-        # response.done cancelled the watchdog, so the create -> response.created gap is the
-        # one window with no deadman: a continuation the provider never starts wedges the
-        # session (mic gated while SPEAKING, so nothing can recover it).
+        # response.done cancelled the watchdog: the create -> response.created gap is the
+        # one window with no deadman, and a continuation never started wedges the session
+        # (mic gated while SPEAKING, so nothing can recover it).
         self._arm_watchdog()
         self._cleanup_response(rid)
 
@@ -952,9 +905,9 @@ class RealtimeBackend(TurnEventMixin):
         self._response_had_tools.pop(rid, None)
 
     def _discard_response_tools(self, rid: str) -> None:
-        """Drop a cancelled response's tool bookkeeping so it can't leak. A call whose
-        ``ToolCall`` already reached the shell still gets answered (``_session_calls``
-        keeps it); it just triggers no new response, its rid mapping being gone."""
+        """Drop a cancelled response's tool bookkeeping. A call already dispatched to the
+        shell still gets answered (``_session_calls`` keeps it); it just resumes nothing,
+        its rid mapping being gone."""
         orphans = self._tools_pending.pop(rid, set())
         self._metrics.calls_abandoned(orphans)
         for cid in orphans:
@@ -994,9 +947,8 @@ class RealtimeBackend(TurnEventMixin):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            # A device-layer failure (USB audio unplugged mid-playout) must not skip the
-            # IDLE transition: the watchdog died at response.done and gated-mic SPEAKING
-            # mutes the mic, so no speech_started could ever recover it.
+            # A device failure must not skip the IDLE transition: the watchdog died at
+            # response.done and gated-mic SPEAKING mutes the mic — nothing else recovers.
             self._log.warning("drain failed ({}); forcing IDLE", exc)
         self._audio_item_id = None
         await self._set_turn(VoiceState.IDLE)
@@ -1012,15 +964,14 @@ class RealtimeBackend(TurnEventMixin):
 
     async def _watchdog(self) -> None:
         try:
-            # DEADMAN, not a whole-turn cap: audio deltas push _progress_t forward, so a
-            # long reply still streaming never trips it, while one that emits nothing at
-            # all recovers after turn_timeout_s of true silence.
+            # DEADMAN, not a whole-turn cap: deltas push _progress_t forward, so a long
+            # streaming reply never trips it; only turn_timeout_s of true silence does.
             await wait_for_stall(lambda: self._progress_t, self._rt.turn_timeout_s)
             self._log.warning("realtime turn watchdog fired (no progress); recovering")
             rid, self._active_response_id = self._active_response_id, None
             if rid:
-                # Recover, not just report: stragglers drop via _is_live, a late tool
-                # result cannot re-trigger the response, and the server stops generating.
+                # Recover, not just report: stragglers drop via _is_live, a late tool result
+                # cannot re-trigger the response, and the server stops generating.
                 self._note_cancelled(rid)
                 self._discard_response_tools(rid)
                 with suppress(Exception):

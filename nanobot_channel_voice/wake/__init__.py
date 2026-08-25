@@ -1,12 +1,8 @@
 """Wake-word gate backends (``wake.mode`` != "off").
 
-Two tiers share the gate: the transcript tier (:class:`WakePhrase`, always
-active when ``wake.phrases`` is set — zero models, every language the STT
-covers) and an optional acoustic tier picked by ``wake.engine``
-(``"openwakeword"`` = openWakeWord/livekit-wakeword-format ONNX/RKNN, one
-model per phrase). Like the turn-analyzer registry, an unavailable acoustic
-engine is never a startup failure: ``make_wake_detector`` warns and returns
-None, and gating continues on transcripts alone.
+Two tiers: the transcript tier (:class:`WakePhrase`, active whenever ``wake.phrases``
+is set) and an optional acoustic tier picked by ``wake.engine``. An unavailable
+acoustic engine is never a startup failure — gating continues on transcripts alone.
 """
 
 from __future__ import annotations
@@ -32,8 +28,7 @@ def _build_openwakeword(cfg: WakeConfig, sample_rate: int, frame_ms: int) -> Wak
 
 
 ENGINES: dict[str, EngineSpec] = {
-    # "text" is deliberately absent: the transcript tier lives in the backend
-    # and needs no model.
+    # "text" is deliberately absent: the transcript tier needs no model.
     "openwakeword": EngineSpec(
         required=(
             ("openwakeword.embedding_path", "openwakeword.embeddingPath"),
@@ -50,9 +45,8 @@ ENGINES: dict[str, EngineSpec] = {
 
 
 def _meta_advisories(cfg: WakeConfig) -> None:
-    """Advisory package-sidecar checks (never fatal): a fetched head that
-    disagrees with the configuration still summons, but misbehaves subtly —
-    say why at startup instead."""
+    """Package-sidecar checks, never fatal: a head disagreeing with the config still
+    summons but misbehaves subtly, so say why at startup."""
     oww = cfg.openwakeword
     if not oww.meta_path:
         return
@@ -90,8 +84,8 @@ _DEGRADE = "wake gating continues on transcripts only"
 def make_wake_detector(
     cfg: WakeConfig, sample_rate: int, frame_ms: int
 ) -> WakeDetector | None:
-    """Build the configured acoustic wake detector, or None (gate disabled, the
-    text tier selected, or the engine unavailable — never a startup failure)."""
+    """The configured acoustic wake detector, or None (gate off, text tier selected,
+    or engine unavailable — never a startup failure)."""
     if cfg.mode == "off":
         return None
     spec = ENGINES.get(cfg.engine)

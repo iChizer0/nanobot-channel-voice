@@ -1,9 +1,8 @@
 """On-device MMS-TTS (VITS) over RKNN/ONNX, ported from the Rockchip rknn_model_zoo
-``examples/mms_tts`` demo: the encoder predicts per-token durations + prior
-distribution, a host-side "middle process" (the only math between the two models,
-reimplemented in numpy so the board needs no torch) expands them into the alignment
-``attn`` and output mask, and the decoder vocodes the waveform. Imported lazily by
-:func:`make_tts`, so the plugin imports without numpy.
+``examples/mms_tts`` demo: the encoder predicts per-token durations + prior, a
+"middle process" (the only math between the two models, in numpy so the board needs
+no torch) expands them into the alignment ``attn`` and output mask, and the decoder
+vocodes. Imported lazily by :func:`make_tts`, so the plugin imports without numpy.
 """
 
 from __future__ import annotations
@@ -49,11 +48,10 @@ def preprocess_input(
     text: str, max_length: int, vocab: dict[str, int]
 ) -> tuple[np.ndarray, np.ndarray]:
     """Char-tokenise ``text`` and pad/trim to ``max_length`` (ref ``preprocess_input``):
-    each kept char becomes a ``0`` (blank) followed by its id, a trailing ``0`` closes
-    the sequence; returns batched ``(input_ids, attention_mask)``, empty when no char
-    maps. Lowercasing is the whole Latin-script frontend. Unmapped chars are dropped
-    silently (reference behaviour); the shell's speakability guard reports them once per
-    character, seeing the same vocab through :meth:`MmsTtsAdapter._can_speak`."""
+    each kept char becomes ``0`` (blank) then its id, a trailing ``0`` closes the
+    sequence; returns batched ``(input_ids, attention_mask)``, empty when no char maps.
+    Lowercasing is the whole frontend; unmapped chars are dropped silently (reference
+    behaviour) and reported once each by the shell's speakability guard."""
     input_id: list[int] = []
     for ch in text.lower():
         if ch not in vocab:
@@ -102,7 +100,7 @@ def middle_process(
     cum_duration = np.cumsum(duration, axis=-1).reshape(batch_size * input_length, 1)
     valid_indices = (np.arange(output_length)[None, :] < cum_duration).astype(np.float32)
     valid_indices = valid_indices.reshape(batch_size, input_length, output_length)
-    # first difference along the input axis (== reference F.pad([..,1,0,..]) then subtract)
+    # first difference along the input axis (ref F.pad([..,1,0,..]) then subtract)
     padded = np.pad(valid_indices, ((0, 0), (1, 0), (0, 0)))[:, :-1, :]
     padded_indices = valid_indices - padded
     attn = np.transpose(padded_indices[:, None, :, :], (0, 1, 3, 2)) * attn_mask
@@ -133,8 +131,7 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
         # The built-in vocab IS mms-tts-eng: expand numbers into English words, since
         # it has no "7"/"8"/"9" and "7:45" would otherwise tokenize to "4 5".
         self._verbalize_en = vocab is _ENG_VOCAB
-        # A supplied vocab.json carries no language label, so only the built-in one can be
-        # named; a custom vocab claims nothing rather than claiming English wrongly.
+        # A supplied vocab.json carries no language label: claim nothing, not English.
         self.spoken_language = "en" if self._verbalize_en else None
         self._max_length = max_length
         self._speaking_rate = speaking_rate
@@ -142,8 +139,8 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
 
     @classmethod
     def from_config(cls, cfg: MmsTtsConfig) -> MmsTtsAdapter:
-        # Vocab and frontend first: a missing file or G2P dep must fail before any
-        # model is loaded, so the registry can fall back to system TTS.
+        # Vocab and frontend first: a missing file or G2P dep must fail before any model
+        # loads, so the registry can fall back to system TTS.
         vocab = load_mms_vocab(cfg.vocab_path) if cfg.vocab_path else _ENG_VOCAB
         frontend = make_text_frontend(cfg.text_frontend)
         model_kw = dict(

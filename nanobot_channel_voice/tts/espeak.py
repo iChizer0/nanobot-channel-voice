@@ -34,13 +34,13 @@ _lib_data: str | None = None  # the data root it was initialized with (None = th
 def make_ipa_phonemizer(
     voice: str, *, espeak_path: str | None = None, data_dir: str | None = None
 ) -> Callable[[str], str]:
-    """text -> IPA (espeak ``--ipa`` form, one clause per line). Probed once here so
-    a bad path/voice/library fails at BUILD time (registry falls back to system TTS),
-    not per chunk where the shell swallows errors into a silent channel.
+    """text -> IPA (espeak ``--ipa`` form, one clause per line). Probed once here so a bad
+    path/voice/library fails at BUILD time (registry falls back to system TTS), not per
+    chunk where errors become a silent channel.
 
     ``data_dir``: the voice pack the consuming model was TRAINED against. IPA spellings
-    drift between espeak releases — en-us FORCE moved oː -> ɔː — and a drifted vowel
-    lands on a different embedding id, so training-time data beats what is installed."""
+    drift between espeak releases (en-us FORCE moved oː -> ɔː) and a drifted vowel lands
+    on a different embedding id."""
     if espeak_path and not (os.path.isfile(espeak_path) and os.access(espeak_path, os.X_OK)):
         raise RuntimeError(f"tts espeakPath '{espeak_path}' is not an executable file")
     root = _data_root(data_dir) if data_dir else None
@@ -63,9 +63,8 @@ def make_ipa_phonemizer(
         raise
     except Exception as exc:  # noqa: BLE001 - OSError/Timeout/ctypes: name the probe
         raise RuntimeError(f"espeak-ng probe failed ({exe or 'bundled library'}): {exc}") from exc
-    # U+30FB flips espeak into symbol naming + letter spelling ("t e s t
-    # japanesesymbol c a s e"); it is a word separator, so fold it to the one
-    # espeak understands. Line structure is preserved for batched callers.
+    # U+30FB flips espeak into symbol naming + letter spelling; it is a word separator,
+    # so fold it to the one espeak understands. Line structure is preserved.
     return lambda text, _ph=phonemize: _ph(text.replace("・", " "))
 
 
@@ -85,7 +84,9 @@ def _subprocess_phonemizer(exe: str, voice: str, root: str | None) -> Callable[[
     def phonemize(text: str) -> str:
         proc = subprocess.run(
             [*argv, "--", text],
-            capture_output=True, text=True, timeout=_TIMEOUT_S,
+            # IPA is non-ASCII: the locale encoding would mojibake it.
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_TIMEOUT_S,
         )
         if proc.returncode != 0:
             raise RuntimeError(
@@ -102,8 +103,7 @@ def _load_library(root: str | None = None) -> ctypes.CDLL:
     with _lock:
         if _lib is not None:
             if root and _lib_data != root:
-                # espeak_Initialize is once-per-process, so a second model's pack cannot
-                # be loaded: name the data the phonemes actually come from.
+                # espeak_Initialize is once-per-process: a second model's pack can't load.
                 logger.warning(
                     "voice: espeak-ng library already initialized with {}; '{}' is "
                     "ignored and phonemes may not match this model's training",
@@ -112,7 +112,6 @@ def _load_library(root: str | None = None) -> ctypes.CDLL:
             return _lib
         import espeakng_loader  # ImportError -> the caller names the [espeak] extra
 
-        # An override is already normalized; the loader's path is what the wheel expects.
         data = Path(root) if root else Path(espeakng_loader.get_data_path())
         if len(str(data)) >= _MAX_DATA_PATH:
             data = _shorten_data_path(data)

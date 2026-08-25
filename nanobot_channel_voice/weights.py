@@ -1,9 +1,8 @@
 """Local model-weight store: fetch, prune, and engine-path resolution.
 
 The plugin never bundles model files. An INDEX (JSON) maps a weights key
-(``<kind>/<model-path>/<platform>``, with one or more model-path segments,
-e.g. ``stt/whisper/base/onnx`` or ``tts/matcha/en-US/ljspeech/rknn.rv1126b``)
-to per-file URLs plus sha256::
+(``<kind>/<model-path...>/<platform>``, e.g. ``stt/whisper/base/onnx``) to per-file URLs
+plus sha256::
 
     {"version": 1, "models": {"stt/whisper/base/onnx": {
         "source": "https://... (where these files come from)",
@@ -12,19 +11,17 @@ to per-file URLs plus sha256::
         "files": {"encoder.onnx": {"url": "https://...", "sha256": "...", "size": 42000000},
                   "decoder.onnx": {"url": "file:///srv/models/decoder.onnx"}}}}}
 
-``accept`` makes ``fetch`` print the notice and demand confirmation (``--yes``
-to script it); per-file ``size`` (bytes) only feeds ``list``'s estimate. The
-wheel ships NO entries and NO weights, only the mechanism: entries come from
-vendor/user-served index files (``--index`` / ``$NANOBOT_VOICE_INDEX``, else
-:data:`DEFAULT_INDEX_SOURCES`). ``http(s)://`` sources stream into the store and
-MUST pin a sha256; ``file://`` sources are symlinked in place, verified when the
-index pins one.
+``accept`` makes ``fetch`` print the notice and demand confirmation (``--yes`` to
+script it); per-file ``size`` (bytes) only feeds ``list``'s estimate. The wheel ships NO
+entries and NO weights: they come from vendor/user index files (``--index`` /
+``$NANOBOT_VOICE_INDEX``, else :data:`DEFAULT_INDEX_SOURCES`). ``http(s)://`` sources
+stream into the store and MUST pin a sha256; ``file://`` sources are symlinked in place,
+verified when the index pins one.
 
 File names inside an entry are the resolution contract: an engine block setting
-``weights: <key>`` gets its unset ``*_path`` fields filled from the fetched
-files by stem + any extension (``encoder_path`` -> ``encoder.<ext>``); explicit
-paths always win. The network belongs to the CLI alone (index reads and
-``fetch`` downloads); :func:`apply_weights` touches only the local store.
+``weights: <key>`` gets its unset ``*_path`` fields filled by stem + any extension
+(``encoder_path`` -> ``encoder.<ext>``); explicit paths always win. The network belongs
+to the CLI alone; :func:`apply_weights` touches only the local store.
 """
 
 from __future__ import annotations
@@ -44,9 +41,8 @@ from typing import Any
 
 MANIFEST = ".manifest.json"
 
-# Consulted when neither --index nor $NANOBOT_VOICE_INDEX names a source. URLs
-# only, never a bundled data file, so `nanobot-voice list` works out of the box
-# while the wheel still ships no entries; an explicit source replaces this entirely.
+# Consulted when neither --index nor $NANOBOT_VOICE_INDEX names a source. URLs only,
+# never a bundled data file (the wheel ships no entries); an explicit source replaces it.
 DEFAULT_INDEX_SOURCES: tuple[str, ...] = (
     "https://huggingface.co/iChizer0/nanobot-channel-voice-models/resolve/main/weights-index.json",
 )
@@ -119,8 +115,8 @@ def _validate_entry(source: str, key: str, entry: Any) -> None:
 
 
 def load_index(sources: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
-    """Merge the sources (a path, ``file://`` or ``http(s)://`` URL) in order,
-    later winning per key; empty means :data:`DEFAULT_INDEX_SOURCES`."""
+    """Merge the sources (path, ``file://`` or ``http(s)://``) in order, later winning
+    per key; empty means :data:`DEFAULT_INDEX_SOURCES`."""
     models: dict[str, dict[str, Any]] = {}
     for source in sources or DEFAULT_INDEX_SOURCES:
         try:
@@ -167,10 +163,10 @@ def fetch(
     root: Path | None = None,
     log: Callable[[str], None] = lambda _line: None,
 ) -> Path:
-    """Verify-and-install one index entry into the store; idempotent. Files
-    already present with the index's sha256 (per the manifest) are kept and
-    ``force`` refetches everything. Downloads stream to ``.partial-*``, verify,
-    then atomically replace, so a partial never lands on the final name."""
+    """Verify-and-install one index entry into the store; idempotent. Files already
+    present with the index's sha256 (per the manifest) are kept; ``force`` refetches
+    everything. Downloads stream to ``.partial-*``, verify, then atomically replace: a
+    partial never lands on the final name."""
     d = store_dir(key, root)
     # nested keys would let the stale-file sweep rmtree the inner installation
     for other in installed(root):
@@ -245,9 +241,8 @@ def fetch(
             )
     payload = {"key": key, "fetched_unix": int(time.time()), "files": recorded}
     (d / MANIFEST).write_text(json.dumps(payload, indent=2) + "\n", "utf-8")
-    # A file dropped by a later revision of the entry would poison <stem>.*
-    # resolution forever. Sweeping AFTER the manifest write means a fetch that
-    # raised deletes nothing; any .partial-* here is a SIGKILLed download's.
+    # A file dropped by a later revision of the entry would poison <stem>.* resolution
+    # forever. Sweep AFTER the manifest write: a fetch that raised deletes nothing.
     for p in d.iterdir():
         if p.name == MANIFEST or p.name in recorded:
             continue
@@ -262,11 +257,9 @@ def fetch(
 
 
 def installed(root: Path | None = None) -> dict[str, Path]:
-    """Fetched keys -> store dirs (anything holding a manifest, index or not).
-
-    Keys are hierarchical, so discover manifests at arbitrary depth. Validation keeps
-    stray or malformed directories from being exposed as installed model keys.
-    """
+    """Fetched keys -> store dirs (anything holding a manifest, index or not). Keys are
+    hierarchical, so manifests are discovered at arbitrary depth; validation keeps stray
+    directories from being exposed as installed keys."""
     base = root or store_root()
     if not base.is_dir():
         return {}
@@ -304,8 +297,7 @@ def prune(key: str, root: Path | None = None) -> int:
         raise WeightsError(f"'{key}' is not in the store ({base})")
     freed = disk_usage(d)
     shutil.rmtree(d)
-    # A model path can have arbitrary depth. Remove every now-empty ancestor, but
-    # never the store root itself (and stop as soon as a sibling remains).
+    # Remove every now-empty ancestor, never the store root, stopping at a sibling.
     parent = d.parent
     while parent != base and parent.is_dir() and not any(parent.iterdir()):
         parent.rmdir()
@@ -317,8 +309,8 @@ def prune(key: str, root: Path | None = None) -> int:
 
 
 def fill_engine_paths(block: Any) -> Any:
-    """Copy of an engine block with unset ``*_path`` fields resolved from the
-    store dir named by ``block.weights``; explicit paths always win."""
+    """Copy of an engine block with unset ``*_path`` fields resolved from the store dir
+    named by ``block.weights``; explicit paths always win."""
     key = getattr(block, "weights", None)
     if not key:
         return block
@@ -334,8 +326,8 @@ def fill_engine_paths(block: Any) -> Any:
             continue
         # Manifest-recorded names only: a hand-dropped file must not shadow the entry.
         matches = sorted(p for p in d.glob(name[:-5] + ".*") if p.name in known)
-        # ONNX external data sits beside its model under the name recorded in the
-        # graph (encoder.onnx.data / encoder.onnx_data): a companion, not a variant.
+        # ONNX external data (encoder.onnx.data / encoder.onnx_data) is a companion,
+        # not a variant.
         matches = [
             m for m in matches
             if not any(
@@ -356,9 +348,9 @@ def fill_engine_paths(block: Any) -> Any:
 
 
 def apply_weights(cfg: Any, block_name: str) -> Any:
-    """``cfg`` with the named engine block store-resolved (a bilingual
-    ``secondary`` sub-block resolves too); a no-op when nothing names a
-    ``weights`` key. Local filesystem only."""
+    """``cfg`` with the named engine block store-resolved (a bilingual ``secondary``
+    sub-block resolves too); a no-op when nothing names a ``weights`` key. Local
+    filesystem only."""
     block = getattr(cfg, block_name, None)
     if block is None:
         return cfg

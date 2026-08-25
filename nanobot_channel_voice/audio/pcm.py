@@ -76,10 +76,9 @@ def wav_duration_ms(blob: bytes) -> float:
             frames = w.getnframes()
             frame_b = w.getsampwidth() * w.getnchannels()
             if frame_b > 0:
-                # The header can LIE: a non-seekable writer (espeak-ng --stdout)
-                # stamps a placeholder data-chunk size (0x7ffff000 ~= 13.5 h). Never
-                # claim more audio than the blob physically holds; 44 is the canonical
-                # PCM header, and an honest header's frame count wins the min anyway.
+                # The header can LIE: a non-seekable writer (espeak-ng --stdout) stamps
+                # a placeholder data size (0x7ffff000 ~= 13.5 h). 44 = canonical PCM
+                # header; an honest header's frame count wins the min anyway.
                 frames = min(frames, max(0, len(blob) - 44) // frame_b)
             return frames / rate * 1000.0
     except Exception:  # noqa: BLE001 - duration is best-effort metadata
@@ -138,7 +137,9 @@ def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     if _np is not None:
         x = _np.arange(n_out, dtype=_np.float64) * (src_rate / dst_rate)
         i = _np.minimum(x.astype(_np.int64), len(src) - 2)
-        frac = x - i
+        # Clamped with the taps: past the last pair an unclamped weight EXTRAPOLATES,
+        # which wraps int16 on a loud final sample.
+        frac = _np.minimum(x - i, 1.0)
         s = _np.frombuffer(src, dtype=_np.int16).astype(_np.float64)
         out = s[i] * (1.0 - frac) + s[i + 1] * frac
         return out.astype(_np.int16).tobytes()
@@ -147,7 +148,7 @@ def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     for j in range(n_out):
         x = j * step
         i = min(int(x), len(src) - 2)
-        frac = x - i
+        frac = min(1.0, x - i)  # see the numpy path
         out[j] = int(src[i] * (1.0 - frac) + src[i + 1] * frac)
     return out.tobytes()
 
@@ -167,17 +168,15 @@ def fade_tail_pcm(pcm: bytes, rate: int, *, ms: float = 10.0) -> bytes:
 
 
 def ding_pcm(rate: int, *, peak: float = 0.18) -> bytes:
-    """The "captured" receipt cue (~230 ms, S16 mono): a STRUCK rising fifth
-    (A5 -> E6) — 3 ms attack, overlapping exponential decays, warm harmonics.
-    The struck envelope is the point: it reads "ding" not "beep" and measured
-    least speech-like of the audition set; ``peak`` ~-15 dBFS sits under speech."""
+    """The "captured" receipt cue (~230 ms, S16 mono): a STRUCK rising fifth (A5 -> E6),
+    measured least speech-like of the audition set; ``peak`` ~-15 dBFS sits under
+    speech."""
     return _struck_pcm(rate, ((880.0, 0.0, 140.0, 45.0), (1318.5, 60.0, 170.0, 60.0)), peak)
 
 
 def dong_pcm(rate: int, *, peak: float = 0.18) -> bytes:
-    """The attention-close cue: the receipt pair reversed (E6 -> A5), the
-    falling contour reading "closing" against ``ding_pcm``'s rising "heard";
-    the long ring lands on the LOW note, so the tail reads settled."""
+    """The attention-close cue: ``ding_pcm``'s pair reversed (E6 -> A5) so the contour
+    falls and the long ring lands on the LOW note."""
     return _struck_pcm(rate, ((1318.5, 0.0, 140.0, 45.0), (880.0, 60.0, 170.0, 60.0)), peak)
 
 

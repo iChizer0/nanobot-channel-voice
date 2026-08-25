@@ -6,29 +6,40 @@ from __future__ import annotations
 
 import abc
 
+from nanobot_channel_voice.audio.pcm import pcm_rms
+
 
 class Vad(abc.ABC):
     # True when is_speech() is costly enough (neural inference) that the caller must
-    # run it off the event loop; False keeps the default path free of thread-hop overhead.
+    # run it off the event loop.
     heavy: bool = False
 
-    # Probability behind the latest is_speech() decision, for diagnostics (the
-    # Endpointer aggregates it per utterance). None on engines without one (webrtc,
-    # energy); may repeat across frames shorter than the model's decision window.
+    # Probability behind the latest is_speech() decision (the Endpointer aggregates it
+    # per utterance). None on webrtc/energy; repeats across sub-window frames.
     last_prob: float | None = None
+
+    # Loudness gate AND'd with the model decision; 0.0 = off. Set by the neural
+    # engines from their own config block.
+    _min_volume: float = 0.0
 
     @abc.abstractmethod
     def is_speech(self, frame: bytes) -> bool: ...
 
+    def _gated(self, speech: bool, frame: bytes) -> bool:
+        """Loudness AND'd with the model: distant TV speech is real speech to the model
+        but too quiet to be the user. Apply to every RETURNED decision (held sub-window
+        state included), never to the model run, or the streaming cache desyncs."""
+        if speech and self._min_volume > 0.0:
+            return pcm_rms(frame) >= self._min_volume
+        return speech
+
     def reset(self) -> None:
-        """Reset any streaming state. The ``Endpointer`` calls this after each utterance
-        and before re-listening, so no state crosses a half-duplex mic gap."""
+        """Reset streaming state. Called after each utterance and before re-listening,
+        so no state crosses a half-duplex mic gap."""
 
     def release(self) -> None:
-        """Give back accelerator resources. Idempotent; only the neural backend holds
-        an NPU/ORT context."""
+        """Give back accelerator resources. Idempotent."""
 
     def scale_floor(self, factor: float) -> None:
-        """Duck synchronization: when the sink ducks playback by a known gain, the
-        acoustic leak the mic hears drops by exactly that factor, so an adaptive floor
-        can apply it INSTANTLY instead of re-converging over ~a second."""
+        """Duck sync: the mic's acoustic leak drops by exactly the sink's duck gain, so
+        an adaptive floor applies it instantly instead of re-converging over ~a second."""

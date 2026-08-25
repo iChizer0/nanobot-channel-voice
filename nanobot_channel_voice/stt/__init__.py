@@ -1,9 +1,6 @@
-"""STT adapter selection.
-
-Every fallback (unknown provider, failed weights resolve, missing config field, failed
-import/construct) warns and delegates to nanobot's transcription layer, so registering
-an engine is one :data:`ENGINES` spec plus one factory.
-"""
+"""STT adapter selection: every failure path warns and delegates to nanobot's
+transcription layer, so registering an engine is one :data:`ENGINES` spec plus one
+factory."""
 
 from __future__ import annotations
 

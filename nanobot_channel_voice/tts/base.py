@@ -1,10 +1,9 @@
 """TTS adapter interface + WAV helpers.
 
-:meth:`TtsAdapter.synthesize` returns a complete, self-describing WAV blob, played
-byte-for-byte by blob mode; adapters with a native raw-PCM path also declare
-``output_rate`` and implement :meth:`TtsAdapter.synthesize_pcm`, which the local
-pipeline drives through the gapless stream-mode sink instead. Synthesis is per
-speakable chunk (a sentence/clause from the chunker) for low first-audio latency.
+``synthesize`` returns a complete WAV blob, played byte-for-byte by blob mode;
+adapters with a native raw-PCM path also declare ``output_rate`` and implement
+``synthesize_pcm``, which the gapless stream-mode sink drives instead. One
+synthesis per speakable chunk, for first-audio latency.
 """
 
 from __future__ import annotations
@@ -21,11 +20,9 @@ class TtsAdapter(abc.ABC):
     # such adapters. Per-INSTANCE: one class serves cloud and local compat servers.
     probe_ok: bool = True
 
-    # The ONE ISO 639-1 code this adapter can actually voice, or None for unrestricted/
-    # unknown. Every on-device engine is fixed to a single language at load, so text in
-    # any other language comes out silent or as noise; the channel projects this into
-    # the agent's context so replies are written in a language the speaker can say.
-    # Per-INSTANCE: the same class serves several languages.
+    # The ONE ISO 639-1 code this adapter can voice, None = unrestricted. On-device
+    # engines are fixed at load, so other text comes out silent or as noise; the
+    # channel projects this into the agent's context. Per-INSTANCE.
     spoken_language: str | None = None
     # A bilingual adapter (zh-en dialect, script router) declares both here.
     spoken_languages: tuple[str, ...] | None = None
@@ -39,21 +36,17 @@ class TtsAdapter(abc.ABC):
         raise NotImplementedError("raw-PCM synthesis not supported by this adapter")
 
     def release(self) -> None:
-        """Give back accelerator resources; idempotent, no-op by default. Needed because
-        refcount-GC does NOT free an RKNN context, so an in-process channel restart
-        would exhaust the NPU."""
+        """Give back accelerator resources; idempotent, no-op by default. Refcount-GC
+        does NOT free an RKNN context, so an in-process restart would exhaust the NPU."""
 
     async def warmup(self) -> None:
-        """Prime caches/arenas so the first real chunk pays no cold-start. No-op by
-        default. The contract is NO BILLABLE CALLS: cloud-backed adapters clear
-        ``probe_ok`` (no startup synthesis) but may still warm connections —
-        DNS/TCP/TLS are free and otherwise land in the first reply's TTFA."""
+        """Prime caches/arenas so the first real chunk pays no cold-start; no-op by
+        default. Contract is NO BILLABLE CALLS: cloud adapters clear ``probe_ok`` but
+        may still warm DNS/TCP/TLS, which otherwise land in the first reply's TTFA."""
 
 
-# Startup texts keyed by spoken_language (None = the default/unknown row): a
-# single-language engine turns English into silence (lexicon: zero tokens, no
-# inference at all) or noise, so an English-only warmup never warms and an
-# English-only calibration measures nothing — exactly on the boards that need it.
+# Keyed by spoken_language (None = default row): a single-language engine mangles
+# English, so an English-only warmup warms the wrong path and mistimes calibration.
 WARMUP_TEXT = {None: "Okay.", "zh": "好的。", "ja": "はい。", "ko": "네.", "de": "Okay."}
 CALIBRATION_TEXT = {
     None: "This is a short calibration sentence for timing.",
@@ -76,9 +69,9 @@ _SPLIT_PUNCT = set(",.!?;:") | set("、。，．！？；：")
 
 
 def split_for_budget(text: str, max_len: int) -> list[str]:
-    """Split ``text`` into pieces of at most ``max_len`` chars for a fixed input
-    budget: prefer a space, then clause punctuation (CJK included, space-free text
-    must not be hard-cut mid-run), then a hard cut."""
+    """Split ``text`` into pieces of at most ``max_len`` chars: prefer a space, then
+    clause punctuation (CJK included — space-free text must not be hard-cut mid-run),
+    then a hard cut."""
     pieces: list[str] = []
     text = text.strip()
     while len(text) > max_len:

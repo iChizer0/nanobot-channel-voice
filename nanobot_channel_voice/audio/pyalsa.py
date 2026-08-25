@@ -1,10 +1,9 @@
-"""In-process ALSA capture/playback via ``pyalsaaudio`` (libasound bindings).
+"""In-process ALSA capture/playback via ``pyalsaaudio`` (``audio.backend="pyalsa"``,
+the ``[pyalsa]`` extra, needs ``libasound2-dev`` to build).
 
-Alternative to the ``arecord``/``aplay`` subprocess backend (``audio.backend =
-"pyalsa"``; the ``[pyalsa]`` extra, which needs ``libasound2-dev`` to build). Opens
-named PCMs (including ``dsnoop``/``dmix`` ``plug`` devices) and uses ``snd_pcm_drop``
-for instant barge-in. Blocking libasound calls never run on the event loop: capture
-lives in a reader thread, playback/streaming on the default executor.
+Opens named PCMs (``dsnoop``/``dmix`` ``plug`` included) and uses ``snd_pcm_drop`` for
+instant barge-in. Blocking libasound calls never run on the event loop: capture in a
+reader thread, playback/streaming on the default executor.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from contextlib import suppress
 
 from loguru import logger
 
-from nanobot_channel_voice.aio import put_drop_oldest
+from nanobot_channel_voice.aio import Throttle, put_drop_oldest
 from nanobot_channel_voice.audio.base import (
     CaptureSource,
     PlaybackSink,
@@ -33,8 +32,11 @@ class PyAlsaCapture(CaptureSource):
     def __init__(self, device: str, sample_rate: int, frame_ms: int):
         self._device = device
         self._rate = sample_rate
+        self._frame_ms = frame_ms
         self._periodsize = max(1, sample_rate * frame_ms // 1000)
         self._frame_bytes = frame_bytes(sample_rate, frame_ms)
+        self._overruns = 0
+        self._overrun_throttle = Throttle()
         self._pcm = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -45,9 +47,8 @@ class PyAlsaCapture(CaptureSource):
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue(maxsize=50)  # ~1 s at 20 ms frames; drop-oldest bounds latency
-        # On the executor (dsnoop setup can block), degrading to EOF like the arecord
-        # backend: a bad/busy device must surface later as b"", not raise out of
-        # start() and crash channel startup.
+        # On the executor (dsnoop setup can block); a bad/busy device must surface
+        # later as b"", not raise out of start() and crash channel startup.
         try:
             self._pcm = await self._loop.run_in_executor(None, self._open_pcm)
         except Exception as exc:  # noqa: BLE001
@@ -71,6 +72,9 @@ class PyAlsaCapture(CaptureSource):
             channels=1,
             format=alsaaudio.PCM_FORMAT_S16_LE,
             periodsize=self._periodsize,
+            # periodsize is the VAD frame, and the default 4 periods would make the
+            # device ring 40 ms at frameMs=10: ~100 ms regardless of frame size.
+            periods=max(4, -(-100 // self._frame_ms)),
         )
 
     def _reader(self) -> None:
@@ -87,7 +91,17 @@ class PyAlsaCapture(CaptureSource):
                 self._running = False
                 self._push(b"")
                 return
-            if length < 0 or not data:
+            if length < 0:
+                # Overrun: alsaaudio already recovered the PCM, but the gap is real
+                # capture loss — count it instead of hiding it.
+                self._overruns += 1
+                if self._overrun_throttle.ready():
+                    self._log.warning(
+                        "pyalsa capture overrun ({} so far); the frame path is not "
+                        "draining the device in time", self._overruns,
+                    )
+                continue
+            if not data:
                 continue
             # Re-chunk to EXACT frame_bytes: ALSA may return a period differing from
             # the request, but the endpointer counts frames assuming a fixed frame_ms.
@@ -143,9 +157,8 @@ class PyAlsaCapture(CaptureSource):
                 await asyncio.get_running_loop().run_in_executor(None, thread.join, 2.0)
             joined = not thread.is_alive()
         self._thread = None
-        # Only once the reader has exited: closing a snd_pcm_t while another thread is
-        # blocked in pcm.read() on it is undefined behaviour (can segfault). A wedged
-        # reader instead leaks the handle to the daemon thread / process exit.
+        # Only once the reader has exited: closing a snd_pcm_t under a thread blocked
+        # in pcm.read() can segfault. A wedged reader leaks the handle instead.
         if self._pcm is not None and joined:
             with suppress(Exception):
                 self._pcm.close()
@@ -155,9 +168,8 @@ class PyAlsaCapture(CaptureSource):
 class PyAlsaPlayback(PlaybackSink):
     """Blob WAVs *and* gapless raw-PCM streams, both on the executor.
 
-    ``play_wav`` opens a PCM at the WAV's own rate/format (a ``plug:`` device
-    resamples to hardware, mirroring ``aplay``). ``abort()`` covers the blob PCM only
-    (streams are killed through their handles).
+    ``play_wav`` opens a PCM at the WAV's own rate/format (``plug:`` resamples to
+    hardware). ``abort()`` covers the blob PCM only — streams die via their handles.
     """
 
     def __init__(self, device: str):
@@ -223,6 +235,11 @@ class PyAlsaPlayback(PlaybackSink):
         finally:
             with self._lock:  # serialized with abort()'s drop
                 self._current = None
+                if self._abort:
+                    # close() implicitly DRAINS a playback PCM: without a drop first
+                    # the barged-out tail still plays.
+                    with suppress(Exception):
+                        pcm.drop()
                 with suppress(Exception):
                     pcm.close()
 
@@ -251,10 +268,9 @@ class PyAlsaPlayback(PlaybackSink):
 
     async def abort(self) -> None:
         self._abort = True
-        # Off the loop (drop is a libasound call) and INSIDE the lock the writer's
-        # finally closes under: libasound's thread-safety layer does not cover
-        # snd_pcm_close, so a lock-free drop could hit a freed handle (native crash).
-        # The writer never holds the lock around pcm.write, so this cannot block.
+        # Off the loop, and INSIDE the lock the writer's finally closes under:
+        # libasound does not protect snd_pcm_close, so a lock-free drop could hit a
+        # freed handle (native crash).
         await asyncio.get_running_loop().run_in_executor(None, self._abort_blocking)
 
     def _abort_blocking(self) -> None:
@@ -267,14 +283,11 @@ class PyAlsaPlayback(PlaybackSink):
 class _PyAlsaPlaybackStream(PlaybackStream):
     """One persistent stream-mode PCM, all blocking calls on the executor.
 
-    Writes are serialized by the AudioSink worker, but ``kill()`` (barge-in) may land
-    at ANY moment and overlap ``drain()``. So ``pcm.drop()`` runs OUTSIDE the io-lock —
-    the documented way to unblock an in-flight ``pcm.write`` instantly — while
-    ``pcm.close()`` always runs INSIDE it, never freeing the C object under a writer.
-    Because libasound deliberately does not protect ``snd_pcm_close``, drop and close
-    serialize on their own mutex (a lock-free drop overlapping close is a use-after-free
-    of the ``snd_pcm_t``); drop never blocks nor takes the io-lock, so that mutex is
-    cheap and cycle-free.
+    ``kill()`` may land at ANY moment and overlap ``drain()``: ``pcm.drop()`` runs
+    OUTSIDE the io-lock (the documented way to unblock an in-flight ``pcm.write``),
+    ``pcm.close()`` always INSIDE it, never freeing the C object under a writer. Drop
+    and close serialize on a second mutex — libasound does not protect
+    ``snd_pcm_close``, so overlapping them is a use-after-free of the ``snd_pcm_t``.
     """
 
     def __init__(self, pcm):

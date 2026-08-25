@@ -1,11 +1,9 @@
 """Configuration models for the ``channels.voice`` section of ``~/.nanobot/config.json``.
 
-All models inherit :class:`_VoiceBase`: keys parse as camelCase or snake_case, a typo is
-a startup error, and a key present in both spellings folds per its docstring.
-Frame-counted fields scale silently with ``audio.frameMs``; perceptual/algorithmic
-constants are not configurable and stay in code beside their rationale (e.g. the duck
-envelope in ``audio_sink.py``). A field only one backend/engine reads says so in its
-comment.
+All models inherit :class:`_VoiceBase`: keys parse as camelCase or snake_case, a typo is a
+startup error, both spellings of one key fold per ``_fold_alias_twins``. Frame-counted fields
+scale silently with ``audio.frameMs``; perceptual constants are not configurable and stay in
+code beside their mechanism. A field only one backend/engine reads says so.
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ from pydantic import ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel, to_snake
 from pydantic_core import PydanticUndefined
 
-_UNSET = object()  # "this field has no comparable default" for the twin fold
+_UNSET = object()  # "no comparable default" for the twin fold
 
 
 def _emptyish(value: Any) -> bool:
@@ -32,19 +30,17 @@ def _emptyish(value: Any) -> bool:
 
 def resolve_openai_key(explicit: str | None) -> str | None:
     """The ONE home of the ``OPENAI_API_KEY`` fallback, shared by ``tts.apiKey`` and
-    ``realtime.apiKey``. Sharp edge: with a non-OpenAI realtime provider plus an
-    OpenAI-compatible LOCAL TTS server, an exported OPENAI_API_KEY reaches both.
+    ``realtime.apiKey``. Sharp edge: an exported key reaches a non-OpenAI realtime provider
+    AND an OpenAI-compatible LOCAL TTS server alike.
     """
     return explicit or os.environ.get("OPENAI_API_KEY")
 
 
 def parse_import_blob(raw: Any) -> dict[str, Any]:
-    """Parse the WebUI ``importJson`` paste into a plain section dict.
-
-    Accepts the bare ``channels.voice`` object, or the same object still wrapped in
-    ``{"channels": {"voice": ...}}`` / ``{"voice": ...}`` (people paste whole files);
-    the wrapper keys are unambiguous because no VoiceConfig field is named either.
-    Raises ``ValueError`` with a message fit for a WebUI check row.
+    """Parse the WebUI ``importJson`` paste into a plain section dict: the bare
+    ``channels.voice`` object, or one still wrapped in ``{"channels": {"voice": ...}}`` /
+    ``{"voice": ...}`` (unambiguous — no VoiceConfig field is named either). ``ValueError``
+    messages are written for a WebUI check row.
     """
     if not isinstance(raw, str):
         raise ValueError("importJson must be a JSON string (the pasted object, quoted)")
@@ -58,15 +54,15 @@ def parse_import_blob(raw: Any) -> dict[str, Any]:
         parsed = parsed["voice"]
     if not isinstance(parsed, dict):
         raise ValueError("importJson must be a JSON object: the channels.voice section")
-    parsed.pop("importJson", None)  # a paste of a not-yet-consumed section must not recurse
+    parsed.pop("importJson", None)  # a not-yet-consumed section must not recurse
     parsed.pop("import_json", None)
     return parsed
 
 
 def _apply_import(section: dict[str, Any], blob: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge a parsed paste over the section, the paste winning. Pasted keys are
-    canonicalized to camelCase and REPLACE a section twin in either spelling, so a
-    paste can never end up shadowed by ``_fold_alias_twins``'s filler heuristics."""
+    canonicalized to camelCase and REPLACE a section twin in either spelling, so
+    ``_fold_alias_twins``'s filler heuristics can never shadow a paste."""
     out = dict(section)
     for key, value in blob.items():
         camel = to_camel(key) if isinstance(key, str) else key
@@ -86,8 +82,8 @@ def _apply_import(section: dict[str, Any], blob: dict[str, Any]) -> dict[str, An
 
 
 class _VoiceBase(Base):
-    """nanobot's ``Base`` leaves pydantic's ``extra="ignore"``, so a typo'd key would parse
-    and silently do nothing; ``forbid`` makes it a startup error (ChannelManager logs
+    """nanobot's ``Base`` leaves pydantic's ``extra="ignore"``, so a typo'd key would parse and
+    silently do nothing; ``forbid`` makes it a startup error (ChannelManager logs
     "voice channel not available: ...")."""
 
     model_config = ConfigDict(extra="forbid")  # merged onto Base's alias config
@@ -95,17 +91,11 @@ class _VoiceBase(Base):
     @model_validator(mode="before")
     @classmethod
     def _fold_alias_twins(cls, data: Any) -> Any:
-        """A camelCase writer never case-folds against what a hand-written config
-        already uses, so a snake_case config can carry BOTH spellings of a field,
-        which ``forbid`` would reject wholesale; fold the twins instead:
+        """Fold a field a config spells BOTH ways, which ``forbid`` would else reject.
 
-        - a consumed ``importJson`` paste expands under canonical camelCase keys: a
-          fresh edit, so camelCase wins (also pydantic's own alias priority);
-        - an empty-ish or exactly-default camelCase twin is filler ('' materialized
-          for unset strings/secrets): it loses to hand-written data.
-
-        Equal twins fold silently; a decided conflict warns with spellings only
-        (either side may hold a secret)."""
+        camelCase wins (pydantic's alias priority; a consumed ``importJson`` paste expands
+        under it) unless that twin is empty-ish or exactly-default writer filler. Equal twins
+        fold silently; a decided conflict warns with spellings only (either may be a secret)."""
         if not isinstance(data, dict):
             return data
         twins = [
@@ -146,15 +136,14 @@ class _VoiceBase(Base):
 class OnDeviceRuntime(_VoiceBase):
     """Accelerator knobs; every on-device engine block inherits these and reads its OWN.
 
-    ``.rknn`` runs on rknn-toolkit-lite2 (``coreMask`` selects NPU cores;
-    ``target``/``deviceId`` are the full-toolkit fallback). ``.onnx`` runs on onnxruntime
-    with configurable execution providers (Jetson TensorRT/CUDA off the same artifact) and
-    the parallel per-provider option list.
+    ``.rknn`` runs on rknn-toolkit-lite2 (``coreMask`` selects NPU cores; ``target``/
+    ``deviceId`` are the full-toolkit fallback). ``.onnx`` runs on onnxruntime with
+    configurable execution providers (Jetson TensorRT/CUDA off one artifact) + the parallel
+    per-provider option list.
     """
 
-    # Store key ("stt/whisper/base/onnx") installed by ``nanobot-voice fetch``: unset
-    # ``*Path`` fields resolve from the fetched files by field stem (``encoderPath`` ->
-    # ``encoder.<ext>``). Explicit paths always win.
+    # Store key ("stt/whisper/base/onnx") installed by ``nanobot-voice fetch``: unset ``*Path``
+    # fields resolve by field stem (``encoderPath`` -> ``encoder.<ext>``); explicit paths win.
     weights: str | None = None
     core_mask: Literal["auto", "0", "1", "2", "0_1", "0_1_2", "all"] = "auto"
     target: str = "rk3588"
@@ -164,11 +153,8 @@ class OnDeviceRuntime(_VoiceBase):
 
 
 class AudioConfig(_VoiceBase):
-    """ALSA audio I/O. The default backend shells out to ``arecord``/``aplay`` against
-    named PCMs, so shared ``dsnoop``/``dmix`` ``plug`` devices work by name::
-
-        "captureDevice": "plug:mic", "playbackDevice": "plug:speaker"
-    """
+    """ALSA audio I/O. The default backend shells out to ``arecord``/``aplay`` against named
+    PCMs, so shared ``dsnoop``/``dmix`` ``plug`` devices work by name ("plug:mic")."""
 
     # "pyalsa" = in-process libasound ([pyalsa] extra); "null" = headless/no audio.
     backend: Literal["alsa", "pyalsa", "null"] = "alsa"
@@ -178,10 +164,9 @@ class AudioConfig(_VoiceBase):
     frame_ms: Literal[10, 20, 30] = 20  # capture granularity fed to the VAD
     arecord_path: str = "arecord"
     aplay_path: str = "aplay"
-    # Playback-device latency AFTER our pacing (ALSA/dmix buffer + DAC): the AEC3
-    # stream-delay hint (aec="webrtc"). AEC3 tracks the true delay continuously, so this only
-    # speeds convergence on boards with deep dmix buffers. Above WebRTC's 500 ms ceiling the
-    # APM rejects the hint and every capture frame raises.
+    # Playback latency AFTER our pacing (ALSA/dmix buffer + DAC): the AEC3 stream-delay hint
+    # (aec="webrtc"), which only speeds convergence since AEC3 tracks the true delay. Above
+    # WebRTC's 500 ms ceiling the APM rejects the hint and every capture frame raises.
     playout_delay_ms: int = Field(default=50, ge=0, le=500)
 
 
@@ -192,24 +177,22 @@ class FireRedVadConfig(OnDeviceRuntime):
     cmvn_path: str | None = None    # cmvn.ark (Kaldi global CMVN stats)
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     smooth_frames: int = Field(default=5, ge=1)  # rolling avg over 10 ms MODEL frames (1 = off)
-    # Loudness gate AND'd with the model: frames whose normalized RMS (0..1, same unit
-    # as vad.energyThreshold) fall below this are non-speech even when the model says
-    # speech: cuts spurious ducks from distant TVs/radios. 0 = off (default).
+    # Loudness gate AND'd with the model: frames under this normalized RMS (0..1, same unit
+    # as vad.energyThreshold) are non-speech even when the model says speech — cuts ducks from
+    # distant TVs/radios. 0 = off.
     min_volume: float = Field(default=0.0, ge=0.0, lt=1.0)
 
 
 class SileroVadConfig(OnDeviceRuntime):
-    """On-device Silero VAD (``vad.engine="silero"``; v6 recommended, the VAD
-    Pipecat/LiveKit ship — v5 has the same I/O). Raw waveform in — no fbank/CMVN side
-    file — one decision per 32 ms window. The combined upstream export
-    (``silero_vad.onnx``) runs at 8 or 16 kHz; a fixed-shape port (``.rknn``) must
-    take ``input[1, context+window]`` + ``state[2,1,128]`` and return
-    ``(output, stateN)``."""
+    """On-device Silero VAD (``vad.engine="silero"``; v6 recommended, v5 has the same I/O).
+    Raw waveform in — no fbank/CMVN side file — one decision per 32 ms window. The combined
+    upstream export (``silero_vad.onnx``) runs at 8 or 16 kHz; a fixed-shape port (``.rknn``)
+    must take ``input[1, context+window]`` + ``state[2,1,128]`` and return ``(output, stateN)``."""
 
     model_path: str | None = None   # ".onnx" (CPU/TensorRT EP) or ".rknn" (NPU)
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)   # speech enters at/above this
-    # Hysteresis exit: speech ends only when the probability falls BELOW this (upstream
-    # VADIterator behavior; stops mid-word flicker). None = threshold - 0.15.
+    # Hysteresis exit: speech ends only BELOW this (upstream VADIterator behavior; stops
+    # mid-word flicker). None = threshold - 0.15.
     neg_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     # Same AND'd loudness gate as vad.firered.minVolume (0..1 normalized RMS; 0 = off).
     min_volume: float = Field(default=0.0, ge=0.0, lt=1.0)
@@ -226,38 +209,34 @@ class SileroVadConfig(OnDeviceRuntime):
 
 
 class TurnConfig(OnDeviceRuntime):
-    """Audio-native end-of-turn model layered over the endpointer
-    (``vad.turn.engine="smartturn"`` = Smart Turn v3 over ONNX/RKNN, ``[ondevice]``
-    extra; needs ``audio.sampleRate=16000``). At ``consultMs`` of trailing silence
-    the utterance-so-far is scored once: COMPLETE closes the turn immediately
-    (typically ~300 ms before ``hangoverMs``), INCOMPLETE waits out ``hangoverMs``:
-    the silence timer becomes the hard upper bound instead of the decision, so
-    ``hangoverMs`` can be raised for hesitant speakers without slowing every turn."""
+    """Audio-native end-of-turn model over the endpointer (``vad.turn.engine="smartturn"`` =
+    Smart Turn v3 on ONNX/RKNN, ``[ondevice]`` extra; needs ``audio.sampleRate=16000``). At
+    ``consultMs`` of trailing silence the utterance-so-far is scored once: COMPLETE closes the
+    turn now (~300 ms before ``hangoverMs``), INCOMPLETE waits ``hangoverMs`` out — the silence
+    timer becomes the hard upper bound, not the decision."""
 
     engine: Literal["none", "smartturn"] = "none"
     model_path: str | None = None  # ".onnx" (CPU) or ".rknn" (NPU)
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # P(complete) above => close
-    # Trailing silence before the model is consulted. Must be < hangoverMs to matter;
-    # the default matches stt.eagerMs so the eager transcript and the verdict land
-    # together. Consults fire once per pause.
+    # Trailing silence before the model is consulted; must be < hangoverMs to matter. The
+    # default matches stt.eagerMs so eager transcript and verdict land together. Once per pause.
     consult_ms: int = Field(default=240, ge=20)
 
 
 class VadConfig(_VoiceBase):
     """Voice-activity detection / utterance endpointing. ``engine`` picks the per-frame
-    detector; the endpointing knobs apply to all of them. ``energy`` is zero-dep;
-    ``webrtc`` is spectral (``[webrtc]`` extra); ``firered`` and ``silero`` are
-    on-device neural over RKNN/ONNX (``[ondevice]`` extra, own blocks): firered has
-    the fewest false alarms in noise, silero the better recall, a 3x cheaper decision
-    cadence (32 ms vs 10 ms), and no side files."""
+    detector; the endpointing knobs apply to all. ``energy`` is zero-dep, ``webrtc`` spectral
+    ([webrtc] extra), ``firered``/``silero`` on-device neural over RKNN/ONNX ([ondevice] extra,
+    own blocks) — firered has the fewest false alarms in noise, silero better recall, a 3x
+    cheaper decision cadence (32 ms vs 10 ms) and no side files."""
 
     engine: Literal["energy", "webrtc", "firered", "silero"] = "energy"
     start_frames: int = Field(default=5, ge=1)      # consecutive speech frames to open an utterance
-    preroll_ms: int = Field(default=300, ge=0)      # audio kept before onset so a slow VAD doesn't clip word 1
+    preroll_ms: int = Field(default=300, ge=0)      # pre-onset audio; slow VADs clip word 1
     hangover_ms: int = Field(default=600, ge=100)   # trailing silence that ends an utterance
-    # Opt-in adaptive hangover: set to make the effective hangover START here (snappy)
-    # and grow toward hangoverMs only on evidence the endpointer cut a real pause
-    # short (the user resuming right after a close). None = fixed hangoverMs.
+    # Opt-in adaptive hangover: the effective hangover STARTS here and grows toward hangoverMs
+    # only on evidence a real pause was cut short (the user resuming right after a close).
+    # None = fixed hangoverMs.
     hangover_min_ms: int | None = Field(default=None, ge=100)
     min_utterance_ms: int = Field(default=200, ge=0)
     max_utterance_ms: int = Field(default=30000, ge=1000)
@@ -281,32 +260,29 @@ class VadConfig(_VoiceBase):
 
 
 class SenseVoiceSttConfig(OnDeviceRuntime):
-    """On-device SenseVoice-Small (``stt.provider="sensevoice"``): non-autoregressive CTC,
-    one model for zh/yue/en/ja/ko, ~5-15x faster than Whisper on CPU. Consumes the
-    ORIGINAL FunASR export — the dynamic `.onnx` (CPU; int8 recommended — faster
-    AND smaller for ASR) or the static
-    mask-input `.rknn` port (NPU, fp16 — int8 collapses this model) — plus the
-    exporter's ``frontend.json`` sidecar and ``tokens.txt``."""
+    """On-device SenseVoice-Small (``stt.provider="sensevoice"``): non-autoregressive CTC, one
+    model for zh/yue/en/ja/ko, ~5-15x faster than Whisper on CPU. Consumes the ORIGINAL FunASR
+    export — dynamic `.onnx` (CPU, int8 recommended) or the static mask-input `.rknn` (NPU,
+    fp16; int8 collapses this model) — plus ``frontend.json`` and ``tokens.txt``."""
 
     model_path: str | None = None
     tokens_path: str | None = None
-    # CMVN/LFR stats, language/itn id tables (FunASR runtime constants, in no model
-    # artifact), feats_len (.rknn window); auto-resolved from the weights store.
+    # CMVN/LFR stats, language/itn id tables, feats_len (.rknn window): FunASR runtime constants
+    # in no model artifact; auto-resolved from the weights store.
     frontend_path: str | None = None
     language: str = "auto"  # auto/zh/en/ja/ko/yue, validated against the sidecar
     use_itn: bool = True    # inverse text normalization: numbers/punctuation written out
 
 
 class ZipformerSttConfig(OnDeviceRuntime):
-    """On-device streaming Zipformer transducer (``stt.provider="zipformer"``).
+    """On-device streaming Zipformer transducer (``stt.provider="zipformer"``); 16 kHz only.
 
-    The STREAMING engine: audio is decoded during speech, so the transcript is ready
-    ~immediately at the endpoint. One model per language (pair). Use a sherpa-onnx
-    export (`.onnx` on CPU: chunk geometry and decoder context come from the model
-    metadata; int8 recommended) or the project's static `.rknn` trio port (NPU,
-    fp16), which additionally needs ``metaPath`` (the exporter's meta.json sidecar:
-    state specs in declared order, output order, per-state len increments, feedback
-    layout — an .rknn has no introspection surface). Requires 16 kHz capture."""
+    The STREAMING engine: audio decodes during speech, so the transcript is ready at the
+    endpoint. One model per language (pair). Use a sherpa-onnx export (`.onnx` on CPU: chunk
+    geometry and decoder context come from the model metadata; int8 recommended) or the
+    project's static `.rknn` trio (NPU, fp16), which also needs ``metaPath`` — state specs in
+    declared order, output order, per-state len increments, feedback layout, none of it
+    introspectable on an .rknn."""
 
     encoder_path: str | None = None
     decoder_path: str | None = None
@@ -318,49 +294,45 @@ class ZipformerSttConfig(OnDeviceRuntime):
 
 class WhisperSttConfig(OnDeviceRuntime):
     """On-device Whisper encoder+decoder (``stt.provider="whisper"``), following Rockchip's
-    rknn_model_zoo Whisper demo export; models + assets supplied by path. ".rknn" runs on
-    the NPU, ".onnx" on CPU/GPU."""
+    rknn_model_zoo Whisper demo export; models + assets supplied by path. ".rknn" runs on the
+    NPU, ".onnx" on CPU/GPU."""
 
     encoder_path: str | None = None
     decoder_path: str | None = None
-    # Preferably an ORIGINAL artifact: multilingual.tiktoken (openai/whisper assets) or
-    # vocab.json (HF export); a flat "<id> <token>" byte-level file also works. Detokenization
-    # is always the byte-level BPE inverse map; the legacy per-subword base64 re-encoding
-    # (vocab_zh.txt) is rejected.
+    # Preferably an ORIGINAL artifact: multilingual.tiktoken or vocab.json (HF); a flat
+    # "<id> <token>" byte-level file also works. Detokenization is always the byte-level BPE
+    # inverse map; the legacy per-subword base64 re-encoding (vocab_zh.txt) is rejected.
     vocab_path: str | None = None
     mel_filters_path: str | None = None   # flat 80x201 mel filterbank text file
-    # PREFERRED language, one ISO code: sets the decoder prompt's language token and is the
-    # fallback when detection is off or unconfident. The export is the multilingual base
-    # (all 99 language tokens), so no per-language re-export is needed.
+    # PREFERRED language, one ISO code: the decoder prompt's language token, and the fallback
+    # when detection is off or unconfident. The export is the multilingual base (all 99 tokens).
     language: str = "en"
-    # DECODABLE languages, e.g. ["en", "zh", "ja"]: bounds what may be OUTPUT (tokens in no
-    # enabled script are re-picked) AND the candidate set for per-utterance language ID;
-    # see stt/whisper.py. None or one entry => both off, fixed to `language`, which should
-    # itself be a member (else the first entry wins, with a warning).
+    # DECODABLE languages: bounds what may be OUTPUT (tokens in no enabled script are
+    # re-picked) AND the language-ID candidate set; see stt/whisper.py. None or one entry =>
+    # both off, fixed to `language`, which should be a member (else entry 0 wins, with a warning).
     languages: list[str] | None = None
-    # Min softmax confidence (over the enabled set only) to accept a detection; 0 = always
-    # take the top candidate. Raise on a quantized (.rknn int8) model, where a 99-way logit
-    # comparison degrades faster than greedy decoding does.
+    # Min softmax confidence (over the enabled set) to accept a detection; 0 = always take the
+    # top candidate. Raise on .rknn int8: a 99-way logit compare degrades faster than decoding.
     language_min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    # Seconds; MUST match the exported model. A decode window, not a cap: longer audio
-    # is decoded in window-sized pieces (stt/base.py transcribe_chunked).
+    # Seconds; MUST match the exported model. A decode window, not a cap: longer audio is
+    # decoded in window-sized pieces (stt/base.py transcribe_chunked).
     chunk_length: int = Field(default=20, ge=1)
 
 
 class SttServeConfig(_VoiceBase):
     """Serve the loaded on-device STT adapter as a local OpenAI-compatible
-    ``POST /v1/audio/transcriptions`` endpoint, so nanobot core's own transcription
-    consumers (WebUI mic dictation, channel voice notes) run on THIS box: point core's
-    ``transcription.provider`` at an OpenAI-shaped provider entry whose ``apiBase`` is this
-    endpoint (use one you don't chat through, e.g. ``providers.siliconflow``). Shares the
+    ``POST /v1/audio/transcriptions``, so core's own transcription consumers (WebUI dictation,
+    voice notes) run on THIS box: point core's ``transcription.provider`` at an OpenAI-shaped
+    provider entry whose ``apiBase`` is this endpoint (one you do not chat through, e.g.
+    ``providers.siliconflow``). Shares the
     pipeline's SINGLE adapter instance: models are never loaded twice.
     """
 
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = Field(default=8035, ge=0, le=65535)  # 0 = ephemeral (tests)
-    # Requires "Authorization: Bearer <apiKey>"; core sends the provider entry's apiKey, so
-    # give both sides the same value.
+    # Requires "Authorization: Bearer <apiKey>"; core sends the provider entry's apiKey, so give
+    # both sides the same value.
     api_key: str | None = None
     max_upload_mb: int = Field(default=32, ge=1, le=256)
 
@@ -380,21 +352,20 @@ class SttServeConfig(_VoiceBase):
 
 
 class SttConfig(_VoiceBase):
-    """Speech-to-text selection. ``nanobot`` delegates to nanobot's top-level
-    ``transcription`` config (cloud, or a local OpenAI-compatible Whisper server) with no
-    extra deps; the on-device engines each read their own block."""
+    """Speech-to-text selection. ``nanobot`` delegates to nanobot's top-level ``transcription``
+    config (cloud, or a local OpenAI-compatible Whisper server) with no extra deps; the
+    on-device engines each read their own block."""
 
     provider: Literal["nanobot", "whisper", "sensevoice", "zipformer"] = "nanobot"
     whisper: WhisperSttConfig = Field(default_factory=WhisperSttConfig)
     sensevoice: SenseVoiceSttConfig = Field(default_factory=SenseVoiceSttConfig)
     zipformer: ZipformerSttConfig = Field(default_factory=ZipformerSttConfig)
     serve: SttServeConfig = Field(default_factory=SttServeConfig)
-    # Eager (speculative) STT: decode the utterance-so-far once this much trailing silence has
-    # accumulated instead of waiting the full vad.hangoverMs. That gap is silence by definition,
-    # so the speculative transcript is exactly valid when the endpoint confirms: pure overlap,
-    # zero accuracy cost. ON-DEVICE batch STT only: the cloud delegate would waste billed calls
-    # whenever the speaker resumes, and zipformer already decodes live. 0 disables; >=
-    # vad.hangoverMs never fires.
+    # Eager (speculative) STT: decode the utterance-so-far after this much trailing silence
+    # instead of the full vad.hangoverMs. That gap is silence, so the transcript is exactly
+    # valid when the endpoint confirms: pure overlap, no accuracy cost. ON-DEVICE BATCH STT
+    # only (the cloud delegate would waste billed calls on a resume; zipformer decodes live).
+    # 0 disables; >= vad.hangoverMs never fires.
     eager_ms: int = Field(default=240, ge=0)
 
     @model_validator(mode="after")
@@ -409,15 +380,14 @@ class SttConfig(_VoiceBase):
 
 
 class SupertonicTtsConfig(OnDeviceRuntime):
-    """On-device Supertonic-3 (``tts.provider="supertonic"``): flow-matching TTS, 31
-    languages in ONE model (en/ko/ja/de/fr/es/..., NO zh), 44.1 kHz out, ~99M params.
+    """On-device Supertonic-3 (``tts.provider="supertonic"``): flow-matching TTS, 31 languages
+    in ONE model (en/ko/ja/de/fr/es/..., NO zh), 44.1 kHz out, ~99M params.
 
-    Artifacts come straight from the ORIGINAL release (huggingface.co/Supertone/supertonic-3;
-    OpenRAIL-M weights (use restrictions) with MIT inference code): four ``onnx/*.onnx``
-    graphs plus ``onnx/tts.json``, ``onnx/unicode_indexer.json`` and one ``voice_styles/*.json``.
-    Nothing is repackaged, so the same fp32 graphs also source int8/RKNN conversion. The text
-    front-end is a per-codepoint unicode lookup (no G2P, no tokenizer); language is selected by
-    wrapping the text in ``<lang>...</lang>`` tags."""
+    ORIGINAL release artifacts only (huggingface.co/Supertone/supertonic-3; OpenRAIL-M weights
+    = use restrictions, MIT inference code): four ``onnx/*.onnx`` graphs plus ``onnx/tts.json``,
+    ``onnx/unicode_indexer.json`` and one ``voice_styles/*.json``; nothing repackaged, so the
+    same fp32 graphs source int8/RKNN conversion. The text front-end is a per-codepoint unicode
+    lookup (no G2P, no tokenizer); language is selected by ``<lang>...</lang>`` tags."""
 
     text_encoder_path: str | None = None
     duration_predictor_path: str | None = None
@@ -444,23 +414,21 @@ class MmsTtsConfig(OnDeviceRuntime):
     # (mms-tts-eng). Each language is its own model + vocab.json (e.g. mms-tts-deu for German).
     vocab_path: str | None = None
     # Runs before char-tokenisation. "none" for Latin (en/de); "uroman" romanizes non-Latin
-    # scripts ([uroman] extra); "japanese" is kanji-aware (pyopenjtalk -> uroman, [japanese]
-    # extra) for mms-tts-jpn.
+    # ([uroman] extra); "japanese" is kanji-aware (pyopenjtalk -> uroman, [japanese] extra).
     text_frontend: Literal["none", "uroman", "japanese"] = "none"
-    max_length: int = Field(default=200, ge=1)  # encoder input length; MUST match the exported model
+    max_length: int = Field(default=200, ge=1)  # encoder input length; MUST match the export
     speaking_rate: float = Field(default=1.0, gt=0)  # >1 = faster (shorter durations)
 
 
 class MatchaTtsConfig(OnDeviceRuntime):
     """On-device Matcha-TTS (``tts.provider="matcha"``, 22.05 kHz, ~18M params).
 
-    Preferred: the OFFICIAL embedded-vocoder export (``python -m matcha.onnx.export``,
-    only ``acousticModelPath`` needed; VCTK selects voices via ``speakerId``). Mel-only
-    exports add ``vocoderPath`` (HiFi-GAN or Vocos). icefall ``matcha-icefall-*``
-    releases also work: ``tokensPath``, zh-baker plus ``lexiconPath`` (non-commercial
-    training data) - the only zh option. English needs espeak-ng (binary or
-    ``espeakPath``). Static NPU splits name ``encoderPath``/``decoderPath``/
-    ``vocoderPath`` + ``tokensPath``; extension picks ONNX vs RKNN per graph."""
+    Preferred: the OFFICIAL embedded-vocoder export (``python -m matcha.onnx.export``, only
+    ``acousticModelPath``; VCTK picks voices via ``speakerId``). Mel-only exports add
+    ``vocoderPath`` (HiFi-GAN or Vocos). icefall ``matcha-icefall-*`` also work: ``tokensPath``,
+    zh-baker plus ``lexiconPath`` (non-commercial training data) - the only zh option. English
+    needs espeak-ng. Static NPU splits name ``encoderPath``/``decoderPath``/``vocoderPath`` +
+    ``tokensPath``; extension picks ONNX vs RKNN per graph."""
 
     acoustic_model_path: str | None = None  # dynamic export
     encoder_path: str | None = None         # static split (with decoder+vocoder+tokens)
@@ -478,8 +446,8 @@ class MatchaTtsConfig(OnDeviceRuntime):
     lexicon_overrides_path: str | None = None  # same format; entries win over lexiconPath
     espeak_path: str | None = None          # explicit espeak-ng binary; None => $PATH
     espeak_voice: str | None = None         # None => the model's own voice (en-us)
-    # Voice pack the model was trained against (IPA spellings drift between espeak
-    # releases); None => an espeak-ng-data beside the model files, else the install's own
+    # Voice pack the model was trained against (IPA spellings drift between espeak releases);
+    # None => an espeak-ng-data beside the model files, else the install's own
     espeak_data_dir: str | None = None
     speaker_id: int = Field(default=0, ge=0)  # multi-speaker exports only; ignored otherwise
     noise_scale: float = Field(default=0.667, ge=0)  # upstream temperature default
@@ -487,19 +455,18 @@ class MatchaTtsConfig(OnDeviceRuntime):
     # Grad-TTS spectral denoiser on separate WAVEFORM (HiFi-GAN) vocoders, upstream's CLI
     # default; 0 = off. Vocos and embedded-vocoder exports carry no bias and are skipped.
     denoiser_strength: float = Field(default=0.00025, ge=0)
-    # Per-piece text budget in codepoints; 0 = the defaults (120 for dynamic lexicon
-    # models, 300 for dynamic espeak models, 80 for static espeak encoders, 40 for
-    # static lexicon encoders). Longer chunks split at space/clause.
+    # Per-piece text budget in codepoints; 0 = the defaults (120 for dynamic lexicon models, 300
+    # for dynamic espeak models, 80 for static espeak encoders, 40 for static lexicon encoders).
+    # Longer chunks split at space/clause.
     max_len: int = Field(default=0, ge=0)
-    # Bilingual: a SECOND complete matcha engine for the other script (one must be
-    # CJK-language, one Latin). Text routes per script run; the vocoder session is
-    # shared when both dynamic engines name the same vocoderPath (~+54 MB total).
+    # Bilingual: a SECOND complete matcha engine for the other script (one must be CJK-language,
+    # one Latin). Text routes per script run; the vocoder session is shared when both dynamic
+    # engines name the same vocoderPath (~+54 MB total).
     secondary: MatchaTtsConfig | None = None
 
     @model_validator(mode="after")
     def _one_contract(self) -> MatchaTtsConfig:
-        # A config authored with BOTH contracts is a contradiction, not a preference;
-        # reject at parse time where the WebUI import check can show it.
+        # Both contracts at once is a contradiction, not a preference: reject at parse time.
         if self.acoustic_model_path and (self.encoder_path or self.decoder_path):
             raise ValueError(
                 "matcha: acousticModelPath (dynamic export) and encoderPath/decoderPath "
@@ -518,9 +485,8 @@ class MatchaTtsConfig(OnDeviceRuntime):
 class TtsConfig(_VoiceBase):
     """Text-to-speech. The default provider speaks OpenAI-compatible ``/audio/speech`` over
     httpx, driving cloud OR any local server (Kokoro-FastAPI, piper-http, ...) by changing
-    ``apiBase``: local neural TTS with no decoder here. ``mms``/``supertonic``/``matcha``
-    are the on-device ONNX/RKNN engines; ``system`` is the zero-dep espeak-ng/say
-    fallback."""
+    ``apiBase``. ``mms``/``supertonic``/``matcha`` are the on-device ONNX/RKNN engines;
+    ``system`` is the zero-dep espeak-ng/say fallback."""
 
     enabled: bool = True
     provider: Literal[
@@ -539,14 +505,13 @@ class TtsConfig(_VoiceBase):
     # Rate of the server's RAW-PCM responses (audioFormat=pcm only). OpenAI/Kokoro emit
     # 24 kHz; a server emitting 22.05/44.1 kHz needs this or playback is pitch-shifted.
     pcm_sample_rate: int = Field(default=24000, gt=0)
-    # The language this TTS speaks, ONE ISO 639-1 code. Two consumers: the system
-    # provider's espeak/say voice, and, for engines that cannot know their own language
-    # (an openai_compat server, MMS with a custom vocabPath), the declaration behind the
-    # agent's "reply in this language" context line. Engines that DO know (supertonic,
-    # built-in-vocab MMS) ignore it with a warning on conflict; see make_tts.
+    # The language this TTS speaks, ONE ISO 639-1 code. Two consumers: the system provider's
+    # espeak voice (`say` keeps the host default), and the agent's "reply in this language"
+    # context line for engines that cannot know their own language (openai_compat, MMS with a
+    # custom vocabPath). Engines that DO know ignore it, warning on conflict; see make_tts.
     language: str | None = None
-    # openai/openai_compat PER-ATTEMPT cap; the retry ladder is bounded at 2x this, so a
-    # wedged server cannot hold the turn in SPEAKING.
+    # openai/openai_compat PER-ATTEMPT cap; the retry ladder is bounded at 2x this, so a wedged
+    # server cannot hold the turn in SPEAKING.
     timeout_s: float = Field(default=60.0, gt=0)
 
 
@@ -562,29 +527,26 @@ class ChunkerConfig(_VoiceBase):
 
 class PerfConfig(_VoiceBase):
     """Device-performance adaptation (local mode): tune pacing WITHIN the chosen engine set
-    from measurements taken on the device at session start. Invariants: only
-    PACING values are derived, never a
-    behavior change; an explicit config value always wins; every derived value is logged at
-    INFO with its measurement."""
+    from measurements taken on the device at session start. Only PACING is derived, never
+    behavior; an explicit config value always wins; every derived value is logged at INFO."""
 
     calibrate: bool = True
 
 
 class PrologueConfig(_VoiceBase):
-    """Filler audio while the agent is still working (local backend only; cloud modes get
-    model-spoken filler instead). A neutral phrase, synthesized once with the session's own
-    TTS voice and cached, plays after ``afterMs`` of THINKING with no reply, then every
-    ``intervalMs``. Fillers are epoch-stamped audio, so every barge-in path kills them like
-    real speech; keep phrases short (the half-duplex mic is gated while one plays)."""
+    """Filler audio while the agent is still working (local backend; cloud modes get
+    model-spoken filler). A neutral phrase, synthesized once with the session TTS and cached,
+    plays after ``afterMs`` of THINKING with no reply, then every ``intervalMs``. Fillers are
+    epoch-stamped audio, so every barge-in path kills them like real speech; keep phrases short
+    — the half-duplex mic is gated while one plays."""
 
     enabled: bool = False
-    # Floor for filler 1: the live delay stretches past the session's typical
-    # first-reply latency (EMA), so fillers mark anomalous waits, not ordinary
-    # generation (filler + instant answer reads as broken).
+    # Floor for filler 1: the live delay also stretches past the session's typical first-reply
+    # latency (EMA), so fillers mark anomalous waits (filler + instant answer reads as broken).
     after_ms: int = Field(default=2000, ge=0)
     interval_ms: int = Field(default=8000, ge=1000)  # re-filler cadence during long waits
-    # Escalation script; None = built-ins matched to the TTS engine's language (an
-    # on-device engine speaks exactly one, and English through a zh lexicon is silence).
+    # Escalation script; None = built-ins matched to the TTS engine's language (an on-device
+    # engine speaks exactly one, and English through a zh lexicon is silence).
     phrases: list[str] | None = None
 
 
@@ -592,11 +554,10 @@ class RealtimeConfig(_VoiceBase):
     """Shared settings for the OpenAI-Realtime **dialect family** of e2e speech-to-speech
     backends (``backend`` = openai / xai / azure / qwen / glm / stepfun).
 
-    Cloud-only. The provider does ASR + reasoning + TTS in one WebSocket session; the plugin
-    owns local mic capture + speaker playback and routes tool calls to nanobot where the
-    provider supports it. Audio rate is provider-fixed
-    (24 kHz mostly, 16 kHz input for Qwen/GLM) and comes from the profile, NOT from
-    ``AudioConfig.sample_rate``.
+    Cloud-only: the provider does ASR + reasoning + TTS in one WebSocket session; the plugin
+    owns mic capture + playback and routes tool calls to nanobot where supported. Audio rate is
+    provider-fixed (24 kHz mostly, 16 kHz input for Qwen/GLM) and comes from the profile, NOT
+    from ``AudioConfig.sample_rate``.
     """
 
     # None => the provider profile's default. Override for a pinned model, a self-hosted /
@@ -605,11 +566,9 @@ class RealtimeConfig(_VoiceBase):
     base_url: str | None = None           # ``?model=`` appended at connect (GA/beta)
     api_key: str | None = None            # falls back to OPENAI_API_KEY
     voice: str | None = None              # provider voice (e.g. OpenAI cedar/marin, Qwen Chelsie)
-    # Replaces the built-in persona (style/identity) ONLY. The tool rules for the resolved
-    # toolMode (the filler preamble, and supervisor's ask_nanobot delegation contract)
-    # are appended by the channel and cannot be overridden: they are the wire contract the
-    # backend depends on, and a persona that dropped them would leave supervisor mode
-    # answering from the small realtime model alone. Say nothing about tools here.
+    # Replaces the built-in persona (style/identity) ONLY: the resolved toolMode's tool rules
+    # (filler preamble, supervisor's ask_nanobot contract) are appended by the channel and
+    # cannot be overridden — they are the wire contract. Say nothing about tools here.
     persona: str | None = None
 
     # A realtime model is small and non-reasoning, so it plans multi-step tool sequences badly.
@@ -617,66 +576,61 @@ class RealtimeConfig(_VoiceBase):
     #                  light, single-step tool use.
     #   "supervisor" = declare ONE tool (ask_nanobot): it owns the conversation but delegates
     #                  all reasoning/tool work to nanobot's AgentLoop and speaks the finished
-    #                  answer (Responder-Thinker). Robust multi-step tool use, costing a ~1-2s
-    #                  delegation the mandatory filler masks. Tool-capable providers only.
+    #                  answer. Robust multi-step use, costing a ~1-2s delegation the mandatory
+    #                  filler masks. Tool-capable providers only.
     tool_mode: Literal["direct", "supervisor"] = "direct"
     server_vad: bool = True               # server-side turn detection + native barge-in
     interrupt_response: bool = True        # server auto-cancels the response on user speech (GA)
     # None => input transcription off => the cloud backend emits no InputTranscript.
     input_transcription_model: str | None = None
 
-    # An open mic without echo cancellation feeds our own TTS back up the uplink and self-cancels
-    # every turn, so "aec" requires one of ``aec_available``, top-level ``aec="hardware"`` or
-    # ``aec="webrtc"``, enforced at start() (channel.py). "gated" needs no such assertion: the
-    # uplink is suspended while speaking (the shell's SPEAKING mic-gate), resuming after drain.
+    # An open mic without echo cancellation feeds our TTS up the uplink and self-cancels every
+    # turn, so "aec" requires ``aec_available``, top-level ``aec="hardware"`` or ``aec="webrtc"``,
+    # enforced at start() (channel.py). "gated" suspends the uplink while speaking (the shell's
+    # SPEAKING mic-gate), resuming after drain.
     barge_in: Literal["aec", "gated"] = "gated"
     aec_available: bool = False           # assert hardware/OS AEC so open-mic is safe
     turn_timeout_s: float = Field(default=30.0, gt=0)  # watchdog for a missing response.done
-    # Budget for ONE ask_nanobot delegation (supervisor mode); None -> turn_timeout_s. A tool-heavy
-    # agent turn routinely runs past 30 s; raise THIS, not the wire watchdog, which stays tight.
+    # Budget for ONE ask_nanobot delegation (supervisor mode); None -> turn_timeout_s. A
+    # tool-heavy agent turn routinely runs past 30 s; raise THIS, not the wire watchdog.
     delegation_timeout_s: float | None = Field(default=None, gt=0)
 
 
 class TelemetryConfig(_VoiceBase):
     """OpenTelemetry export of TOOL CALLS (opt-in, [otel] extra, lazily imported).
 
-    Tool calls follow the OTel GenAI semantic conventions (``execute_tool {name}`` spans with
-    ``gen_ai.tool.*``), portable across Langfuse / Phoenix / Braintrust / LangSmith. Voice latency
-    has NO convention: the semconv covers no audio, realtime, endpointing or barge-in signal
-    (semconv issue #304 is open), so it stays in ``VoiceMetrics`` in-process and is not
-    exported.
+    Tool calls follow the OTel GenAI semconv (``execute_tool {name}`` spans with
+    ``gen_ai.tool.*``), portable across Langfuse / Phoenix / Braintrust / LangSmith. Voice
+    latency has NO convention (semconv issue #304 open), so it stays in ``VoiceMetrics``
+    in-process, unexported.
     """
 
     enabled: bool = False
     namespace: str = "voice"  # prefix for the non-semconv tool attrs (outcome/mode/stale)
-    # Opt-In in the semconv BECAUSE THEY ARE USER DATA: a voice tool call carries whatever the
-    # user just said. Leave off unless the collector is trusted; names, timings and outcomes flow
-    # regardless.
+    # Opt-in in the semconv BECAUSE IT IS USER DATA: a voice tool call carries whatever the user
+    # just said. Names, timings and outcomes flow regardless.
     capture_content: bool = False
 
 
 class DebugConfig(_VoiceBase):
-    """Diagnostics. ``dumpAudio`` (local backend) writes every endpointed capture
-    segment as a WAV named by the pipeline's verdict (``publish``/``interrupt``/
-    ``inject``/``goal``/``empty``/``echo``/``ack``/``stop``/``gated``/``wake``/
-    ``blip``/``probe``/``gap``), so a false barge-in is diagnosed by ear; with
-    ``aec="webrtc"`` a ``.raw.wav`` twin holds the same span pre-cancellation (TTS audible there but not in the post-AEC file = the
-    canceller works and the trigger is acoustic). Each session directory also holds
-    ``manifest.jsonl`` (a config-header line, then one record per segment) and an
-    ``index.html`` viewer: serve the directory (``python -m http.server``) to browse,
-    filter and play the records. Segments are recordings of the operator's room:
-    leave this off outside debugging sessions."""
+    """Diagnostics. ``dumpAudio`` (local backend) writes every endpointed capture segment as a
+    WAV named by the pipeline's verdict (``publish``/``interrupt``/``inject``/``goal``/
+    ``empty``/``echo``/``ack``/``stop``/``gated``/``wake``/``blip``/``probe``/``gap``), so a
+    false barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the same
+    span pre-cancellation (TTS audible there but not post-AEC = the canceller works, the trigger
+    is acoustic). Each session directory also holds ``manifest.jsonl`` (config header, then one
+    record per segment) and an ``index.html`` viewer: serve the directory to browse. Segments
+    record the operator's room — leave off outside debugging sessions."""
 
     dump_audio: bool = False
-    # Root for the per-session dump directories. None => the weights-store
-    # convention: $XDG_DATA_HOME|~/.local/share/nanobot-voice/dumps.
+    # Root for the per-session dump directories. None => the weights-store convention:
+    # $XDG_DATA_HOME|~/.local/share/nanobot-voice/dumps.
     dump_dir: str | None = None
-    # Best-effort disk cap over the root: older sessions are pruned first, then the
-    # live session's oldest segments, so the most recent evidence survives.
+    # Best-effort disk cap over the root: older sessions are pruned first, then the live
+    # session's oldest segments, so the most recent evidence survives.
     dump_max_mb: int = Field(default=200, ge=1)
-    # Log the in-process metrics snapshot (latency percentiles + counters, one JSON
-    # line) every this many seconds; None = only the session-end summary. Floored at
-    # 1 s: each snapshot sorts the sample rings on the event loop.
+    # Log the metrics snapshot (latency percentiles + counters, one JSON line) every N seconds;
+    # None = session-end summary only. Floored at 1 s: each snapshot sorts the rings on the loop.
     metrics_interval_s: float | None = Field(default=None, ge=1.0)
 
 
@@ -686,27 +640,25 @@ class BargeInConfig(_VoiceBase):
     """
 
     # What the confirm window does to live playback. "duck": attenuate by duckDb and keep
-    # playing (a false alarm is barely audible). "pause": stop the stream entirely and
-    # resume where it left off on a false verdict: the bot's leak vanishes from the mic
-    # during the user's utterance, which is exactly the soft-duplex failure mode; the
-    # cost is a silent gap of the confirm window's length when the alarm was false.
-    # Stream-mode open-mic only; blob mode keeps the static duckDb bake.
+    # playing (a false alarm is barely audible). "pause": stop the stream and resume where it
+    # left off on a false verdict — the bot's leak vanishes from the mic during the user's
+    # utterance, at the cost of a confirm-window-long silent gap on a false alarm. Stream-mode
+    # open-mic only; blob mode keeps the static duckDb bake.
     mode: Literal["duck", "pause"] = "duck"
-    # Early-confirm word bar: a decode holding this many words that are neither our own TTS
-    # (echo) nor ack phrases confirms the interrupt before the endpoint verdict: streaming
-    # partials (zipformer) check it live, batch engines at their eager decode. Also the bar a
-    # transcript classified as self-echo must clear to still count as an interruption.
-    # Counted in the echo filter's units: words for spaced scripts, character bigrams
-    # for CJK (n fresh hanzi ~ n-1 units), so the default carries across languages.
+    # Early-confirm bar: a decode holding this many words that are neither our own TTS (echo)
+    # nor ack phrases confirms the interrupt before the endpoint verdict — streaming partials
+    # (zipformer) check it live, batch engines at their eager decode. Also the bar a self-echo
+    # transcript must clear to still count as an interruption. Counted in the echo filter's
+    # units: words for spaced scripts, character bigrams for CJK (n fresh hanzi ~ n-1 units).
     min_words: int = Field(default=2, ge=1)
-    # Duck on SUSPICION: consecutive VAD speech frames (x audio.frameMs) while the bot speaks before
-    # the reversible duck engages, deliberately below vad.startFrames, because a false dip is cheap
-    # (attack 30 ms, release 250 ms) while every frame of delay is the bot talking over the user at
-    # full volume; a run that dies before onset just releases. >= vad.startFrames = duck at onset.
+    # Duck on SUSPICION: consecutive VAD speech frames (x audio.frameMs) while the bot speaks
+    # before the reversible duck engages; deliberately below vad.startFrames because a false dip
+    # is cheap (attack 30 ms, release 250 ms) and a run dying before onset just releases.
+    # >= vad.startFrames = duck at onset.
     duck_start_frames: int = Field(default=2, ge=1)
     # On a confirmed barge-in (stream-mode TTS), append a bracketed note to the published
-    # utterance saying how much of the cancelled reply the user actually heard: the in-channel
-    # stand-in for history truncation (core keeps the full text; a channel cannot edit it).
+    # utterance saying how much of the cancelled reply the user heard: the stand-in for history
+    # truncation (core keeps the full text; a channel cannot edit it).
     heard_marker: bool = True
     # Backchannels: a transcript made ENTIRELY of these (lower-cased word tokens) while the bot
     # works/speaks is an acknowledgement, not an interruption; the reply survives, duck releases.
@@ -718,11 +670,10 @@ class BargeInConfig(_VoiceBase):
             "はい", "うん", "ええ", "そう",
         ]
     )
-    # Stop commands: a transcript made ENTIRELY of these phrases (backchannel words and
-    # politeness fillers may ride along) aimed at a live reply kills it and is CONSUMED —
-    # nothing is published, silence is the acknowledgment. Mixed utterances ("stop, use
-    # Tokyo instead") still publish as normal interruptions, and a cold stop with nothing
-    # live forwards to the agent. Empty list = off.
+    # Stop commands: a transcript made ENTIRELY of these (backchannels and politeness fillers
+    # may ride along) aimed at a live reply kills it and is CONSUMED — nothing is published,
+    # silence is the acknowledgment. Mixed utterances ("stop, use Tokyo instead") publish as
+    # normal interruptions; a cold stop with nothing live forwards to the agent. Empty = off.
     stop_phrases: list[str] = Field(
         default=[
             "stop", "stop it", "shut up", "be quiet", "quiet", "enough",
@@ -737,13 +688,11 @@ class BargeInConfig(_VoiceBase):
 class GoalConfig(_VoiceBase):
     """Spoken entry to nanobot's sustained-goal mode (``local`` backend)."""
 
-    # An ordinary turn ends the moment the model answers without calling a tool, so
-    # "I'll keep trying" IS a final answer. Core's sustained goal is the one mode that
-    # refuses that ending, and it starts only from ``/goal`` — which speech can never
-    # produce. An utterance carrying one of these publishes VERBATIM behind ``/goal ``,
-    # the whole sentence being the objective. Matched ANYWHERE (the commitment usually
-    # trails the task), hence defaults that are explicit promises rather than anything
-    # conversational; empty list = off.
+    # An ordinary turn ends the moment the model answers without calling a tool, so "I'll keep
+    # trying" IS a final answer; core's sustained goal is the one mode that refuses that ending,
+    # and it starts only from ``/goal``, which speech cannot produce. An utterance carrying one
+    # of these publishes VERBATIM behind ``/goal ``, the whole sentence being the objective.
+    # Matched ANYWHERE, hence defaults that are explicit promises. Empty list = off.
     phrases: list[str] = Field(
         default=[
             "keep working on", "keep trying until", "don't stop until",
@@ -755,59 +704,45 @@ class GoalConfig(_VoiceBase):
 
 
 class OpenWakeWordConfig(OnDeviceRuntime):
-    """openWakeWord-format acoustic wake word (``wake.engine="openwakeword"``,
-    ``[ondevice]`` extra; needs ``audio.sampleRate=16000``). ORIGINAL upstream
-    artifacts: a mel frontend — ``melPath`` (melspectrogram.onnx) or, for
-    hybrid NPU packages whose STFT ops don't convert, ``melFiltersPath`` (the
-    graph's frozen filterbank, run as an exact numpy port) — plus the shared
-    ``embeddingPath`` (embedding_model.onnx, ``.onnx`` or a static ``.rknn``)
-    and the per-phrase ``modelPath`` classifier head. livekit-wakeword heads
-    speak the same backbone contract and load here too. NOTE: openWakeWord's
-    official pretrained heads are CC-BY-NC-SA (non-commercial);
-    livekit-wakeword and self-trained heads (either project's training
-    pipeline) are unrestricted."""
+    """openWakeWord-format acoustic wake word (``wake.engine="openwakeword"``, ``[ondevice]``
+    extra; needs ``audio.sampleRate=16000``). ORIGINAL upstream artifacts: a mel frontend —
+    ``melPath``, or ``melFiltersPath`` (the graph's frozen filterbank as an exact numpy port)
+    for hybrid NPU packages whose STFT ops don't convert — plus the shared ``embeddingPath``
+    and the per-phrase ``modelPath`` head. livekit-wakeword heads speak the same backbone
+    contract. NOTE: openWakeWord's pretrained heads are CC-BY-NC-SA (non-commercial);
+    livekit-wakeword and self-trained heads are unrestricted."""
 
     mel_path: str | None = None          # melspectrogram.onnx (ONNX mel frontend)
     mel_filters_path: str | None = None  # mel_filters.npy (numpy frontend); exactly one of the two
     embedding_path: str | None = None    # embedding_model.onnx (Google speech_embedding re-export)
     model_path: str | None = None        # the wake-phrase classifier head
-    # Package sidecar (meta.json) from the weights store: advisory startup
-    # checks that the head's declared phrase is in wake.phrases (a mismatch
-    # breaks wake-phrase stripping) and that an .rknn matches ``target``.
+    # Package sidecar (meta.json) from the weights store: advisory checks that the head's
+    # declared phrase is in wake.phrases (a mismatch breaks stripping) and .rknn matches target.
     meta_path: str | None = None
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # sigmoid score at/above => hit
-    # Minimum spacing between hits: the phrase echoing in a hard room must not
-    # double-fire the gate.
+    # Minimum spacing between hits: the phrase echoing in a hard room must not double-fire.
     refractory_s: float = Field(default=2.0, ge=0.0)
 
 
 class EarconsConfig(_VoiceBase):
-    """Non-verbal notification cues (local backend only): synthesized struck
-    two-note tones, ~¼ s — no asset, no TTS call, no language. ``captured``
-    (rising, A5→E6) plays at every ACCEPTED turn (the publish), the
-    Gemini-Live-style receipt that the sentence was heard and the agent is
-    working; it lands ~1-3 s before any spoken feedback (prologue filler,
-    reply). ``attention`` (falling, E6→A5) plays when the wake attention
-    window closes — the audible "the name is needed again": at the deadline
-    lapse under ``attention="conversation"``, right at the reply's settle when
-    the window is already spent (``"sentence"``, or ``windowS=0``); it needs
-    wake gating and stays silent forever with ``wake.mode="off"``. Verdicts
-    that must stay silent stay silent: gated/echo (never reveal liveness to
-    bystanders), consumed stops (silence IS the acknowledgment), bare summons
-    (the wake ack owns those). Frequent cues fire far too often for speech:
-    hence tones."""
+    """Non-verbal cues (local backend only): synthesized struck two-note tones, ~¼ s — no
+    asset, no TTS call, no language. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
+    (the publish), ~1-3 s before any spoken feedback. ``attention`` (falling E6→A5) plays when
+    the wake attention window closes — at the deadline lapse under ``attention="conversation"``,
+    at the reply's settle when the window is already spent (``"sentence"``, or ``windowS=0``);
+    it needs wake gating and stays silent with ``wake.mode="off"``. Verdicts that must stay
+    silent do: gated/echo (never reveal liveness to bystanders), consumed stops (silence IS the
+    acknowledgment), bare summons (the wake ack owns those)."""
 
     captured: bool = False
     attention: bool = False
-    # Custom cues: a short S16 WAV per cue (stereo downmixes; blob playback
-    # keeps its rate, pcm sinks resample). Edge-trimmed like every canned
-    # clip, then capped at 600 ms with a faded cut — a cue must stay short;
-    # files over 2 MB refuse to load. None => the built-in; an unreadable
-    # file degrades loudly to the built-in.
+    # Custom cues: a short S16 WAV per cue (stereo downmixes; blob playback keeps its rate, pcm
+    # sinks resample). Edge-trimmed, then capped at 600 ms with a faded cut; files over 2 MB
+    # refuse to load. None => the built-in, as does an unreadable file (loudly).
     path: str | None = None
     attention_path: str | None = None
-    # Level adjust for the cues (built-in or file); boosts saturate at full
-    # scale. The built-ins peak ~-15 dBFS.
+    # Level adjust for the cues (built-in or file); boosts saturate at full scale. The built-ins
+    # peak ~-15 dBFS.
     gain_db: float = Field(default=0.0, ge=-30.0, le=12.0)
 
     @model_validator(mode="after")
@@ -830,70 +765,54 @@ class EarconsConfig(_VoiceBase):
 class WakeAckConfig(_VoiceBase):
     """Spoken acknowledgment at every bare-wake settle ("hey nanobot" → "I'm here.").
 
-    The cold summon's only feedback, and in half-duplex the audible mic-open marker:
-    the contract becomes *phrase — ack — command*. Synthesized once with the session's
-    own TTS and cached; canned audio — it yields to user speech, any real turn flushes
-    it, and the agent never sees it. Keep phrases SHORT (≤ ~0.6 s spoken): the
-    half-duplex mic is gated while one plays."""
+    The cold summon's only feedback, and in half-duplex the audible mic-open marker: the
+    contract becomes *phrase — ack — command*. Synthesized once with the session TTS and cached;
+    canned audio — it yields to user speech, any real turn flushes it, the agent never sees it.
+    Keep phrases SHORT (≤ ~0.6 s spoken): the half-duplex mic is gated while one plays."""
 
     enabled: bool = False
-    # Rotated round-robin across summons. None = built-ins keyed to the TTS engine's
-    # language; a phrase the engine cannot speak synthesizes to silence (prewarm warns).
+    # Rotated round-robin across summons. None = built-ins keyed to the TTS engine's language; a
+    # phrase the engine cannot speak synthesizes to silence (prewarm warns).
     phrases: list[str] | None = None
 
 
 class WakeConfig(_VoiceBase):
     """Wake-word gate (LOCAL backend only; the cloud paths are ungated by design).
 
-    ``mode="gate"``: starting a conversation from cold requires the wake phrase;
-    once engaged, follow-ups and barge-in stay natural for ``windowS`` after each
-    turn. ``mode="strict"`` additionally requires the phrase to interrupt a live
-    reply — while the bot speaks, non-wake speech neither ducks nor stops it,
-    which is the robust posture for public/multi-speaker spaces (and what makes
-    barge-in SIMPLE there: a hit is the whole verdict); it also gates speech
-    while the agent is still WORKING once the attention window is shut (a long
-    tool run must not be steerable by bystanders). Detection is two-tier:
-    the transcript prefix (``phrases``, any language the STT covers) always
-    counts, and ``engine="openwakeword"`` adds an acoustic detector that hears
-    through the bot's own playback. A leading wake phrase is stripped from the
-    published text, repeats included ("小娜小娜" is one summon — saying the
-    name when it was not needed is free); an utterance that is ONLY the phrase
-    publishes nothing and just opens the attention window — silently, unless
-    ``ack`` speaks a short acknowledgment ("hey nanobot" → "I'm here."). A bare
-    summon while the agent is still WORKING never cancels the query: it is
-    answered (prologue filler, else the ack) and the reply still comes.
-    Half-duplex contract: detection trails the phrase and the mic-reopen flush
-    discards audio up to it, so the command belongs AFTER the reply stops
-    (phrase, beat, command) — same-breath content survives only in the open-mic
-    modes. With the ack on, the ack IS the beat: wait for it, then speak."""
+    ``mode="gate"``: a cold start needs the wake phrase; once engaged, follow-ups and barge-in
+    stay natural for ``windowS`` after each turn. ``mode="strict"`` additionally requires the
+    phrase to interrupt a live reply (non-wake speech neither ducks nor stops it) and gates
+    speech while the agent is WORKING once the window is shut — the posture for public rooms,
+    where a hit is the whole barge-in verdict. Detection is two-tier: the transcript prefix
+    (``phrases``, any language the STT covers) always counts, ``engine="openwakeword"`` adds an
+    acoustic detector that hears through the bot's own playback. A leading wake phrase is
+    stripped from the published text, repeats included ("小娜小娜" is one summon); an utterance
+    that is ONLY the phrase publishes nothing and just opens the attention window, silently
+    unless ``ack`` speaks. A bare summon while the agent is WORKING never cancels the query.
+    Half-duplex contract: detection trails the phrase and the mic-reopen flush discards audio up
+    to it, so the command belongs AFTER the reply stops (phrase, beat, command) — same-breath
+    content survives only in the open-mic modes; with the ack on, the ack IS the beat."""
 
     mode: Literal["off", "gate", "strict"] = "off"
-    # The spoken wake phrases, matched at utterance START (hesitation fillers may
-    # precede). Also what the transcript tier strips from published turns.
+    # The spoken wake phrases, matched at utterance START (hesitation fillers may precede). Also
+    # what the transcript tier strips from published turns.
     phrases: list[str] = Field(default_factory=list)
-    # Extra transcript spellings treated as the phrase (wake + strip): the renders
-    # YOUR STT actually produces for the name (e.g. "hey nanobot" back as 嘿难道爸
-    # on a zh-en zipformer). Warmup learning (learnAliases) seeds these and logs
-    # them; pin the renders it shows you here.
+    # Extra transcript spellings treated as the phrase (wake + strip): the renders YOUR STT
+    # actually produces (e.g. "hey nanobot" back as 嘿难道爸 on a zh-en zipformer). learnAliases
+    # seeds and logs these; pin the renders it shows you here.
     aliases: list[str] = Field(default_factory=list)
-    # Warmup calibration: synthesize each phrase with the session TTS, decode it
-    # with the session STT, and register mis-renders as aliases (logged loudly).
-    # Runs only for on-device STT (stt.provider != "nanobot") and a probe-safe
-    # TTS — nothing at startup may be billed.
+    # Warmup calibration: synthesize each phrase with the session TTS, decode it with the
+    # session STT, register mis-renders as aliases (logged loudly). On-device STT only
+    # (stt.provider != "nanobot") and a probe-safe TTS — nothing at startup may be billed.
     learn_aliases: bool = True
-    # What one wake buys. "conversation": attention re-opens for windowS after
-    # every turn — natural follow-ups, at the cost of an invisible open window.
-    # "sentence": the window opens ONLY on wake evidence and the next published
-    # turn SPENDS it — a predictable one-name-one-sentence contract for public
-    # rooms; a reply ENDING with a question re-opens it so the agent's own
-    # clarifying question gets its answer (any other question re-gates — the
-    # user re-summons, which the ack makes cheap).
+    # What one wake buys. "conversation": attention re-opens for windowS after every turn —
+    # natural follow-ups, at the cost of an invisible open window. "sentence": the window opens
+    # ONLY on wake evidence and the next published turn SPENDS it; a reply ENDING with a
+    # question re-opens it so the agent's clarifying question gets its answer.
     attention: Literal["conversation", "sentence"] = "conversation"
-    # Attention window: seconds after a wake/turn during which cold starts need
-    # no wake phrase. 0 = every cold start needs the phrase. Default sized to
-    # industry follow-up windows (~8 s) plus slack: re-summoning is cheap
-    # (stripped and acked wherever it lands), while a long stale window
-    # publishes bystander speech.
+    # Seconds after a wake/turn during which cold starts need no wake phrase; 0 = every cold
+    # start needs it. Sized to industry follow-up windows (~8 s) plus slack: re-summoning is
+    # cheap, a long stale window publishes bystander speech.
     window_s: float = Field(default=15.0, ge=0.0)
     engine: Literal["text", "openwakeword"] = "text"
     openwakeword: OpenWakeWordConfig = Field(default_factory=OpenWakeWordConfig)
@@ -959,9 +878,9 @@ class VoiceConfig(_VoiceBase):
     enabled: bool = False
 
     # Reasoning brain / supplier. "local" = on-box VAD/STT/TTS + nanobot over the text bus (full
-    # brain, no cloud). The rest are e2e speech-to-speech over a provider's OpenAI-Realtime-dialect
-    # WebSocket ([realtime] extra; "qwen" is Alibaba, "glm" Zhipu) sharing the ``realtime.*`` block;
-    # their model/endpoint/rates come from backend/profiles.py.
+    # brain, no cloud). The rest are e2e speech-to-speech over a provider's
+    # OpenAI-Realtime-dialect WebSocket ([realtime] extra; "qwen" is Alibaba, "glm" Zhipu)
+    # sharing the ``realtime.*`` block; their model/endpoint/rates come from backend/profiles.py.
     backend: Literal[
         "local", "openai", "xai", "azure", "qwen", "glm", "stepfun"
     ] = "local"
@@ -974,29 +893,24 @@ class VoiceConfig(_VoiceBase):
     #   "auto"     => half-duplex: mic suspended while speaking (the safe default).
     #   "hardware" => full-duplex: mic stays open; asserts hardware/OS echo cancellation.
     #   "soft"     => open mic WITHOUT AEC; the bot's own voice is dropped by matching the
-    #                 known TTS text (self-echo rejection), so you can barge in by
-    #                 talking. Best-effort; pair with duckDb for SNR.
-    #   "webrtc"   => SOFTWARE echo cancellation ([aec] extra, WebRTC AEC3): full-duplex
-    #                 barge-in with no hardware AEC, our own playback being the reference
-    #                 subtracted from the mic before VAD/STT. Degrades to "soft" if the extra
-    #                 is missing, or for WAV-blob TTS, which supplies no playout-timed
-    #                 reference (raw-PCM stream-mode does). Also satisfies the CLOUD open-mic
-    #                 requirement (realtime.bargeIn="aec"): it sits in front of the uplink.
+    #                 known TTS text (self-echo rejection). Best-effort; pair with duckDb.
+    #   "webrtc"   => SOFTWARE AEC ([aec] extra, WebRTC AEC3): our playback is the reference
+    #                 subtracted from the mic before VAD/STT. Degrades to "soft" without the
+    #                 extra, or for WAV-blob TTS, which supplies no playout-timed reference
+    #                 (raw-PCM stream-mode does). Also satisfies realtime.bargeIn="aec".
     aec: Literal["auto", "soft", "webrtc", "hardware"] = "auto"
 
     # Self-echo rejection (every duplex mode): drop a transcript whose words are at least this
-    # fraction contained in the recently-spoken TTS: it's the bot hearing itself. Half-duplex
-    # included: its mic gate is a read-time approximation, and what leaks past a mistimed
-    # hangover or capture lag must not publish as a user turn.
+    # fraction contained in the recently-spoken TTS. Half-duplex included: its mic gate is a
+    # read-time approximation, and leakage must not publish as a user turn.
     echo_reject_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     # Include user speech in gateway logs. OFF because transcripts are personal data and logs
     # get shipped/persisted; operational lines still fire, with word counts instead of content.
     log_transcripts: bool = False
-    # Open-mic duck depth in dB (0 = off; -12 ~ a quarter as loud). LOCAL backend only: the cloud
-    # path interrupts server-side (truncate/cancel) and never ducks. Stream-mode playback ducks
-    # DYNAMICALLY: fast-attack to this floor the moment speech is detected while the bot speaks,
-    # released if the transcript verdict says it wasn't a real interruption. Blob-mode (WAV-only
-    # TTS) can't change gain mid-chunk and bakes it in statically.
+    # Open-mic duck depth in dB (0 = off; -12 ~ a quarter as loud). LOCAL backend only: the
+    # cloud path interrupts server-side and never ducks. Stream-mode playback ducks DYNAMICALLY
+    # (fast attack the moment speech is detected, released if the verdict says it wasn't a real
+    # interruption); blob mode (WAV-only TTS) can't change gain mid-chunk and bakes it in.
     duck_db: float = Field(default=-12.0, le=0.0)
     barge_in: BargeInConfig = Field(default_factory=BargeInConfig)
     goal: GoalConfig = Field(default_factory=GoalConfig)
@@ -1005,19 +919,17 @@ class VoiceConfig(_VoiceBase):
     # Tail after playback drains before re-listening (local only; the cloud drain has no hangover).
     playback_hangover_ms: int = Field(default=250, ge=0)
 
-    # Stalled-agent deadman (local backend; cloud analog: realtime.turnTimeoutS), on two
-    # clocks: "the user has heard nothing" and "the core is dead" are different failures.
-    # stallNoticeS = audible silence on a LIVE turn: speak stallPhrase, then double the
-    # interval (capped at agentTimeoutS) for the rest of the turn, never killing — a tool
-    # chain that stops narrating is dead air the core clock cannot see. None = notices on
-    # core silence only. agentTimeoutS = no bus traffic at all for this chat (deltas,
-    # segment ends, any send() — progress/tool events need core's channels.sendProgress,
-    # its default): one silent budget warns, a SECOND /stops the run and speaks
-    # timeoutPhrase. 300 matches core's own ceilings (LLM timeout, subagent wait): tighter
-    # kills turns core would still finish. None disables both clocks. Both phrases are
-    # spoken by the session TTS — localize them together, and never put a stop phrase
-    # inside one (validated): a just-spoken word is self-echo, so the invited command
-    # would be swallowed.
+    # Stalled-agent deadman (local; cloud analog: realtime.turnTimeoutS) on two clocks — "the
+    # user has heard nothing" and "the core is dead" are different failures. stallNoticeS =
+    # audible silence on a LIVE turn: speak stallPhrase, then double the interval (capped at
+    # agentTimeoutS) for the rest of the turn, never killing — a tool chain that stops narrating
+    # is dead air the core clock cannot see. None = notices on core silence only. agentTimeoutS =
+    # no bus traffic at all for this chat (deltas, segment ends, any send(); progress/tool events
+    # need core's channels.sendProgress, its default): one silent budget warns, a SECOND /stops
+    # the run and speaks timeoutPhrase. 300 matches core's own ceilings (LLM timeout, subagent
+    # wait); tighter kills turns core would still finish. None disables both. Both phrases are
+    # spoken by the session TTS — localize them together, and never put a stop phrase inside one
+    # (validated): a just-spoken word is self-echo, so the invited command would be swallowed.
     agent_timeout_s: float | None = Field(default=300.0, gt=0)
     stall_notice_s: float | None = Field(default=60.0, gt=0)
     stall_phrase: str = "Still working on it. This is taking longer than usual."
@@ -1044,16 +956,15 @@ class VoiceConfig(_VoiceBase):
                     )
         return self
 
-    # The WebUI's paste box (the manifest's only field; rationale on its SETUP_SPEC):
-    # the WHOLE channels.voice section as one JSON object, deep-merged at parse time
-    # (paste wins) and expanded into real config.json keys at channel start by
-    # consume_import_json(), which deletes the blob — a transport, never a stored copy.
+    # The WebUI's paste box (the manifest's only field): the WHOLE channels.voice section as one
+    # JSON object, deep-merged at parse time (paste wins) and expanded into real config.json keys
+    # at channel start by consume_import_json(), which deletes the blob — a transport, never a
+    # stored copy.
     import_json: str | None = None
 
-    # LOCAL backend: operator text appended to the voice runtime-context block — the
-    # voice-scoped seam for guidance that must not leak elsewhere (a SOUL.md directive
-    # applies to every channel; THIS is spoken turns only). Re-sent on every turn, so
-    # keep it to a nudge; nanobot owns the local persona, cloud ones realtime.persona.
+    # LOCAL backend: operator text appended to the voice runtime-context block — guidance scoped
+    # to spoken turns (a SOUL.md directive applies to every channel). Re-sent on every turn, so
+    # keep it to a nudge; nanobot owns the local persona, realtime.persona the cloud ones.
     context: str | None = None
 
     audio: AudioConfig = Field(default_factory=AudioConfig)
@@ -1071,9 +982,8 @@ class VoiceConfig(_VoiceBase):
     @model_validator(mode="before")
     @classmethod
     def _merge_import_json(cls, data: Any) -> Any:
-        """Fold a pending ``importJson`` paste into the section it configures. Runs in
-        any order relative to ``_fold_alias_twins``: it reads both spellings itself and
-        leaves exactly one behind, so the fold never sees a conflict it must guess at.
+        """Fold a pending ``importJson`` paste into the section it configures. Order-independent
+        vs ``_fold_alias_twins``: it reads both spellings itself and leaves exactly one behind.
         The raw blob is kept on the field so ``start()`` knows to consume it."""
         if not isinstance(data, dict):
             return data
@@ -1127,12 +1037,11 @@ class VoiceConfig(_VoiceBase):
 
 
 def consume_import_json(config_path: Path | None = None) -> int:
-    """Expand a pending ``channels.voice.importJson`` paste in ``config.json`` into the
-    real section keys and delete the blob; returns how many top-level keys the paste
-    carried (0 = nothing pending). Read-modify-write on the FILE, not core's in-memory
-    ``Config``: core's own writers load fresh per operation, so this is the same
-    contract as a hand edit landing between two WebUI saves. Only the voice section is
-    touched; the rest of the document is re-serialized in core's own format
+    """Expand a pending ``channels.voice.importJson`` paste in ``config.json`` into real section
+    keys and delete the blob; returns how many top-level keys the paste carried (0 = nothing
+    pending). Read-modify-write on the FILE, not core's in-memory ``Config`` (core's writers load
+    fresh per operation, so this is the same contract as a hand edit between two WebUI saves).
+    Only the voice section is touched; the rest is re-serialized in core's own format
     (indent=2, ensure_ascii=False).
     """
     if config_path is None:
@@ -1161,8 +1070,7 @@ def consume_import_json(config_path: Path | None = None) -> int:
 
 
 def _write_json_atomic(path: Path, document: Any) -> None:
-    """Same shape as core's config writer: temp file in place, mode preserved
-    (config.json holds secrets), fsync, atomic replace."""
+    """Core's config-writer shape: temp file in place, mode preserved (secrets), fsync, replace."""
     import stat
     from contextlib import suppress
 

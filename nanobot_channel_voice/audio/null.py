@@ -1,6 +1,6 @@
-"""No-op audio backend for headless hosts (no ALSA tools/devices): capture yields paced
-silence so the interaction loop runs without ever producing an utterance, playback
-discards; keeps the channel alive instead of crashing the gateway.
+"""No-op audio backend for headless hosts: capture yields paced silence so the loop
+runs without ever producing an utterance, playback discards. Keeps the channel alive
+instead of crashing the gateway.
 """
 
 from __future__ import annotations

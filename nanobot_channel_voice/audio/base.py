@@ -1,7 +1,6 @@
-"""Audio backend interfaces: the only view the interaction loop has of the concrete
-backend (arecord/aplay subprocess, in-process pyalsaaudio, or null). All PCM is 16-bit
-little-endian mono at the configured sample rate; blob playback additionally receives
-a complete, self-describing WAV.
+"""Audio backend interfaces: the interaction loop's only view of the concrete backend
+(arecord/aplay, pyalsaaudio, or null). All PCM is S16_LE mono at the configured sample
+rate; blob playback instead receives a complete, self-describing WAV.
 """
 
 from __future__ import annotations
@@ -23,12 +22,11 @@ class CaptureSource(abc.ABC):
         """Return exactly one frame of S16_LE mono PCM, or ``b""`` at end of stream."""
 
     async def flush(self) -> int:
-        """Discard capture already buffered behind :meth:`read_frame` (pipe/queue
-        backlog) without blocking on new audio, returning the bytes dropped. The mic
-        gate applies at READ time but the device records continuously, so frames
-        captured while the bot was audible would replay into the VAD as fresh speech;
-        the shell calls this at the gate-reopen edge to realign the read position with
-        the wall clock. Default: paced sources hold no backlog."""
+        """Discard capture already buffered behind :meth:`read_frame` without blocking
+        on new audio; returns bytes dropped. The mic gate applies at READ time but the
+        device records continuously, so the shell calls this at the gate-reopen edge or
+        audio from while the bot was audible replays into the VAD as fresh speech.
+        Default: paced sources hold no backlog."""
         return 0
 
     @abc.abstractmethod
@@ -38,9 +36,8 @@ class CaptureSource(abc.ABC):
 class PlaybackStream(abc.ABC):
     """One open raw-PCM playback stream (S16_LE mono, fixed rate).
 
-    The CALLER owns it, so whoever holds the handle can always ``kill()`` it
-    (including while another task is inside ``drain()``) and barge-in never races hidden
-    backend state. ``drain()`` and ``kill()`` are terminal, idempotent, and may run
+    The CALLER owns it: ``kill()`` is valid at any moment, including inside another
+    task's ``drain()``. ``drain()`` and ``kill()`` are terminal, idempotent, and may run
     concurrently with each other or an in-flight ``write()``, which then discards.
     """
 
@@ -50,8 +47,7 @@ class PlaybackStream(abc.ABC):
     @property
     def dead(self) -> bool:
         """The device died UNDER the stream (not a deliberate drain/kill) and writes are
-        being discarded, so the sink can reopen instead of feeding a corpse for the rest
-        of the turn. False for backends that cannot tell."""
+        being discarded, so the sink can reopen. False for backends that cannot tell."""
         return False
 
     @abc.abstractmethod
@@ -66,7 +62,7 @@ class PlaybackStream(abc.ABC):
 class PlaybackSink(abc.ABC):
     """A speaker sink that plays complete WAV blobs one at a time. :meth:`open_stream`
     is the optional gapless raw-PCM path used by the stream-mode ``AudioSink``; the
-    default raises so a backend without it fails loudly rather than mis-playing."""
+    default raises so a backend without it fails loudly."""
 
     @abc.abstractmethod
     async def play_wav(self, wav_bytes: bytes) -> bool:

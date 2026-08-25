@@ -1,11 +1,8 @@
 """Shared machinery for the engine registries (stt / tts / vad).
 
-Each registry keeps its own fallback POLICY (delegate to nanobot, degrade to the
-system voice, fall back to energy VAD) and wording; here lives the shape they
-share: the spec table entry, dotted-attribute resolution into nested config
-blocks, the required-field check, and turning a build failure into an actionable
-message: a missing optional dependency names its pip extra instead of a bare
-``No module named 'kaldi_native_fbank'``.
+Each registry keeps its own fallback POLICY and wording; here lives the shape they
+share: the spec table entry, dotted-attribute resolution, the required-field check, and
+turning a build failure into a message that names the missing pip extra.
 """
 
 from __future__ import annotations
@@ -18,12 +15,11 @@ from typing import Any
 
 @dataclass(frozen=True)
 class EngineSpec:
-    """One selectable engine: required config fields (dotted attr path +
-    camelCase name for the warning), the importable modules it needs beyond the
-    hard dependencies (probed by :func:`preflight`, never imported here), and a
-    lazily-importing factory. The factory signature is registry-specific
-    (stt/tts pass ``cfg``; vad adds the rates). ``required_any`` lists alternative
-    field-sets; satisfied when any one set is fully present."""
+    """One selectable engine: required config fields (dotted attr path + camelCase name
+    for the warning), the optional modules it needs (probed by :func:`preflight`, never
+    imported here), and a lazily-importing factory. Factory signature is
+    registry-specific (stt/tts pass ``cfg``; vad adds the rates). ``required_any`` lists
+    alternative field-sets; satisfied when any one set is fully present."""
 
     build: Callable[..., Any]
     required: tuple[tuple[str, str], ...] = ()
@@ -54,9 +50,9 @@ def missing_fields(cfg: Any, spec: EngineSpec) -> list[str]:
     return missing
 
 
-# Top-level module name of a failed import -> the pyproject extra providing it.
-# Only imports surfacing through make_audio/make_stt/make_tts/make_vad reach here;
-# realtime/aec/otel/text-frontend catch ImportError themselves with more context.
+# Top-level module name of a failed import -> the pyproject extra providing it. Only
+# make_audio/make_stt/make_tts/make_vad reach here; realtime/aec/otel/text-frontend
+# catch ImportError themselves with more context.
 _EXTRA_BY_MODULE = {
     "numpy": "ondevice",
     "onnxruntime": "ondevice",
@@ -64,9 +60,8 @@ _EXTRA_BY_MODULE = {
     "webrtcvad": "webrtc",
     "alsaaudio": "pyalsa",
     # A .rknn load with NEITHER runtime installed surfaces as the LAST import attempt's
-    # module ("rknn", the full-toolkit fallback); "rknnlite" covers any future direct
-    # import. The extra only resolves on aarch64 Linux <= py3.12 (see pyproject);
-    # elsewhere the fix is a .onnx artifact, but naming the extra still points at the doc.
+    # module ("rknn"); "rknnlite" covers a future direct import. The extra resolves only
+    # on aarch64 Linux <= py3.12; elsewhere the real fix is a .onnx artifact.
     "rknn": "rknn",
     "rknnlite": "rknn",
     "espeakng_loader": "espeak",
@@ -82,21 +77,23 @@ def describe_build_error(exc: BaseException) -> str:
     return str(exc)
 
 
-def preflight(cfg: Any, engine: str, table: dict[str, EngineSpec], *, prefix: str = "") -> str | None:
-    """Validate-time mirror of a registry's fallback triggers: the static reason
-    the selected engine would degrade at start: an unresolvable ``weights``
-    store key, unset required fields, or a missing optional dependency; else
-    None. Engines outside the table (the zero-config defaults) are always None.
-    Nothing is imported or loaded; runtime construction can still fail.
-    ``prefix`` (e.g. ``"vad."``) turns the block-relative field names into full
-    config keys for user-facing messages."""
+def preflight(
+    cfg: Any, engine: str, table: dict[str, EngineSpec], *, prefix: str = "",
+    block: str | None = None,
+) -> str | None:
+    """Validate-time mirror of a registry's fallback triggers: the static reason the
+    selected engine would degrade at start (unresolvable ``weights`` key, unset required
+    fields, missing optional dependency), else None. Engines outside the table are always
+    None. Nothing is imported or loaded; runtime construction can still fail. ``prefix``
+    (``"vad."``) makes field names full config keys; ``block`` names the weights
+    sub-block when it differs from the engine (``vad.turn`` -> ``"smartturn"``)."""
     spec = table.get(engine)
     if spec is None:
         return None
     from nanobot_channel_voice.weights import WeightsError, apply_weights
 
     try:
-        cfg = apply_weights(cfg, engine)
+        cfg = apply_weights(cfg, block or engine)
     except WeightsError as exc:
         return str(exc)
     missing = missing_fields(cfg, spec)

@@ -1,16 +1,12 @@
 """openWakeWord-format acoustic wake word over ONNX/RKNN (``wake.engine="openwakeword"``).
 
-Original upstream artifacts, chained host-side exactly as the upstream runtime
-chains them: a mel frontend — ``melspectrogram.onnx``, or its frozen filterbank
-``mel_filters.npy`` through :class:`PythonMelFrontend` for NPU packages — (raw
-int16-valued float samples in, mel frames out, then the fixed ``x/10 + 2``
-transform), the shared ``embedding_model.onnx`` (76 mel frames -> one 96-dim
-embedding, stride 8 = one embedding per 80 ms chunk), and a per-phrase
-classifier head (a window of embeddings -> one sigmoid score). livekit-wakeword
-heads follow the same backbone contract and load through the same path. 16 kHz
-only; scoring cadence
-is one decision per 1280-sample chunk (~12.5 Hz), cheap enough for the frame
-hop even on A55-class CPUs.
+Upstream artifacts, chained host-side exactly as the upstream runtime chains them: a mel
+frontend (``melspectrogram.onnx``, or its frozen filterbank ``mel_filters.npy`` through
+:class:`PythonMelFrontend` for NPU packages) taking raw int16-VALUED float samples and
+applying the fixed ``x/10 + 2`` transform, the shared ``embedding_model.onnx`` (76 mel
+frames -> one 96-dim embedding, stride 8 = one per 80 ms chunk), and a per-phrase
+classifier head (a window of embeddings -> one sigmoid score). livekit-wakeword heads
+share the backbone contract. 16 kHz only; one decision per 1280-sample chunk (~12.5 Hz).
 """
 
 from __future__ import annotations
@@ -23,12 +19,12 @@ from loguru import logger
 
 from nanobot_channel_voice.aio import Throttle
 from nanobot_channel_voice.config import OpenWakeWordConfig
-from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
+from nanobot_channel_voice.ondevice.runtime import OnDeviceModel, check_deterministic
 from nanobot_channel_voice.wake.base import WakeDetector
 
-# Upstream pipeline geometry (openWakeWord AudioFeatures): 80 ms steps at 16 kHz;
-# the mel model sees each chunk with 3 hops of left context so edge frames get a
-# full 25 ms analysis window; 8 new mel frames per chunk (160-sample hop).
+# Upstream geometry (openWakeWord AudioFeatures): 80 ms steps at 16 kHz; the mel model
+# sees each chunk with 3 hops of left context so edge frames get a full analysis window;
+# 8 new mel frames per chunk (160-sample hop).
 _RATE = 16000
 _CHUNK = 1280
 _MEL_CONTEXT = 480
@@ -45,11 +41,10 @@ _FAIL_LOG_EVERY_S = 30.0
 
 
 class PythonMelFrontend:
-    """Exact numpy port of ``melspectrogram.onnx``, fed by its frozen mel
-    matrix (``mel_filters.npy``): unpadded 512-point STFT, power, mel, dB with
-    the graph's dynamic ``max - 80`` per-call floor. For NPU packages, whose
-    STFT ops don't convert; parity with the ONNX graph is ~2e-5 dB. Duck-types
-    the ``OnDeviceModel`` surface the adapter touches."""
+    """Exact numpy port of ``melspectrogram.onnx``, fed by its frozen mel matrix:
+    unpadded 512-point STFT, power, mel, dB with the graph's dynamic ``max - 80``
+    per-call floor. For NPU packages, whose STFT ops don't convert; measured parity
+    ~2e-5 dB. Duck-types the ``OnDeviceModel`` surface the adapter touches."""
 
     def __init__(self, filters_path: str):
         filters = np.load(filters_path)
@@ -106,9 +101,8 @@ class OpenWakeWord(WakeDetector):
                 "openWakeWord needs exactly one mel frontend: melPath "
                 "(melspectrogram.onnx) or melFiltersPath (mel_filters.npy)"
             )
-        # _validate() raising is the EXPECTED path make_wake_detector catches to
-        # degrade to the transcript tier, so the ExitStack must release every
-        # claimed session on it.
+        # The prime raising is the EXPECTED make_wake_detector degrade path, so the
+        # ExitStack must release every claimed session on it.
         with ExitStack() as models:
             kw = dict(
                 core_mask=core_mask, target=target, device_id=device_id,
@@ -119,9 +113,8 @@ class OpenWakeWord(WakeDetector):
                 self._mel = models.enter_context(OnDeviceModel(mel_path, **kw))
             else:
                 self._mel = PythonMelFrontend(mel_filters_path)  # type: ignore[arg-type]
-            # The TF-derived import reports an NHWC [N,32,1,76] input while
-            # the graph computes on [N,76,32,1]; (0,2,3,1) hands Lite its
-            # expected buffer (see OnDeviceModel.rknn_input_permutation).
+            # The TF-derived import reports NHWC [N,32,1,76] while the graph computes
+            # on [N,76,32,1]; (0,2,3,1) hands Lite the buffer it expects.
             self._emb = models.enter_context(
                 OnDeviceModel(embedding_path, rknn_input_permutation=(0, 2, 3, 1), **kw)
             )
@@ -169,37 +162,30 @@ class OpenWakeWord(WakeDetector):
         return specs[0][0] if specs else fallback  # RKNN: no introspection, positional anyway
 
     def release(self) -> None:
-        """Give the sessions/NPU contexts back. Idempotent; refcount-GC does NOT
-        free an RKNN context."""
+        """Idempotent; refcount-GC does NOT free an RKNN context."""
         for model in (self._mel, self._emb, self._head):
             model.release()
 
     def reset(self) -> None:
         self._pending = np.empty(0, dtype=np.float32)
-        # A full-context zero tail makes EVERY mel call exactly
-        # [1, context+chunk]: uniform shapes are what a fixed-graph RKNN port
-        # needs, and the edge effect is one padded analysis window.
+        # A full-context zero tail makes EVERY mel call exactly [1, context+chunk]:
+        # a fixed-graph RKNN port needs uniform shapes.
         self._raw_tail = np.zeros(_MEL_CONTEXT, dtype=np.float32)
-        # Upstream startup state: a full ones window (transformed-mel space),
-        # so scoring starts on the FIRST chunk — empty would leave an ~800 ms
-        # deaf window after every reset (session start, capture gaps).
+        # Upstream startup state: a full ones window (transformed-mel space), so
+        # scoring starts on the FIRST chunk — empty leaves an ~800 ms deaf window.
         self._mels = np.ones((_EMB_WINDOW, _MEL_BINS), dtype=np.float32)
-        # Restore the primed embedding window: all-zero rows are outside the
-        # embedding model's output distribution and can score arbitrarily on
-        # some heads (upstream prefills with noise embeddings for the same
-        # reason).
+        # Restore the primed embedding window: all-zero rows are outside the embedding
+        # model's output distribution and score arbitrarily on some heads.
         self._embs = self._embs_prime.copy()
         self._armed = True          # re-armed by a sub-threshold score
         self._last_hit = float("-inf")
         self.last_score = None
 
     def _prime_and_validate(self) -> None:
-        """One pass of noise audio through the whole pipeline at construction:
-        proves all three models' I/O contracts (an incompatible export fails
-        HERE and the registry degrades to the transcript tier instead of
-        failing per-frame in the hop) and captures a REAL-embedding window for
-        ``reset()`` to restore — upstream parity (its AudioFeatures prefills
-        the feature buffer from 4 s of random audio)."""
+        """One noise pass through the whole pipeline: proves all three models' I/O
+        contracts HERE (an incompatible export degrades to the transcript tier, rather
+        than failing per-frame in the hop) and captures the REAL-embedding window
+        ``reset()`` restores."""
         rng = np.random.default_rng(0)  # deterministic: the same prime every start
         noise = rng.integers(-1000, 1000, _PRIME_SECONDS * _RATE).astype(np.float32)
         score = None
@@ -219,13 +205,19 @@ class OpenWakeWord(WakeDetector):
                 "single-score per-phrase heads are supported (multi-class "
                 "exports would silently score the wrong class)."
             )
-        # Loose band: int8 dequantization may jitter a real sigmoid slightly
-        # outside [0, 1]; a logit/swapped output lands far outside it.
+        # Loose band: int8 dequantization jitters a real sigmoid slightly outside
+        # [0, 1]; a logit/swapped output lands far outside.
         if score is None or not (-0.05 <= score <= 1.05):
             raise RuntimeError(
                 f"openWakeWord head score {score} is not sigmoid-like "
                 "-- check the model export (output order/shape)."
             )
+        # A sigmoid head saturates, so corrupt embeddings still score in-band: only
+        # repeating the embedding call separates a broken runtime from a quiet room.
+        check_deterministic(self._emb, [(
+            self._emb_in,
+            np.ascontiguousarray(self._mels.reshape(1, _EMB_WINDOW, _MEL_BINS, 1)),
+        )])
         self._embs_prime = self._embs.copy()
         self.reset()  # the probe must not leave its own streaming state behind
 
@@ -253,8 +245,8 @@ class OpenWakeWord(WakeDetector):
 
     def _debounce(self, score: float, now: float | None = None) -> bool:
         """Threshold + re-arm hysteresis + refractory: one hit per crossing, no
-        retriggers while the score rides above the threshold, and a floor on
-        hit spacing (the same phrase echoing in a room must not double-fire)."""
+        retriggers while the score rides high, and a floor on hit spacing (a room echo
+        must not double-fire)."""
         t = time.monotonic() if now is None else now
         if score >= self._threshold:
             hit = self._armed and (t - self._last_hit) >= self._refractory_s

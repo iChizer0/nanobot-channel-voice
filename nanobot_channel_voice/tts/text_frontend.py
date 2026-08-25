@@ -3,9 +3,8 @@ tokenizer of a char-input TTS model (e.g. MMS-TTS / VITS). Language deps import 
 so a missing one raises an error the registry turns into the system-TTS fallback.
 
 * ``none``:     identity; Latin scripts need no romanization.
-* ``uroman``:   romanize ANY script to Latin (the documented MMS path for non-Latin
-                 languages; ``[uroman]`` extra). Context-free: good for kana,
-                 imperfect for kanji.
+* ``uroman``:   romanize ANY script to Latin (the documented MMS path; ``[uroman]``
+                 extra). Context-free: good for kana, imperfect for kanji.
 * ``japanese``: ``pyopenjtalk`` reads kanji -> katakana, then ``uroman`` romanizes
                  the reading (``[japanese]`` extra).
 """
@@ -82,11 +81,9 @@ def _sub_padded(pattern: re.Pattern[str], text: str, render: Callable[[str], str
 
 
 # ---- English number verbalization -------------------------------------------
-#
 # MMS char vocabs carry few or no digits (mms-tts-eng has "0"-"6", no 7, 8, 9!), so
-# unverbalized numbers are silently mangled: "at 7:45" tokenizes to "4 5", corrupting
-# exactly the highest-value content. English-only; other languages need their own
-# verbalizer and rely on the shell's speakability-guard warning instead.
+# unverbalized numbers are silently mangled: "at 7:45" tokenizes to "4 5". English
+# only; other languages need their own verbalizer.
 
 _ONES = (
     "zero one two three four five six seven eight nine ten eleven twelve "
@@ -120,8 +117,7 @@ def en_digit_words(digits: str) -> str:
 
 
 def _en_run_words(run: str) -> str:
-    """A cardinal never carries a leading zero, and reading one as a cardinal deletes
-    it ("007" -> "seven")."""
+    """A cardinal never carries a leading zero: reading "007" as one deletes it."""
     return en_digit_words(run) if len(run) > 1 and run[0] == "0" else _int_words(int(run))
 
 
@@ -175,8 +171,8 @@ def _en_percent(text: str) -> str:
 def _dotted_words(
     number: str, point: str, digits: Callable[[str], str], run_words: Callable[[str], str]
 ) -> str:
-    """Dotted parts, joined by the spoken dot. A dotted quad is an address, read
-    digit-wise; anything else is a version, whose parts are numbers."""
+    """Dotted parts joined by the spoken dot: a dotted quad is an address (digit-wise),
+    anything else a version (parts are numbers)."""
     parts = number.split(".")
     ip = len(parts) == 4 and all(len(p) <= 3 and int(p) <= 255 for p in parts)
     return point.join((digits if ip else run_words)(p) for p in parts)
@@ -192,13 +188,13 @@ def verbalize_numbers_en(text: str) -> str:
     text = _RE_EN_DECADE.sub(_en_decade, text)
     text = _sub_padded(_RE_CURRENCY, text, _en_currency)
     text = _RE_DEGREES.sub(_en_degrees, text)
-    text = _RE_DOTTED.sub(
-        lambda m: _dotted_words(m.group(), " point ", en_digit_words, _en_run_words), text
+    text = _sub_padded(
+        _RE_DOTTED, text,
+        lambda run: _dotted_words(run, " point ", en_digit_words, _en_run_words),
     )
     text = _RE_TIME.sub(_time_words, text)
     text = _sub_padded(_RE_PERCENT, text, _en_percent)
-    # Decimal before grouped, or "1,234.56" loses its integer part to words and
-    # strands an unspeakable "."
+    # Decimal before grouped, or "1,234.56" loses its integer part and strands a ".".
     text = _sub_padded(_RE_DECIMAL, text, _en_amount_words)
     text = _RE_GROUPED.sub(lambda m: _int_words(int(m.group().replace(",", ""))), text)
     text = _RE_ORDINAL.sub(lambda m: _ordinal_words(int(m.group(1))), text)
@@ -207,9 +203,8 @@ def verbalize_numbers_en(text: str) -> str:
 
 
 # ---- Chinese number verbalization -------------------------------------------
-#
 # Same failure as English: the matcha zh lexicon voices 零..九 but has no "0".."9"
-# entries, so unverbalized digits are dropped as OOV: exactly the highest-value content.
+# entries, so unverbalized digits are dropped as OOV.
 
 _ZH_DIGITS = "零一二三四五六七八九"
 _ZH_SMALL_UNITS = ("", "十", "百", "千")
@@ -281,19 +276,18 @@ def _zh_time_words(m: re.Match) -> str:
 # is decimal-aware and runs BEFORE decimal or "3.5%" loses its integer part.
 _RE_TIME_ZH = re.compile(r"(?<!\d)(\d{1,2})[:：]([0-5]\d)(?!\d)")
 _RE_GROUPED_ZH = re.compile(rf"(?<!\d){_GROUPED}(?!\d)")
-_RE_PERCENT_ZH = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*[%％]")
-_RE_DECIMAL_ZH = re.compile(r"(?<!\d)(\d+)\.(\d+)(?!\d)")
-# A year is read digit-wise in Mandarin — 2026年 is 二零二六年, never 两千零二十六年.
-# Bounded to 1000-2999: the residue it cannot separate is a round duration ("共2000年").
-# A range's head carries no 年 of its own (2020至2024年), so the lookahead reaches
-# through the connective.
+_RE_PERCENT_ZH = re.compile(rf"(?<!\d)((?:{_GROUPED}|\d+)(?:\.\d+)?)\s*[%％]")
+_RE_DECIMAL_ZH = re.compile(rf"(?<!\d)({_GROUPED}|\d+)\.(\d+)(?!\d)")
+# A year reads digit-wise in Mandarin (2026年 = 二零二六年, never 两千零二十六年), bounded
+# to 1000-2999 (the residue is a round duration, "共2000年"). A range's head carries no
+# 年 of its own (2020至2024年), so the lookahead reaches through the connective.
 _RE_YEAR_ZH = re.compile(r"(?<!\d)[12]\d{3}(?=年|[至到~～][12]\d{3}年)")
 # Generation labels read digit-wise: 90后/85后 are 九零后/八五后, never 九十后.
 # 后面/后边/后方/后头 mark position ("排在10后面"), not a cohort.
 _RE_ZH_GEN = re.compile(r"(?<!\d)\d[05](?=后(?![面边方头]))")
-# "08月" is a date field, not an identifier: drop the pad before the leading-zero
-# sequence rule claims it (零八月). Only 月/日 are safe — 号 marks an identifier
-# (订单08号) as often as a day, and 分/秒 keep their 零 (三点零五分).
+# "08月" is a date field: drop the pad before the leading-zero sequence rule claims it
+# (零八月). Only 月/日 are safe — 号 marks an identifier (订单08号) as often as a day,
+# and 分/秒 keep their 零 (三点零五分).
 _RE_ZH_PADDED_DATE = re.compile(r"(?<!\d)0([1-9])(?=[月日])")
 _RE_INT_ZH = re.compile(r"\d+")
 
@@ -302,9 +296,8 @@ _ZH_VALUE = {ch: i for i, ch in enumerate(_ZH_DIGITS)} | {"两": 2}
 
 
 def zh_numeral_value(run: str) -> int | None:
-    """Value of a zh numeral run (四十五 -> 45, 两百 -> 200); a run with no unit
-    character reads positionally (一二三 -> 123). None when any character is
-    not numeral material."""
+    """Value of a zh numeral run (四十五 -> 45, 两百 -> 200); with no unit character it
+    reads positionally (一二三 -> 123). None when a character is not numeral material."""
     if not run or any(ch not in _ZH_VALUE and ch not in "十百千万亿" for ch in run):
         return None
     if all(ch in _ZH_VALUE for ch in run):
@@ -334,15 +327,21 @@ def verbalize_numbers_zh(text: str) -> str:
     text = _RE_ZH_PADDED_DATE.sub(r"\1", text)
     text = _sub_padded(_RE_CURRENCY, text, _zh_currency)
     text = _RE_DEGREES.sub(_zh_degrees, text)
-    text = _RE_DOTTED.sub(
-        lambda m: _dotted_words(m.group(), "点", zh_digit_words, _zh_run_words), text
+    text = _sub_padded(
+        _RE_DOTTED, text,
+        lambda run: _dotted_words(run, "点", zh_digit_words, _zh_run_words),
     )
     text = _RE_TIME_ZH.sub(_zh_time_words, text)
-    text = _RE_GROUPED_ZH.sub(lambda m: m.group().replace(",", ""), text)
-    text = _RE_PERCENT_ZH.sub(lambda m: f"百分之{_zh_number(m.group(1))}", text)
-    text = _RE_DECIMAL_ZH.sub(
-        lambda m: f"{_zh_int(int(m.group(1)))}点{zh_digit_words(m.group(2))}", text
+    text = _RE_PERCENT_ZH.sub(
+        lambda m: f"百分之{_zh_number(m.group(1).replace(',', ''))}", text
     )
+    text = _RE_DECIMAL_ZH.sub(
+        lambda m: f"{_zh_int(int(m.group(1).replace(',', '')))}点{zh_digit_words(m.group(2))}",
+        text,
+    )
+    # To WORDS, after the amount passes and before the sequence pass: dropping the
+    # separators alone leaves a 7-digit run that _SEQ_MIN_BARE claims as an id.
+    text = _RE_GROUPED_ZH.sub(lambda m: _zh_int(int(m.group().replace(",", ""))), text)
     # Sequences first: _RE_YEAR_ZH would eat the tail of "2020-2024年" and strand the head.
     text = _read_sequences(text, "zh", zh_digit_words)
     text = _RE_YEAR_ZH.sub(lambda m: zh_digit_words(m.group()), text)
@@ -351,7 +350,6 @@ def verbalize_numbers_zh(text: str) -> str:
 
 
 # ---- dates, currency and degrees ---------------------------------------------
-#
 # Dates are ISO order only: DD-MM and MM-DD are ambiguous with each other and with
 # id fragments.
 
@@ -359,28 +357,26 @@ _HYPHENS = r"\-‑–"  # escaped: it is interpolated into character classes
 _MONTHS_EN = ("January", "February", "March", "April", "May", "June", "July",
               "August", "September", "October", "November", "December")
 _MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)  # Feb 29 allowed blind
-# Same separator both times; a trailing 日/号 means the writer already suffixed the
-# date, which the renderers would double. "." is a separator too (2026.8.19, common
-# in zh/ja writing) — a year-based software version (2024.1.2) then reads as a date,
-# the rarer shape in speech; ".digit" after the day marks a version and bails out.
+# Same separator both times; a trailing 日/号 means the writer already suffixed the date,
+# which the renderers would double. "." is a separator too (2026.8.19), so a year-based
+# version (2024.1.2) reads as a date; ".digit" after the day bails out.
 _RE_ISO_DATE = re.compile(
     rf"(?<![\d{_HYPHENS}/.])[12]\d{{3}}([{_HYPHENS}/.])(?:0?[1-9]|1[0-2])\1"
     rf"(?:0?[1-9]|[12]\d|3[01])(?![\d{_HYPHENS}/日号]|\.\d)"
 )
 # The ISO timestamp's T reads as a letter and glues the time shut ("19T21:33").
 _RE_ISO_T = re.compile(r"(?<=\d)T(?=\d{1,2}:\d{2})")
-# symbol -> (en singular, en plural, zh); the regex class derives from the keys so
-# they cannot drift. ¥ reads as CNY: bilingual context makes yuan the likelier unit.
+# symbol -> (en singular, en plural, zh); the regex class derives from the keys so they
+# cannot drift. ¥ reads as CNY.
 _CURRENCIES = {
     "$": ("dollar", "dollars", "美元"), "€": ("euro", "euros", "欧元"),
     "£": ("pound", "pounds", "英镑"), "¥": ("yuan", "yuan", "元"),
     "￥": ("yuan", "yuan", "元"),
 }
-# A scale word belongs in front of the relocated unit ($5 million -> 5 million
-# dollars, ¥200万 -> 200万元). Shapes the pass cannot own — a glued letter suffix
-# ($100k), a range or time tail ($20-30, $12:30), 多/几万, an explicit unit word
-# (¥199元, $5 million dollars) — fall through to the plain number passes. The digit
-# in the guard stops backtracking from claiming a prefix ($1,234k must not match $1).
+# A scale word belongs in front of the relocated unit ($5 million -> 5 million dollars).
+# Shapes the pass cannot own — glued suffix ($100k), range or time tail ($20-30, $12:30),
+# 多/几万, explicit unit (¥199元) — fall through. The digit in the guard stops
+# backtracking onto a prefix ($1,234k vs $1).
 _RE_CURRENCY = re.compile(
     rf"[{''.join(_CURRENCIES)}]\s?(?:{_GROUPED}|\d+)(?:\.\d+)?"
     rf"(?:\s?(?:thousand|million|billion|trillion)\b|[万亿]+)?"
@@ -389,14 +385,14 @@ _RE_CURRENCY = re.compile(
     re.IGNORECASE,
 )
 # The minus survives only here: elsewhere a hyphen marks a range or id as often as a
-# sign, but "-3.5°C" is a temperature, and the sign is OOV in every lexicon path.
-# The lookbehinds keep "20-30°C" a range and "wind-3°C" a compound.
+# sign, and the sign is OOV in every lexicon path. The lookbehinds keep "20-30°C" a
+# range and "wind-3°C" a compound.
 _RE_DEGREES = re.compile(
     r"(?<!\d)(?:(?<![A-Za-z])([-−])\s?)?(\d+(?:\.\d+)?)\s*(?:°\s?[CF](?![A-Za-z])|℃|℉)",
     re.IGNORECASE,
 )
-# The two-codepoint spellings _RE_DEGREES accepts, foldable to their single
-# codepoints — which are non-alpha, so a script classifier keeps them neutral.
+# The two-codepoint spellings _RE_DEGREES accepts, foldable to the single codepoints
+# (non-alpha, so a script classifier keeps them neutral).
 _RE_DEGREE_MARK = re.compile(r"(?<=\d)(\s?)°\s?([CF])(?![A-Za-z])", re.IGNORECASE)
 _RE_ONE = re.compile(r"1(?:\.0+)?")  # the amounts that read singular
 
@@ -407,9 +403,8 @@ def _date_parts(date: str) -> tuple[str, int, int]:
 
 
 def _sub_dates(text: str, render: Callable[[str], str]) -> str:
-    """``_sub_padded`` over ISO dates, plus the calendar check the regex cannot do:
-    an impossible day (2026-02-30) marks an identifier, which keeps its sequence
-    reading."""
+    """``_sub_padded`` over ISO dates, plus the calendar check the regex cannot do: an
+    impossible day (2026-02-30) is an identifier and keeps its sequence reading."""
 
     def _one(m: re.Match[str]) -> str:
         _, month, day = _date_parts(m.group())
@@ -440,9 +435,8 @@ _RE_EN_MONTH_DAY = re.compile(
     rf"(?!\d|[:：]\d)"  # "May 12:30" is a month and a clock, not a day
 )
 _RE_EN_MONTH_YEAR = re.compile(rf"\b({_MONTH_ALT}),?\s+([12]\d{{3}})\b(?![\d:：])")
-# A bare 4-digit decade is unambiguous; a 2-digit one needs a determiner or "30s"
-# could as well be thirty seconds. The possessive ("1990's hits") is a spoken
-# homophone of the plural, so the apostrophe is welcome either side.
+# A bare 4-digit decade is unambiguous; a 2-digit one needs a determiner or "30s" could
+# be thirty seconds. The possessive ("1990's hits") is a spoken homophone of the plural.
 _RE_EN_DECADE = re.compile(
     r"\b(?:([12]\d{2}0)|(?:the|his|her|their|your|my|our|early|late|mid)"
     r"[ \-]['’]?([2-9]0))['’]?s\b"
@@ -457,9 +451,8 @@ def _en_decade(m: re.Match[str]) -> str:
 
 
 def _sub_month_dates(text: str) -> str:
-    """"August 19(, 2026)" and "August(,) 2026": ordinal day, spoken year. A unit
-    after the number keeps a quantity a quantity ("May 5 minutes"); so does an
-    impossible day."""
+    """"August 19(, 2026)" and "August(,) 2026": ordinal day, spoken year. A trailing
+    unit ("May 5 minutes") or an impossible day keeps the quantity reading."""
 
     def _day(m: re.Match[str]) -> str:
         day = int(m.group(2))
@@ -518,10 +511,8 @@ def fold_degree_marks(text: str) -> str:
 
 
 # ---- sequence detection ------------------------------------------------------
-#
 # A digit run reads as a SEQUENCE, not a quantity, when the surface form carries evidence
-# a cardinal cannot produce or a trigger word names it. Held out, the pair never read a
-# quantity as a sequence; a miss is just the cardinal reading.
+# a cardinal cannot produce or a trigger word names it. A miss is the cardinal reading.
 
 _SEQ_MIN_BARE = 7  # conversational text does not state a 7-digit quantity ungrouped
 _SEQ_MIN_GLUE = 3  # shorter and letter-glued is a model name: COVID-19, gate B12
@@ -573,7 +564,7 @@ _RE_ZH_UNIT = re.compile(r"^\s*(?:" + "|".join(sorted(_ZH_UNITS, key=len, revers
 
 
 def _en_triggered(left: str) -> bool:
-    """Whole-token match over the last four words — as a substring, "phone" would make
+    """Whole-token match over the last four words: as a substring, "phone" would make
     every iPhone a phone number."""
     tail = [t.lower() for t in _RE_WORD.findall(left)[-4:]]
     return bool(_EN_TRIGGERS.intersection(tail)) or any(
@@ -622,7 +613,9 @@ def _sequence_spans(text: str, lang: str) -> list[tuple[int, int, str, list[str]
             continue
         parts = _RE_RUN.findall(g.group())
         if _RE_YEAR_RANGE.match(g.group()):
-            spans.append((*g.span(), "year_range", parts))
+            spans.append((*g.span(), "year_range", parts))  # "2020-2024年" keeps its 年
+        elif unit.match(text[g.end():g.end() + _CTX_RIGHT]):
+            continue  # "5-10 minutes" is a quantity range: the same guard bare runs get
         elif (g.group()[0] == "+" or len(parts) > 2 or len({len(p) for p in parts}) > 1
                 or sum(map(len, parts)) >= _SEQ_MIN_BARE):
             spans.append((*g.span(), "digits", parts))
@@ -650,7 +643,7 @@ def _read_sequences(
     """Replace each sequence span with its reading; unclaimed runs fall through to the
     cardinal pass. ``year`` defaults to ``digits``: Chinese years are read digit-wise."""
     year = year or digits
-    join, to = ("", "到") if lang == "zh" else (", ", " to ")
+    join, to = ("", "到") if lang == "zh" else (", ", " to " if lang == "en" else ", ")
     out: list[str] = []
     last = 0
     for s, e, kind, parts in _sequence_spans(text, lang):
@@ -670,18 +663,21 @@ def _read_sequences(
 def space_digit_sequences(text: str, language: str | None = "en") -> str:
     """Sequences re-spaced into single digits, for an engine that owns its own number
     grammar (espeak names spaced digits in every voice). English also renders dates,
-    currency and degrees to words — dates as full words so the sequence pass cannot
-    re-shred them; other (or unknown) languages keep the language-neutral spacing."""
+    currency and degrees to words — dates fully, so the sequence pass cannot re-shred
+    them; other languages keep the language-neutral spacing."""
     if not _RE_INT.search(text):
         return text
     text = _RE_ISO_T.sub(" ", text)
-    if language and language.startswith("en"):
+    en = bool(language and language.startswith("en"))
+    if en:
         text = _sub_dates(text, _en_date_words)
         text = _sub_month_dates(text)
         text = _RE_EN_DECADE.sub(_en_decade, text)
         text = _sub_padded(_RE_CURRENCY, text, _en_currency)
         text = _RE_DEGREES.sub(_en_degrees, text)
-    return _read_sequences(text, "en", lambda run: " ".join(run), _en_year_split)
+    return _read_sequences(
+        text, "en" if en else "", lambda run: " ".join(run), _en_year_split if en else None
+    )
 
 
 _FRONTENDS = {
@@ -692,9 +688,8 @@ _FRONTENDS = {
 
 
 def make_text_frontend(name: str) -> TextFrontend:
-    """Build a text frontend by name. Unknown name -> ValueError; missing optional
-    dependency -> RuntimeError (the registry then falls back to system TTS).
-    ``none`` never fails."""
+    """Build a text frontend by name. Unknown name -> ValueError; missing optional dep ->
+    RuntimeError (the registry then falls back to system TTS). ``none`` never fails."""
     try:
         factory = _FRONTENDS[name]
     except KeyError:

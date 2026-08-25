@@ -12,9 +12,8 @@ class WebRtcVad(Vad):
     def __init__(self, sample_rate: int, frame_ms: int, aggressiveness: int):
         import webrtcvad
 
-        # Validate HERE, not per frame: is_speech swallows exceptions, so an invalid
-        # rate/frame combination would silently return "no speech" forever (a
-        # permanently deaf session). Raising lets make_vad fall back to energy.
+        # Validate HERE, not per frame: is_speech swallows exceptions, so a bad
+        # rate/frame pair would mean "no speech" forever. Raising falls back to energy.
         if sample_rate not in (8000, 16000, 32000, 48000):
             raise ValueError(f"webrtcvad supports 8/16/32/48 kHz, not {sample_rate} Hz")
         if frame_ms not in (10, 20, 30):

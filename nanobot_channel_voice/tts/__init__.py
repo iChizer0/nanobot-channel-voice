@@ -1,8 +1,7 @@
 """TTS adapter selection: a declarative :data:`ENGINES` table plus one fallback policy
 (missing config or a failed import/construct warns and degrades to ``system``), so the
-channel always speaks. ``openai``/``openai_compat`` (cloud or any OpenAI-compatible
-local server) is the default; ``system`` (espeak-ng/``say``) is the always-available
-floor.
+channel always speaks. ``openai``/``openai_compat`` is the default; ``system``
+(espeak-ng/``say``) is the always-available floor.
 """
 
 from __future__ import annotations
@@ -71,17 +70,14 @@ def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
     if second is None:
         return primary
     if getattr(primary, "spoken_languages", None):
-        # Routing script runs away from an already-bilingual model trades its one voice
-        # for two and leaves the half it was trained to speak unused.
         logger.warning(
             "voice: tts.matcha.secondary is set while the primary model already speaks "
             "{} in one voice; code-switching will change voice instead",
             "+".join(primary.spoken_languages),  # type: ignore[attr-defined]
         )
     try:
-        # One vocoder session serves both when the dynamic engines name the same
-        # file; the share is caller-decided so a failed secondary build can never
-        # tear down the primary's session.
+        # One vocoder session serves both when the dynamic engines name the same file;
+        # caller-decided, so a failed secondary build never tears down primary's session.
         share = (
             primary._vocoder  # type: ignore[union-attr]
             if cfg.matcha.acoustic_model_path and second.acoustic_model_path
@@ -145,12 +141,10 @@ ENGINES: dict[str, EngineSpec] = {
 def make_tts(cfg: TtsConfig) -> TtsAdapter | None:
     """Build the configured TTS adapter, or None when TTS is disabled.
 
-    However the adapter was built (fallbacks included), ``tts.language`` settles its
-    ``spoken_language``: an engine that knows its own language wins (a conflicting
-    config claim is logged and ignored), while one that cannot know (an ``openai_compat``
-    server, MMS with a supplied ``vocabPath``) takes the operator's declaration.
-    Downstream (agent voice-context block, speakability warning) reads only the settled
-    value."""
+    On every build path (fallbacks included) ``spoken_language`` is settled here: an
+    engine that knows its own language wins (a conflicting ``tts.language`` is logged and
+    ignored), one that cannot know (``openai_compat``, MMS with a supplied ``vocabPath``)
+    takes the operator's declaration. Downstream reads only the settled value."""
     if not cfg.enabled:
         return None
     adapter = _build(cfg)

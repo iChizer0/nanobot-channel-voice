@@ -37,7 +37,12 @@ pyalsa = ["pyalsaaudio>=0.10.0"]        # in-process libasound backend (audio.ba
 # sensevoice/zipformer/firered share; the NPU (.rknn) path additionally needs [rknn].
 # Jetson: install a JetPack-matched `onnxruntime-gpu` wheel (Jetson Zoo, not PyPI)
 # and set executionProviders to the TensorRT/CUDA EPs — same .onnx, no re-export.
-ondevice = ["numpy>=1.23", "onnxruntime>=1.16", "kaldi-native-fbank>=1.15"]
+# onnxruntime 1.27.0 is excluded: measured non-deterministic output (uninitialized
+# memory) for the zipformer encoder and the openWakeWord embedding, which degrades
+# into empty transcripts and dead wake words with no error. Vendor wheels (Jetson,
+# Rockchip) carry no such pin, so those two adapters re-run their construction probe
+# and compare (ondevice/runtime.check_deterministic) rather than trust the version.
+ondevice = ["numpy>=1.23", "onnxruntime>=1.16,!=1.27.0", "kaldi-native-fbank>=1.15"]
 # Rockchip NPU runtime for .rknn artifacts, on top of [ondevice]:
 # `pip install 'nanobot-channel-voice[ondevice,rknn]'` on the board. PyPI has only
 # manylinux aarch64 cp37-cp312 wheels (no sdist), so the requirement is marker-scoped:

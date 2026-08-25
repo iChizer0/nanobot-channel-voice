@@ -1,13 +1,11 @@
 """FireRedVAD: on-device neural VAD backend (ONNX / RKNN).
 
-A DFSMN streaming VAD (beats webrtc/silero on noisy audio), run through the shared
-:class:`OnDeviceModel` so ``.onnx`` (CPU) and ``.rknn`` (NPU) need no extra code. Each
-``is_speech(frame)`` runs the new audio through fbank+CMVN, then the streaming model
-**one 10 ms frame at a time** (``feat[1,1,80]`` + carried cache), and smooths the
-sigmoid probability into a binary decision. Per-frame (``T=1``) inference is purely
-causal (the model skips lookahead) and keeps every tensor a fixed shape, so the same
-path converts cleanly to RKNN; the cache is carried in Python (``caches_in`` ->
-``caches_out``) and zeroed on :meth:`reset`.
+A DFSMN streaming VAD (beats webrtc/silero on noisy audio). Each ``is_speech(frame)``
+runs the new audio through fbank+CMVN, then the model **one 10 ms frame at a time**
+(``feat[1,1,80]`` + carried cache), and smooths the sigmoid into a binary decision.
+Per-frame (``T=1``) inference is purely causal and fixed-shape, so the same path
+converts to RKNN; the cache rides in Python (``caches_in`` -> ``caches_out``) and is
+zeroed on :meth:`reset`.
 """
 
 from __future__ import annotations
@@ -19,14 +17,13 @@ import numpy as np
 from loguru import logger
 
 from nanobot_channel_voice.aio import Throttle
-from nanobot_channel_voice.audio.pcm import pcm_rms
 from nanobot_channel_voice.config import FireRedVadConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
 from nanobot_channel_voice.vad.base import Vad
 from nanobot_channel_voice.vad.features import FbankCmvn
 
-# Reference FireRedVAD stream export: 8 FSMN caches of [1, 128, 19]. Used when the
-# shape can't be read (RKNN); ONNX is auto-detected from the session.
+# Reference stream export: 8 FSMN caches of [1, 128, 19]. Used when the shape can't be
+# read (RKNN); ONNX is auto-detected from the session.
 _CACHE_SHAPE = (8, 1, 128, 19)
 _FEAT_NAME = "feat"
 _CACHE_NAME = "caches_in"
@@ -51,8 +48,8 @@ class FireRedVad(Vad):
         providers: list | None = None,
         provider_options: list | None = None,
     ):
-        # _validate() raising is the EXPECTED path make_vad catches to fall back to
-        # energy, so the ExitStack must release the claimed NPU/ORT session on it.
+        # _validate() raising is the EXPECTED make_vad fallback path, so the ExitStack
+        # must release the claimed NPU/ORT session on it.
         with ExitStack() as models:
             self._model = models.enter_context(OnDeviceModel(
                 model_path, core_mask=core_mask, target=target, device_id=device_id,
@@ -88,9 +85,7 @@ class FireRedVad(Vad):
         )
 
     def release(self) -> None:
-        """Give the NPU context / ORT session back. Idempotent; refcount-GC does NOT
-        free an RKNN context, so an in-process channel restart would otherwise exhaust
-        the NPU cores."""
+        """Idempotent; refcount-GC does NOT free an RKNN context."""
         self._model.release()
 
     def reset(self) -> None:
@@ -102,11 +97,8 @@ class FireRedVad(Vad):
         self.last_prob = None
 
     def _validate(self) -> None:
-        """Prove the model's I/O contract once, at construction, on a zeroed frame, so
-        that a loadable-but-incompatible export (wrong input/output name, shape or
-        order) fails HERE and ``make_vad`` falls back to energy, rather than failing
-        per-frame in :meth:`is_speech`, flooding the log and leaving the channel deaf.
-        """
+        """Prove the I/O contract HERE, so an incompatible export degrades to energy
+        instead of failing per-frame in :meth:`is_speech` (a deaf channel)."""
         feat0 = np.zeros((1, 1, _FEAT_DIM), dtype=np.float32)
         try:
             _, caches = self._model.run([(_FEAT_NAME, feat0), (_CACHE_NAME, self._caches)])
@@ -123,14 +115,6 @@ class FireRedVad(Vad):
                 "-- check the model export (output name/order)."
             )
 
-    def _gated(self, speech: bool, frame: bytes) -> bool:
-        """Loudness AND'd with the model (Pipecat's gate): distant TV speech is real
-        speech to the model but too quiet to be the user. Applied to EVERY returned
-        decision (including held state on sub-window frames) never to the model
-        run itself, so the FSMN cache stays coherent."""
-        if speech and self._min_volume > 0.0:
-            return pcm_rms(frame) >= self._min_volume
-        return speech
 
     def is_speech(self, frame: bytes) -> bool:
         try:

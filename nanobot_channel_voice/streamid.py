@@ -1,11 +1,9 @@
 """Turn/delegation identity: parse core's stream ids, mint our own tokens.
 
 One home for the wire knowledge that a stream id is
-``"<session_key>:<time_ns of turn start>[:<segment>]"`` (nanobot's AgentLoop):
-the staleness guards key off the embedded start time, so an upstream format
-change breaks one parser, not scattered heuristics. Degrades toward accepting
-live turns: an id carrying no plausible ``time_ns`` yields ``None``, which
-callers treat as "no verdict", never stale.
+``"<session_key>:<time_ns of turn start>[:<segment>]"`` (nanobot's AgentLoop): staleness
+guards key off the embedded start time. Degrades toward accepting live turns: an id with
+no plausible ``time_ns`` yields ``None``, which callers treat as "no verdict".
 """
 
 from __future__ import annotations
@@ -27,9 +25,9 @@ _TOKEN_SEQ = itertools.count()
 
 
 def unique_token() -> str:
-    """Process-unique opaque token (turn/delegation identity, equality-compared).
-    Bare time_ns collides inside one clock quantum (~1 us on macOS), letting a dead
-    turn's staleness gate swallow a live reply; the sequence tail prevents that."""
+    """Process-unique opaque token (turn/delegation identity, equality-compared). Bare
+    time_ns collides inside one clock quantum (~1 us on macOS), letting a dead turn's
+    staleness gate swallow a live reply; the sequence tail prevents that."""
     return f"{time.time_ns()}-{next(_TOKEN_SEQ)}"
 
 

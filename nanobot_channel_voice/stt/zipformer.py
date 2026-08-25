@@ -1,32 +1,27 @@
-"""On-device streaming Zipformer transducer ASR (ONNX), the sherpa-onnx export.
+"""On-device streaming Zipformer transducer ASR (ONNX/RKNN), the sherpa-onnx export.
 
-A ``streaming = True`` engine: frames are decoded DURING speech (one encoder chunk per
-320 ms of audio), so at the endpoint only the final tail remains and STT latency stops
-existing as a pipeline stage. One model per language pair; the bilingual zh-en
-artifact is the reference target.
+``streaming = True``: frames decode DURING speech (one encoder chunk per 320 ms), so
+only the tail remains at the endpoint. Contract, verified against
+``sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20``:
 
-Verified against the pinned artifact
-(``sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20``, 2026-07-29):
+* encoder ``x [N, T=39, 80]`` + ~35 ``cached_*`` states (int64 ``cached_len_*``,
+  float32 the rest) -> ``encoder_out [N, T', 512]`` + ``new_cached_*``. Each call
+  consumes T=39 frames and ADVANCES by decode_chunk_len=32 (7 frames of right context
+  re-read).
+* stateless decoder ``y [N, context_size=2]`` int64 -> ``[N, 512]``; joiner
+  ``(encoder_out, decoder_out) -> logit``.
+* ``tokens.txt`` is ``<token> <id>`` with ``<blk> 0``; BPE ``▁`` marks word starts.
 
-* encoder ``x [N, T=39, 80]`` fbank frames + ~35 ``cached_*`` state tensors (int64
-  ``cached_len_*``, float32 the rest) -> ``encoder_out [N, T', 512]`` +
-  ``new_cached_*``. Metadata ``T = 39``, ``decode_chunk_len = 32``: each call consumes
-  39 frames and ADVANCES by 32, re-reading 7 frames of right context.
-* decoder (stateless) ``y [N, 2]`` int64 -> ``decoder_out [N, 512]`` (metadata
-  ``context_size = 2``); joiner ``(encoder_out, decoder_out) -> logit [N, 6254]``.
-* ``tokens.txt`` is ``<token> <id>`` with ``<blk> 0``; BPE ``▁`` marks word starts,
-  CJK tokens are bare chars.
+State plumbing is GENERIC (zero states from the encoder's declared inputs, each
+``new_X`` output feeding the next call's ``X``), so a re-export with different cache
+geometry still runs. ``.rknn`` has no introspection, so that contract rides in the
+exporter's ``meta.json``: state specs and output names IN DECLARED ORDER (RKNN is fed
+positionally) plus per-state ``cached_len`` increments — the rv1126b converter cannot
+emit the int64 ``new_cached_len_*`` outputs, so the host advances those states itself.
 
-State plumbing is GENERIC: zero states come from the encoder's declared inputs and
-each ``new_X`` output feeds the next call's ``X`` input, so a re-export with different
-cache geometry still runs. For `.rknn` (no introspection surface) that contract rides
-in the RKNN exporter's ``meta.json`` sidecar: state specs and output names IN DECLARED
-ORDER (RKNN is fed positionally), plus per-state ``cached_len`` increments — the
-rv1126b converter cannot emit the int64 ``new_cached_len_*`` assembly (toolkit 2.4.0
-SIGABRT), so the port drops those outputs and the host advances the len states itself.
-icefall front-end contract: fbank 80 (25/10 ms, dither 0) over waveform normalized to
-[-1, 1], NOT the int16 scale SenseVoice uses; the streaming path requires 16 kHz
-capture.
+icefall front-end: fbank 80 (25/10 ms, dither 0, mel ceiling 7600 Hz,
+``snip_edges=False``) over waveform normalized to [-1, 1], NOT SenseVoice's int16
+scale; 16 kHz capture only.
 """
 
 from __future__ import annotations
@@ -40,7 +35,7 @@ import numpy as np
 from loguru import logger
 
 from nanobot_channel_voice.config import ZipformerSttConfig
-from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
+from nanobot_channel_voice.ondevice.runtime import OnDeviceModel, check_deterministic
 from nanobot_channel_voice.stt.base import (
     SttAdapter,
     SttStream,
@@ -58,8 +53,7 @@ _FINISH_PAD_S = 0.66
 
 class _ZipformerStream(SttStream):
     """One utterance's decode state (fbank + encoder caches + hypothesis); every
-    consumer (live capture, a detached endpoint ``finish()`` thread, the batch path)
-    builds its OWN handle per the :class:`SttStream` contract."""
+    consumer builds its OWN handle per the :class:`SttStream` contract."""
 
     __slots__ = ("_engine", "fbank", "consumed", "states", "hyp", "decoder_out")
 
@@ -67,13 +61,7 @@ class _ZipformerStream(SttStream):
         self._engine = engine
         self.fbank = engine._knf.OnlineFbank(engine._opts)
         self.consumed = 0  # fbank frames already fed to the encoder (chunk starts)
-        self.states = {
-            name: np.zeros(
-                [1 if not isinstance(d, int) else d for d in shape],
-                dtype=np.int64 if "int64" in typ else np.float32,
-            )
-            for name, shape, typ in engine._state_specs
-        }
+        self.states = engine._zero_states()
         self.hyp: list[int] = []
         y = np.array([[_BLANK_ID] * engine._context], dtype=np.int64)
         self.decoder_out = engine._decoder.run([("y", y)])[0]
@@ -85,8 +73,8 @@ class _ZipformerStream(SttStream):
         self._engine._decode_ready(self)
 
     def partial(self) -> str:
-        """Live hypothesis for the min-words early-confirm gate: just a token join,
-        since the decode already ran in accept()."""
+        """Live hypothesis for the early-confirm gate: a token join, the decode
+        already ran in accept()."""
         return self._engine._decode_text(self)
 
     def finish(self) -> str:
@@ -124,6 +112,11 @@ class ZipformerOnDeviceStt(SttAdapter):
         opts.frame_opts.frame_length_ms = 25
         opts.frame_opts.frame_shift_ms = 10
         opts.frame_opts.dither = 0.0
+        # knf's defaults are NOT the training geometry: icefall/sherpa-onnx use a
+        # 7600 Hz mel ceiling and centred frames. Measured against sherpa-onnx 1.13.6:
+        # knf defaults reproduce the WRONG transcript word for word, these the reference.
+        opts.frame_opts.snip_edges = False
+        opts.mel_opts.high_freq = -400.0
         opts.mel_opts.num_bins = _NUM_MEL_BINS
         self._opts = opts
 
@@ -140,7 +133,7 @@ class ZipformerOnDeviceStt(SttAdapter):
         ]
         self._out_names = out_names or encoder.output_names()
         self._increments = state_increments or {}
-        # .rknn: 4D caches return NCHW; the sidecar permutation restores the declared feed.
+        # .rknn: 4D caches return NCHW; the sidecar permutation restores the feed order.
         self._feedback_transpose = feedback_transpose
         if not self._state_specs or not self._out_names:
             raise RuntimeError(
@@ -155,10 +148,16 @@ class ZipformerOnDeviceStt(SttAdapter):
                 f"sidecar increment): {missing} -- meta.json/encoder mismatch"
             )
         self._log = logger.bind(component="stt-zipformer")
-        # Contract probe doubling as warmup: one zero chunk (25 ms window + chunk_t
-        # 10 ms hops) through encoder+joiner, so a stale export or meta.json mismatch
-        # raises here — loud registry degrade, not _transcribe_sync's blanket except.
+        # Contract probe + warmup: a stale export or meta.json mismatch raises HERE,
+        # not inside _transcribe_sync's blanket except.
         self.stream_start().accept(bytes(2 * (25 + 10 * self._chunk_t) * (SAMPLE_RATE // 1000)))
+        # A broken runtime corrupts the encoder silently: blank wins every frame and
+        # every utterance transcribes to "".
+        check_deterministic(
+            self._encoder,
+            [("x", np.zeros((1, self._chunk_t, _NUM_MEL_BINS), np.float32))]
+            + list(self._zero_states().items())
+        )
 
     @classmethod
     def from_config(cls, cfg: ZipformerSttConfig) -> ZipformerOnDeviceStt:
@@ -168,8 +167,8 @@ class ZipformerOnDeviceStt(SttAdapter):
         kw = dict(
             core_mask=z.core_mask, target=z.target, device_id=z.device_id,
             providers=z.execution_providers, provider_options=z.provider_options,
-            # Shared by the frame hop's chunk decode AND batch transcribe(); the frame
-            # budget wins (sherpa-onnx ships this model single-threaded too).
+            # Shared by the frame hop's chunk decode AND batch transcribe(): the frame
+            # budget wins.
             intra_op_threads=1,
         )
         with ExitStack() as models:  # any failure below releases every loaded model
@@ -194,8 +193,8 @@ class ZipformerOnDeviceStt(SttAdapter):
 
     @staticmethod
     def _load_sidecar(path: str | None) -> dict:
-        """The exporter's ``meta.json`` -> constructor kwargs: the encoder contract
-        an ``.rknn`` cannot introspect (see the module docstring)."""
+        """The exporter's ``meta.json`` -> constructor kwargs: the encoder contract an
+        ``.rknn`` cannot introspect."""
         if not path:
             raise RuntimeError(
                 "zipformer .rknn needs stt.zipformer.metaPath (the exporter's meta.json sidecar)"
@@ -219,13 +218,21 @@ class ZipformerOnDeviceStt(SttAdapter):
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise RuntimeError(f"bad zipformer meta sidecar {path}: {exc!r}") from exc
 
+    def _zero_states(self) -> dict[str, np.ndarray]:
+        """Fresh encoder caches, per the declared contract (symbolic dims are batch 1)."""
+        return {
+            name: np.zeros(
+                [1 if not isinstance(d, int) else d for d in shape],
+                dtype=np.int64 if "int64" in typ else np.float32,
+            )
+            for name, shape, typ in self._state_specs
+        }
+
     def stream_start(self) -> _ZipformerStream:
         return _ZipformerStream(self)
 
     async def warmup(self) -> None:
-        """One dummy decode so the first real utterance pays no cold-start (ORT
-        arena allocation, RKNN core spin-up); the batch path builds its own stream
-        handle, so this warms the per-frame graphs the live capture uses."""
+        """One dummy decode so the first real utterance pays no cold-start."""
         await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
 
     def release(self) -> None:
@@ -253,8 +260,8 @@ class ZipformerOnDeviceStt(SttAdapter):
     # ---- internals (all state via the handle argument) ----------------------
 
     def _decode_ready(self, s: _ZipformerStream) -> None:
-        """Run the encoder over every complete chunk available, greedy-decoding its
-        frames as they come: this is where streaming actually happens."""
+        """Encode every complete chunk available, greedy-decoding its frames as they
+        come: this is where streaming happens."""
         while s.fbank.num_frames_ready - s.consumed >= self._chunk_t:
             chunk = np.vstack([
                 s.fbank.get_frame(s.consumed + i) for i in range(self._chunk_t)
@@ -275,9 +282,8 @@ class ZipformerOnDeviceStt(SttAdapter):
                 else:
                     # .rknn drops the int64 new_cached_len_* outputs: advance host-side.
                     s.states[name] = s.states[name] + self._increments[name]
-            # Commit the cursor exactly here: shift 32 of the 39 frames (7 of right
-            # context re-read). Earlier, a raising encoder would skip the chunk with
-            # stale caches; later, a raising joiner would re-feed already-advanced ones.
+            # Commit the cursor exactly HERE: earlier, a raising encoder would skip the
+            # chunk with stale caches; later, a raising joiner would re-feed advanced ones.
             s.consumed += self._chunk_shift
             self._greedy(s, np.asarray(named["encoder_out"])[0])
 

@@ -3,12 +3,11 @@
 # WhisperFeatureExtractor (Apache-2.0) with chunk_length=8 defaults.
 """Numpy-only Whisper-style log-mel features for the Smart Turn v3 model.
 
-The model was trained on ``WhisperFeatureExtractor(chunk_length=8)`` output:
-8 s of 16 kHz audio -> float32 ``(80, 800)`` log-mel in roughly ``[-1, 1]``.
-Callers pad/truncate to exactly 128 000 samples BEFORE calling (Smart Turn
-pads at the START so speech sits at the window end); this module then matches
-the reference bit-for-bit: normalize the waveform first, reflect-padded
-centered power spectrogram, Slaney mel filterbank, log10, dynamic-range floor.
+Trained on ``WhisperFeatureExtractor(chunk_length=8)`` output: 8 s of 16 kHz audio ->
+float32 ``(80, 800)`` log-mel in roughly ``[-1, 1]``. Callers pad/truncate to exactly
+128 000 samples BEFORE calling. Matches the reference bit-for-bit: normalize the
+waveform first, reflect-padded centered power spectrogram, Slaney mel filterbank,
+log10, dynamic-range floor.
 """
 
 from __future__ import annotations
@@ -93,8 +92,7 @@ def _power_spectrogram(
     win = window.astype(np.float64)
     windows = sliding_window_view(padded, frame_length)[::hop_length]
     spec = np.fft.rfft(windows * win, axis=-1)
-    # re^2 + im^2, not |z|^2: same value without a sqrt per bin (and marginally
-    # more accurate: the reference's abs() rounds through the sqrt first).
+    # re^2 + im^2, not |z|^2: same value without a sqrt per bin.
     power = np.square(spec.real)
     power += np.square(spec.imag)
     return power.T

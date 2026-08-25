@@ -1571,7 +1571,9 @@ def test_synth_filler_bakes_the_blob_duck_once():
     async def _case():
         from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes, wav_pcm
         from nanobot_channel_voice.backend.audio_sink import (
-            scale_pcm, trim_lead_silence, trim_tail_silence,
+            scale_pcm,
+            trim_lead_silence,
+            trim_tail_silence,
         )
 
         async with EvalConversation(**_wake("gate", ack={"enabled": True})) as conv:

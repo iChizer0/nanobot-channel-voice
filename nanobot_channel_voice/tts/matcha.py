@@ -1,10 +1,9 @@
-"""On-device Matcha-TTS (``tts.provider="matcha"``), export dialects detected from
-the graph: OFFICIAL (``scales`` input, in-code symbol table, optional embedded
-vocoder -> direct wav) and icefall/sherpa (metadata-driven front-end, tokens.txt
-[+ lexicon.txt for zh], mel out) — including the bilingual zh-en flavour
-(``voice: "zh en-us"``: lexicon zh + espeak English, no blank interleave). Mel needs
-``vocoderPath``: Vocos (mag/cos/sin -> host ISTFT) or any single-output waveform
-vocoder. Imported lazily by make_tts.
+"""On-device Matcha-TTS (``tts.provider="matcha"``), export dialects detected from the
+graph: OFFICIAL (``scales`` input, in-code symbol table, optional embedded vocoder ->
+direct wav) and icefall/sherpa (metadata-driven front-end, tokens.txt [+ lexicon.txt
+for zh], mel out), including the bilingual zh-en flavour (``voice: "zh en-us"``:
+lexicon zh + espeak English, no blank interleave). Mel needs ``vocoderPath``: Vocos
+(mag/cos/sin -> host ISTFT) or any single-output waveform vocoder. Imported lazily.
 """
 
 from __future__ import annotations
@@ -36,10 +35,9 @@ _SAMPLE_RATE_DEFAULT = 22050  # every published matcha vocoder (HiFi-GAN, Vocos 
 _LANG_NAMES = {"english": "en", "chinese": "zh", "german": "de", "japanese": "ja"}
 
 
-# CJK terminators split anywhere; ASCII only before whitespace/end ("3.14" survives)
-# A closer after the terminator (。」 / 。") belongs to its sentence: splitting
-# before it strands a pause token at the next utterance's head. One trailing
-# closer is covered (fixed-width lookbehind); a longer run just fuses, never blips.
+# CJK terminators split anywhere; ASCII only before whitespace/end ("3.14" survives).
+# A closer after the terminator (。」) belongs to its sentence, or a pause token
+# strands at the next utterance's head; one trailing closer is covered.
 _CLOSE_AFTER_TERM = re.escape("」』”’）】〉》\"')]}»")
 _SENTENCE_SPLIT_RE = re.compile(
     rf"(?:(?<=[。！？…])(?![。！？…{_CLOSE_AFTER_TERM}])"
@@ -65,8 +63,7 @@ def official_token2id() -> dict[str, int]:
 
 
 def read_tokens(path: str) -> dict[str, int]:
-    """sherpa-onnx ``tokens.txt``: ``<sym> <id>`` per line; a lone id means the
-    symbol is the space character."""
+    """sherpa-onnx ``tokens.txt``: ``<sym> <id>`` per line; a lone id means space."""
     token2id: dict[str, int] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -104,8 +101,8 @@ def fold_punct_aliases(token2id: dict[str, int]) -> dict[str, int]:
 
 
 def _parse_lexicon(path: str, token2id: dict[str, int]) -> tuple[dict[str, list[int]], list[str]]:
-    """``lexicon.txt``: ``<word> <phone>...`` per line, first spelling wins; a word
-    with any unknown phone is dropped (sherpa behaviour) and returned by name."""
+    """``lexicon.txt``: ``<word> <phone>...`` per line, first spelling wins; a word with
+    any unknown phone is dropped (sherpa behaviour) and returned by name."""
     word2ids: dict[str, list[int]] = {}
     dropped: list[str] = []
     with open(path, encoding="utf-8") as f:
@@ -125,10 +122,9 @@ def _parse_lexicon(path: str, token2id: dict[str, int]) -> tuple[dict[str, list[
 
 def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
     word2ids, dropped = _parse_lexicon(path, token2id)
-    # Heuristic, deliberately sensitive: a correct pairing drops ~0 (measured 0 of 68k
-    # for zh-en, 4 of 66k for baker) while a cross-model one drops 2% (same pinyin
-    # inventory, different ids) to ~100% (different alphabet). It only ever costs a log
-    # line, and the failure it names is otherwise silent — right rhythm, wrong sounds.
+    # Deliberately sensitive: a correct pairing drops ~0 (measured 0/68k zh-en, 4/66k
+    # baker), a cross-model one 2% (same pinyin, different ids) to ~100%. The failure
+    # is otherwise silent — right rhythm, wrong sounds.
     if len(dropped) * 100 > len(dropped) + len(word2ids):
         logger.warning(
             "voice: matcha lexicon '{}' dropped {} of {} entries whose phones are "
@@ -229,8 +225,8 @@ def stft(wav: np.ndarray, *, n_fft: int, hop_length: int, center: bool
 
 
 def _is_latin(ch: str) -> bool:
-    """Non-Latin would be voiced as garbage IPA after espeak language-switches;
-    refusing it lets the speakability guard skip + warn instead."""
+    """Non-Latin voices as garbage IPA after espeak language-switches; refusing it lets
+    the speakability guard skip + warn instead."""
     cp = ord(ch)
     return cp < 0x0250 or 0x1E00 <= cp <= 0x1EFF  # ASCII..IPA block; Latin ext additional
 
@@ -274,8 +270,8 @@ class EspeakFrontend:
         return ids
 
     def _phonemize_clauses(self, clauses: list[str]) -> list[str]:
-        """One call per batch (espeak emits one clause per line); a line-count
-        mismatch falls back to per-clause calls."""
+        """One call per batch (espeak emits one clause per line); a line-count mismatch
+        falls back to per-clause calls."""
         if len(clauses) > 1:
             lines = self._phonemize("\n".join(clauses)).splitlines()
             if len(lines) == len(clauses):
@@ -324,18 +320,17 @@ _PINYIN_SYLLABLE = re.compile(r"[a-z]{1,6}[1-5]\Z")
 
 def is_zh_en_tokens(token2id: dict[str, int]) -> bool:
     """Only the zh-en table carries BOTH halves: folded English diphthongs and tonal
-    pinyin. A zh-only export has the pinyin alone, a character-level English table the
-    capitals alone. For the dynamic path the graph metadata settles the dialect; the
-    split path has no metadata and only this."""
+    pinyin. The dynamic path settles the dialect from graph metadata; the split path
+    has none and only this."""
     return _ZH_EN_FOLDED <= token2id.keys() and any(
         _PINYIN_SYLLABLE.match(token) for token in token2id
     )
 
 
 class EnglishToIpa:
-    """Word -> token ids for the bilingual zh-en table: espeak IPA folded to the
-    trained alphabet. Same shape as EnglishToPinyin, so LexiconFrontend cannot
-    tell native English from transliteration."""
+    """Word -> token ids for the bilingual zh-en table: espeak IPA folded to the trained
+    alphabet. Same shape as EnglishToPinyin, so LexiconFrontend cannot tell native
+    English from transliteration."""
 
     def __init__(self, token2id: dict[str, int], phonemize: Callable[[str], str]):
         self._token2id = token2id
@@ -355,8 +350,8 @@ class EnglishToIpa:
         return ids
 
     def prime(self, words: list[str]) -> None:
-        """Batch-phonemize uncached words in ONE espeak call — subprocess espeak
-        spawns per call, so a fresh English clause would otherwise spawn per word."""
+        """Batch-phonemize uncached words in ONE espeak call: subprocess espeak spawns
+        per call, so an English clause would otherwise spawn a process per word."""
         fresh = list(dict.fromkeys(w for w in words if w not in self._cache))
         if len(fresh) < 2:
             return
@@ -379,24 +374,20 @@ class EnglishToIpa:
         return ids
 
 
-# Punctuation policy for lexicon models, measured on matcha-icefall-zh-en: the
-# pause class synthesizes trained silence, but wrapping/structural marks in the
-# token table ("“”()：…—) each synthesize ~0.2s of VOICED audio — a phantom
-# syllable ("zhang") after every quoted word. Only the pause class may reach the
-# model; pause-bearing outliers fold to a trained pause first, the rest drop.
+# Measured on matcha-icefall-zh-en: the pause class synthesizes trained silence, but
+# wrapping marks ("“”()：…—) each synthesize ~0.2s of VOICED audio (a phantom "zhang").
+# Only the pause class reaches the model; pause-bearing outliers fold to it, rest drop.
 _PAUSE_PUNCT = frozenset("，,。.！!？?；;、")
 _PAUSE_FOLD = {"：": "，", ":": "，", "—": "，", "–": "，", "…": "。"}
 
 
 class LexiconFrontend:
     """Text -> per-sentence token ids by greedy longest lexicon match, single chars
-    falling back to the token table; OOV drops, the speakability guard reports.
-    Punctuation passes only as the ``_PAUSE_PUNCT`` class (folded first) — a
-    deliberate deviation from sherpa, which feeds every table id.
-    With an ``english`` resolver, Latin word runs voice through it instead of
-    dropping: pinyin transliteration (see pinyin_english) or the zh-en model's
-    real espeak English. ``latin_space_id`` mirrors sherpa's zh-en frontend: the
-    id emitted after every voiced Latin word, before whatever follows."""
+    falling back to the token table; OOV drops. Punctuation passes only as the
+    ``_PAUSE_PUNCT`` class (folded first) — a deliberate deviation from sherpa, which
+    feeds every table id. With an ``english`` resolver, Latin word runs voice through
+    it instead of dropping. ``latin_space_id`` mirrors sherpa's zh-en frontend: emitted
+    after every voiced Latin word."""
 
     def __init__(
         self,
@@ -440,9 +431,8 @@ class LexiconFrontend:
         i = 0
         while i < len(low):
             if self._english is not None and "a" <= low[i] <= "z":
-                # Whole Latin run at once, ORIGINAL case (all-caps = acronym): a
-                # per-char walk would leak letters that coincide with pinyin
-                # syllables ("o" -> 哦) into the ids.
+                # Whole Latin run at once, ORIGINAL case (all-caps = acronym): a per-char
+                # walk leaks letters that coincide with pinyin syllables ("o" -> 哦).
                 j = i + 1
                 while j < len(low) and ("a" <= low[j] <= "z" or low[j] == "'"):
                     j += 1
@@ -481,9 +471,8 @@ class VocoderSpec(NamedTuple):
 
 
 # Grad-TTS/WaveGlow denoiser: upstream's CLI subtracts the vocoder's zero-mel bias
-# spectrum from every HiFi-GAN output, but the ONNX export only clamps — without this
-# the export carries a constant hiss the demo doesn't. Vocos has no such bias, and an
-# embedded vocoder can't be probed alone, so neither is denoised.
+# from every HiFi-GAN output while the ONNX export only clamps, so without this it
+# hisses. Vocos has no such bias, an embedded vocoder cannot be probed: not denoised.
 _DENOISE_STFT = {"n_fft": 1024, "hop_length": 256, "center": True}
 
 
@@ -530,13 +519,11 @@ def denoise(wav: np.ndarray, bias: np.ndarray) -> np.ndarray:
 
 def _espeak_data_dir(cfg: MatchaTtsConfig) -> str | None:
     """The voice pack this model was trained against: config, else the ``espeak-ng-data``
-    beside the model files (every sherpa espeak export ships one). Absent it, the
-    installed espeak's release picks the phonemes — en-us FORCE drifted oː -> ɔː, which
-    lands English on a different embedding."""
+    beside the model files. Absent it, the installed espeak's release picks the
+    phonemes — drift (en-us FORCE oː -> ɔː) lands English on a different embedding."""
     if cfg.espeak_data_dir:
         return cfg.espeak_data_dir
-    # encoder_path last: a conversion output dir may hold a stale pack, and split
-    # deployments keep the authoritative one beside tokens/lexicon.
+    # encoder_path last: a conversion output dir may hold a stale pack.
     for path in (cfg.acoustic_model_path, cfg.tokens_path, cfg.lexicon_path, cfg.encoder_path):
         if path and (data := Path(path).expanduser().parent / "espeak-ng-data").is_dir():
             return str(data)
@@ -572,8 +559,7 @@ def _lexicon_frontend(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> Lexicon
 
 def _zh_en_frontend(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> LexiconFrontend:
     """dengcunqin bilingual (sherpa is_zh_en): zh via lexicon, English via espeak IPA
-    folded to the trained alphabet, no blank interleave. espeak is mandatory here —
-    English is half the model."""
+    folded to the trained alphabet, no blank interleave. espeak is mandatory."""
     if not cfg.lexicon_path:
         raise ValueError("this matcha model needs tts.matcha.lexiconPath")
     if cfg.espeak_voice:
@@ -620,8 +606,8 @@ class _MatchaCommon:
         return self._max_len  # type: ignore[attr-defined]
 
     def _normalize(self, text: str) -> str:
-        # The zh lexicon has 零..九 but no "0".."9". espeak reads digits itself, but its
-        # grammar is cardinal-biased, so only the sequences are re-spaced for it to name.
+        # The zh lexicon has 零..九 but no "0".."9". espeak reads digits itself, but
+        # cardinal-biased: only sequences are re-spaced for it to name.
         if self.spoken_language == "zh":  # type: ignore[attr-defined]
             return verbalize_numbers_zh(text)
         return space_digit_sequences(text, self.spoken_language)  # type: ignore[attr-defined]
@@ -688,9 +674,9 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     def from_config(
         cls, cfg: MatchaTtsConfig, *, vocoder_share: VocoderSpec | None = None
     ) -> MatchaTtsAdapter:
-        """``vocoder_share``: a sibling engine's already-loaded vocoder (bilingual
-        router, same vocoderPath) — used instead of loading a second session, and
-        deliberately NOT registered with this build's cleanup stack."""
+        """``vocoder_share``: a sibling engine's already-loaded vocoder (same
+        vocoderPath), used instead of a second session and deliberately NOT registered
+        with this build's cleanup stack."""
         if not cfg.acoustic_model_path:
             raise ValueError("matcha dynamic export needs tts.matcha.acousticModelPath")
         model_kw = dict(
@@ -863,10 +849,9 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
 class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     """Static three-graph icefall Matcha: the host bridges durations -> alignment ->
     tiling -> denorm -> vocoding between fixed buckets (RKNN cannot express them).
-    The decoder needs a PERIODIC tail - its attention has no time mask. Extension
-    picks the runtime, so an .onnx triple validates the split off-board. The vocoder
-    is Vocos (3 outputs, host ISTFT) or a waveform HiFi-GAN (1 output, denoised),
-    classified by a build-time probe."""
+    The decoder needs a PERIODIC tail — its attention has no time mask. Extension picks
+    the runtime, so an .onnx triple validates the split off-board. Vocos (3 outputs,
+    host ISTFT) or waveform HiFi-GAN (1 output, denoised), classified by a probe."""
 
     output_rate = _SAMPLE_RATE_DEFAULT
     _label = "Matcha-split"
@@ -954,9 +939,8 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
 
         token2id = fold_punct_aliases(read_tokens(cfg.tokens_path))  # type: ignore[arg-type]
         # No graph metadata here: the exporter's sidecar declares the frontend
-        # ({"frontend": "zh-en-lexicon" | "lexicon" | "espeak"}, the published-package
-        # spelling); undeclared falls back to side-file inference (lexicon exports
-        # are all zh).
+        # ({"frontend": "zh-en-lexicon" | "lexicon" | "espeak"}); undeclared falls back
+        # to side-file inference.
         declared = side.get("frontend")
         if declared not in (None, "zh-en-lexicon", "lexicon", "espeak"):
             raise ValueError(
@@ -964,8 +948,8 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 "(expected zh-en-lexicon, lexicon, or espeak)"
             )
         if declared is None and is_zh_en_tokens(token2id):
-            # Refusing beats synthesizing (fluent rhythm over wrong sounds): the
-            # dialect needs the exporter's word, not a heuristic's.
+            # The dialect needs the exporter's word, not a heuristic's: refusing beats
+            # fluent rhythm over wrong sounds.
             raise ValueError(
                 "these look like bilingual zh-en artifacts: the split builds that "
                 'dialect only when the exporter declares it (meta.json {"frontend": '
@@ -973,8 +957,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 "(tts.matcha.acousticModelPath)"
             )
         if declared in ("lexicon", "espeak") and is_zh_en_tokens(token2id):
-            # A stale or copied sidecar beside zh-en artifacts would otherwise build
-            # the wrong dialect with no complaint.
+            # A stale sidecar beside zh-en artifacts would build the wrong dialect mutely.
             raise ValueError(
                 f'matcha split: meta.json declares frontend="{declared}" but the '
                 'token table carries the bilingual zh-en signature — wrong sidecar? '
@@ -1025,10 +1008,9 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                         f"matcha split: graph input {name} is {list(shape)}, "
                         f"configured geometry wants {list(want)}"
                     )
-            # One zero-mel probe classifies the vocoder without graph introspection
-            # (RKNN has none): 1 output = waveform (HiFi-GAN), 3 = Vocos. It also
-            # yields the upsample factor and the denoiser bias, and a graph that
-            # cannot run its own bucket fails HERE, not mid-conversation.
+            # One zero-mel probe classifies the vocoder without graph introspection (RKNN
+            # has none): 1 output = waveform (HiFi-GAN), 3 = Vocos. It also yields the
+            # upsample factor and bias, and a graph that cannot run its bucket fails HERE.
             probe = vocoder.run([("mels", np.zeros((1, 80, mel_len), np.float32))])
             stft_params, voc_factor, bias = None, 0, None
             if len(probe) == 1:

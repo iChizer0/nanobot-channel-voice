@@ -1,23 +1,16 @@
 """Self-transcription rejection: drop STT that is the bot hearing its own TTS.
 
-With the mic open while the bot speaks, capture contains the bot's own voice;
-since the spoken text is known, a transcript mostly contained in recently-spoken
-TTS is that echo, not a barge-in, and is dropped, while genuinely different
-speech passes through to cancel-then-send. This makes open-mic modes usable and
-hardens hardware AEC against residual echo. Stdlib only.
+A transcript mostly contained in recently-spoken TTS is echo, not a barge-in, and is
+dropped; genuinely different speech passes through to cancel-then-send. Stdlib only.
 
-The comparison alphabet (:func:`units_of`) is script-aware: spaced-script
-tokens compare whole, CJK segments as character BIGRAMS — a fused zh run and
-the TTS text it echoes then overlap whatever punctuation either side carries
-(word-token containment could never see zh echo: the whole transcript is ONE
-``\\w+`` token), while unigrams would be too loose (common hanzi recur in any
-reply and would flag genuine speech).
+The comparison alphabet (:func:`units_of`) is script-aware: spaced-script tokens compare
+whole, CJK segments as character BIGRAMS — word-token containment could never see zh
+echo (a fused run is ONE ``\\w+`` token) and unigrams are too loose (common hanzi recur
+in any reply).
 
-STT renders the same audio differently than the TTS text wrote it, so exact
-units are bridged two ways: spoken text grows number-reading VARIANTS ("7点45分"
-comes back 七点四十五分 from a character-output model, "seven forty five" from a
-word-output one), and a heard Latin unit still matches as a substring of the
-spoken text's space-stripped Latin stream ("Wi-Fi"/"playsomemusic"). ``protect``
+STT renders audio differently than the TTS text wrote it, so units are bridged twice:
+spoken text grows number-reading VARIANTS, and a heard Latin unit matches as a substring
+of the spoken text's space-stripped Latin stream ("Wi-Fi"/"playsomemusic"). ``protect``
 units (the stop lexicon) are exempt from the latter: "stop" heard during spoken
 "unstoppable" must stay fresh evidence.
 """
@@ -31,8 +24,8 @@ from collections.abc import Iterable, Iterator
 
 from nanobot_channel_voice.phrases import tokens_of, words_of
 
-# The same functions the TTS side speaks digits through: variants match what
-# became audible by construction. (text_frontend's optional deps load lazily.)
+# The same functions the TTS side speaks digits through: variants match what became
+# audible by construction; its optional deps load lazily, so the import stays top-level.
 from nanobot_channel_voice.tts.text_frontend import (
     en_digit_words,
     verbalize_numbers_en,
@@ -43,7 +36,7 @@ from nanobot_channel_voice.tts.text_frontend import (
 
 __all__ = ["SelfEchoFilter", "units_of", "words_of"]
 
-_CJK_FLOOR = 0x2E80  # same script split as phrases/chunker
+_CJK_FLOOR = 0x2E80  # same script split as wake/phrase.py, backend/local.py, tts/router.py
 
 _DIGIT_RUN = re.compile(r"\d+")
 _ZH_NUM_RUN = re.compile(r"[零一二三四五六七八九十百千万亿两]+")
@@ -75,17 +68,17 @@ def units_of(text: str) -> set[str]:
 
 
 def _latin_stream(text: str) -> str:
-    """Space/hyphen-stripped concatenation of the non-CJK material, in order:
-    the string STT respacing of the same audio must still be a substring of."""
+    """Space/hyphen-stripped non-CJK material, in order: the string an STT respacing of
+    the same audio must still be a substring of."""
     return "".join(
         seg for token in tokens_of(text) for cjk, seg in _script_segs(token) if not cjk
     )
 
 
 def _number_variants(text: str) -> list[str]:
-    """Alternate renderings of *text*'s numbers, as whole texts so CJK bigrams
-    form across the number boundary (七点/点四). Bigrams are local, so per-run
-    reading choices need no cross-product: one variant per reading covers all."""
+    """Alternate renderings of *text*'s numbers, as whole texts so CJK bigrams form
+    across the number boundary (七点/点四). Bigrams are local: one variant per reading
+    covers all, no cross-product needed."""
     variants: list[str] = []
     if _DIGIT_RUN.search(text):
         zh = verbalize_numbers_zh(text)
@@ -118,11 +111,10 @@ class SelfEchoFilter:
         self._spoken: deque[tuple[float, set[str], str, str]] = deque()
 
     def note_spoken(self, text: str, hold_ms: float = 0.0) -> None:
-        """Record TTS text about to play. ``hold_ms``, the estimated delay until
-        it stops sounding (sink backlog + own duration), shifts the stamp so the
-        eviction window runs from last-audible, not feed time: an LLM streams a
-        30 s reply's text in seconds, and feed-time stamps would evict its tail
-        mid-playback, letting the bot barge in on itself."""
+        """Record TTS text about to play. ``hold_ms`` (delay until it stops sounding:
+        sink backlog + own duration) shifts the stamp so eviction runs from
+        last-audible, not feed time — text streams far faster than it plays, and
+        feed-time stamps let the bot barge in on its own tail."""
         units = units_of(text)
         if not units:
             return
@@ -143,10 +135,9 @@ class SelfEchoFilter:
         return covered / len(heard) >= self._threshold
 
     def fresh_words(self, transcript: str) -> set[str]:
-        """Units in *transcript* that are NOT recently-spoken TTS. Callable from
-        the frame worker thread while ``note_spoken`` runs on the loop: snapshot
-        only, never mutates (skipping evict just makes the caller's min-words
-        gate more conservative)."""
+        """Units in *transcript* that are NOT recently-spoken TTS. Callable from the frame
+        worker thread while ``note_spoken`` runs on the loop: snapshot only, never
+        mutates (skipping evict only makes the caller's min-words gate stricter)."""
         heard = units_of(transcript)
         if not heard:
             return set()
@@ -158,9 +149,9 @@ class SelfEchoFilter:
         }
 
     def recent_text(self) -> str:
-        """The unexpired spoken texts, oldest first, joined: the ordered view
-        the wake echo veto searches for a literal phrase mention. Loop-side
-        only (evicts; ``fresh_words`` keeps the thread-safe contract)."""
+        """The unexpired spoken texts, oldest first, joined: the ordered view the wake
+        echo veto searches. Loop-side only (evicts; ``fresh_words`` is the thread-safe
+        one)."""
         self._evict()
         return " ".join(t for _, _, _, t in self._spoken)
 

@@ -6,9 +6,8 @@ from __future__ import annotations
 from nanobot_channel_voice.phrases import (
     FILLER_WORDS,
     PhraseLexicon,
-    covered,
+    PhraseMatcher,
     phrase_within,
-    pure_command,
     tokens_of,
 )
 
@@ -21,7 +20,7 @@ ACK = PhraseLexicon(["ok", "okay", "got it", "嗯", "好的", "うん"])
 
 
 def _stop(text: str) -> bool:
-    return pure_command(tokens_of(text), STOP, ACK, extra=FILLER_WORDS)
+    return PhraseMatcher(STOP, ACK, extra=FILLER_WORDS).pure(tokens_of(text))
 
 
 # ---- spaced scripts ---------------------------------------------------------
@@ -72,19 +71,19 @@ def test_japanese_with_polite_fillers():
 
 def test_cjk_ack_repetition_is_covered():
     # The _is_ack upgrade: unspaced repetition must read as backchannel material.
-    assert covered(tokens_of("好的好的"), ACK)
-    assert covered(tokens_of("うんうん"), ACK)
-    assert not covered(tokens_of("好的走吧"), ACK)
-    assert not covered([], ACK)
+    assert PhraseMatcher(ACK).covers(tokens_of("好的好的"))
+    assert PhraseMatcher(ACK).covers(tokens_of("うんうん"))
+    assert not PhraseMatcher(ACK).covers(tokens_of("好的走吧"))
+    assert not PhraseMatcher(ACK).covers([])
 
 
 # ---- per-token hit (the early-confirm / echo-override primitive) ------------
 
 def test_single_token_hits():
-    assert pure_command(["stop"], STOP, ACK, extra=FILLER_WORDS)
-    assert pure_command(["停停停"], STOP, ACK, extra=FILLER_WORDS)
-    assert not pure_command(["up"], STOP, ACK, extra=FILLER_WORDS)
-    assert not pure_command(["okay"], STOP, ACK, extra=FILLER_WORDS)
+    assert PhraseMatcher(STOP, ACK, extra=FILLER_WORDS).pure(["stop"])
+    assert PhraseMatcher(STOP, ACK, extra=FILLER_WORDS).pure(["停停停"])
+    assert not PhraseMatcher(STOP, ACK, extra=FILLER_WORDS).pure(["up"])
+    assert not PhraseMatcher(STOP, ACK, extra=FILLER_WORDS).pure(["okay"])
 
 
 # ---- phrase inside free content (the goal trigger) --------------------------

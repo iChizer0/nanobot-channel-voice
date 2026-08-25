@@ -1,7 +1,6 @@
-"""ALSA capture/playback via the ``arecord``/``aplay`` subprocesses: talks to named
-ALSA PCMs (shared ``dsnoop``/``dmix`` ``plug`` devices work by name), the most portable
-"direct ALSA" path — no C-extension build, asyncio-native, barge-in is an instant
-``kill()``.
+"""ALSA capture/playback via the ``arecord``/``aplay`` subprocesses: named ALSA PCMs
+(shared ``dsnoop``/``dmix`` ``plug`` devices work by name), no C-extension build,
+barge-in is an instant ``kill()``.
 """
 
 from __future__ import annotations
@@ -36,10 +35,9 @@ async def _terminate(proc: asyncio.subprocess.Process | None) -> None:
 class _StderrTail:
     """Continuously drain a child's stderr, keeping only the last few chunks.
 
-    alsa-utils prints xrun complaints ("overrun!!!"/"underrun!!!") UNCONDITIONALLY:
-    ``-q`` does not silence them, and a loaded SBC emits thousands. Left in a PIPE
-    nobody reads, the 64 KB buffer fills, the child blocks in ``fprintf`` and stops
-    moving audio, with no EOF for anything upstream to notice."""
+    alsa-utils prints xrun complaints unconditionally (``-q`` does not silence them).
+    Unread, the 64 KB pipe buffer fills and the child blocks in ``fprintf``, silently
+    starving audio with no EOF for anything upstream to notice."""
 
     def __init__(self, proc: asyncio.subprocess.Process):
         self._chunks: deque[bytes] = deque(maxlen=4)  # last <=16 KB
@@ -73,9 +71,8 @@ class AlsaCapture(CaptureSource):
         self._device = device
         self._sample_rate = sample_rate
         self._frame_bytes = frame_bytes(sample_rate, frame_ms)
-        # flush(): a backlogged frame is already buffered and returns ~instantly; a
-        # LIVE frame takes a full frame_ms to exist. Half a period cleanly separates
-        # them while keeping a whole flush bounded even against a bursty writer.
+        # flush(): a backlogged frame returns ~instantly, a LIVE one takes a full
+        # frame_ms; half a period separates them and bounds the whole flush.
         self._flush_step_s = frame_ms / 2000.0
         self._flush_cap = sample_rate * 2 * 10  # never spin past ~10 s of backlog
         self._bin = arecord_path
@@ -107,10 +104,9 @@ class AlsaCapture(CaptureSource):
         try:
             return await proc.stdout.readexactly(self._frame_bytes)
         except asyncio.IncompleteReadError:
-            # arecord exited (bad device, unplug, or stop()). Every later read raises
-            # at once, so latch one line per start() cycle, BEFORE the stderr await,
-            # so a concurrent reader cannot slip through. stop() nulls _proc, so it
-            # stays silent.
+            # arecord exited. Latch one line per start() cycle BEFORE the stderr await,
+            # so a concurrent reader cannot slip through; stop() nulls _proc, so a
+            # deliberate stop stays silent.
             if self._running_died() and not self._eof_logged:
                 self._eof_logged = True
                 err = await self._stderr.text() if self._stderr else ""
@@ -123,11 +119,8 @@ class AlsaCapture(CaptureSource):
     async def flush(self) -> int:
         """Drop buffered whole frames until the stream runs at the live edge.
 
-        Whole frames only, via ``readexactly`` under a timeout: ``readexactly``
-        extracts from the StreamReader's buffer only once ALL n bytes are present, so
-        a timeout cancellation mid-wait leaves the buffer intact and the S16 sample
-        alignment can never shear. The kernel-pipe remainder refills the reader
-        within a loop tick, so one sub-period timeout per drained frame is enough."""
+        ``readexactly`` under a timeout: it extracts only once ALL n bytes are present,
+        so a timeout mid-wait leaves the buffer intact and S16 alignment cannot shear."""
         proc = self._proc
         if proc is None or proc.stdout is None:
             return 0
@@ -166,9 +159,8 @@ class AlsaPlayback(PlaybackSink):
         if not wav_bytes:
             return True
         cmd = [self._bin, "-q", "-D", self._device, "-"]
-        # Clear BEFORE the spawn await, re-check AFTER publishing self._proc: an
-        # abort() landing in the fork/exec window would otherwise be clobbered here and
-        # the whole blob would play through the barge-in.
+        # Clear BEFORE the spawn await, re-check AFTER publishing _proc: an abort() in
+        # the fork/exec window would otherwise be clobbered and the blob play through.
         self._aborted = False
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -185,8 +177,7 @@ class AlsaPlayback(PlaybackSink):
             return False
         stderr = b""
         try:
-            # An abort() killing the process mid-write returns here promptly, as
-            # BrokenPipeError.
+            # An abort() mid-write returns here promptly, as BrokenPipeError.
             _, stderr = await proc.communicate(wav_bytes)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -220,8 +211,7 @@ class AlsaPlayback(PlaybackSink):
             self._bin, "-q", "-D", self._device,
             "-f", "S16_LE", "-c", "1", "-r", str(rate), "-t", "raw", "-",
         ]
-        # A spawn failure raises to the caller (the AudioSink worker logs it), as does
-        # a barge-in in the fork/exec window: the caller holds the handle.
+        # A spawn failure raises to the caller (the AudioSink worker logs it).
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdin=_PIPE, stdout=_DEVNULL, stderr=_PIPE,
         )
@@ -230,9 +220,8 @@ class AlsaPlayback(PlaybackSink):
 
 
 class _AlsaPlaybackStream(PlaybackStream):
-    """One persistent ``aplay``; the handle IS the process, so whoever holds it can
-    kill it at any point, including mid-``drain()``, which is what lets a barge-in
-    stop the buffered tail."""
+    """One persistent ``aplay``: the handle IS the process, killable at any point,
+    including mid-``drain()`` — that is what stops the buffered tail on barge-in."""
 
     def __init__(self, proc: asyncio.subprocess.Process):
         self._proc = proc
@@ -247,9 +236,9 @@ class _AlsaPlaybackStream(PlaybackStream):
         return self._proc.returncode is not None and not self._killed and not self._eof
 
     async def _log_death(self) -> None:
-        """Surface an aplay that died underneath us: device-open failures (busy dmix,
-        wrong name) land AFTER spawn and would otherwise show only as eaten writes.
-        Once per handle; a deliberate kill() is not a death."""
+        """Surface an aplay that died underneath us: device-open failures land AFTER
+        spawn and would otherwise show only as eaten writes. Once per handle; a
+        deliberate kill() is not a death."""
         if self._death_logged or self._killed:
             return
         self._death_logged = True
@@ -283,8 +272,7 @@ class _AlsaPlaybackStream(PlaybackStream):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except TimeoutError:
-            # Wedged device (e.g. a stuck dmix). _killed so the rc=-9 below is not
-            # reported as a death.
+            # Wedged device (e.g. a stuck dmix); _killed so rc=-9 is not a "death".
             self._killed = True
             self._log.warning("aplay did not exit within 30s after EOF; killing")
             await _terminate(proc)

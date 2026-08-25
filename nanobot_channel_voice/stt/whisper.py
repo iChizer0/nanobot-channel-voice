@@ -1,8 +1,8 @@
 """On-device Whisper ASR (RKNN/ONNX), ported from the Rockchip rknn_model_zoo
 ``examples/whisper`` demo: a log-mel front-end feeds a fixed-length encoder, then a
-sliding 12-token window decoder greedily emits the transcript. The reference's
-torch/scipy preprocessing is reimplemented in numpy only (no torch on the NPU board);
-``numpy`` is imported at module load, so :func:`make_stt` imports this module lazily.
+sliding 12-token window decoder greedily emits the transcript. Preprocessing is numpy
+only (no torch on the NPU board); ``numpy`` is imported at module load, so
+:func:`make_stt` imports this module lazily.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def load_mel_filters(path: str) -> np.ndarray:
 
 def log_mel_spectrogram(audio: np.ndarray, mel_filters: np.ndarray) -> np.ndarray:
     """numpy port of the reference ``log_mel_spectrogram`` (== torch.stft, center=True)."""
-    # Periodic Hann window, identical to torch.hann_window(N_FFT).
+    # Periodic Hann, identical to torch.hann_window(N_FFT).
     window = np.hanning(N_FFT + 1)[:-1].astype(np.float32)
     padded = np.pad(audio, N_FFT // 2, mode="reflect")             # center=True
     frames = sliding_window_view(padded, N_FFT)[::HOP_LENGTH]      # (n_frames, N_FFT)
@@ -61,8 +61,8 @@ def log_mel_spectrogram(audio: np.ndarray, mel_filters: np.ndarray) -> np.ndarra
     s = spec[:-1]
     mag = np.square(s.real)
     mag += np.square(s.imag)
-    # Pin float32 whatever rfft returned (complex128 under numpy<2) so the
-    # (80,201)@(201,n) product runs in float32: half the memory traffic and cost.
+    # Pin float32 whatever rfft returned (complex128 under numpy<2): halves the
+    # (80,201)@(201,n) memory traffic.
     magnitudes = mag.T.astype(np.float32)                          # (201, n_frames-1)
     mel_spec = mel_filters @ magnitudes                            # (80, n_frames-1)
     log_spec = np.log10(np.clip(mel_spec, 1e-10, None))
@@ -112,8 +112,8 @@ class WhisperOnDeviceStt(SttAdapter):
         lang, codes = resolve_languages(cfg.language, cfg.languages)
         requested = (cfg.language or "en").lower()
         if requested != lang and "language" in cfg.model_fields_set:
-            # Also fires for a SINGLE-entry languages list (codes collapses to ()), but
-            # only when the user actually SET a language: overriding the bare default.
+            # Fires for a single-entry languages list too (codes collapses to ()), but
+            # only when the user actually SET a language.
             detail = (
                 f"stt.whisper.languages {list(codes)}"
                 if codes else "a single-entry stt.whisper.languages"
@@ -142,7 +142,7 @@ class WhisperOnDeviceStt(SttAdapter):
                 OnDeviceModel(cfg.decoder_path, **model_kw)  # type: ignore[arg-type]
             )
             # Prefer the export's own window over chunkLength when it declares one
-            # (ONNX only; None for RKNN/dynamic): a mismatch makes every encoder run raise.
+            # (ONNX only): a mismatch makes every encoder run raise.
             max_frames = cfg.chunk_length * 100
             shape = encoder.input_shape("x")
             if shape is not None and len(shape) == 3:
@@ -175,11 +175,9 @@ class WhisperOnDeviceStt(SttAdapter):
             return adapter
 
     def _validate(self) -> None:
-        """Prove the encoder/decoder I/O contract with one zeroed pass: input names,
-        encoder window, the fixed 12-token decoder prompt. A loadable-but-incompatible
-        export then fails HERE, where make_stt falls back to nanobot transcription,
-        not inside every utterance's swallowed try (a silently mute channel). Works on
-        RKNN too, which has no introspection surface to check against."""
+        """Prove the encoder/decoder I/O contract HERE, so an incompatible export makes
+        make_stt fall back instead of failing inside every utterance's swallowed try.
+        Works on RKNN, which cannot introspect."""
         x_mel = np.zeros((1, N_MELS, self._max_frames), dtype=np.float32)
         try:
             out_encoder = self._encoder.run([("x", x_mel)])[0]
@@ -204,8 +202,7 @@ class WhisperOnDeviceStt(SttAdapter):
         return await asyncio.to_thread(self._transcribe_sync, pcm, sample_rate)
 
     async def warmup(self) -> None:
-        """One dummy decode so the first real utterance pays no cold-start
-        (ORT arena allocation, RKNN core spin-up, TensorRT engine build)."""
+        """One dummy decode so the first real utterance pays no cold-start."""
         await self.transcribe(b"\x00" * SAMPLE_RATE, SAMPLE_RATE)  # 0.5 s of silence
 
     def _transcribe_sync(self, pcm: bytes, sample_rate: int) -> str:
@@ -221,11 +218,9 @@ class WhisperOnDeviceStt(SttAdapter):
                     mel.shape[1] * HOP_LENGTH / SAMPLE_RATE,
                     self._max_frames * HOP_LENGTH / SAMPLE_RATE,
                 )
-            # Pad/trim the mel to the fixed encoder length (ref ``pad_or_trim``). The
-            # reference zero-pads the AUDIO; through log10/clip/floor/normalize that
-            # region lands at max(normalized_max - 2.0, -1.5), the 1e-10 clip floor
-            # winning on very quiet captures. Plain 0.0 padding is the port mismatch
-            # behind hallucinations.
+            # Pad/trim the mel to the fixed encoder length. The reference zero-pads the
+            # AUDIO, which lands at max(mel_max - 2.0, -1.5) after log10/floor/normalize;
+            # plain 0.0 padding is the port mismatch behind hallucinations.
             fill = max(float(mel.max()) - 2.0, -1.5) if mel.size else 0.0
             x_mel = np.full((N_MELS, self._max_frames), fill, dtype=np.float32)
             real = min(mel.shape[1], self._max_frames)
@@ -239,13 +234,10 @@ class WhisperOnDeviceStt(SttAdapter):
             return ""
 
     def _pick_token(self, row) -> tuple[int, bool]:
-        """Greedy pick constrained to the DECODABLE languages, plus whether it had to be
-        re-picked; per-decode state stays in the caller's locals because decodes on one
-        adapter legitimately overlap. Optimistic: masking up front would copy ~52k floats
-        EVERY step to reject a token that is almost never chosen, so test the
-        unconstrained argmax (``row`` is a zero-copy view) against a boolean array and
-        pay the masked re-argmax only on the rare out-of-language step.
-        """
+        """Greedy pick constrained to the DECODABLE languages, plus whether it was
+        re-picked. Per-decode state stays in the caller's locals: decodes on one adapter
+        legitimately overlap. Deliberately optimistic — masking up front would copy ~52k
+        floats every step, so only the rare blocked argmax pays a masked re-argmax."""
         token = int(row.argmax())
         if self._blocked is None or token >= self._blocked.shape[0] or not self._blocked[token]:
             return token, False
@@ -255,18 +247,14 @@ class WhisperOnDeviceStt(SttAdapter):
 
     def _window(self, lang_token: int) -> list[int]:
         """The 12-token decoder window: the real 4-token prompt, then filler. Indices
-        0-3 are never evicted (``pop_id`` floors at 4), pinning SOT at position 0 for
-        the whole decode: what makes language detection free."""
+        0-3 are never evicted (``pop_id`` floors at 4), pinning SOT at position 0 —
+        what makes language detection free."""
         return [SOT, lang_token, TRANSCRIBE, NOTIMESTAMPS] * (MAX_TOKENS // 4)
 
     def _decode(self, out_encoder) -> str:
-        """Greedy sliding-window decode, ported from the reference ``run_decoder``.
-
-        With languages enabled the FIRST step also does language ID for free:
-        ``out[0, 0]`` is the row for the position holding SOT, which is the posterior
-        :func:`detect_language` reads. Only a disagreement with the assumed language
-        costs anything: one redone step.
-        """
+        """Greedy sliding-window decode (reference ``run_decoder``). With languages
+        enabled the first step also does language ID: ``out[0, 0]`` is the SOT row
+        :func:`detect_language` reads; only a disagreement costs a redone step."""
         lang_token = self._lang_token
         tokens = self._window(lang_token)
         tokens_str = ""
@@ -310,8 +298,7 @@ class WhisperOnDeviceStt(SttAdapter):
                 break
             if next_token >= TIMESTAMP_BEGIN:
                 # Timestamps stay out of the transcript but must still ROLL the window:
-                # the reference `continue`s without popping, growing it past the fixed
-                # 12, which a fixed-shape decoder export rejects on the next step.
+                # the reference grows it past the fixed 12, which the export rejects.
                 if pop_id > 4:
                     pop_id -= 1
                 tokens.pop(pop_id)
@@ -320,14 +307,12 @@ class WhisperOnDeviceStt(SttAdapter):
                 pop_id -= 1
             tokens.pop(pop_id)
             if next_token < EOT:
-                # Non-timestamp specials (language tags, <|nospeech|>, <|startofprev|>,
-                # ...) roll the window like any token but never reach the transcript:
+                # Non-timestamp specials roll the window but never reach the transcript:
                 # the flat vocab carries their literal strings, so a greedy <|nospeech|>
                 # on noise would reach the agent as user speech.
                 tokens_str += next_token_str
                 # Repetition trap (music, hum): eight IDENTICAL consecutive text tokens
-                # never occur in real speech: bail and shed the looping tail rather
-                # than burn the whole step cap on junk.
+                # never occur in real speech; bail and shed the looping tail.
                 recent.append(next_token)
                 if len(recent) > 8:
                     del recent[0]

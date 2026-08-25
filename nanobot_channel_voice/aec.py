@@ -1,19 +1,16 @@
 """Software acoustic echo cancellation (``aec="webrtc"``, ``[aec]`` extra).
 
-Wraps WebRTC's AEC3 (``livekit.rtc`` AudioProcessingModule) as a capture
-front-end: our own TTS is subtracted from the mic before VAD/STT see it, so
-full-duplex barge-in works without hardware AEC.
+Wraps WebRTC's AEC3 (``livekit.rtc`` AudioProcessingModule) as a capture front-end:
+our own TTS is subtracted from the mic before VAD/STT see it, so full-duplex barge-in
+works without hardware AEC.
 
-Reference alignment: the stream-mode sink paces writes against the wall clock
-and stamps each reference block with the time its audio leaves the speaker; the
-canceller withholds the block until then, leaving AEC3's delay estimator only
-the residual device latency (ALSA buffer + DAC, tens of ms, inside its tracked
-range) instead of our full pacing lead.
+Each reference block is stamped with the time its audio leaves the speaker and withheld
+until then, leaving AEC3's delay estimator only the residual device latency instead of
+our full pacing lead.
 
-Threading: ``push_reference`` runs on the event loop, ``process`` on the
-session's single capture path; the handoff is a deque of immutable tuples
-(GIL-atomic append/popleft) and the APM is touched only by ``process``: single
-consumer, no locks.
+Threading: ``push_reference`` runs on the event loop, ``process`` on the session's single
+capture path; the handoff is a deque of immutable tuples (GIL-atomic append/popleft) and
+the APM is touched only by ``process``: single consumer, no locks.
 """
 
 from __future__ import annotations
@@ -57,30 +54,27 @@ class EchoCanceller:
         self._log.info("webrtc AEC3 front-end up (capture {} Hz)", capture_rate)
 
     def reference_ms(self) -> float:
-        """Cumulative reference audio accepted: how much playback AEC3 has had a
-        chance to learn from. A convergence proxy: wall time is wrong for it (the
-        clock runs during silence, when the filter learns nothing)."""
-        return self._ref_ms
+        """Cumulative reference audio accepted: a convergence proxy (wall time is
+        wrong — the clock runs through silence). Bypassed, the counter is frozen, so
+        report converged or the warmup hold kills early-confirm barge-in all session."""
+        return float("inf") if self._bypassed else self._ref_ms
 
     # ---- reference (our own playback), event-loop side ----------------------
 
     def push_reference(self, pcm: bytes, rate: int, playout_at: float) -> None:
-        """Queue playback audio stamped with the wall-clock time it becomes
-        audible; the sink derives ``playout_at`` from the stream's byte position
-        vs. its open time."""
+        """Queue playback audio stamped with the wall-clock time it becomes audible."""
         if self._bypassed:
             return  # process() no longer drains _pending; don't grow it forever
         if rate % 100:
-            # Same rate/100 framing constraint as capture; degrade to no-reference
-            # instead of raising inside process_reverse_stream per frame.
+            # Same rate/100 framing as capture; degrade rather than raise per frame.
             if self._warned_rate != rate:
                 self._warned_rate = rate
                 self._log.warning("AEC reference rate {} not divisible by 100; ignoring reference", rate)
             return
         if self._carry_rate != rate:
             self._ref_carry, self._carry_rate = b"", rate
-        # The carry sounds BEFORE this block: back-date the stamp by its duration,
-        # else every frame is withheld past its true playout and AEC3 re-converges per push.
+        # The carry sounds BEFORE this block: back-date the stamp by its duration, else
+        # every frame is withheld past its true playout and AEC3 re-converges per push.
         base = playout_at - len(self._ref_carry) / (2.0 * rate)
         self._ref_ms += len(pcm) / (2.0 * rate) * 1000.0
         data = self._ref_carry + pcm
@@ -104,10 +98,8 @@ class EchoCanceller:
 
     def process(self, pcm: bytes) -> bytes:
         """Run one capture frame through the canceller; returns cleaned PCM.
-        Feeds every reference block whose playout time has arrived (silence is
-        implicit: with nothing due, AEC3 sees no render activity). Only whole
-        10 ms APM frames are processed; ``audio.frameMs`` (10/20/30) at a rate
-        divisible by 100 never leaves a remainder."""
+        Feeds every reference block whose playout time has arrived (silence is implicit:
+        nothing due means no render activity). Only whole 10 ms APM frames are processed."""
         if self._bypassed:
             return pcm
         rtc = self._rtc
@@ -115,8 +107,8 @@ class EchoCanceller:
         try:
             while True:
                 try:
-                    # peek+pop races reference_dropped()'s barge-in clear(); deque ops
-                    # are GIL-atomic, so the lost race surfaces as IndexError: nothing due.
+                    # peek+pop races reference_dropped()'s clear(); deque ops are
+                    # GIL-atomic, so a lost race surfaces as IndexError: nothing due.
                     if not self._pending or self._pending[0][0] > now:
                         break
                     _, ref, rate = self._pending.popleft()
@@ -132,14 +124,12 @@ class EchoCanceller:
                 chunk = pcm[i * self._frame_b:(i + 1) * self._frame_b]
                 frame = rtc.AudioFrame(data=chunk, sample_rate=self._rate,
                                        num_channels=1, samples_per_channel=len(chunk) // 2)
-                # APM contract: the delay hint applies to the NEXT process_stream,
-                # so it is set per frame, not hoisted out of the loop.
+                # APM contract: the hint applies to the NEXT process_stream; per frame.
                 self._apm.set_stream_delay_ms(self._device_delay_ms)
                 self._apm.process_stream(frame)
                 out += frame.data.tobytes()
         except Exception as exc:  # noqa: BLE001 - AEC must never deafen capture
-            # Upstream of the endpointer: an escaping raise costs the session every
-            # frame from here on. Drop the now-meaningless reference timeline.
+            # Upstream of the endpointer: a raise here would deafen the session.
             self._pending.clear()
             self._ref_carry = b""
             self._fails += 1
@@ -154,8 +144,8 @@ class EchoCanceller:
 
 
 def make_echo_canceller(capture_rate: int, *, device_delay_ms: int = 50) -> EchoCanceller | None:
-    """Build the AEC front-end, or ``None`` with a warning; callers degrade
-    (local falls back to soft-duplex, cloud open-mic refuses to start)."""
+    """Build the AEC front-end, or ``None`` with a warning; callers degrade (local
+    falls back to soft-duplex, cloud open-mic refuses to start)."""
     try:
         return EchoCanceller(capture_rate, device_delay_ms=device_delay_ms)
     except ImportError:

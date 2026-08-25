@@ -2,8 +2,8 @@
 around a swappable ``VoiceBackend`` (``local`` or a realtime provider). Capture -> STT
 publishes via ``_handle_message``, so allow-list and session routing work as for any
 channel; barge-in publishes the priority ``/stop``, then the new utterance
-(cancel-then-send); ``send_delta`` text is spoken chunk-by-chunk, while ``send`` speaks
-only genuine final messages (see :func:`_speakable`)."""
+(cancel-then-send). ``send_delta`` text is spoken chunk-by-chunk, ``send`` only genuine
+final messages (see :func:`_speakable`)."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import ToolDef, VoiceState
 from nanobot_channel_voice.backend.local import LocalBackend
-from nanobot_channel_voice.backend.openai_realtime import RealtimeBackend
+from nanobot_channel_voice.backend.openai_realtime import RealtimeBackend, _load_connect
 from nanobot_channel_voice.backend.profiles import backend_kind, resolve_profile
 from nanobot_channel_voice.config import (
     VoiceConfig,
@@ -53,8 +53,8 @@ _DEFAULT_PERSONA = (
     "You are a helpful, concise voice assistant. Keep replies short and conversational."
 )
 
-# Direct tool mode: the filler preamble is what the user hears across a tool round-trip;
-# without it the line goes dead. Appended only when tools are actually declared.
+# Direct mode: the filler is what the user hears across a tool round-trip, else the line
+# goes dead. Appended only when tools are declared.
 _DIRECT_RULES = (
     "Before a tool call that will keep the user waiting, say a brief neutral filler "
     "in the user's language, such as \"One moment.\" or \"Let me check.\" (never "
@@ -63,17 +63,16 @@ _DIRECT_RULES = (
     "answer is pure answer: never open it with wait phrases or progress narration."
 )
 
-# Silence-is-the-ack, model-side half: the enforcement is the client's transcript-gated
-# response.cancel (backend._consume_stop), but that needs input transcription enabled and
-# can lose a race to a very fast ack — this line keeps the un-cancellable head short and
-# covers providers whose transcription events never arrive. Appended in EVERY mode.
+# Silence-is-the-ack, model-side half: enforcement is backend._consume_stop's
+# transcript-gated response.cancel, which needs input transcription and can lose the race
+# to a fast ack. Appended in EVERY mode.
 _STOP_RULE = (
     "If the user only tells you to stop, be quiet, or wait, do not answer — "
     "produce no speech at all."
 )
 
-# Supervisor tool mode (Responder-Thinker): the realtime model owns the conversational
-# surface, delegating reasoning/tool work to nanobot; the filler masks the round-trip.
+# Supervisor mode (Responder-Thinker): the realtime model owns the conversational surface
+# and delegates reasoning/tool work to nanobot; the filler masks the round-trip.
 _SUPERVISOR_RULES = (
     "Handle greetings, small talk, and clarifying questions yourself. For ANYTHING "
     "that needs a fact you don't already know, an action, a lookup, or multi-step "
@@ -85,8 +84,8 @@ _SUPERVISOR_RULES = (
     "or that you delegated."
 )
 
-# Supervisor mode's only declared tool: persona + this schema is the whole realtime
-# context, while MCP/skills/memory stay in nanobot.
+# Supervisor's only declared tool: persona + this schema is the whole realtime context,
+# MCP/skills/memory stay in nanobot.
 _SUPERVISOR_TOOL = ToolDef(
     name="ask_nanobot",
     description=(
@@ -114,19 +113,16 @@ _SUPERVISOR_TOOL = ToolDef(
     },
 )
 
-# The ask_nanobot result when the user barges in mid-delegation; only satisfies the
-# function call, since the backend's stale-response guard drops it (barge-in already
-# cancelled the response).
+# The ask_nanobot result on a mid-delegation barge-in: only satisfies the function call,
+# the backend's stale-response guard drops it.
 _DELEGATION_INTERRUPTED = "(interrupted by the user)"
 
-# Tags our own priority commands. Core copies INBOUND metadata onto the command ack
-# ("Stopped 1 task(s)."), so this is how _speakable drops it: untagged, every confirmed
-# barge-in speaks the ack (local) or resolves a delegation with it (supervisor).
+# Tags our own priority commands: core copies INBOUND metadata onto the command ack
+# ("Stopped 1 task(s)."), so _speakable can drop it — untagged, every barge-in speaks it.
 _VOICE_CMD_META = "_voice_cmd"
 
-# Trace flags older cores stamp on outbound metadata; newer cores moved the same semantics
-# onto the typed ``OutboundMessage.event``. BOTH are checked: neither alone covers every
-# core the plugin runs against.
+# Trace flags older cores stamp on outbound metadata; newer cores moved the semantics onto
+# the typed ``OutboundMessage.event``. BOTH checked: neither alone covers every core.
 _TRACE_META = (
     "_streamed",        # already spoken via send_delta
     "_progress",
@@ -151,14 +147,11 @@ def _speakable(msg: OutboundMessage) -> bool:
 
 
 def _streamed_final(msg: OutboundMessage) -> bool:
-    """The turn's final, stamped "already delivered as deltas" — usually honest.
-
-    Core stamps it on the text it SUBSTITUTES for a blank model answer too
-    (``empty_final_response``, the max-iterations finalization), which was never streamed
-    at all: dropping that is how a small model's give-up becomes dead air. Only the
-    backend knows what the turn actually said, so it decides (see ``speak_unanswered``).
-    Either encoding may arrive — core derives the event for its own routing without
-    rewriting the message."""
+    """The turn's final, stamped "already delivered as deltas" — usually honest: core also
+    stamps it on text it SUBSTITUTES for a blank answer (``empty_final_response``, the
+    max-iterations finalization), never streamed at all, and dropping that is dead air. The
+    backend, which knows what the turn said, decides (``speak_unanswered``). Either
+    encoding may arrive."""
     meta = msg.metadata or {}
     if any(meta.get(k) for k in _TRACE_META if k != "_streamed"):
         return False  # a progress/tool/reasoning trace, not a reply
@@ -169,17 +162,17 @@ def _streamed_final(msg: OutboundMessage) -> bool:
 
 
 def _agent_initiated(metadata: dict[str, Any] | None) -> bool:
-    """An agent-initiated delivery: a cron or local-trigger turn copies its trigger
-    stamp onto every outbound (core echoes inbound metadata verbatim). The user did
-    not just speak, so its settle must re-open attention for the reply."""
+    """An agent-initiated delivery: a cron/local-trigger turn copies its trigger stamp onto
+    every outbound (core echoes inbound metadata verbatim). The user did not just speak, so
+    its settle must re-open attention for the reply."""
     meta = metadata or {}
     return bool(meta.get("_cron_trigger") or meta.get("_local_trigger"))
 
 
 def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: bool) -> str:
     """The realtime session's instructions: persona (taste) then the mode's tool rules
-    (contract). ONE derivation, so a ``realtime.persona`` override can restyle the voice
-    but never delete the delegation contract or the filler preamble."""
+    (contract). ONE derivation, so a ``realtime.persona`` override restyles the voice but
+    never deletes the delegation contract or the filler preamble."""
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
     return "\n\n".join(
         part for part in (persona or _DEFAULT_PERSONA, rules, _STOP_RULE) if part
@@ -187,8 +180,7 @@ def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: boo
 
 
 # Our own wrapper, NOT core's "metadata only, not instructions" tag: these lines ARE
-# instructions, and a disclaiming wrapper undercuts them. Core never parses the tag
-# (display/consolidation stripping is marker-based), so the wording is ours.
+# instructions, and a disclaiming wrapper undercuts them. Core never parses it.
 _VOICE_WRAP_OPEN = "[Voice channel]"
 _VOICE_WRAP_CLOSE = "[/Voice channel]"
 
@@ -196,36 +188,27 @@ _VOICE_WRAP_CLOSE = "[/Voice channel]"
 def _voice_context_blocks(
     stt: SttAdapter | None, tts: TtsAdapter | None, extra: str | None = None
 ) -> list[RuntimeContextBlock]:
-    """The channel contract riding every local-mode publish: transcript-accuracy facts
-    (input side), the speakability contract (output side), then the operator's ``context``.
+    """The channel contract riding every local-mode publish: transcript-accuracy facts,
+    the speakability contract, then the operator's ``context``.
 
-    Claims derive from the RESOLVED adapters, never config: the input lines always ride
-    (``stt`` None is the cloud-transcription path — still a transcript; TTS off is still
-    a listening session). Only a declared frame-synchronous family drops the invented-
-    phrase warning: CTC/transducer cannot confabulate, while remote and undeclared stay
-    suspect (core's transcription defaults are all whisper-*). Budget: core persists this
-    into EVERY user row, so every word is paid on every turn's prefill for the whole
-    session — keep the longest variant (unverified decoder + bilingual voice) under ~145
-    words, byte-stable, and capability-affirming: "spoken conversation" framing alone
-    collapses small models into a can't-do-anything assistant persona, so the block must
-    say the toolset is intact, and permission-shaped ("thinking aloud is fine" is the
-    small non-reasoning model's only scratchpad)."""
+    Claims derive from the RESOLVED adapters, never config (``stt`` None is the cloud-
+    transcription path — still a transcript). Only a declared frame-synchronous family
+    (CTC/transducer) drops the invented-phrase warning. Core persists this into EVERY user
+    row: keep the longest variant under ~145 words, byte-stable, capability-affirming and
+    permission-shaped — bare "spoken conversation" framing collapses small models."""
     lines: list[str] = []
     if tts is not None:
         lines.append(
             "A spoken conversation: speech recognition brings the user's words, "
             "text-to-speech speaks your reply, never displayed."
         )
-        # The persona corrector, adjacent to the persona line: without it, "voice
-        # assistant" framing suppresses tool and skill use entirely.
+        # Persona corrector: without it "voice assistant" framing suppresses tool use.
         lines.append(
             "You have your full tools and skills; use them. Speech changes only "
             "the reply's style."
         )
     else:
         lines.append("The user's words arrive via speech recognition.")
-    # Read-by-sound licenses charitable decoding (homophones); act-then-confirm scoping
-    # keeps benign requests acted on (ask-first only where a wrong reading costs).
     if getattr(stt, "decoder_family", "") in ("ctc", "transducer"):
         lines.append(
             "The transcript may mis-hear words; read it by sound and context; act "
@@ -256,15 +239,13 @@ def _voice_context_blocks(
                 "only — other scripts are dropped or voiced as noise."
             )
         lines.append(
-            # The backend detects the spoken status line (agent_prologue) and defers
-            # the canned filler behind it.
+            # The backend detects this status line (agent_prologue) to defer the filler.
             "Thinking aloud briefly is fine. Before a slow tool call, say one short "
             "sentence about what you are doing; keep the answer for after the "
             "results, with no wait-phrases (\"One moment\")."
         )
         # A plain answer ENDS the turn in core, so "I will keep trying" is itself a
-        # give-up unless the model spends the same turn trying: the one prompt-side
-        # counterweight (see goal.phrases for the enforced version).
+        # give-up: the one prompt-side counterweight (goal.phrases is the enforced one).
         lines.append(
             "If a step fails, try another way, and always say how it ended."
         )
@@ -275,33 +256,29 @@ def _voice_context_blocks(
 
 
 # Stamped on a delegated ask_nanobot request; the AgentLoop echoes inbound metadata onto
-# the turn's FINAL send, so the reply carries the token back, the non-streaming analogue
-# of accepts_stream, since a /stop-ped delegation can finish minutes later with a bare
-# final send. Mismatch => straggler; absent => accept, as for an unrecognized stream id.
+# the turn's FINAL send (a /stop-ped delegation can finish minutes later with a bare final
+# send). Mismatch => straggler; absent => accept.
 _DELEGATION_META = "_voice_delegation"
 
 
 class _DelegationCollector:
-    """Collects one delegated nanobot turn's reply off the bus (supervisor mode); the
-    first terminal the streaming contract produces resolves the future. Streaming ON:
-    deltas accumulate and ``_stream_end`` resolves; the final ``_streamed`` send DOES
-    reach the channel (the manager exempts it only from duplicate suppression) and is
-    ignored here, the future being done. Streaming OFF: a single final ``send`` resolves."""
+    """Collects one delegated nanobot turn's reply off the bus (supervisor mode); the first
+    terminal resolves the future. Streaming ON: deltas accumulate, ``_stream_end`` resolves,
+    the final ``_streamed`` send (which DOES reach the channel) is ignored. OFF: one final
+    ``send`` resolves."""
 
     def __init__(self, metrics: VoiceMetrics) -> None:
         self._future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._parts: list[str] = []
         self._metrics = metrics
-        # A supervisor turn is a full AgentLoop run, so its first token is the TTFT analogue.
         self._started_at = time.monotonic()
         self._first_token = False
         # Tombstone: a /stop-ped turn's reply may still be in flight, so a dead collector
-        # stays registered to swallow it instead of resolving the NEXT delegation.
+        # stays registered to swallow it, not resolve the NEXT delegation.
         self.dead = False
-        # Watermark against a PREVIOUS turn's stragglers: core stream ids embed the turn's
-        # start time_ns (see streamid) and any turn answering THIS delegation starts after
-        # the collector, so an older base is a stopped turn's queued deltas racing the
-        # tombstone swap. An unrecognized id format accepts everything.
+        # Watermark against a PREVIOUS turn's stragglers: stream ids embed the turn's start
+        # time_ns (streamid) and one answering THIS delegation starts after the collector.
+        # An unrecognized id format accepts everything.
         self._created_ns = time.time_ns()
         self.token = unique_token()  # non-streaming identity, see _DELEGATION_META
 
@@ -323,18 +300,17 @@ class _DelegationCollector:
             self._parts.append(delta)
 
     def note_boundary(self) -> None:
-        """A tool-boundary segment break: separate the reply's parts WITHOUT latching
-        the first-token clock — the separator is channel-fabricated, not a model token,
-        and latching would under-report TTFT for exactly the tool-first delegations
-        supervisor mode exists for."""
+        """A tool-boundary segment break: separates the reply's parts WITHOUT latching the
+        first-token clock — the separator is channel-fabricated, and latching would
+        under-report TTFT for exactly the tool-first delegations supervisor mode is for."""
         self._parts.append("\n")
 
     def finish(self, fallback: str = "") -> None:
         text = "".join(self._parts).strip() or (fallback or "").strip()
         if not text:
-            # Not a terminal: core also fires on_stream_end(resuming=False) mid-turn on its
-            # blank-response retry path, so keep collecting: the real end or
-            # delegationTimeoutS decides. Marking a first token would suppress the real one.
+            # Not a terminal: core fires on_stream_end(resuming=False) mid-turn on its
+            # blank-response retry, so keep collecting (the real end or delegationTimeoutS
+            # decides) and do not mark a first token, which would suppress the real one.
             return
         self._mark_first_token()
         self._resolve(text)
@@ -345,15 +321,15 @@ class _DelegationCollector:
         self._resolve(text)
 
     def entomb(self) -> None:
-        """Mark dead AND latch the first-token flag: a tombstone's late reply must
-        neither resolve the next delegation nor time a delegation that failed."""
+        """Mark dead AND latch first-token: a tombstone's late reply must neither resolve
+        the next delegation nor time a delegation that failed."""
         self.dead = True
         self._first_token = True
 
     def abandon(self, text: str) -> None:
-        """Release the delegation, latching the first-token flag: the user barged in, so
-        no answer was produced, and the cancelled turn's late ``send``/``send_delta``
-        (possible until ``_pending_delegation`` is cleared) must not be timed as one."""
+        """Release the delegation, latching first-token: no answer was produced, and the
+        cancelled turn's late ``send``/``send_delta`` (possible until
+        ``_pending_delegation`` clears) must not be timed as one."""
         self._first_token = True
         self.dead = True
         self._resolve(text)
@@ -369,14 +345,12 @@ class _DelegationCollector:
 class VoiceChannel(BaseChannel):
     name = "voice"
     display_name = "Voice"
-    # Defaults only: the ChannelManager overwrites all three from channels.* config.
-    # Progress/tool-event traffic is WANTED here — it feeds the deadman's liveness
-    # tap in send() (never spoken; _speakable drops it) — so mirror core's defaults.
+    # Defaults only (the ChannelManager overwrites all three). Progress/tool-event traffic
+    # is WANTED: it feeds the deadman's liveness tap in send(), never spoken.
     send_progress = True
     send_tool_hints = True
     show_reasoning = False
-    # Core tool-gateway seam: when the ChannelManager injects the gateway, the cloud
-    # backend routes the model's tool calls through nanobot's guarded ToolRegistry.
+    # With the gateway injected, cloud tool calls route through nanobot's ToolRegistry.
     wants_tool_gateway = True
 
     def __init__(self, config: Any, bus: MessageBus, *, tool_gateway: Any = None):
@@ -391,23 +365,20 @@ class VoiceChannel(BaseChannel):
         self._stt: SttAdapter | None = None
         self._stt_server = None             # stt.serve: local /v1/audio/transcriptions
         self._tts_adapter = None            # local mode only; kept for warmup
-        # Local mode only: speakability context riding every published utterance; empty
-        # for cloud, where the provider both reasons and speaks under its own persona.
-        # Delivered via the context bridge (see context_tool), NEVER inbound metadata:
-        # non-JSON metadata corrupts every tool that snapshots it (cron's origin_metadata).
+        # Local mode only (cloud speaks under its own persona). Delivered via the context
+        # bridge, NEVER inbound metadata: non-JSON metadata corrupts every tool that
+        # snapshots it (cron's origin_metadata).
         self._voice_context: list[RuntimeContextBlock] = []
         self._context_bridge: VoiceContextBridge | None = None
         self._warmup_task: asyncio.Task | None = None
         self._metrics_task: asyncio.Task | None = None  # debug.metricsIntervalS reporter
-        # Supervisor mode only: the in-flight ask_nanobot delegation whose reply the bus
-        # glue collects. One slot, since a bus reply can't be correlated to a specific
-        # concurrent delegation, so the lock serializes them.
+        # Supervisor mode only: the in-flight ask_nanobot delegation the bus glue collects.
+        # One slot — a bus reply can't be correlated to a concurrent delegation, so the lock
+        # serializes them.
         self._pending_delegation: _DelegationCollector | None = None
         self._delegation_lock = asyncio.Lock()
-        # One per session, shared with backend and shell, so a tool call's segments
-        # (seen -> dispatched -> executed -> continuation) join on call_id in one place.
+        # One per session, shared with backend and shell: segments join on call_id.
         self._metrics = VoiceMetrics()
-        # Optional OTel mirror, resolved once so a disabled exporter costs nothing per call.
         self._tracer = VoiceTracer(self.config.telemetry)
 
     @classmethod
@@ -420,10 +391,9 @@ class VoiceChannel(BaseChannel):
         self._running = True
         self._stop_event = asyncio.Event()
         if self.config.import_json:
-            # A WebUI paste is pending in config.json: expand it into the real section
-            # keys and delete the blob. self.config already carries the merged values
-            # (the schema folded the paste at parse time), so a failed rewrite only
-            # means the blob is consumed on a later start, never a wrong runtime config.
+            # A WebUI paste pending in config.json: expand it into real section keys and
+            # delete the blob. self.config already carries the merged values, so a failed
+            # rewrite only defers the blob; it can never yield a wrong runtime config.
             try:
                 imported = await asyncio.to_thread(consume_import_json)
             except Exception as exc:  # noqa: BLE001 - config file may have changed underneath
@@ -447,8 +417,7 @@ class VoiceChannel(BaseChannel):
                 self._stt = make_stt(self.config.stt)
                 shell, instructions, tools = self._build_local()
             else:
-                # A declared-but-unimplemented kind (a future "gemini") must refuse
-                # loudly; falling through to local would silently run the wrong brain.
+                # Refuse loudly: falling through to local would run the wrong brain.
                 raise RuntimeError(f"voice backend kind '{kind}' is not implemented")
             if not self._running:
                 self._backend = None
@@ -461,9 +430,9 @@ class VoiceChannel(BaseChannel):
             )
             await shell.start(instructions=instructions, tools=tools)
         except BaseException:
-            # Must not report healthy, leave a never-started backend registered
-            # (speak_final queues into a worker that never runs), or leave a half-started
-            # shell holding devices (shell.start's first await already spawned arecord).
+            # Must not report healthy, leave a never-started backend registered (speak_final
+            # queues into a worker that never runs), or leave a half-started shell holding
+            # devices (shell.start's first await already spawned arecord).
             self._running = False
             self._backend = None
             self._drop_bridge()
@@ -472,8 +441,7 @@ class VoiceChannel(BaseChannel):
                     await shell.stop()
             raise
         if not self._running:
-            # stop() landed mid-start and found nothing to stop (self._shell is published
-            # only below); tear the shell down here.
+            # stop() landed mid-start, before _shell was published: tear it down here.
             await shell.stop()
             self._backend = None
             self._drop_bridge()
@@ -482,8 +450,8 @@ class VoiceChannel(BaseChannel):
         try:
             server = await self._start_stt_server()
         except BaseException:
-            # A configured serve endpoint that cannot bind (port in use, bad host) refuses
-            # loudly rather than leave WebUI dictation broken, and takes the shell down.
+            # A serve endpoint that cannot bind refuses loudly (WebUI dictation would be
+            # silently broken) and takes the shell down.
             self._running = False
             self._shell = None
             self._backend = None
@@ -493,8 +461,7 @@ class VoiceChannel(BaseChannel):
             raise
         if not self._running:
             # stop() raced the endpoint coming up: the handle is published only after the
-            # bind, so stop() saw None and skipped it; THIS frame owns the listener, so
-            # stop it via the local and clear the just-published handle.
+            # bind, so stop() saw None. THIS frame owns the listener.
             if server is not None:
                 with suppress(Exception):
                     await server.stop()
@@ -517,16 +484,16 @@ class VoiceChannel(BaseChannel):
         # The adapter's window, not config: a whisper export may override chunkLength.
         window = None if self._stt is None else self._stt.max_decode_ms
         if window is not None and self.config.vad.max_utterance_ms > window:
-            # The whisper defaults land here (30 s cap vs a 20 s export); harmless —
-            # long captures decode in pieces — but say once where the seams come from.
+            # Harmless (decoded in pieces), but name the seam once; the whisper defaults
+            # land here: 30 s cap vs a 20 s export.
             self.logger.info(
                 "stt decode window ({:.0f}s) is under vad.maxUtteranceMs ({}); longer "
                 "utterances are decoded in window-sized pieces cut at the quietest gap",
                 window / 1000, self.config.vad.max_utterance_ms,
             )
         if self.config.stt.provider == "zipformer" and self.config.audio.sample_rate != 16000:
-            # The streaming path feeds raw capture frames to the model unresampled (only
-            # the batch path resamples), so another rate yields time-stretched garbage.
+            # The streaming path feeds capture frames unresampled (only batch resamples),
+            # so another rate yields time-stretched garbage.
             raise RuntimeError(
                 "stt.provider='zipformer' requires audio.sampleRate=16000 "
                 f"(configured: {self.config.audio.sample_rate})"
@@ -542,9 +509,8 @@ class VoiceChannel(BaseChannel):
         tts = make_tts(self.config.tts)
         self._tts_adapter = tts
         if tts is not None:
-            # The engine that actually LOADED: a failed build degrades to the system
-            # voice behind a lone warning, which sounds like the configured engine
-            # mispronouncing everything rather than like a different engine speaking.
+            # The engine that actually LOADED: a failed build degrades to the system voice
+            # behind one warning, and sounds like mispronunciation rather than a swap.
             langs = getattr(tts, "spoken_languages", None) or (
                 getattr(tts, "spoken_language", None),
             )
@@ -559,7 +525,7 @@ class VoiceChannel(BaseChannel):
             self.name, self.config.chat_id, self._voice_context
         )
         if tool_created():
-            # `context` is unbounded and the per-turn cost is invisible: say it once.
+            # `context` is unbounded and the per-turn cost invisible: say it once.
             self.logger.info(
                 "voice context: {} words ride every published utterance (voice_context tool)",
                 sum(len(block.content.split()) for block in self._voice_context),
@@ -570,20 +536,18 @@ class VoiceChannel(BaseChannel):
                 "(nanobot.tools entry point not visible?): NO voice context reaches "
                 "the model; reinstall the plugin so the gateway sees its entry points"
             )
-        # A raw-PCM TTS (MMS, openai with audioFormat=pcm) streams gaplessly through one
-        # persistent player, no per-chunk aplay spawn; WAV-only adapters keep blob mode.
+        # Raw-PCM TTS streams gaplessly through one persistent player (no per-chunk aplay
+        # spawn); WAV-only adapters keep blob mode.
         pcm_capable = tts is not None and getattr(tts, "output_rate", None) is not None
         audio_sink = AudioSink(sink_dev, mode="stream" if pcm_capable else "blob")
         # Software AEC ([aec] extra), wired twice: the sink feeds it our playback as the
-        # reference, the backend runs capture through it. A missing extra or a WAV-blob TTS
-        # (its sink never feeds the reference tap) warns and degrades to soft-duplex; NOT
-        # building the canceller is the degrade, since open_mic already holds for "webrtc"
-        # without it, and a reference-starved canceller cancels nothing while its warmup
-        # hold suppresses the early-confirm shortcuts forever (reference_ms() never advances).
+        # reference, the backend runs capture through it. NOT building it is the degrade to
+        # soft-duplex — a starved canceller cancels nothing while its warmup hold suppresses
+        # early-confirm forever.
         aec_stage = None
         if self.config.aec == "webrtc":
-            # AEC3 frames 10 ms blocks: a rate % 100 != 0 (matcha's 22050) would drop
-            # every reference block -> the starved canceller described above
+            # AEC3 frames 10 ms blocks: rate % 100 != 0 (matcha's 22050) drops every
+            # reference block -> the starved canceller above
             tts_rate = getattr(tts, "output_rate", None) if pcm_capable else None
             if tts_rate is None:
                 self.logger.warning(
@@ -610,8 +574,8 @@ class VoiceChannel(BaseChannel):
                 if aec_stage is not None:
                     audio_sink.set_reference_tap(aec_stage)
         # A streaming adapter decodes DURING speech, so eager speculation is pointless;
-        # batch on-device adapters get it. The nanobot delegate gets neither: it may be a
-        # billed cloud API, where a resumed speaker wastes one call per pause.
+        # batch on-device adapters get it. Never the nanobot delegate: it may be a billed
+        # cloud API, where a resumed speaker wastes one call per pause.
         streaming = self._stt is not None and getattr(self._stt, "streaming", False)
         self._backend = LocalBackend(
             self.config,
@@ -635,7 +599,7 @@ class VoiceChannel(BaseChannel):
             backend=self._backend,
             open_mic=self.config.open_mic,
             on_fatal=self.stop,  # a dead shell must release the channel too
-            # Sharing these stops the shell building its own and re-logging the telemetry banner.
+            # Shared, else the shell builds its own and re-logs the telemetry banner.
             metrics=self._metrics,
             tracer=self._tracer,
         )
@@ -644,19 +608,19 @@ class VoiceChannel(BaseChannel):
     async def _build_cloud(self) -> tuple[VoiceShell, str, list]:
         rt = self.config.realtime
         profile = resolve_profile(self.config.backend)  # openai/xai/azure/qwen/glm/stepfun
-        # Fail fast on STATIC config errors, before any device is claimed: left to the
-        # backend they raise in the rx task, where the reconnect ladder mistakes them for
-        # transport blips (three retries, then "reconnect exhausted").
+        # Fail fast on STATIC config errors before any device is claimed: left to the
+        # backend they raise in the rx task, where the reconnect ladder reads them as
+        # transport blips.
         profile.base_url(rt.base_url)  # raises for a provider with no default (Azure)
+        _load_connect()  # missing [realtime] extra: a transport-shaped error otherwise
         if not resolve_openai_key(rt.api_key):
             raise RuntimeError(
                 f"no API key for realtime provider '{profile.key}' "
                 "(set channels.voice.realtime.apiKey or OPENAI_API_KEY)"
             )
         # The mic stays open for server-VAD barge-in only with echo cancellation: asserted
-        # hardware/OS AEC (aecAvailable=true or the top-level aec="hardware", same physical
-        # fact) or the software AEC3 canceller (aec="webrtc"). Else the gated fallback,
-        # the shell's SPEAKING mic-gate, where barge-in resumes after playback.
+        # hardware/OS AEC (aecAvailable=true or aec="hardware", one physical fact) or AEC3
+        # (aec="webrtc"). Else the shell's SPEAKING gate: barge-in resumes after playback.
         aec_stage = None
         if rt.barge_in == "aec":
             hw_aec = rt.aec_available or self.config.full_duplex
@@ -676,16 +640,16 @@ class VoiceChannel(BaseChannel):
                     "realtime.bargeIn='gated'."
                 )
         if not rt.server_vad:
-            # No client-side input_audio_buffer.commit / response.create path exists, so
-            # audio would stream up forever and the session would never answer.
+            # No client-side commit / response.create path exists: audio would stream up
+            # forever and the session would never answer.
             raise RuntimeError(
                 "realtime.serverVad=false is not supported: the channel relies on "
                 "server-side turn detection to commit audio and create responses."
             )
         open_mic = rt.barge_in == "aec"  # aec => open; gated => shell gates while SPEAKING
         # Capture at the PROVIDER's input rate (24 kHz OpenAI/xAI/Azure, 16 kHz Qwen/GLM);
-        # the ALSA `plug` layer resamples the device. Stream-mode playback opens its
-        # persistent stream at the provider's output rate, so asymmetric rates are fine.
+        # ALSA `plug` resamples the device. Playback opens at the OUTPUT rate: asymmetric
+        # rates are fine.
         audio_cfg = self.config.audio.model_copy(update={"sample_rate": profile.input_rate})
         capture, sink_dev = make_audio(audio_cfg)
         audio_sink = AudioSink(sink_dev, mode="stream")
@@ -695,8 +659,7 @@ class VoiceChannel(BaseChannel):
             self.config, sink=audio_sink, profile=profile, metrics=self._metrics,
             aec=aec_stage,
         )
-        # Capability is PER MODEL, so a newer generation can enable tools while older
-        # ones stay persona-only.
+        # Capability is PER MODEL: a newer generation can enable tools.
         model = self.config.realtime.model or profile.default_model
         supported = bool(profile.capabilities_for(model)["supports_tools"])
         tools, exec_tool = await self._cloud_tools(supported, rt.tool_mode)
@@ -713,8 +676,8 @@ class VoiceChannel(BaseChannel):
             metrics=self._metrics,
             tracer=self._tracer,
         )
-        # Supervisor rules only when the delegated tool is actually wired; direct rules
-        # only when there are tools whose round-trip needs masking.
+        # Supervisor rules only when the delegated tool is wired; direct rules only when
+        # there are tools whose round-trip needs masking.
         supervisor = rt.tool_mode == "supervisor" and exec_tool is not None
         instructions = _cloud_instructions(
             rt.persona, supervisor=supervisor, has_tools=bool(tools)
@@ -724,13 +687,11 @@ class VoiceChannel(BaseChannel):
     async def _cloud_tools(self, supported: bool, tool_mode: str):
         """(tool_defs, exec_tool) for the realtime model, or ([], None) persona-only.
 
-        ``supported`` is the profile's tool capability: a provider whose function-call
-        flow isn't the OpenAI exchange (e.g. Qwen) stays persona-only even with the
-        gateway wired. ``tool_mode`` picks the surface: ``"direct"`` declares nanobot's N
-        tools, each call a guarded ``execute_tool`` slice with the realtime model planning
-        the sequence; ``"supervisor"`` declares ONE tool (``ask_nanobot``) delegating the
-        whole request to nanobot's AgentLoop over the bus, so multi-step planning leaves
-        the weak model."""
+        ``supported`` is the profile's tool capability: a provider whose function-call flow
+        isn't the OpenAI exchange (Qwen) stays persona-only even with the gateway wired.
+        ``"direct"`` declares nanobot's N tools, each call a guarded ``execute_tool`` slice
+        the realtime model sequences; ``"supervisor"`` declares ONE (``ask_nanobot``)
+        delegating the whole request, so multi-step planning leaves the weak model."""
         gw = self._tool_gateway
         if gw is None or not supported:
             if gw is not None and not supported:
@@ -747,8 +708,8 @@ class VoiceChannel(BaseChannel):
             # Not execute_tool: a delegated request is a whole turn, driven over the bus.
             return [_SUPERVISOR_TOOL], self._delegate_to_nanobot
 
-        # Direct mode. The gateway derives the session key from channel/chat_id exactly as
-        # the bus does, so cloud tools share the voice session's working dir / memory.
+        # Direct mode. The gateway derives the session key from channel/chat_id as the bus
+        # does, so cloud tools share the voice session's working dir / memory.
         tools = [ToolDef.from_nanobot_schema(s) for s in await gw.get_tool_definitions()]
 
         async def exec_tool(name: str, args: str):
@@ -762,9 +723,8 @@ class VoiceChannel(BaseChannel):
         """``ask_nanobot`` handler (supervisor mode): run a full nanobot turn over the bus
         and return its final text for the realtime model to speak.
 
-        The request goes out as an ordinary inbound message, so it runs a complete turn
-        (planning, multi-tool, memory, MCP, skills) under the normal guards, sharing the
-        voice session; the reply is collected from ``send``/``send_delta`` into the one
+        An ordinary inbound message, so it runs a complete turn under the normal guards in
+        the voice session; the reply is collected from ``send``/``send_delta`` into the one
         ``_pending_delegation`` slot, serialized by ``_delegation_lock`` because the shell
         runs tool calls concurrently off its rx loop."""
         try:
@@ -782,11 +742,11 @@ class VoiceChannel(BaseChannel):
             return "I didn't catch what you needed. Could you say that again?"
         text = f"{request}\n\n[context from the conversation: {context}]" if context else request
 
-        # Queuing is its own latency component: a delegation can wait on the lock as long
-        # as it later takes to run, and folding the two would blame the AgentLoop.
+        # Queue wait is its own component: a delegation can wait on the lock as long as it
+        # then takes to run, and folding them would blame the AgentLoop.
         queued_at = time.monotonic()
         # Its own budget: an ask_nanobot turn is a full AgentLoop run (tool-heavy ones
-        # routinely exceed 30 s), whereas turn_timeout_s is the REALTIME WIRE watchdog.
+        # exceed 30 s), whereas turn_timeout_s is the REALTIME WIRE watchdog.
         timeout_s = self.config.realtime.delegation_timeout_s or self.config.realtime.turn_timeout_s
         async with self._delegation_lock:
             self._metrics.observe(
@@ -815,9 +775,8 @@ class VoiceChannel(BaseChannel):
                     self._pending_delegation = None
 
     async def _on_cloud_barge_in(self) -> None:
-        """Supervisor mode: the user talked over an in-flight ask_nanobot delegation, so
-        cancel the moot nanobot turn (``/stop``, as local barge-in does) and release the
-        delegation; no-op in direct mode or with nothing delegating."""
+        """Supervisor mode: the user talked over an in-flight ask_nanobot delegation — stop
+        the moot nanobot turn (``/stop``) and release the delegation. No-op otherwise."""
         collector = self._pending_delegation
         if collector is None or collector.dead:
             return  # nothing delegating (a tombstone is not a live delegation)
@@ -826,13 +785,13 @@ class VoiceChannel(BaseChannel):
         collector.abandon(_DELEGATION_INTERRUPTED)
 
     async def _start_stt_server(self):
-        """``stt.serve``: expose the loaded on-device STT to nanobot core as a local
-        OpenAI-compatible endpoint (WebUI dictation, channel voice notes).
+        """``stt.serve``: expose the loaded on-device STT as a local OpenAI-compatible
+        endpoint (WebUI dictation, voice notes).
 
-        SINGLETON by construction: the server borrows ``self._stt`` (memory-limited
-        targets can't fit two copies), building one only under a cloud backend, which
-        never loads STT itself. Returns the server so the caller's reference survives a
-        concurrent ``stop()`` clearing the attribute."""
+        SINGLETON by construction: the server borrows ``self._stt`` (memory-limited targets
+        can't fit two copies), built here only under a cloud backend, which never loads STT
+        itself. Returns the server so the caller's reference survives a concurrent
+        ``stop()`` clearing the attribute."""
         cfg = self.config.stt.serve
         if not cfg.enabled:
             return None
@@ -840,8 +799,7 @@ class VoiceChannel(BaseChannel):
             self._stt = make_stt(self.config.stt)  # cloud backend + serve: build ONCE here
         if self._stt is None:
             # Config validation rejects provider='nanobot', so None means the engine
-            # degraded (missing model files/deps; make_stt logged why), and an enabled
-            # endpoint that silently isn't there breaks WebUI dictation invisibly.
+            # degraded (make_stt logged why); a silently absent endpoint breaks dictation.
             raise RuntimeError(
                 "stt.serve is enabled but no on-device STT adapter could be built "
                 "(see the preceding voice log line for what is missing)"
@@ -855,10 +813,9 @@ class VoiceChannel(BaseChannel):
 
     async def _warmup(self) -> None:
         """Warm each on-device adapter once, then (``perf.calibrate``) measure the WARM
-        steady state to derive this device's pacing knobs. Failures are logged and ignored
-        (both are optimizations, never gates). Capture is already live, so hop-cost
-        accounting is held across each saturating burst — and ONLY the bursts:
-        ``_calibrate``'s wait-for-IDLE is live conversation and must stay accounted."""
+        steady state; failures are logged and ignored (optimizations, never gates). Capture
+        is already live, so hop-cost accounting is held across each saturating burst and
+        ONLY those — ``_calibrate``'s wait-for-IDLE is live conversation, kept accounted."""
         local = self._local()
         if local is not None:
             local.hold_hop_accounting(True)
@@ -886,12 +843,12 @@ class VoiceChannel(BaseChannel):
 
     async def _calibrate(self) -> None:
         """Measure warm STT/TTS on THIS device and hand the numbers to the local backend.
-        Runs only after warmup, keeping cold-start noise out of the measurements."""
+        After warmup only, keeping cold-start noise out of the measurements."""
         local = self._local()
         if local is None:
             return  # cloud paces itself; nothing to derive
         # The probes share the live adapters, which keep STRICTLY one decode in flight, so
-        # a real utterance would both be slowed and measured wrong. Best-effort wait.
+        # a real utterance would be both slowed and measured wrong. Best-effort wait.
         for _ in range(30):
             shell = self._shell
             if shell is None or shell.state is VoiceState.IDLE:
@@ -904,17 +861,17 @@ class VoiceChannel(BaseChannel):
         try:
             if self._stt is not None:
                 t0 = time.monotonic()
-                # Fixed-cost probe: 1 s of silence (16 kHz * 2 B = 32000 B). For a
-                # fixed-window model (whisper) this IS the per-utterance decode floor;
-                # length-proportional engines underestimate long utterances.
+                # Fixed-cost probe: 1 s of silence (16 kHz * 2 B). For a fixed-window model
+                # (whisper) this IS the decode floor; length-proportional engines
+                # underestimate long utterances.
                 await self._stt.transcribe(b"\x00" * 32000, 16000)
                 stt_ms = (time.monotonic() - t0) * 1000.0
             tts = self._tts_adapter
-            # probe_ok is False for cloud-backed adapters: nothing at startup may be
-            # billed, and a cloud RTF measures the network, not the box.
+            # probe_ok is False on cloud adapters: no startup billing, and a cloud RTF
+            # measures the network, not the box.
             if tts is not None and getattr(tts, "probe_ok", True):
-                # The engine's own language: an English probe through a zh/ja
-                # lexicon would trip the empty-synth guard below (see tts.base).
+                # The engine's own language: an English probe through a zh/ja lexicon
+                # trips the empty-synth guard below.
                 text = startup_text(
                     CALIBRATION_TEXT, getattr(tts, "spoken_language", None)
                 )
@@ -945,8 +902,7 @@ class VoiceChannel(BaseChannel):
         )
 
     async def _metrics_reporter(self, interval_s: float) -> None:
-        """``debug.metricsIntervalS``: the live snapshot as one JSON line per interval
-        (no transcript content), so distributions are readable during a repro."""
+        """``debug.metricsIntervalS``: the live snapshot, one JSON line per interval."""
         while True:
             await asyncio.sleep(interval_s)
             if self._metrics.has_data:
@@ -959,8 +915,8 @@ class VoiceChannel(BaseChannel):
                 )
 
     def _drop_bridge(self) -> None:
-        """Stop serving context for this channel instance. Identity-checked, so a late
-        teardown never removes a restarted channel's fresh bridge."""
+        """Stop serving context for this channel instance. Identity-checked: a late
+        teardown must not remove a restarted channel's fresh bridge."""
         if self._context_bridge is not None:
             unregister_bridge(self.name, self.config.chat_id, self._context_bridge)
             self._context_bridge = None
@@ -993,12 +949,11 @@ class VoiceChannel(BaseChannel):
 
     async def _transcribe_pcm(self, pcm: bytes) -> str:
         if self._stt is not None:
-            # Chunked: vad.maxUtteranceMs may exceed the adapter's decode window (the
-            # defaults do for whisper: 30 s cap vs a 20 s export).
+            # Chunked: vad.maxUtteranceMs may exceed the adapter's decode window.
             return await transcribe_chunked(self._stt, pcm, self.config.audio.sample_rate)
-        # No on-device STT: hand a WAV to nanobot's transcription layer (cloud, or a local
-        # Whisper server). Off the loop: a ~1 MB mkstemp+wave write and its unlink can
-        # stall an SD-card SBC for tens of ms, and capture, VAD and sink pacing share it.
+        # No on-device STT: hand a WAV to nanobot's transcription layer. Off the loop —
+        # a ~1 MB mkstemp+wave write and its unlink can stall an SD-card SBC for tens of ms,
+        # and capture, VAD and sink pacing share it.
         path = await asyncio.to_thread(write_temp_wav, pcm, self.config.audio.sample_rate)
         try:
             return await self.transcribe_audio(path)
@@ -1011,12 +966,9 @@ class VoiceChannel(BaseChannel):
     ) -> None:
         """Publish a captured utterance tagged with the turn it opens: core echoes inbound
         metadata onto that turn's final send, so ``send`` can tell the live turn's reply
-        from a barged-out one's straggler. Notes ride the context bridge keyed by the
-        token — metadata stays JSON-plain (tools snapshot it; cron persists the snapshot)
-        and nothing is glued onto the text. See context_tool for the seam.
-
-        ``text`` is the transcript verbatim, except for a goal verdict, which hands us
-        the utterance behind ``/goal `` (see ``LocalBackend._is_goal``)."""
+        from a barged-out one's straggler. Notes ride the context bridge keyed by the token,
+        keeping metadata JSON-plain (tools snapshot it, cron persists the snapshot). ``text``
+        is the transcript verbatim, except a goal verdict (``LocalBackend._is_goal``)."""
         if self._context_bridge is not None:
             self._context_bridge.stash_notes(turn_token, notes)
         await self._publish_user_text(text, metadata={TURN_META: turn_token})
@@ -1048,17 +1000,15 @@ class VoiceChannel(BaseChannel):
     # ---- output -------------------------------------------------------------
 
     def _local(self) -> LocalBackend | None:
-        """The backend when it's the local pipeline (bus glue speaks the reply), else None.
-
-        For cloud the text bus is not the reasoning path, so ``send``/``send_delta`` are
-        inert, EXCEPT supervisor mode, which collects a delegated reply before this check.
-        """
+        """The backend when it's the local pipeline (bus glue speaks the reply), else None:
+        cloud's text bus is not the reasoning path, so ``send``/``send_delta`` are inert —
+        EXCEPT supervisor mode, which collects a delegated reply before this check."""
         return self._backend if isinstance(self._backend, LocalBackend) else None
 
     async def send(self, msg: OutboundMessage) -> None:
-        # A pending delegation's non-streaming terminal (a genuine final send, not a
-        # trace); _stream_end in send_delta is the streaming one, first wins. Only OUR
-        # session chat qualifies: a delivery routed elsewhere (cron) must not resolve it.
+        # A pending delegation's non-streaming terminal; _stream_end in send_delta is the
+        # streaming one, first wins. Only OUR session chat qualifies: a delivery routed
+        # elsewhere (cron) must not resolve it.
         meta = msg.metadata or {}
         if self._pending_delegation is not None and msg.chat_id == self.config.chat_id:
             echoed = meta.get(_DELEGATION_META)
@@ -1073,19 +1023,17 @@ class VoiceChannel(BaseChannel):
         if local is None:
             return
         if msg.chat_id == self.config.chat_id:
-            # ANY traffic for our chat — progress, tool events, trace sends — proves the
-            # core is alive on this session: feed the deadman before filtering, so it
-            # measures a silent core rather than a long tool run between segments.
+            # ANY traffic for our chat proves the core is alive on this session: feed the
+            # deadman BEFORE filtering, so it measures a silent core, not a long tool run.
             local.note_agent_activity()
         speakable = _speakable(msg)
         if not speakable and not _streamed_final(msg):
             return
         turn = meta.get(TURN_META)
         if turn is not None and local.is_dead_turn(turn) and not _agent_initiated(meta):
-            # A killed turn's late final; a superseded-but-live turn still speaks.
-            # Trigger-stamped sends are exempt: a cron job snapshots its CREATION
-            # turn's token and every fire echoes it — if that turn was ever barged
-            # out, the gate would silently eat the reminder itself.
+            # A killed turn's late final; a superseded-but-live turn still speaks. Trigger-
+            # stamped sends are exempt: a cron job snapshots its CREATION turn's token and
+            # every fire echoes it, so the gate would eat the reminder itself.
             return
         text = (msg.content or "").strip()
         if not text:
@@ -1107,11 +1055,10 @@ class VoiceChannel(BaseChannel):
         stream_end: bool = False,
         resuming: bool = False,
     ) -> None:
-        # The manager passes stream framing (stream_id/stream_end/resuming) as kwargs
-        # unconditionally, so declaring these parameters is load-bearing: an override
-        # without them fails delivery on every delta. Supervisor mode accumulates the
-        # delegated reply here; a resuming end is only a tool boundary, and resolving there
-        # would truncate to the pre-tool status line.
+        # The manager passes stream framing as kwargs unconditionally, so declaring these
+        # parameters is load-bearing: an override without them fails every delta. Supervisor
+        # mode accumulates the delegated reply here; a resuming end is only a tool boundary,
+        # so resolving there would truncate to the pre-tool status line.
         if self._pending_delegation is not None and chat_id == self.config.chat_id:
             if not self._pending_delegation.accepts_stream(stream_id):
                 return  # a stopped PREVIOUS turn's queued straggler, not our answer
@@ -1127,9 +1074,8 @@ class VoiceChannel(BaseChannel):
         if local is None:
             return
         if _agent_initiated(metadata) and chat_id == self.config.chat_id:
-            # A cron/trigger turn streaming into this chat: mark before the delta plays
-            # so the settle re-opens attention (the fire-time turn echoes its trigger
-            # metadata on every stream event).
+            # A cron/trigger turn streaming into this chat: mark BEFORE the delta plays,
+            # so the settle re-opens attention.
             local.note_proactive()
         if stream_end:
             await local.on_stream_end(resuming=resuming, stream_id=stream_id)

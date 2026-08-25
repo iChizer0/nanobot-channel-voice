@@ -1,12 +1,10 @@
 """English-into-pinyin fallback for lexicon (zh) Matcha models.
 
-The zh token space can only say Mandarin, so English is voiced the way the
-language nativizes it: acronyms spell as the Mandarin letter readings, words
-transliterate espeak IPA to the nearest pinyin syllables. A loanword-accent
-approximation by design — it makes "打开WiFi" speakable, it does not make the
-model bilingual; full English sentences belong on an English engine. Every
-emitted syllable is validated against the live token set, so an unmappable
-fragment degrades to spelling (or silence) rather than a bad id.
+The zh token space can only say Mandarin: acronyms spell as the Mandarin letter
+readings, words transliterate espeak IPA to the nearest pinyin syllables. A
+loanword-accent approximation by design — full English sentences belong on an
+English engine. Every emitted syllable is validated against the live token set, so
+an unmappable fragment degrades to spelling (or silence) rather than a bad id.
 """
 
 from __future__ import annotations
@@ -14,9 +12,9 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-# Mandarin letter readings as (syllable, preferred tone) sequences. Tone
-# resolution against the token set tries the tone ladder then the toneless
-# twin; a letter with any unresolvable syllable is dropped at build.
+# Mandarin letter readings as (syllable, preferred tone) sequences; resolution tries
+# the tone ladder then the toneless twin, and a letter with any unresolvable syllable
+# is dropped at build.
 _LETTERS = {
     "a": [("ei", 1)], "b": [("bi", 4)], "c": [("xi", 1)], "d": [("di", 4)],
     "e": [("yi", 1)], "f": [("ai", 4), ("fu", 2)], "g": [("ji", 4)],
@@ -44,8 +42,8 @@ _INITIALS = {
     "tʃ": "ch", "dʒ": "zh", "ts": "c", "w": "w", "j": "y", "ɹ": "r",
     "r": "r", "l": "l",
 }
-# A consonant with no vowel to carry it takes a filler-vowel syllable
-# (consonant clusters do not exist in pinyin: "street" -> si te rui te).
+# A consonant with no vowel takes a filler-vowel syllable: pinyin has no clusters
+# ("street" -> si te rui te).
 _ALONE = {
     "p": ("pu", 1), "b": ("bu", 4), "t": ("te", 4), "d": ("de", 2),
     "k": ("ke", 4), "ɡ": ("ge", 2), "g": ("ge", 2), "m": ("mu", 3),
@@ -116,26 +114,55 @@ class EnglishToPinyin:
         """Token ids for one Latin word run; [] = nothing mappable."""
         ids = self._cache.get(word)
         if ids is None:
-            ids = self._ids(word)
-            if len(self._cache) >= _CACHE_CAP:
-                self._cache.clear()
-            self._cache[word] = ids
+            ids = self._put(word, self._ids(word))
         return ids
 
+    def _put(self, word: str, ids: list[int]) -> list[int]:
+        if len(self._cache) >= _CACHE_CAP:
+            self._cache.clear()
+        self._cache[word] = ids
+        return ids
+
+    def _spell(self, word: str) -> list[int]:
+        return [i for ch in word.lower() for i in self._letters.get(ch, ())]
+
+    def prime(self, words: list[str]) -> None:
+        """Batch-phonemize uncached words in ONE espeak call: subprocess espeak spawns per
+        call, so an English clause would otherwise cost a process per word."""
+        if self._phonemize is None:
+            return
+        fresh = list(dict.fromkeys(
+            w for w in words if w not in self._cache and not w.isupper()
+        ))
+        if len(fresh) < 2:
+            return
+        try:
+            lines = self._phonemize("\n".join(fresh)).splitlines()
+        except Exception:  # noqa: BLE001 - the per-word path reports instead
+            return
+        if len(lines) != len(fresh):
+            return  # espeak re-claused the batch: per-word calls stay correct
+        for word, ipa in zip(fresh, lines):
+            self._put(word, self._from_ipa(ipa) or self._spell(word))
+
     def _ids(self, word: str) -> list[int]:
-        # All-caps reads as an acronym (USB, CPU); words transliterate, and a
-        # word espeak/mapping cannot carry falls back to spelling.
+        # All-caps reads as an acronym (USB, CPU); anything unmappable spells out.
         if not word.isupper() and self._phonemize is not None:
             ids = self._transliterate(word)
             if ids:
                 return ids
-        return [i for ch in word.lower() for i in self._letters.get(ch, ())]
+        return self._spell(word)
 
     def _transliterate(self, word: str) -> list[int]:
         try:
-            phones = _parse(self._phonemize(word))  # type: ignore[misc]
+            ipa = self._phonemize(word)  # type: ignore[misc]
         except Exception:  # noqa: BLE001 - espeak hiccup degrades to spelling
             return []
+        return self._from_ipa(ipa)
+
+    def _from_ipa(self, ipa: str) -> list[int]:
+        """Pure IPA -> zh token ids, so ``prime`` can map a batched line."""
+        phones = _parse(ipa)
         out: list[int] = []
         i = 0
         while i < len(phones):

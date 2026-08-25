@@ -16,11 +16,10 @@ def cancel_task(task: asyncio.Task | None) -> None:
 
 
 async def cancel_and_wait(task: asyncio.Task | None) -> None:
-    """Cancel ``task`` and await its exit, swallowing cancellation AND failure:
-    a teardown caller has nowhere to send a dying task's exception. Transparent
-    to the CALLER's own cancellation: a CancelledError aimed at the awaiting
-    task is re-raised rather than mistaken for the child's, because nanobot's
-    ChannelManager cancels ``channel.stop()`` from above."""
+    """Cancel ``task`` and await its exit, swallowing cancellation AND failure.
+    Transparent to the CALLER's own cancellation: a CancelledError aimed at the
+    awaiting task is re-raised, not mistaken for the child's (nanobot's
+    ChannelManager cancels ``channel.stop()`` from above)."""
     if task is None:
         return
     task.cancel()
@@ -35,8 +34,8 @@ async def cancel_and_wait(task: asyncio.Task | None) -> None:
 
 
 async def wait_until(deadline: Callable[[], float]) -> None:
-    """Sleep until the MOVING ``deadline()`` (``time.monotonic`` domain) passes: recomputed
-    on every wake, so one waiter can watch several clocks (the ``min`` of their deadlines)."""
+    """Sleep until the MOVING ``deadline()`` (``time.monotonic``) passes: recomputed on
+    every wake, so one waiter can watch several clocks (the ``min`` of their deadlines)."""
     while True:
         now = time.monotonic()
         due = deadline()
@@ -46,17 +45,14 @@ async def wait_until(deadline: Callable[[], float]) -> None:
 
 
 async def wait_for_stall(last_activity: Callable[[], float], budget_s: float) -> None:
-    """Sleep until ``budget_s`` has passed since the MOVING ``last_activity()``
-    stamp (``time.monotonic`` domain): activity pushes the stamp forward, so only
-    a full budget of silence returns. A deadman, not a cap: the caller decides
-    what recovery means."""
+    """Sleep until ``budget_s`` of silence since the MOVING ``last_activity()`` stamp
+    (``time.monotonic``). A deadman, not a cap: the caller decides what recovery means."""
     await wait_until(lambda: last_activity() + budget_s)
 
 
 class Throttle:
-    """Rate-limit a repeating warning to once per ``interval_s``. :meth:`ready`
-    latches the clock only when it returns True, so suppressed calls never push
-    the window forward; the first call is always ready."""
+    """Rate-limit a repeating warning to once per ``interval_s``. :meth:`ready` latches
+    the clock only when it returns True; the first call is always ready."""
 
     __slots__ = ("_interval", "_last")
 
@@ -73,9 +69,9 @@ class Throttle:
 
 
 def put_drop_oldest(q: asyncio.Queue, item: Any) -> Any | None:
-    """Non-blocking put that DROPS THE OLDEST queued item on overflow, keeping
-    the queue near real time. Returns the dropped item (``task_done`` already
-    called), or None. Event-loop side only: asyncio.Queue is not thread-safe."""
+    """Non-blocking put that DROPS THE OLDEST item on overflow, keeping the queue near
+    real time. Returns the dropped item (``task_done`` already called), or None.
+    Event-loop side only: asyncio.Queue is not thread-safe."""
     dropped = None
     if q.full():
         with suppress(asyncio.QueueEmpty):

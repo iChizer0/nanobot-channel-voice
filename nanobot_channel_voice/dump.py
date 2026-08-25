@@ -1,30 +1,18 @@
 """Capture-segment WAV dumps for by-ear debugging (``debug.dumpAudio``).
 
-Each segment lands as ``utt-<id>-<verdict>.wav`` - the audio exactly as the
-VAD/STT judged it (post-AEC) - plus a ``.raw.wav`` twin of the same span straight
-off the mic when a software canceller is active, so a false barge-in can be
-attributed to AEC residual vs. real room sound by listening to the pair. ``id``
-is the backend's capture-segment id, the same number the ``utt #N:`` summary log
-line carries, so a WAV maps to its log record exactly even though dump WRITE
-order can trail capture order (an utterance submits after its STT verdict, a
-probe/blip drop immediately).
+Each segment lands as ``utt-<id>-<verdict>.wav`` (post-AEC, exactly what VAD/STT
+judged) plus a ``.raw.wav`` pre-AEC twin when a software canceller is active. ``id``
+is the backend's capture-segment id, the same number the ``utt #N:`` summary log line
+carries; dump WRITE order can trail capture order.
 
-``manifest.jsonl`` in the session directory gets one record per segment (id,
-verdict, duration, rms, plus whatever metadata the backend attached - close
-shape, STT cost, VAD confidence, capture-side wall stamp), so a dump directory
-is filtered with jq before anything is listened to. Its first line is a
-``{"type": "session", ...}`` record of the config in effect, so threshold
-experiments stay attributable across sessions; readers skip lines bearing
-``type``. A record outlives its WAV (the byte cap deletes audio, never
-manifest lines), so ``file`` may name a pruned segment.
+``manifest.jsonl`` gets one record per segment for jq filtering. Its first line is a
+``{"type": "session", ...}`` config record; readers skip lines bearing ``type``. A
+record outlives its WAV (the byte cap deletes audio, never manifest lines), so ``file``
+may name a pruned segment. ``index.html`` (the packaged ``dump_viewer.html``) lands
+beside it: serve the directory and the session is browsable.
 
-``index.html`` (the packaged ``dump_viewer.html``) lands next to the manifest:
-serve the directory (``python -m http.server``) and the session is browsable -
-filterable record table, inline players. It re-reads the manifest per load, so
-it needs no per-record refresh and survives a crash.
-
-:meth:`submit` only enqueues (producers must never block on disk); one daemon
-writer thread does all file I/O, including the startup prune.
+:meth:`submit` only enqueues (producers must never block on disk); one daemon writer
+thread does all file I/O, including the startup prune.
 """
 
 from __future__ import annotations
@@ -45,24 +33,23 @@ from nanobot_channel_voice.aio import Throttle
 from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_rms
 
 _QUEUE_DEPTH = 16  # segments in flight; a 30 s max utterance is ~1 MB, so <=~16 MB held
-# Head span for the manifest/log rms (triage metadata, not an unbounded pass over a
-# max-length utterance), matching the backend summary line's cap.
+# Head span for the manifest/log rms: bounds the pass, matches the summary line's cap.
 _RMS_HEAD_S = 1.0
 
 
 def default_dump_root() -> Path:
-    """``$XDG_DATA_HOME|~/.local/share/nanobot-voice/dumps``: the weights store's
-    base convention, but never ``$NANOBOT_VOICE_MODELS_DIR`` - that relocates model
-    artifacts, not diagnostics."""
+    """``$XDG_DATA_HOME|~/.local/share/nanobot-voice/dumps``: the weights store's base
+    convention, but never ``$NANOBOT_VOICE_MODELS_DIR`` - that moves models, not
+    diagnostics."""
     xdg = os.environ.get("XDG_DATA_HOME")
     base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
     return base / "nanobot-voice" / "dumps"
 
 
 class AudioDumper:
-    """One session's segment writer: a timestamped directory under ``root``, a
-    bounded queue, and a best-effort byte cap (older sessions pruned first, then
-    the live session's oldest segments)."""
+    """One session's segment writer: a timestamped directory under ``root``, a bounded
+    queue, and a best-effort byte cap (old sessions pruned first, then oldest
+    segments)."""
 
     def __init__(
         self, root: Path, sample_rate: int, max_bytes: int,
@@ -105,9 +92,9 @@ class AudioDumper:
         seq: int | None = None,
         meta: dict | None = None,
     ) -> None:
-        """Queue one segment; never blocks. ``raw`` = the pre-AEC span of ``pcm``;
-        ``seq`` = the backend's capture-segment id (filename + manifest identity);
-        ``meta`` = extra manifest fields the backend judged at close/verdict time."""
+        """Queue one segment; never blocks. ``raw`` = the pre-AEC span of ``pcm``; ``seq``
+        = the backend's capture-segment id (filename + manifest identity); ``meta`` =
+        extra manifest fields."""
         if not pcm:
             return
         try:
@@ -166,8 +153,7 @@ class AudioDumper:
             "dumped segment #{} {} ({} ms, rms {:.3f}{}) -> {}",
             seq, verdict, dur_ms, rms, ", +raw" if raw else "", path,
         )
-        # Writer stamps spread second so meta can never clobber identity keys;
-        # default=str so a non-JSON meta value costs a field, not the record.
+        # Identity keys spread second: meta can never clobber them.
         record = {
             **(meta or {}),
             "id": seq, "verdict": verdict, "file": path.name,
@@ -175,22 +161,23 @@ class AudioDumper:
         }
         self._append_manifest(record)
         while self._written_bytes > self._max_bytes and len(self._written) > 1:
-            old, size = self._written.pop(0)
+            old, size = self._written[0]
             try:
                 old.unlink(missing_ok=True)
-                self._written_bytes -= size
             except OSError:
-                break  # best-effort; retried on the next write
+                break  # entry stays in the ledger, so the next write really does retry
+            self._written.pop(0)
+            self._written_bytes -= size
 
     def _append_manifest(self, record: dict) -> None:
         if self._manifest is None:
             self._manifest = open(self.dir / "manifest.jsonl", "a", encoding="utf-8")
+        # default=str: a non-JSON meta value costs a field, not the record.
         self._manifest.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         self._manifest.flush()  # a crash must not cost the records that led to it
 
     def _install_viewer(self) -> None:
-        """Copy the packaged viewer in as ``index.html``: serving the directory over
-        HTTP is then all the browsing setup there is."""
+        """Copy the packaged viewer in as ``index.html``."""
         try:
             html = (
                 resources.files("nanobot_channel_voice") / "dump_viewer.html"
@@ -210,9 +197,8 @@ class AudioDumper:
         self._written_bytes += size
 
     def _prune_old_sessions(self) -> None:
-        """Delete oldest session dirs until what predates this session fits the cap.
-        Only our own timestamped dirs are touched - anything else in the tree is a
-        user's saved sample."""
+        """Delete oldest session dirs until what predates this session fits the cap. Only
+        our own timestamped dirs are touched - anything else is a user's saved sample."""
         sessions: list[tuple[Path, int]] = []
         try:
             for entry in self._root.iterdir():
@@ -229,8 +215,7 @@ class AudioDumper:
             if total <= self._max_bytes:
                 break
             try:
-                # Delete only what the dumper wrote: a user file parked in the dir
-                # survives, and keeps the dir alive.
+                # Delete only what the dumper wrote; a parked user file survives.
                 for f in path.glob("*.wav"):
                     f.unlink(missing_ok=True)
                 (path / "manifest.jsonl").unlink(missing_ok=True)

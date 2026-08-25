@@ -2,14 +2,9 @@
 engines behind one adapter, text split into script runs — CJK runs to the
 CJK-language engine, everything else to the Latin one, neutral characters
 (digits, punctuation, space) riding with the run they follow. Runs synthesize
-SEQUENTIALLY (on-device engines keep one decode in flight); a non-final run
-without trailing pause punctuation gets a continuation comma, so the engine
-renders a clause contour + its own pause instead of end-of-utterance prosody —
-the seams are model-voiced, never synthetic silence. Each engine's own
-frontend/normalization applies to its runs. Engine-agnostic in principle, but
-both must share ``output_rate``. (Loudness is deliberately NOT equalized:
-measured cross-engine mismatch ~1.5 dB is below within-engine variance, and
-RMS scaling would pump natural dynamics.)
+SEQUENTIALLY (on-device engines keep one decode in flight), and both engines
+must share ``output_rate``. Loudness is deliberately NOT equalized: measured
+cross-engine mismatch ~1.5 dB is below within-engine variance.
 """
 
 from __future__ import annotations
@@ -32,10 +27,9 @@ def _is_cjk(ch: str) -> bool:
 
 
 def script_runs(text: str) -> list[tuple[bool | None, str]]:
-    """(is_cjk, run) spans covering ``text``; a text with no scripted character
-    at all yields one ``(None, text)`` run — the router's PRIMARY takes it, so a
-    digits-only chunk ("338。" cut off a long sentence) speaks in the session's
-    main language, not whichever engine happens to be Latin."""
+    """(is_cjk, run) spans covering ``text``; text with no scripted character at all
+    yields one ``(None, text)`` run, which PRIMARY takes — a digits-only chunk speaks
+    in the session's main language, not whichever engine happens to be Latin."""
     runs: list[tuple[bool | None, str]] = []
     cls: bool | None = None
     start = 0
@@ -53,8 +47,8 @@ def script_runs(text: str) -> list[tuple[bool | None, str]]:
 
 
 def _hint(run: str, cjk: bool) -> str:
-    """Continuation comma for a NON-FINAL fragment: measured on both engines, it
-    buys a voiced pause and a non-terminal pitch contour at the seam."""
+    """Continuation comma for a NON-FINAL fragment: measured to buy a voiced pause and
+    a non-terminal contour, so seams are model-voiced, never synthetic silence."""
     stripped = run.rstrip()
     if not stripped or stripped[-1] in _PAUSE_PUNCT:
         return run
@@ -62,10 +56,9 @@ def _hint(run: str, cjk: bool) -> str:
 
 
 class ScriptRoutedTts(TtsAdapter):
-    """``primary``/``secondary`` in config order; routing is by LANGUAGE, so
-    either slot may hold the CJK engine. ``spoken_language`` stays None (no
-    single-language constraint); ``spoken_languages`` carries both for the
-    channel's context line."""
+    """``primary``/``secondary`` in config order; routing is by LANGUAGE, so either
+    slot may hold the CJK engine. ``spoken_language`` stays None (no single-language
+    constraint); ``spoken_languages`` carries both for the channel's context line."""
 
     def __init__(self, primary: TtsAdapter, secondary: TtsAdapter):
         p_lang, s_lang = primary.spoken_language, secondary.spoken_language
@@ -97,7 +90,7 @@ class ScriptRoutedTts(TtsAdapter):
 
     async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
         # ℃/℉ are non-alpha: folded, a temperature never splits its scale letter
-        # onto the Latin engine ("今天25°C"), and both verbalizers read the twins.
+        # onto the Latin engine ("今天25°C").
         runs = script_runs(fold_degree_marks(text))
         if len(runs) == 1:
             cjk, run = runs[0]

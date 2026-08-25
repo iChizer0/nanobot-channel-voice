@@ -1,14 +1,11 @@
 """Transcript tier of the wake gate: leading wake-phrase match + strip.
 
-The wake phrase must LEAD the utterance (Alexa's contract): only hesitation
-fillers may precede it, so "hey nanobot, weather" wakes while "I said hey
-nanobot" stays content. Matching runs on the raw transcript with per-phrase
-regexes whose tokens are joined by non-word runs, which makes them punctuation-
-and case-insensitive for spaced scripts and a plain substring match inside
-fused CJK runs ("小助手今天天气" matches phrase "小助手") — the same alphabet
-rules as :mod:`..phrases`. Spaced-script tokens additionally end on a word
-boundary ("nanobot" never matches inside "nanobots"); a CJK-final phrase keeps
-matching its fused run.
+The phrase must LEAD the utterance: only hesitation fillers may precede it, so "hey
+nanobot, weather" wakes while "I said hey nanobot" stays content. Per-phrase regexes
+join tokens by non-word runs — punctuation- and case-insensitive for spaced scripts, a
+substring match inside fused CJK runs ("小助手今天天气" matches "小助手"), the same
+alphabet rules as :mod:`..phrases`. Spaced-script tokens also end on a word boundary
+("nanobot" never matches inside "nanobots"); a CJK-final phrase keeps its fused run.
 """
 
 from __future__ import annotations
@@ -18,32 +15,28 @@ from collections.abc import Callable, Iterable
 
 from nanobot_channel_voice.phrases import FILLER_WORDS, _segments, tokens_of
 
-# Tokens tolerated BEFORE the wake phrase: politeness fillers plus the
-# hesitation noises STT engines actually emit at utterance starts. Anything
-# else in front demotes the phrase to content. Unspaced CJK fillers arrive
-# FUSED ("嗯那个"), so a prefix token may also be a greedy segmentation over
-# this set (same rule phrases.py applies to command lexicons).
+# Tokens tolerated BEFORE the wake phrase; anything else in front demotes the phrase to
+# content. Unspaced CJK fillers arrive FUSED ("嗯那个"), so a prefix token may also be a
+# greedy segmentation over this set.
 _LEAD_OK = frozenset(FILLER_WORDS) | frozenset({
     "um", "uh", "erm", "hmm", "hey", "so",
     "嗯", "那个", "诶", "请问",
     "あの", "えっと", "ねえ",
 })
 
-# Trailing separators consumed after a stripped phrase: whitespace and true
-# clause punctuation only, so "hey nanobot, tell me..." publishes "tell me..."
-# while sign/quote characters that bind to the following token survive
+# Trailing separators consumed after a stripped phrase: whitespace and clause
+# punctuation ONLY, so sign/quote characters binding to the next token survive
 # ("hey nanobot -3 degrees" keeps its minus).
 _SEP_RE = re.compile(r"^[\s,.!?;:…、，。．！？；：]+")
 
-# Same script split the chunker uses: ideographs/kana/hangul upward are
-# unspaced scripts where mid-run matches are legitimate.
+# Same split the chunker uses: from ideographs/kana/hangul up, mid-run matches are
+# legitimate.
 _CJK_FLOOR = 0x2E80
 
 
 def _lead_ok(prefix: str, extra: Callable[[str], bool] | None = None) -> bool:
-    """Only filler material precedes the phrase; fused CJK runs are accepted
-    when they segment entirely into ``_LEAD_OK`` entries. ``extra`` widens the
-    acceptable set per token (the caller's leak test — see ``strip``)."""
+    """Only filler precedes the phrase; a fused CJK run passes if it segments entirely
+    into ``_LEAD_OK``. ``extra`` widens the acceptable set per token."""
     return all(
         t in _LEAD_OK
         or _segments(t, _LEAD_OK) is not None
@@ -53,10 +46,9 @@ def _lead_ok(prefix: str, extra: Callable[[str], bool] | None = None) -> bool:
 
 
 def _clean_start(text: str, start: int) -> bool:
-    """Mirror of ``_clean_end`` for the left edge, needed where no ``_lead_ok``
-    runs (``present``): a spaced-script match must not continue a same-script
-    word leftward ("ro|bot" never matches phrase "bot"); a CJK-initial match
-    may continue its fused run."""
+    """Left-edge mirror of ``_clean_end``, for callers with no ``_lead_ok`` check
+    (``present``): "ro|bot" never matches phrase "bot"; a CJK-initial match may continue
+    its fused run."""
     if start <= 0 or ord(text[start]) >= _CJK_FLOOR:
         return True
     prev = text[start - 1]
@@ -64,25 +56,23 @@ def _clean_start(text: str, start: int) -> bool:
 
 
 def _clean_end(text: str, end: int) -> bool:
-    """The match ends at a word boundary for spaced scripts. A CJK-final match
-    may continue into its fused run, and a spaced-script match may be followed
-    by CJK (a new word by definition) — only same-script letter/digit
-    continuation ("nanobot|s") rejects."""
+    """The match ends at a word boundary for spaced scripts. A CJK-final match may
+    continue its fused run, and following CJK is a new word — only same-script
+    letter/digit continuation ("nanobot|s") rejects."""
     if end >= len(text) or ord(text[end - 1]) >= _CJK_FLOOR:
         return True
     nxt = text[end]
     return not (nxt.isalnum() or nxt == "_") or ord(nxt) >= _CJK_FLOOR
 
 
-# Skeleton alphabet: vowels/glides drop (vowel confusion dominates STT errors
-# on out-of-vocabulary names), doubles collapse, the first char survives.
+# Skeleton alphabet: vowels/glides drop (vowel confusion dominates STT errors on
+# out-of-vocabulary names), doubles collapse, the first char survives.
 _SOFT = frozenset("aeiouyhw")
 
 
 def _skeleton(text: str) -> str:
-    # Collapse ADJACENT duplicates first ("ll"), THEN drop the soft chars:
-    # collapsing after the drop would fuse consonants that vowels separated
-    # ("nano" must stay "nn").
+    # Collapse ADJACENT duplicates BEFORE dropping soft chars: the other order fuses
+    # consonants that vowels separated ("nano" must stay "nn").
     chars = [c for c in text.casefold() if "a" <= c <= "z"]
     if not chars:
         return ""
@@ -106,14 +96,11 @@ def _edit_distance(a: str, b: str) -> int:
 
 
 class FuzzyWake:
-    """Head-of-utterance phonetic matcher for latin wake phrases the STT
-    mangles ("hey nanobot" -> "he nine obt": consonant skeletons match within
-    1 edit). STRIP-ONLY trust tier: callers consult it only for utterances
-    that already pass on other evidence — a fuzzy match must never open the
-    gate, so its worst false positive eats a name-like head from a turn that
-    was already ours. CJK phrases opt out (a zh-capable STT renders zh names
-    exactly; homophone drift is the alias layer's job), as do names whose
-    skeleton is under 4 chars (too collision-prone)."""
+    """Head-of-utterance phonetic matcher for latin wake phrases the STT mangles ("hey
+    nanobot" -> "he nine obt": consonant skeletons match within 1 edit). STRIP-ONLY
+    trust tier: a fuzzy match must NEVER open the gate, only trim a turn that already
+    passed on other evidence. CJK phrases opt out (homophone drift is the alias layer's
+    job), as do skeletons under 4 chars (too collision-prone)."""
 
     __slots__ = ("_keys",)
 
@@ -131,12 +118,11 @@ class FuzzyWake:
         return bool(self._keys)
 
     def strip_head(self, text: str) -> tuple[str | None, str]:
-        """``(phrase, remainder)`` when leading words of *text* skeleton-match
-        a phrase — best distance wins, SMALLEST window on ties (a larger one
-        could absorb a soft-only content word: "...bot you"); ``(None, text)``
-        otherwise. Hesitation fillers may precede, like the exact tier ("um he
-        nine obt..."); they are consumed with the match. Runs on the raw text
-        so the remainder keeps its original spelling."""
+        """``(phrase, remainder)`` when leading words of *text* skeleton-match a phrase
+        — best distance wins, SMALLEST window on ties (a larger one could absorb a
+        soft-only content word: "...bot you"); ``(None, text)`` otherwise. Hesitation
+        fillers may precede and are consumed with the match. Runs on the raw text, so
+        the remainder keeps its original spelling."""
         words = list(re.finditer(r"\w+", text, re.UNICODE))
         lead_max = 0
         for m in words[:3]:
@@ -165,11 +151,10 @@ class FuzzyWake:
 
 
 class WakePhrase:
-    """Compiled wake-phrase list; ``strip`` is the one hot call. Falsy when no
-    phrase survived tokenization (the gate then has no text tier). An entry may
-    be ``(display, spelling)``: the SPELLING matches (an STT's mis-render of
-    the name), the DISPLAY is reported as ``matched`` — so an alias summons
-    still routes the ack by the phrase the user actually called."""
+    """Compiled wake-phrase list; ``strip`` is the one hot call. Falsy when no phrase
+    survived tokenization (the gate then has no text tier). An entry may be
+    ``(display, spelling)``: the SPELLING matches (an STT mis-render), the DISPLAY is
+    reported as ``matched``, so an alias summons still acks by the name called."""
 
     __slots__ = ("_patterns",)
 
@@ -177,8 +162,8 @@ class WakePhrase:
         self._patterns = []
         for entry in phrases:
             display, spelling = (entry, entry) if isinstance(entry, str) else entry
-            # casefold() folds what IGNORECASE's simple folding misses
-            # (straße/STRASSE); identical variants dedupe via the set.
+            # casefold() folds what IGNORECASE misses (straße/STRASSE); identical
+            # variants dedupe via the set.
             for toks in {
                 tuple(tokens_of(spelling)), tuple(tokens_of(spelling.casefold()))
             }:
@@ -200,9 +185,8 @@ class WakePhrase:
         return self.strip(text, extra_lead)[0] is not None
 
     def present(self, text: str) -> bool:
-        """A wake phrase occurs ANYWHERE in *text* (word-boundary rules of
-        ``strip``, no leading demand): the mention test the wake echo veto
-        runs against recently-spoken TTS."""
+        """A wake phrase occurs ANYWHERE in *text* (``strip``'s word-boundary rules, no
+        leading demand): the mention test the wake echo veto runs against spoken TTS."""
         return any(
             _clean_start(text, m.start()) and _clean_end(text, m.end())
             for _, pat in self._patterns
@@ -212,12 +196,11 @@ class WakePhrase:
     def strip(
         self, text: str, extra_lead: Callable[[str], bool] | None = None
     ) -> tuple[str | None, str]:
-        """``(matched, remainder)``: the SOURCE phrase that leads *text* (only
-        ``_LEAD_OK`` tokens — widened per token by ``extra_lead`` — may precede
-        it; earliest/longest match wins) and the text after it, separators
-        stripped; ``(None, text)`` otherwise. Truthy exactly on a match, so
-        boolean callers read as before. ``search()`` per pattern suffices: any
-        occurrence after a rejected one has non-acceptable content in front."""
+        """``(matched, remainder)``: the SOURCE phrase leading *text* (only ``_LEAD_OK``
+        tokens, widened per token by ``extra_lead``, may precede it; earliest/longest
+        wins) and the text after it, separators stripped; ``(None, text)`` otherwise.
+        One ``search()`` per pattern suffices: any occurrence after a rejected one has
+        non-acceptable content in front."""
         best, best_phrase = None, None
         for phrase, pat in self._patterns:
             m = pat.search(text)

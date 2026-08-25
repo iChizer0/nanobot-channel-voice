@@ -4,7 +4,6 @@ Owns everything EXCEPT the model math: strip/empty guards, the ``to_thread`` hop
 the event loop, the degrade-to-empty error policy ("never let one chunk kill the
 player"), warmup, the speakability guard, and the split-for-budget -> synthesize ->
 join-with-gap loop. An engine supplies :meth:`_synthesize_piece` plus the knobs below.
-Imported only by the engine modules, which the registry imports lazily.
 """
 
 from __future__ import annotations
@@ -23,11 +22,9 @@ from nanobot_channel_voice.tts.base import (
     startup_text,
 )
 
-# Below this fraction of voiceable content chars a piece is a language the engine does
-# not speak, not "text with a few gaps", and synthesizing is worse than skipping:
-# Supertonic resolves unknown ids from the end of the embedding table (noise), MMS drops
-# them (word salad), both indistinguishable from a broken speaker, while a skip + WARNING
-# names the misconfiguration. Above it, the drops are stray accents or symbols.
+# Below this fraction of voiceable content chars the piece is a language the engine
+# does not speak, and synthesizing is worse than skipping: Supertonic resolves unknown
+# ids to noise, MMS drops them (word salad) — a skip + WARNING names the misconfig.
 _MIN_SPEAKABLE = 0.5
 
 
@@ -40,8 +37,7 @@ class OnDeviceTtsAdapter(TtsAdapter):
     _log = logger
 
     def __init__(self) -> None:
-        # Warn once per character per adapter: a wrong-language reply repeats the same
-        # chars every chunk.
+        # Warn once per character: a wrong-language reply repeats the same chars.
         self._warned_unspeakable: set[str] = set()
 
     # ---- knobs the engine supplies ------------------------------------------
@@ -66,11 +62,9 @@ class OnDeviceTtsAdapter(TtsAdapter):
     # ---- the speakability guard ---------------------------------------------
 
     def _speakability(self, text: str) -> tuple[float, set[str]]:
-        """(voiceable fraction, unvoiceable chars) over the CONTENT (alnum) characters.
-
-        Every char vocab here drops punctuation by design, so scoring it would flag
-        ordinary English as unspeakable; no content at all (digits-only after
-        verbalization, punctuation, empty) scores 1.0: nothing to get wrong."""
+        """(voiceable fraction, unvoiceable chars) over the CONTENT (alnum) characters —
+        every char vocab here drops punctuation by design, so scoring it would flag
+        ordinary English as unspeakable. No content at all scores 1.0."""
         content = [c for c in text if c.isalnum()]
         if not content:
             return 1.0, set()
@@ -108,9 +102,7 @@ class OnDeviceTtsAdapter(TtsAdapter):
 
     async def warmup(self) -> None:
         # Every declared language once: a bilingual model routes scripts through
-        # DIFFERENT sub-frontends (matcha zh-en folds English via espeak), and a
-        # single-language warmup leaves the other path cold until the first real
-        # word in that script.
+        # DIFFERENT sub-frontends, so a one-language warmup leaves the other cold.
         langs = getattr(self, "spoken_languages", None) or (self.spoken_language,)
         for lang in dict.fromkeys(langs):
             await self.synthesize(startup_text(WARMUP_TEXT, lang))
@@ -169,12 +161,12 @@ class OnDeviceTtsAdapter(TtsAdapter):
                 self._warn_unspeakable(unvoiceable)
             if ratio < _MIN_SPEAKABLE:
                 # Per piece, not per reply: an English answer quoting one foreign
-                # sentence keeps the English and drops only the quote.
+                # sentence keeps the English.
                 skipped += 1
                 continue
             try:
-                # Salvage is top-level only: an engine may recurse inside
-                # _synthesize_piece, so a raise in a sub-half drops the whole piece.
+                # Salvage is top-level only: a raise inside a recursive
+                # _synthesize_piece drops the whole piece.
                 samples = self._synthesize_piece(piece)
             except Exception as exc:  # noqa: BLE001 - keep the pieces that worked
                 failed.append(exc)

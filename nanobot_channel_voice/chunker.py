@@ -19,25 +19,21 @@ _CJK_TERM = "。！？"
 _CLOSERS = "\"')]}»”’」』】）〉》"
 _SECONDARY = ",;:，、；："
 
-# Line-start anchored (<=3 spaces of indent), the same rule as the streaming fence
-# drop: two ``` runs mid-sentence are prose, and an unanchored regex would eat the
-# words between.
+# Line-start anchored (<=3 spaces of indent), as in the streaming fence drop: two ```
+# runs mid-sentence are prose, and an unanchored regex would eat the words between.
 _RE_FENCE = re.compile(r"(?m)^[ \t]{0,3}```[\s\S]*?```")
 _RE_INLINE_CODE = re.compile(r"`([^`]*)`")
 _RE_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _RE_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 _RE_EMPHASIS = re.compile(r"([*_~]{1,3})(\S(?:.*?\S)?)\1")
-# Bracketed spans are labels, stage directions or leaked placeholders, never speech:
-# "[Current Date and Time]", "[laughs]", "【注意】", "<date>", "{current_time}" — the
-# whitelist below would drop only the brackets and SPEAK the placeholder words.
-# Runs after _RE_LINK so "[text](url)" has already kept its text. Bounded and
-# single-line (best effort: a span a mid-sentence cut splits is not re-joined);
-# CJK quote pairs (「」『』) stay — they quote words meant to be spoken.
+# Bracketed spans are labels/stage directions/leaked placeholders, never speech (the
+# whitelist below would drop the brackets and SPEAK the words). Must run after _RE_LINK
+# so "[text](url)" kept its text. Bounded, single-line; CJK quote pairs (「」『』) stay.
 _RE_STAGE = re.compile(
     r"\[[^\[\]\n]{0,60}\]"
     r"|【[^【】\n]{0,60}】"
     r"|\{[^{}\n]{0,60}\}"
-    r"|<[^<>\s][^<>\n]{0,58}>"
+    r"|<[^<>\s][^<>\s]{0,58}>"
 )
 _RE_HEADER = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
 _RE_BULLET = re.compile(r"(?m)^\s{0,3}[-*+]\s+")
@@ -46,10 +42,9 @@ _RE_WS = re.compile(r"[ \t]+")
 
 # Curly quotes -> ASCII BEFORE the whitelist below, which would drop them.
 _SMART_PUNCT = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
-# Speakable whitelist: Unicode word chars (CJK/Cyrillic survive), whitespace and
-# punctuation a TTS front-end can voice or pause on. Everything else (emoji,
-# arrows, box drawing, missed markdown) becomes a space (never glue neighbors)
-# and collapses in _RE_WS; espeak and MMS VITS read raw codepoint names aloud.
+# Speakable whitelist: Unicode word chars, whitespace, punctuation TTS can voice or
+# pause on. Everything else -> space (never glue neighbours), collapsed by _RE_WS;
+# espeak and MMS VITS read raw codepoint names aloud.
 _RE_UNSPEAKABLE = re.compile(
     r"[^\w\s.,;:!?'\"()\-/%&+=@°$€£¥₹₽¢…。，！？、；：「」『』（）《》〈〉・·—–]"
 )
@@ -95,12 +90,10 @@ def _primary_cut(buf: str) -> int:
 
 
 def _secondary_cut(buf: str, min_chars: int) -> int:
-    """Index of the first clause boundary at/after ``min_chars``, or -1. A
-    separator BETWEEN digits (1,902,567 / 7:45) is number punctuation, not a
-    clause: cutting there mangles the reading and can strand a digits-only
-    chunk on the wrong bilingual engine. Digit+separator at the buffer END is
-    the same case mid-arrival, so it waits for the next delta to disambiguate
-    (mirrors the primary cut's trailing-terminator hold)."""
+    """Index of the first clause boundary at/after ``min_chars``, or -1. A separator
+    BETWEEN digits (1,902,567 / 7:45) is number punctuation, not a clause: cutting
+    there mangles the reading. Digit+separator at the buffer END waits for the next
+    delta to disambiguate."""
     for i in range(min_chars - 1, len(buf)):
         if buf[i] not in _SECONDARY:
             continue
@@ -121,9 +114,8 @@ class SentenceChunker:
     def __init__(self, min_chars: int = 60, max_chars: int = 240, min_chars_first: int | None = None):
         self._min = max(1, min_chars)
         self._max = max(self._min, max_chars)
-        # The FIRST chunk of a turn may cut at an earlier clause boundary (nothing
-        # plays until it exists, so its floor is the TTFA knob); later chunks keep
-        # min_chars for prosody. Clamped to min_chars.
+        # The FIRST chunk of a turn may cut earlier (its floor is the TTFA knob);
+        # later chunks keep min_chars for prosody. Clamped to min_chars.
         self._first_min = min(self._min, max(1, min_chars_first)) if min_chars_first else self._min
         self._spoke = False  # a chunk was emitted since the last flush()
         self._buf = ""
@@ -134,9 +126,8 @@ class SentenceChunker:
         self._prev_char = ""  # last classified char; "" = start of message
 
     def set_first_floor(self, chars: int) -> None:
-        """Adjust the first-chunk clause floor (device-speed calibration): slow
-        TTS needs a LARGER first chunk so its playback covers the next chunk's
-        synthesis (no mid-reply gap); fast TTS can cut early for TTFA."""
+        """Adjust the first-chunk clause floor: slow TTS needs a LARGER first chunk so
+        its playback covers the next chunk's synthesis; fast TTS cuts early for TTFA."""
         self._first_min = min(self._min, max(1, chars))
 
     def feed(self, delta: str) -> list[str]:
@@ -171,9 +162,8 @@ class SentenceChunker:
         return text or None
 
     def _line_start_at(self, text: str, i: int) -> bool:
-        """Is position ``i`` at a line start, allowing the up-to-3 spaces of indent
-        CommonMark permits for a fence opener (list items!) and CR for CRLF?
-        Falls back to ``_prev_char`` when the lookback runs off the delta."""
+        """Line start at ``i``? Allows CommonMark's up-to-3 indent spaces and CRLF; falls
+        back to ``_prev_char`` when the lookback runs off the delta."""
         j, spaces = i, 0
         while j > 0 and text[j - 1] == " " and spaces < 3:
             j -= 1
@@ -183,18 +173,15 @@ class SentenceChunker:
         return self._prev_char in ("", "\n", "\r")
 
     def _update_prev(self, text: str) -> None:
-        """Record the classification context at *text*'s end, collapsing a trailing
-        newline+indent run to "\\n" so an opener split across deltas still sees it."""
+        """Record the context at *text*'s end, collapsing a trailing newline+indent run to
+        "\\n" so an opener split across deltas still sees it."""
         if text:
             self._prev_char = "\n" if self._line_start_at(text, len(text)) else text[-1]
 
     def _drain_raw(self) -> str:
-        """Move classified text out of ``_raw``, dropping fenced-code content.
-        Consumes up to the last complete ```` ``` ```` marker; a trailing run of
-        1-2 backticks is held back, since the next delta may complete it. Info
-        string ("```python") and body are inside the fence and dropped with it;
-        a closed fence collapses to one space so words are never glued together.
-        """
+        """Move classified text out of ``_raw``, dropping fenced-code content. A trailing
+        run of 1-2 backticks is held back: the next delta may complete the marker. A
+        closed fence collapses to one space so words are never glued together."""
         out: list[str] = []
         raw = self._raw
         search_from = 0
@@ -203,8 +190,8 @@ class SentenceChunker:
             if i == -1:
                 break
             if self._in_fence:
-                # Closing marker accepted anywhere: demanding a line start would
-                # mute the rest of the reply on a sloppy close.
+                # Closing marker accepted anywhere: demanding a line start would mute
+                # the rest of the reply on a sloppy close.
                 out.append(" ")
                 self._in_fence = False
                 self._prev_char = "`"
@@ -212,8 +199,8 @@ class SentenceChunker:
                 search_from = 0
                 continue
             if not self._line_start_at(raw, i):
-                # Backticks mid-sentence ("wrap it in ``` fences") are prose, not an
-                # opener: one stray marker must not mute everything after it.
+                # Backticks mid-sentence are prose, not an opener: one stray marker
+                # must not mute everything after it.
                 search_from = i + 3
                 continue
             out.append(raw[:i])
@@ -242,9 +229,8 @@ class SentenceChunker:
         if cut != -1 and cut < self._max:
             return cut
         if len(buf) >= self._max:
-            # Hard cap, taken even when a sentence end lies PAST it (a long
-            # sentence fed at once): downstream synthesis has real input
-            # budgets (MMS-TTS), so no chunk may exceed max_chars.
+            # Hard cap, taken even when a sentence end lies past it: downstream
+            # synthesis has real input budgets (MMS-TTS).
             return _soft_cut(buf, self._max)
         # No primary boundary reachable: fall back to a clause boundary at the floor.
         floor = self._min if self._spoke else self._first_min

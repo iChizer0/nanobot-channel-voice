@@ -1,11 +1,9 @@
 """STT adapter interface + WAV helpers + window-bounded long-form decode.
 
-Default path: captured PCM goes to a temp WAV (helpers here) for nanobot's
-``BaseChannel.transcribe_audio`` (cloud, or a local OpenAI-compatible Whisper server);
-``make_stt`` returns ``None``. On-device path: an :class:`SttAdapter` over RKNN/ONNX
-models, audio never leaving the device, streaming engines decoding during capture via
-:class:`SttStream`; audio that may outrun an adapter's decode window goes through
-:func:`transcribe_chunked`.
+Default path: ``make_stt`` returns None and captured PCM goes to a temp WAV for
+nanobot's ``BaseChannel.transcribe_audio``. On-device path: an :class:`SttAdapter` over
+RKNN/ONNX, streaming engines decoding during capture via :class:`SttStream`; audio that
+may outrun an adapter's decode window goes through :func:`transcribe_chunked`.
 """
 
 from __future__ import annotations
@@ -24,12 +22,11 @@ from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_to_wav_bytes
 class SttStream(abc.ABC):
     """One utterance's decode stream, returned by :meth:`SttAdapter.stream_start`.
 
-    CALLER-owned and per-utterance: after :meth:`finish` the handle is spent, and
-    abandoning one (rejected blip, barge-in) is just dropping the reference. A FRESH
-    handle per utterance means a ``finish()`` still chewing in a worker thread can never
-    touch the next utterance's state; no locks. Methods are sync and cheap-per-call by
-    contract: the local backend calls ``accept`` one frame at a time inside the same
-    off-loop hop that runs a heavy VAD, and runs ``finish`` in its own thread.
+    CALLER-owned and per-utterance: after :meth:`finish` the handle is spent, abandoning
+    one is just dropping the reference. A FRESH handle per utterance means a ``finish()``
+    still running in a worker thread can never touch the next utterance's state; no
+    locks. Methods must be sync and cheap-per-call: ``accept`` runs one frame at a time
+    inside the same off-loop hop as a heavy VAD.
     """
 
     def partial(self) -> str:
@@ -51,9 +48,9 @@ class SttAdapter(abc.ABC):
     # capture, finishing the SttStream at the endpoint instead of calling transcribe().
     streaming: bool = False
 
-    # Decode architecture for the voice context's transcript-accuracy line: "attention"
-    # (AR decoder — can hallucinate fluent text never spoken) vs "ctc"/"transducer"
-    # (frame-synchronous — mis-substitutions only). "" = undeclared: claim no invention.
+    # For the voice context's transcript-accuracy line: "attention" (AR — can
+    # hallucinate fluent text never spoken) vs "ctc"/"transducer" (frame-synchronous,
+    # mis-substitutions only). "" = undeclared: claim no invention.
     decoder_family: str = ""
 
     # Longest audio one transcribe() call decodes faithfully (None = unbounded).
@@ -65,24 +62,22 @@ class SttAdapter(abc.ABC):
         """Transcribe S16_LE mono PCM, returning text (``""`` on empty/failure)."""
 
     async def warmup(self) -> None:
-        """Prime caches/arenas once, in the background, at session start. No-op by
-        default; cloud-backed adapters must keep it so (no billed warmup calls)."""
+        """Prime caches/arenas once, in the background, at session start. Cloud-backed
+        adapters must keep the no-op default (no billed warmup calls)."""
 
     def stream_start(self) -> SttStream:
         raise NotImplementedError("streaming STT not supported by this adapter")
 
     def release(self) -> None:
-        """Give back accelerator resources; idempotent. No-op unless the adapter holds
-        an :class:`OnDeviceModel`: refcount-GC does NOT free an RKNN context, so an
-        in-process channel restart would exhaust the NPU."""
+        """Give back accelerator resources; idempotent. Refcount-GC does NOT free an
+        RKNN context, so an in-process channel restart would exhaust the NPU."""
 
 
 # Chunked decode: trailing span searched for a cut before each window boundary, and
 # the RMS granularity of that search.
 _CHUNK_SEARCH_MS = 3000
 _CHUNK_RMS_MS = 20
-# Scripts written without ASCII spaces (CJK punctuation, kana, ideographs, fullwidth
-# forms). Hangul is deliberately absent: Korean spaces between words.
+# Scripts written without ASCII spaces. Hangul is deliberately absent: Korean spaces.
 _NO_SPACE_SCRIPTS = (
     (0x3000, 0x303F), (0x3040, 0x30FF), (0x3400, 0x4DBF),
     (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0xFF01, 0xFF60),
@@ -95,8 +90,8 @@ def _joins_bare(ch: str) -> bool:
 
 
 def _join_pieces(texts: list[str]) -> str:
-    """Piece transcripts -> one transcript: a space at latin boundaries, bare
-    adjacency when either side of the seam is a no-space script (zh/ja)."""
+    """Join pieces: a space at latin seams, bare adjacency when either side is a
+    no-space script (zh/ja)."""
     out = ""
     for text in texts:
         text = text.strip()
@@ -109,17 +104,15 @@ def _join_pieces(texts: list[str]) -> str:
 
 
 def _quietest_cut(samples, lo: int, hi: int, frame: int) -> int:
-    """Sample index to cut at inside ``[lo, hi)``: the END of the quietest RMS frame,
-    the LAST minimum winning ties so pieces still fill most of the window (a constant-
-    energy span degenerates to the boundary, i.e. a hard cut, not a half-window one)."""
+    """Cut index inside ``[lo, hi)``: the END of the quietest RMS frame, LAST minimum
+    winning ties so pieces still fill most of the window."""
     import numpy as np
 
     span = samples[lo:hi]
     n = len(span) // frame
     if n <= 1:
         return hi
-    # Frames align to the END of the span (the remainder folds into the head), so the
-    # degenerate constant-energy cut is exactly ``hi``, not a frame-remainder short.
+    # Frames align to the END of the span, so the constant-energy cut is exactly ``hi``.
     tail = len(span) - n * frame
     r = np.square(span[tail:].reshape(n, frame).astype(np.float32)).sum(axis=1)
     idx = n - 1 - int(np.argmin(r[::-1]))
@@ -130,11 +123,9 @@ async def transcribe_chunked(adapter: SttAdapter, pcm: bytes, sample_rate: int) 
     """Transcribe S16_LE mono PCM of any length against ``adapter.max_decode_ms``.
 
     Within-window input passes straight through. Longer input is cut into window-sized
-    pieces at the quietest instant near each boundary (a pause, whenever one exists in
-    the trailing search span), decoded SEQUENTIALLY — every caller relies on one decode
-    in flight per adapter — and joined script-aware (:func:`_join_pieces`). Fixed-window
-    models (whisper) otherwise silently drop everything past the window; attention
-    models (sensevoice) pay O(T^2) activation memory for oversized T.
+    pieces at the quietest instant near each boundary and decoded SEQUENTIALLY (callers
+    rely on one decode in flight per adapter). Without this, fixed-window models drop
+    everything past the window and attention models pay O(T^2) activations.
     """
     limit = adapter.max_decode_ms
     if limit is None or pcm_ms(len(pcm), sample_rate) <= limit:
@@ -165,10 +156,10 @@ async def transcribe_chunked(adapter: SttAdapter, pcm: bytes, sample_rate: int) 
 def pcm_to_float_mono(pcm: bytes, src_rate: int, dst_rate: int):
     """Decode S16_LE mono PCM to float32 in [-1, 1], resampled to ``dst_rate``.
 
-    Downsampling goes through the frequency domain (truncating the spectrum at the new
-    Nyquist == a brick-wall anti-alias filter): linear interpolation folds all 8-24 kHz
-    energy (fricatives, hiss) into the speech band on a 48k -> 16k capture, measurably
-    degrading recognition. Upsampling stays linear: no aliasing risk, cheaper.
+    Downsampling MUST go through the frequency domain (spectrum truncated at the new
+    Nyquist = brick-wall anti-alias): linear interpolation folds 8-24 kHz energy into
+    the speech band on a 48k -> 16k capture and measurably degrades recognition.
+    Upsampling stays linear: no aliasing risk, cheaper.
     """
     import numpy as np  # lazy: keeps this module import-safe without numpy
 

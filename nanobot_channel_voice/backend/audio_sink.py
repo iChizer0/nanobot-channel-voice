@@ -1,16 +1,12 @@
 """Shared audio output sink.
 
-A single worker plays queued audio in order. Each item carries the interrupt
-*epoch* it was produced under (:class:`.base.OutputAudio`) and the worker gates
-on that CARRIED epoch, so a barge-in that bumps the epoch drops audio produced
-for the cancelled turn even if it was already queued.
+One worker plays queued audio in order, gating on each item's CARRIED interrupt epoch
+so a barge-in drops already-queued audio from the cancelled turn.
 
-Two modes: ``blob`` plays opaque TTS WAVs byte-for-byte via
-``PlaybackSink.play_wav``; ``stream`` (cloud + raw-PCM local TTS) writes raw PCM
-to a persistent device stream, for gapless output + played-ms accounting.
-
-Synthesis lives in the backends. The duck ENVELOPE is applied here, per written
-block, stream mode only; the backend decides only when to engage it.
+Modes: ``blob`` plays TTS WAVs byte-for-byte via ``PlaybackSink.play_wav``; ``stream``
+writes raw PCM to a persistent device stream (gapless + played-ms accounting).
+Synthesis lives in the backends; the duck envelope is applied here, per written block,
+stream mode only.
 """
 
 from __future__ import annotations
@@ -28,16 +24,15 @@ from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_to_wav_bytes, wav_durati
 
 from .base import OutputAudio
 
-# Duck envelope (stream mode). Sidechain practice: attack fast so the bot yields
-# at speech onset, release slow so the level doesn't pump when VAD flickers.
+# Duck envelope (stream mode): attack fast so the bot yields at speech onset, release
+# slow so the level doesn't pump on VAD flicker.
 _DUCK_ATTACK_MS = 30.0
 _DUCK_RELEASE_MS = 250.0
-# Max audio buffered ahead of the wall clock: writes are paced to this lead, so a
-# gain change is audible within ~this bound and a barge-in discards at most this.
+# Write-ahead of the wall clock: bounds both gain-change latency and barge-in discard.
 _STREAM_LEAD_MS = 240.0
-# Tighter lead when a duck floor is configured: the lead IS the duck's audible
-# latency (already-written audio plays at its baked gain), so trade underrun
-# headroom (a starve re-anchors gracefully) for reaction time.
+# Tighter lead when a duck floor (or pause) is configured: the lead IS the duck's
+# audible latency (written audio keeps its baked gain); trades underrun headroom for
+# reaction time.
 _DUCK_STREAM_LEAD_MS = 120.0
 _GAIN_BLOCK_MS = 20  # envelope granularity (one gain step per block)
 
@@ -51,10 +46,8 @@ except ImportError:  # pragma: no cover - environment-dependent
 def trim_lead_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float = 0.01) -> bytes:
     """Cap the leading silence of raw S16_LE PCM at ``cap_ms``.
 
-    VITS-family TTS (MMS, Kokoro-class) emits up to ~250 ms of silence before the
-    first phoneme: pure time-to-first-audio on a turn's FIRST chunk, stretched
-    inter-sentence pauses later. Trimming only the excess over ``cap_ms`` keeps a
-    preroll for soft onsets and preserves deliberate pauses. ``threshold`` is the
+    VITS-family TTS emits up to ~250 ms before the first phoneme. Trimming only the
+    excess keeps a preroll for soft onsets and deliberate pauses. ``threshold`` is the
     onset peak as a fraction of full scale; an all-silent scan returns unchanged.
     """
     n = len(pcm) & ~1
@@ -84,11 +77,9 @@ def trim_lead_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float 
 def trim_tail_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float = 0.01) -> bytes:
     """Cap the TRAILING silence of raw S16_LE PCM at ``cap_ms``.
 
-    The tail twin of ``trim_lead_silence``, for CANNED clips (acks, fillers):
-    playback holds the turn in SPEAKING — and the half-duplex mic gated — until
-    the padding drains too (measured 580-790 ms of model tail on matcha ack
-    phrases). Replies never take this: their chunk boundaries carry deliberate
-    pauses. An all-silent scan returns unchanged.
+    For CANNED clips only (acks, fillers): the padding holds the turn SPEAKING with the
+    half-duplex mic gated (measured 580-790 ms of tail on matcha acks). Replies never
+    take this — their chunk boundaries carry deliberate pauses. All-silent: unchanged.
     """
     n = len(pcm) & ~1
     if n == 0 or rate <= 0:
@@ -143,29 +134,27 @@ class AudioSink:
         self._worker: asyncio.Task | None = None
         self._idle = asyncio.Event()
         self._idle.set()
-        # Stream mode: one device stream per turn. The handle stays in this slot
-        # until truly finished (drain included) so flush() can ALWAYS kill it.
+        # One device stream per turn; the handle stays in this slot until truly
+        # finished (drain included) so flush() can ALWAYS kill it.
         self._stream: PlaybackStream | None = None
         self._stream_open_t = 0.0
         self._bytes = 0
-        # Bumped per FRESH stream: played_ms() restarts at 0 there, voiding any
-        # offset captured against an earlier one (span accounting keys to this).
+        # Bumped per FRESH stream: played_ms() restarts at 0, voiding earlier offsets.
         self._generation = 0
         self._rate = 0
         self._queued_ms = 0.0  # duration of queued-but-unwritten items (backlog_ms)
         # Drain (EOF) begun: unwritable, still killable; flush() kills BOTH.
         self._draining: PlaybackStream | None = None
         self._reapers: set[asyncio.Task] = set()  # detached natural-drain finishers
-        # Streams the reapers still hold: `_draining` is a single slot a later
-        # drain overwrites, so flush()/stop() sweep this set as well.
+        # Streams the reapers still hold: _draining is one slot a later drain
+        # overwrites, so flush()/stop() sweep this set too.
         self._parked: set[PlaybackStream] = set()
         # Duck floor, set once by the owner; 1.0 = feature off.
         self._duck_floor = 1.0
         self._gain = 1.0
         self._gain_target = 1.0
-        # Pause gate (bargeIn.mode="pause"): set = flowing. Clearing it stalls the
-        # stream writer between blocks; only the ~lead ms already at the device
-        # ring out. Read-side clocks freeze at the pause edge (_clock_now).
+        # Pause gate (bargeIn.mode="pause"): set = flowing. Clearing stalls the writer
+        # between blocks; only the ~lead ms already at the device rings out.
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._paused_at: float | None = None
@@ -175,9 +164,8 @@ class AudioSink:
 
     def set_reference_tap(self, tap) -> None:
         """Register an AEC front-end (``push_reference``/``reference_dropped``).
-        Stream mode only (a tap on a blob-mode sink gets nothing): fed each block
-        as written — post-envelope, i.e. what the speaker plays — with its
-        playout time."""
+        Stream mode only; fed each block as written — post-envelope, i.e. what the
+        speaker plays — with its playout time."""
         self._ref_tap = tap
 
     @property
@@ -185,11 +173,10 @@ class AudioSink:
         return self._mode == "stream"
 
     async def prewarm(self, rate: int) -> None:
-        """Play ~40 ms of silence through the real device path once, at warmup,
-        so device open (dmix spin-up, aplay page-in, PCM negotiation) is off the
-        first reply's TTFA and a wrong playbackDevice fails loudly at startup.
-        Own short-lived handle, worker ``_stream`` slot untouched — the backend
-        gates the call on an idle turn. Never raises."""
+        """Play ~40 ms of silence through the real device path once, so device open is
+        off the first reply's TTFA and a wrong playbackDevice fails loudly at startup.
+        Own short-lived handle, worker ``_stream`` slot untouched — the caller must gate
+        on an idle turn. Never raises."""
         silence = b"\x00" * (int(rate / 1000 * 40) * 2)
         try:
             if self._mode == "stream":
@@ -217,21 +204,19 @@ class AudioSink:
     def duck(self, active: bool) -> None:
         """Duck (or release) live playback toward the configured floor.
 
-        Stage 1 of duck-then-confirm, hence reversible: the caller confirms
-        (flush) or releases once the transcript verdict is in. The stream writer
-        advances the envelope block by block. No-op in blob mode / with no floor.
+        Reversible stage 1 of duck-then-confirm: the caller flushes or releases once the
+        transcript verdict is in. No-op in blob mode / with no floor.
         """
         self._gain_target = self._duck_floor if active else 1.0
 
     def configure_pause(self, capable: bool) -> None:
-        """Declare pause-mode barge-in, once by the owner: tightens the pacing
-        lead so a pause silences within ~one lead, like a configured duck floor."""
+        """Declare pause-mode barge-in, once by the owner: tightens the pacing lead so a
+        pause silences within ~one lead."""
         self._pause_capable = capable
 
     def pause(self, active: bool) -> None:
-        """Pause (or resume) live stream playback: the reversible stage of
-        pause-then-confirm. Nothing is discarded: the writer stalls between
-        blocks and continues exactly where it stopped. No-op in blob mode."""
+        """Pause (or resume) live stream playback. Nothing is discarded: the writer
+        stalls between blocks and continues where it stopped. No-op in blob mode."""
         if self._mode != "stream":
             return
         if active:
@@ -241,16 +226,14 @@ class AudioSink:
         else:
             if self._paused_at is not None and self._stream is not None:
                 # Splice the paused span out of the stream clock, or every
-                # elapsed-based read (played_ms, backlog_ms, starved_ms) counts
-                # the silence as playout until the next write re-anchors.
+                # elapsed-based read counts the silence as playout.
                 self._stream_open_t += time.monotonic() - self._paused_at
             self._pause_gate.set()
             self._paused_at = None
 
     def restore_playback(self) -> None:
-        """Teardown convenience: end any candidate attenuation (gain target back
-        to full and the pause gate open) so no exit path can strand playback
-        quiet or stalled."""
+        """End any candidate attenuation (full gain, gate open) so no exit path can
+        strand playback quiet or stalled."""
         self.duck(False)
         self.pause(False)
 
@@ -259,10 +242,9 @@ class AudioSink:
         return not self._pause_gate.is_set()
 
     def _clock_now(self) -> float:
-        """The playout clock: wall time, FROZEN at the pause edge while paused:
-        else every read-side consumer (echo hold via backlog_ms, played_ms spans)
-        thinks the paused audio kept draining. The writer's starvation re-anchor
-        rebases the clock on resume, so post-resume reads are consistent."""
+        """Playout clock: wall time, FROZEN at the pause edge while paused, else every
+        read-side consumer thinks the paused audio kept draining. The writer's
+        starvation re-anchor rebases it on resume."""
         return self._paused_at if self._paused_at is not None else time.monotonic()
 
     @property
@@ -275,14 +257,26 @@ class AudioSink:
         return self._generation
 
     @property
+    def next_generation(self) -> int:
+        """Identity audio enqueued NOW will play on: the stream opens lazily in the
+        worker, so a producer reading ``stream_generation`` before its first write
+        anchors to a stream that is already gone."""
+        live = (
+            self._stream is not None
+            and self._stream is not self._draining
+            and self._stream not in self._parked
+            and not self._stream.dead  # _stream_write reopens under a dead handle
+        )
+        return self._generation if live else self._generation + 1
+
+    @property
     def busy(self) -> bool:
         return not self._idle.is_set()
 
     def played_ms(self) -> int:
-        """Stream mode: ms the user has ACTUALLY heard on the current stream:
-        ``min(wall-clock since open, buffered duration)``, floored. Authoritative
-        for ``conversation.item.truncate``: the cloud streams far faster than real
-        time, so bytes-emitted would wildly over-count. Blob mode returns 0."""
+        """Stream mode: ms ACTUALLY heard on the current stream, ``min(wall-clock since
+        open, buffered)``. Authoritative for ``conversation.item.truncate``: the cloud
+        streams far faster than real time, so bytes-emitted over-counts. Blob: 0."""
         if self._stream is None or self._rate <= 0:
             return 0
         elapsed = (self._clock_now() - self._stream_open_t) * 1000.0
@@ -290,22 +284,19 @@ class AudioSink:
         return int(min(elapsed, buffered))
 
     def _lead_ms(self) -> float:
-        """Pacing lead for stream writes; tightened when a duck floor or pause
-        capability is configured (both need gain/silence changes audible fast)."""
         if self._duck_floor < 1.0 or self._pause_capable:
             return _DUCK_STREAM_LEAD_MS
         return _STREAM_LEAD_MS
 
     def lead_ms(self) -> float:
-        """The write-ahead the device may still play after a pause/kill: the sink owns
-        pacing policy, so consumers deriving playout physics (the leak-death probe
-        window) ask here instead of copying the constants."""
+        """Write-ahead the device may still play after a pause/kill; consumers deriving
+        playout physics ask here instead of copying the constants."""
         return self._lead_ms()
 
     def backlog_ms(self) -> int:
         """Estimated ms of accepted-but-not-yet-audible audio: queued items plus the
-        written-but-unplayed lead. Over-counts the in-flight item by up to one lead
-        on purpose: its consumer is the echo hold, where more only guards longer.
+        written-but-unplayed lead. Deliberately over-counts the in-flight item by up to
+        one lead — its consumer is the echo hold, where more only guards longer.
         """
         total = self._queued_ms
         if self._mode == "stream" and self._stream is not None and self._rate > 0:
@@ -324,10 +315,9 @@ class AudioSink:
         return 0.0
 
     def starved(self) -> bool:
-        """Is playback running (or about to run) dry? Stream: the wall clock has
-        consumed everything buffered. Blob: the queue is idle. Meaningful when
-        checked as a NON-first chunk is enqueued: synthesis lost the race and the
-        user heard a gap."""
+        """Is playback running (or about to run) dry? Stream: the wall clock consumed
+        everything buffered; blob: the queue is idle. Meaningful only when checked as a
+        NON-first chunk is enqueued (synthesis lost the race, the user heard a gap)."""
         if self._mode == "stream":
             if not self._pause_gate.is_set():
                 return False  # deliberately silent, not starved
@@ -380,8 +370,7 @@ class AudioSink:
         epoch and the worker drops it if a flush intervened."""
         self._idle.clear()
         if audio.epoch == self._epoch:
-            # Credit only what _run's finally debits: a flush between the producer's
-            # epoch read and this call zeroes the counter, stranding the credit.
+            # Credit only at the live epoch: a flush zeroes the counter (see _run).
             self._queued_ms += self._item_ms(audio)
         self._queue.put_nowait(audio)
 
@@ -398,11 +387,10 @@ class AudioSink:
                 drained += 1
         self._queued_ms = 0.0
         played = self.played_ms() if self._mode == "stream" else 0
-        # Kill through OUR handles: valid at any point in a stream's life,
-        # including mid-drain and reaper-parked tails. Nothing survives a barge-in.
+        # Kill through OUR handles: valid mid-drain and for reaper-parked tails too.
         await self._kill_streams()
-        # A flush ends any candidate interrupt: the next turn plays at full level,
-        # unpaused (a writer stalled on the gate wakes into the epoch check).
+        # A flush ends any candidate interrupt: next turn at full level, unpaused (a
+        # writer stalled on the gate wakes into the epoch check).
         self._gain = self._gain_target = 1.0
         self._pause_gate.set()
         self._paused_at = None
@@ -423,11 +411,9 @@ class AudioSink:
         buffered audio finishes playing (no-op in blob mode / when closed). The
         handle stays in ``self._stream`` DURING the drain so a concurrent
         ``flush()`` can kill the tail; detached after, if a flush didn't first."""
-        # A paused drain WAITS for the candidate's verdict instead of forcing the
-        # gate open: forcing it would play the turn's final chunk at FULL level
-        # into the open mic mid-confirm. A release resumes the tail on its own; a
-        # kill's flush opens the gate with a dead epoch. Verdicts always resolve
-        # (release/kill/orphan; failure paths restore playback), so no wedge.
+        # A paused drain WAITS for the verdict rather than forcing the gate: forcing
+        # would play the final chunk at FULL level into the open mic. Verdicts always
+        # resolve (release/kill/orphan), so this cannot wedge.
         await self._pause_gate.wait()
         await self.wait_idle()
         stream = self._stream
@@ -437,10 +423,8 @@ class AudioSink:
         try:
             await stream.drain()
         except asyncio.CancelledError:
-            # EOF is already with the device (the alsa handle sends it before its
-            # first await), so the tail still plays out; killing here would chop a
-            # status line's end on every fast tool round-trip. Park instead: writes
-            # open fresh via _draining, barge-in still kills it, the reaper reaps.
+            # EOF already reached the device, so the tail plays out; killing here would
+            # chop a status line's end on every fast tool round-trip. Park instead.
             self._spawn_reaper(stream)
             raise
         if self._draining is stream:
@@ -482,8 +466,8 @@ class AudioSink:
                 self._log.warning("playback error: {}", exc)
             finally:
                 if item.epoch == self._epoch:
-                    # Debit only what enqueue credited: a flush zeroes the counter,
-                    # so debiting a dead item would thin the NEXT turn's echo hold.
+                    # Debit only what enqueue credited, else a dead item thins the
+                    # NEXT turn's echo hold.
                     self._queued_ms = max(0.0, self._queued_ms - self._item_ms(item))
                 self._queue.task_done()
                 if self._queue.empty():
@@ -492,20 +476,18 @@ class AudioSink:
     async def _stream_write(self, pcm: bytes, rate: int, epoch: int) -> None:
         stream = self._stream
         if stream is not None and (stream is self._draining or stream in self._parked):
-            # A drain EOF'd this handle (maybe a cancelled one, still parked in a
-            # reaper): no more writes. Open fresh; the tail rings on, flush kills both.
+            # EOF'd (or parked in a reaper): no more writes. Open fresh; flush kills both.
             stream = None
         if stream is not None and stream.dead:
-            # The device died UNDER the handle (e.g. an exclusive hw: device
-            # rejected a second open after a cancelled drain, then the first
-            # exited): without a reopen, every later write this turn is discarded.
+            # Device died UNDER the handle (e.g. exclusive hw: refused a second open):
+            # without a reopen every later write this turn is silently discarded.
             with suppress(Exception):
                 await stream.kill()  # reap; already dead, so nothing audible stops
             if self._stream is stream:
                 self._stream = None
             stream = None
         if stream is not None and rate != self._rate:  # rate change (unexpected): reopen
-            # Keep the handle in _stream during the drain so a flush kills the tail.
+            # Handle stays in _stream during the drain: a flush must reach the tail.
             self._draining = stream
             try:
                 await stream.drain()
@@ -521,33 +503,35 @@ class AudioSink:
         if stream is None:
             stream = await self._sink.open_stream(rate)
             if epoch != self._epoch:
-                # flush() landed while opening: its sweep cannot reach an
-                # unpublished handle, so kill it here — leaked, it would make an
-                # exclusive hw: device refuse the next turn's open.
+                # flush()'s sweep cannot reach an unpublished handle; leaked, it would
+                # make an exclusive hw: device refuse the next turn's open.
                 await stream.kill()
                 return
             self._stream = stream
             self._rate = rate
             self._stream_open_t = time.monotonic()
+            if self._paused_at is not None:
+                # Opened while paused: re-anchor, or pause(False)'s splice adds a span
+                # that predates the stream and pushes its clock past now.
+                self._paused_at = self._stream_open_t
             self._bytes = 0
+            self._gain = self._gain_target  # a fresh stream never inherits a mid-ramp duck
             self._generation += 1  # played_ms() restarts: tell span consumers
-        # ~20 ms blocks, paced to _lead_ms() ahead of the wall clock, envelope per
-        # block: pacing is what makes a gain change audible promptly. A flush
-        # mid-write kills the handle and write no-ops (PlaybackStream contract).
+        # ~20 ms blocks paced to _lead_ms() ahead of the wall clock, envelope per block:
+        # pacing is what makes a gain change audible promptly. A flush mid-write kills
+        # the handle and write no-ops (PlaybackStream contract).
         lead_cap_s = self._lead_ms() / 1000.0
         block_b = max(2, (rate * _GAIN_BLOCK_MS // 1000) * 2)
         for off in range(0, len(pcm), block_b):
             if not self._pause_gate.is_set():
-                # Paused (pause-then-confirm): stall between blocks. A release
-                # (pause(False)) or flush() re-opens the gate, so this cannot
-                # wedge; the starvation re-anchor below rebases the clock on resume.
+                # Stall between blocks; pause(False) or flush() re-opens the gate, so
+                # this cannot wedge.
                 await self._pause_gate.wait()
             now = time.monotonic()
             lead_s = self._bytes / (2 * rate) - (now - self._stream_open_t)
             if lead_s < 0.0:
-                # Starved: re-anchor the stream clock to the RESUMED playback or
-                # everything downstream drifts by the gap: pacing would buffer
-                # gap+lead ahead (late duck) and AEC stamps would run early.
+                # Starved: re-anchor to the RESUMED playback, else pacing buffers
+                # gap+lead ahead (late duck) and AEC stamps run early.
                 self._stream_open_t = now - self._bytes / (2 * rate)
                 lead_s = 0.0
             if lead_s > lead_cap_s:
@@ -566,8 +550,7 @@ class AudioSink:
             if self._gain < 0.9995:
                 block = scale_pcm(block, self._gain)
             if self._ref_tap is not None:
-                # Playout = stream position on the wall clock, floored at now (a
-                # starved stream plays the block the moment it lands).
+                # Playout = stream position on the wall clock, floored at now.
                 pos_s = self._bytes / (2 * rate)
                 playout = max(time.monotonic(), self._stream_open_t + pos_s)
                 self._ref_tap.push_reference(block, rate, playout)
