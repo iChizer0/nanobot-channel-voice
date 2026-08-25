@@ -88,7 +88,7 @@ def test_block_is_wrapped_and_names_the_engine_language():
 def test_block_stays_inside_its_token_budget():
     # Every word rides every turn's prefill, so the ceiling is pinned at the LONGEST
     # variant: an unverified decoder (invented-phrase clause) plus a bilingual voice
-    # (6 words over the mono line). A failure means re-bloat — trim, don't raise it.
+    # (11 words over the mono line). A failure means re-bloat — trim, don't raise it.
     [block] = _voice_context_blocks(_FakeStt(), _FakeTts("zh", ("zh", "en")))
     assert len(block.content.split()) <= 145
     [mono] = _voice_context_blocks(_FakeStt("ctc"), _FakeTts("en"))
@@ -105,6 +105,14 @@ def test_context_permits_thinking_and_nudges_pre_tool_narration():
     # non-reasoning models think with.
     assert "NOTHING else" not in block.content
     assert "pure answer" not in block.content
+
+
+def test_context_asks_for_a_retry_and_an_outcome():
+    # A plain answer ends the turn in core, so a promise to keep trying IS the give-up
+    # unless the same turn tries again; goal.phrases is the enforced version.
+    [block] = _voice_context_blocks(None, _FakeTts("en"))
+    assert "try another way" in block.content
+    assert "say how it ended" in block.content
 
 
 def test_capability_affirmation_rides_spoken_sessions():

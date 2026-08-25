@@ -152,3 +152,25 @@ def pure_command(
 ) -> bool:
     """One-shot :meth:`PhraseMatcher.pure` (hot paths hold a matcher instead)."""
     return PhraseMatcher(command, *companions, extra=extra).pure(tokens)
+
+
+def phrase_within(text: str, lexicon: PhraseLexicon) -> bool:
+    """A full phrase occurs anywhere in an utterance that is otherwise free content.
+
+    ``PhraseMatcher.present`` cannot serve here: its fused-run rule decomposes a CJK
+    token ENTIRELY into lexicon singles, so a trigger buried in a real zh/ja sentence
+    never matches. An all-unspaced phrase is compared against the fused transcript,
+    where its own spacing is meaningless too ("持续 处理" must still find 持续处理…);
+    anything with a spaced-script token keeps its boundaries, so "stop" is never
+    "stopwatch".
+    """
+    tokens = tokens_of(text)
+    spaced = " " + " ".join(tokens) + " "
+    fused = "".join(tokens)
+    for phrase in lexicon.phrases:
+        if all(not token.isascii() for token in phrase):
+            if "".join(phrase) in fused:
+                return True
+        elif f" {' '.join(phrase)} " in spaced:
+            return True
+    return False

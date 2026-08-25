@@ -53,6 +53,7 @@ from nanobot_channel_voice.phrases import (
     FILLER_WORDS,
     PhraseLexicon,
     PhraseMatcher,
+    phrase_within,
     tokens_of,
 )
 from nanobot_channel_voice.streamid import base_of, started_ns, unique_token
@@ -758,6 +759,10 @@ class LocalBackend(TurnEventMixin):
         self._stop_match = PhraseMatcher(
             self._stop_lex, self._ack_lex, extra=FILLER_WORDS
         )
+        # Deliberately NOT echo-protected as stop phrases are: a goal is expensive to
+        # start by accident, and a notice phrase is what would read back as one.
+        goal_phrases = config.goal.phrases
+        self._goal_lex = PhraseLexicon(goal_phrases) if goal_phrases else None
         self._min_fresh_words = config.barge_in.min_words
         # Wake-word gate (wake.mode != "off"): "gate" requires the wake phrase to
         # START a conversation from cold (attention window shut), "strict"
@@ -2390,9 +2395,14 @@ class LocalBackend(TurnEventMixin):
         verdict_state = self._turn
         if verdict_state is VoiceState.SPEAKING and self._canned_base is not None:
             verdict_state = self._canned_base
+        # A goal command can never be injected: core dispatches commands inline rather
+        # than queueing them, so an injected "/goal ..." would answer out of band while
+        # the old run kept going. Kill first, and let the goal turn own the session.
+        goal = self._is_goal(text)
         inject = (
             interrupting
             and not preempted
+            and not goal
             and not self._cur_turn.dead
             and verdict_state in (VoiceState.THINKING, VoiceState.SPEAKING)
             and (
@@ -2488,11 +2498,18 @@ class LocalBackend(TurnEventMixin):
             cancel_task(self._attention_task)
         else:
             self._touch_wake()  # an accepted turn keeps the conversation's attention
-        await self._publish_text(text, self._cur_turn.token, tuple(notes))
+        if goal:
+            self._metrics.count("goal_command")
+        await self._publish_text(
+            f"/goal {text}" if goal else text, self._cur_turn.token, tuple(notes)
+        )
         self._arm_prologue()
         self._arm_earcon()  # after _arm_prologue: its cancel sweep covers earcons
         self._arm_timeout()
-        return _summary("interrupt" if killed else "publish")
+        # "goal" over "interrupt"/"publish": interrupt= already flags that a turn was
+        # live, and a mis-fired trigger is what needs finding — the audio dump names
+        # its WAV by this verdict.
+        return _summary("goal" if goal else "interrupt" if killed else "publish")
 
     async def _do_interrupt(self) -> str | None:
         """Cancel-then-send barge-in: invalidate the dead turn, stop audio, /stop.
@@ -2924,6 +2941,13 @@ class LocalBackend(TurnEventMixin):
         """Pure stop command: entirely stop/ack/filler material with a full stop phrase
         present (see PhraseMatcher.pure). Mixed content is NOT a stop."""
         return self._stop_match.pure(tokens_of(text))
+
+    def _is_goal(self, text: str) -> bool:
+        """A spoken commitment ("keep working on it until it's done"): the utterance
+        rides core's /goal command, whose sustained-goal mode is the only one where a
+        plain answer does not end the turn. Unlike a stop, the phrase sits INSIDE real
+        content, so the whole utterance is the objective."""
+        return self._goal_lex is not None and phrase_within(text, self._goal_lex)
 
     @staticmethod
     def _fresh_seq(text: str, fresh: set[str]) -> list[str]:

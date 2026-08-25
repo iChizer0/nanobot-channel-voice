@@ -658,10 +658,9 @@ class TelemetryConfig(_VoiceBase):
 class DebugConfig(_VoiceBase):
     """Diagnostics. ``dumpAudio`` (local backend) writes every endpointed capture
     segment as a WAV named by the pipeline's verdict (``publish``/``interrupt``/
-    ``empty``/``echo``/``ack``/``stop``/``gated``/``wake``/``blip``/``probe``/
-    ``gap``), so a false
-    barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the
-    same span pre-cancellation (TTS audible there but not in the post-AEC file = the
+    ``inject``/``goal``/``empty``/``echo``/``ack``/``stop``/``gated``/``wake``/
+    ``blip``/``probe``/``gap``), so a false barge-in is diagnosed by ear; with
+    ``aec="webrtc"`` a ``.raw.wav`` twin holds the same span pre-cancellation (TTS audible there but not in the post-AEC file = the
     canceller works and the trigger is acoustic). Each session directory also holds
     ``manifest.jsonl`` (a config-header line, then one record per segment) and an
     ``index.html`` viewer: serve the directory (``python -m http.server``) to browse,
@@ -731,6 +730,26 @@ class BargeInConfig(_VoiceBase):
             "wait", "hold on", "hang on",
             "停", "停止", "别说了", "闭嘴", "安静", "够了", "算了", "等等", "等一下",
             "ストップ", "止めて", "やめて", "黙って", "もういい", "待って", "ちょっと待って",
+        ]
+    )
+
+
+class GoalConfig(_VoiceBase):
+    """Spoken entry to nanobot's sustained-goal mode (``local`` backend)."""
+
+    # An ordinary turn ends the moment the model answers without calling a tool, so
+    # "I'll keep trying" IS a final answer. Core's sustained goal is the one mode that
+    # refuses that ending, and it starts only from ``/goal`` — which speech can never
+    # produce. An utterance carrying one of these publishes VERBATIM behind ``/goal ``,
+    # the whole sentence being the objective. Matched ANYWHERE (the commitment usually
+    # trails the task), hence defaults that are explicit promises rather than anything
+    # conversational; empty list = off.
+    phrases: list[str] = Field(
+        default=[
+            "keep working on", "keep trying until", "don't stop until",
+            "dont stop until", "work on it until", "stay on it until",
+            "持续处理", "持续跟进", "一直做到", "一直试到",
+            "終わるまで続けて", "ずっと続けて",
         ]
     )
 
@@ -980,6 +999,7 @@ class VoiceConfig(_VoiceBase):
     # TTS) can't change gain mid-chunk and bakes it in statically.
     duck_db: float = Field(default=-12.0, le=0.0)
     barge_in: BargeInConfig = Field(default_factory=BargeInConfig)
+    goal: GoalConfig = Field(default_factory=GoalConfig)
     wake: WakeConfig = Field(default_factory=WakeConfig)
 
     # Tail after playback drains before re-listening (local only; the cloud drain has no hangover).

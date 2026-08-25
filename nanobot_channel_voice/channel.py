@@ -213,13 +213,13 @@ def _voice_context_blocks(
     lines: list[str] = []
     if tts is not None:
         lines.append(
-            "A spoken conversation: the user's words arrive via speech recognition "
-            "and your reply is spoken by text-to-speech, never displayed."
+            "A spoken conversation: speech recognition brings the user's words, "
+            "text-to-speech speaks your reply, never displayed."
         )
         # The persona corrector, adjacent to the persona line: without it, "voice
         # assistant" framing suppresses tool and skill use entirely.
         lines.append(
-            "You have your full tools and skills — use them; speech changes only "
+            "You have your full tools and skills; use them. Speech changes only "
             "the reply's style."
         )
     else:
@@ -228,18 +228,18 @@ def _voice_context_blocks(
     # keeps benign requests acted on (ask-first only where a wrong reading costs).
     if getattr(stt, "decoder_family", "") in ("ctc", "transducer"):
         lines.append(
-            "The transcript may mis-hear words — read it by sound and context; act "
+            "The transcript may mis-hear words; read it by sound and context; act "
             "on the likeliest reading, confirming first only for hard-to-undo actions."
         )
     else:
         lines.append(
-            "The transcript may mis-hear words or occasionally include a phrase that "
-            "was never said — read it by sound and context; act on the likeliest "
-            "reading, confirming first only for hard-to-undo actions."
+            "The transcript may mis-hear words, or invent a phrase never said; read "
+            "it by sound and context; act on the likeliest reading, confirming first "
+            "only for hard-to-undo actions."
         )
     if tts is not None:
         lines.append(
-            "Write plain prose for the ear — no markdown, code, URLs, or emoji."
+            "Write plain prose for the ear: no markdown, code, URLs, or emoji."
         )
         langs = getattr(tts, "spoken_languages", None)  # bilingual router
         lang = getattr(tts, "spoken_language", None)
@@ -247,7 +247,7 @@ def _voice_context_blocks(
             named = " and ".join(f"'{code}'" for code in langs)
             lines.append(
                 f"The voice pronounces ISO 639-1 {named}; reply in whichever the "
-                "user speaks — mixing is fine; other scripts are dropped or voiced "
+                "user speaks; mixing is fine; other scripts are dropped or voiced "
                 "as noise."
             )
         elif lang:
@@ -260,7 +260,13 @@ def _voice_context_blocks(
             # the canned filler behind it.
             "Thinking aloud briefly is fine. Before a slow tool call, say one short "
             "sentence about what you are doing; keep the answer for after the "
-            "results — no wait-phrases (\"One moment\") when delivering it."
+            "results, with no wait-phrases (\"One moment\")."
+        )
+        # A plain answer ENDS the turn in core, so "I will keep trying" is itself a
+        # give-up unless the model spends the same turn trying: the one prompt-side
+        # counterweight (see goal.phrases for the enforced version).
+        lines.append(
+            "If a step fails, try another way, and always say how it ended."
         )
     if extra and extra.strip():
         lines.append(extra.strip())
@@ -1007,7 +1013,10 @@ class VoiceChannel(BaseChannel):
         metadata onto that turn's final send, so ``send`` can tell the live turn's reply
         from a barged-out one's straggler. Notes ride the context bridge keyed by the
         token — metadata stays JSON-plain (tools snapshot it; cron persists the snapshot)
-        and the user row stays pure speech. See context_tool for the seam."""
+        and nothing is glued onto the text. See context_tool for the seam.
+
+        ``text`` is the transcript verbatim, except for a goal verdict, which hands us
+        the utterance behind ``/goal `` (see ``LocalBackend._is_goal``)."""
         if self._context_bridge is not None:
             self._context_bridge.stash_notes(turn_token, notes)
         await self._publish_user_text(text, metadata={TURN_META: turn_token})

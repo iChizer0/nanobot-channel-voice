@@ -607,6 +607,27 @@ Two layers mask long waits: the voice context asks the agent to speak a short st
 - Phrases are synthesized once at warmup with the session's own voice (local engines only; cloud TTS pays lazily) and cached; an unspeakable phrase is warned about at warmup.
 - Fillers are killed by barge-in like any reply audio and don't count toward latency metrics. Keep them short: in half-duplex the mic is gated while one plays.
 
+### Keep the agent working ("stay on it until it's done")
+
+Local backend only (the realtime backends reason in the provider, not in nanobot). An ordinary turn ends the moment the model answers without calling a tool, so "the search failed, I'll try another way" *is* a final answer and the run stops there. Core has one mode that refuses that ending — a **sustained goal**, which re-prompts the model to continue instead of finalizing — but it starts only from the `/goal` command, which speech can never produce. Say one of these phrases and the whole utterance publishes behind `/goal`:
+
+```json
+{
+  "channels": {
+    "voice": {
+      "goal": {
+        "phrases": ["keep working on", "don't stop until", "持续处理"]
+      }
+    }
+  }
+}
+```
+
+- Matched **anywhere** in the utterance, since the commitment usually trails the task ("find me a flight and *keep working on it* until it's booked"). Keep phrases explicit multi-word promises for that reason; `[]` turns the feature off.
+- The whole sentence is published as the objective — the model consolidates it via `create_goal`, and closes it with `update_goal` when the work completes, is cancelled, or is genuinely blocked. Saying "cancel that" reaches the model normally.
+- A goal phrase is never injected mid-turn: core dispatches a command inline rather than queueing it, so a live run is stopped first and the goal turn owns the session. Metric `goal_command`.
+- Goal turns legitimately run long. `agentTimeoutS` still caps them (core lifts its own LLM wall timeout for a goal, we do not), and `stallNoticeS` is what keeps the wait audible.
+
 ## Realtime
 
 Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback and routes the model's tool calls through nanobot's guarded `ToolRegistry` under `nanobot gateway`. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.
@@ -709,6 +730,7 @@ For CI, containers, or protocol work: the `null` backend captures nothing and di
 - Bot answers but stays silent on some replies: look for "cannot voice" warnings - the agent replied in a language the on-device TTS cannot speak, and the unvoiceable text was dropped rather than played as noise. Configure a TTS for that language or constrain the agent (`tts.language`, top-level `context`).
 - First reply after startup is slow: model warmup runs once in the background after start; later turns are unaffected. If turn 1 stays seconds slower than turn 2+ specifically in `agent_first_token_ms` (the metrics snapshot), the wait is the agent side - provider TLS, prompt prefill, or a local LLM server lazy-loading its model; preload it (e.g. Ollama `keep_alive`, llama.cpp `--mlock`) rather than tuning the voice pipeline.
 - "Still working on it" plays during long tool runs: that is the stall notice, and it now runs on two clocks. `stallNoticeS` (default 60 s) measures what the USER has heard: a turn that keeps working without saying anything gets the notice, then the interval doubles (capped at `agentTimeoutS`) for the rest of that turn - nothing is ever killed on this clock. Raise it if you would rather sit in silence, or set it to `null` to keep notices tied to the core clock alone. `agentTimeoutS` (default 300 s) measures the CORE: one silent budget warns, a second /stops the run and speaks `timeoutPhrase`. Healthy long tools push that clock via progress traffic, so leave core's `channels.sendProgress` on; raise `agentTimeoutS` only for models that genuinely think longer than 5 minutes in silence.
+- The agent answers once and stops instead of persisting: this is how an ordinary nanobot turn ends — a model reply with no tool call is the final answer, whatever it promises in prose. Core only enforces continuation in sustained-goal mode; use a goal phrase (above) for tasks that must run to completion. The voice block also asks for a retry and an outcome ("If a step fails, try another way, and always say how it ended"), but that is a request, not a mechanism, and small models ignore it. Two related core settings worth knowing: `agents.defaults.failOnToolError` (default `true`) kills a **spawned subagent** on its first tool error, so delegated work gives up harder than the main turn; and a tool that *raises* returns a bare `Error: ...` to the model with none of the "try a different approach" hint that error-shaped tool *results* get.
 - The agent says it will retry and then never reports back: check the gateway log for `Empty response on turn N ... retrying` / `... attempting finalization`. Those lines mean the MODEL returned nothing after its tool step; core substitutes "I completed the tool steps but couldn't produce a final answer" and the channel now speaks it (metric `reply_unanswered_final`) instead of dropping it as already-streamed. Frequent hits are a model-capability signal, not a pipeline fault: a small local model with no trained tool-calling narrates the intention and then gives up. Use a model with native tool-calling for the agent (STT/TTS can stay local), and put an explicit retry directive in `channels.voice.context` if you want the attempt narrated.
 - Talking to the bot while it works no longer cancels it: an utterance that lands while a tool is running (including over the status line it spoke before the call) is injected into the live turn instead of /stop-ping it, so a multi-step recovery survives being encouraged, corrected, or asked for a progress check. Audio stops either way - the user has the floor - and the agent is told what was heard. Cancelling still works: a stop phrase, or the wake word in `strict`/`gate` mode, kills the run as before.
 - "no API key for realtime provider": set `realtime.apiKey`, or `OPENAI_API_KEY` - remembering it is the fallback for every provider.

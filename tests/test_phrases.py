@@ -7,6 +7,7 @@ from nanobot_channel_voice.phrases import (
     FILLER_WORDS,
     PhraseLexicon,
     covered,
+    phrase_within,
     pure_command,
     tokens_of,
 )
@@ -84,3 +85,36 @@ def test_single_token_hits():
     assert pure_command(["停停停"], STOP, ACK, extra=FILLER_WORDS)
     assert not pure_command(["up"], STOP, ACK, extra=FILLER_WORDS)
     assert not pure_command(["okay"], STOP, ACK, extra=FILLER_WORDS)
+
+
+# ---- phrase inside free content (the goal trigger) --------------------------
+
+_GOAL = PhraseLexicon([
+    "keep working on", "don't stop until", "stop", "持续处理", "持续 处理",
+])
+
+
+def test_phrase_within_finds_a_trailing_commitment():
+    assert phrase_within("book the flight and keep working on it until it's done", _GOAL)
+    assert phrase_within("don't stop until you find one", _GOAL)
+
+
+def test_phrase_within_honours_token_boundaries_for_spaced_scripts():
+    # The padded join is what keeps a single-word phrase off word interiors.
+    assert phrase_within("stop the timer", _GOAL)
+    assert not phrase_within("set a stopwatch", _GOAL)
+
+
+def test_phrase_within_reaches_inside_a_fused_cjk_run():
+    # PhraseMatcher.present cannot: its decomposition demands the WHOLE token be
+    # lexicon singles, so a trigger surrounded by real content never matches.
+    assert phrase_within("持续处理这个问题直到解决", _GOAL)
+    assert not phrase_within("这个问题很难", _GOAL)
+
+
+def test_phrase_within_ignores_spacing_in_an_unspaced_phrase():
+    # Spacing is meaningless on both sides of an unspaced script, so a configured
+    # "持续 处理" must find 持续处理 in a transcript that never spaces it.
+    assert phrase_within("请持续处理", PhraseLexicon(["持续 处理"]))
+    # And an apostrophe splits identically in phrase and transcript.
+    assert phrase_within("please don't stop until it works", _GOAL)
