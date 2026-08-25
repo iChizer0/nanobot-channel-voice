@@ -373,6 +373,61 @@ def test_steer_rung_stops_at_the_answer():
     _run(_case())
 
 
+def test_a_blank_terminal_does_not_end_the_turn():
+    """Core fires on_stream_end(resuming=False) on its blank-response RETRY path too
+    (runner: _MAX_EMPTY_RETRIES), so an empty terminal is not proof the run is over.
+    Draining there ended the turn's metrics and disarmed its deadman under a live run —
+    and small models take that path constantly after a failed tool."""
+    async def _case():
+        async with EvalConversation(agentTimeoutS=30.0) as c:
+            b = c.backend
+            await c.user_says("check the weather")
+            await b.on_delta("Let me look that up.")
+            await b.on_stream_end(resuming=True)              # tool boundary
+            await c.wait_state(VoiceState.THINKING)
+            await b.on_stream_end(resuming=False)             # blank: model said nothing
+            await asyncio.sleep(0.05)
+            assert b._turn is VoiceState.THINKING             # still working, not settled
+            assert not b._cur_turn.answered
+            assert b._cur_turn.timeout_task is not None       # deadman still guarding
+            assert not b._cur_turn.timeout_task.done()
+
+            # The retry produces the real answer: it speaks into the SAME turn.
+            await b.on_delta("It is sunny in Tokyo today.")
+            await b.on_stream_end(resuming=False)
+            await c.wait_state(VoiceState.IDLE)
+            assert b._cur_turn.answered
+            assert c.interrupts == 0
+
+    _run(_case())
+
+
+def test_a_give_up_turn_says_so_instead_of_going_silent():
+    """End to end through the backend: status line, tool, blank model answer, then core's
+    substitute. It must be spoken exactly once and settle the turn — the round-4 field
+    report was this whole sequence ending in dead air."""
+    async def _case():
+        from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+
+        async with EvalConversation() as c:
+            b = c.backend
+            await c.user_says("book me a table")
+            await b.on_delta("The booking tool failed. Let me try another way.")
+            await b.on_stream_end(resuming=True)
+            await c.wait_state(VoiceState.THINKING)
+            await b.on_stream_end(resuming=False)      # the model returned nothing
+            assert not b._cur_turn.answered
+
+            await b.speak_unanswered(EMPTY_FINAL_RESPONSE_MESSAGE)   # what send() does
+            await c.wait_state(VoiceState.IDLE)
+            assert c.counter("reply_unanswered_final") == 1
+            assert b._cur_turn.answered                # and the turn is answered now
+            await b.speak_unanswered(EMPTY_FINAL_RESPONSE_MESSAGE)   # a straggler
+            assert c.counter("reply_unanswered_final") == 1
+
+    _run(_case())
+
+
 def test_a_terminal_clears_the_steer_latch():
     """`continuation_pending` is a turn latch and the IDLE placeholder is shared, so every
     terminal must clear it: a final arriving as a plain send after a tool boundary (the

@@ -416,7 +416,7 @@ class _Turn:
         "last_activity", "last_audible", "dead", "token", "audible_at",
         "continuation_pending",
         "md_counted", "md_carry", "segment_first",
-        "spoke_text", "emitted_audio", "fallback_done", "proactive",
+        "spoke_text", "emitted_audio", "fallback_done", "answered", "proactive",
     )
 
     def __init__(self, token: str = ""):
@@ -453,6 +453,9 @@ class _Turn:
         self.spoke_text = False
         self.emitted_audio = False
         self.fallback_done = False
+        # An ANSWER segment produced text (a pre-tool status line does not count): what
+        # separates "the model replied" from "the model gave up after its tools".
+        self.answered = False
         # Agent-initiated delivery (cron/trigger metadata on its sends): its settle
         # re-opens sentence attention so the user can answer without a re-wake.
         self.proactive = False
@@ -3088,6 +3091,7 @@ class LocalBackend(TurnEventMixin):
             # ones — a stale emitted_audio latch would swallow the silence fallback.
             turn = self._cur_turn
             turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
+            turn.answered = False
         self._cancel_prologue()  # the reply is arriving; no more filler
         self._cancel_midturn()   # a new segment began; the old boundary watch is stale
         self._cur_turn.last_activity = time.monotonic()
@@ -3134,16 +3138,23 @@ class LocalBackend(TurnEventMixin):
         first, self._cur_turn.segment_first = self._cur_turn.segment_first, None
         if not resuming and first and _opens_with_wait_phrase(first):
             self._metrics.count("reply_wait_phrase")
+        spoke, self._cur_turn.segment_spoke = self._cur_turn.segment_spoke, False
         if resuming:
-            spoke, self._cur_turn.segment_spoke = self._cur_turn.segment_spoke, False
             if spoke:
                 # The agent masked the tool wait with its own spoken status line.
                 self._metrics.count("agent_prologue")
             self._cur_turn.continuation_pending = True
             self._arm_midturn(spoke)
             return
-        self._cur_turn.segment_spoke = False
         self._cur_turn.continuation_pending = False
+        if spoke:
+            self._cur_turn.answered = True
+        elif self._turn is VoiceState.THINKING:
+            # Core fires a non-resuming end on its blank-response RETRY path too, so an
+            # empty terminal does not prove the turn is over — and with nothing playing
+            # there is nothing to drain. Hold, and let the final (or the deadman) decide,
+            # rather than disarming the deadman under a run that is still going.
+            return
         self._schedule_drain()
 
     def _note_reply_markdown(self, text: str) -> None:
@@ -3174,6 +3185,7 @@ class LocalBackend(TurnEventMixin):
         turn = self._cur_turn
         turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
         turn.continuation_pending = False
+        turn.answered = True  # a whole message stands as the turn's spoken reply
         self._note_reply_markdown(text)
         if _opens_with_wait_phrase(text):  # the whole message IS the delivery
             self._metrics.count("reply_wait_phrase")
@@ -3191,6 +3203,17 @@ class LocalBackend(TurnEventMixin):
         if tail:
             self._tts_enqueue(tail)
         self._schedule_drain()
+
+    async def speak_unanswered(self, text: str) -> None:
+        """Core's substitute for a final the model never produced (see the channel's
+        ``_streamed_final``), spoken only when this turn said nothing of its own: after a
+        failed tool a small model often returns blank, and core's explanation is then all
+        that keeps the failure from reading as a dead device."""
+        if self._cur_turn.answered:
+            return  # the turn answered; that stamp was honest
+        self._metrics.count("reply_unanswered_final")
+        self._log.warning("turn produced no answer of its own; speaking core's notice")
+        await self.speak_final(text)
 
     # ---- TTS stage + drain --------------------------------------------------
 

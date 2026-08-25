@@ -752,6 +752,57 @@ def test_send_traffic_feeds_the_deadman():
     _run(_t())
 
 
+def test_a_substituted_final_is_spoken_when_the_turn_never_answered():
+    """Core stamps StreamedResponseEvent on the text it SUBSTITUTES for a blank model
+    answer (empty_final_response / max-iterations), which was never streamed — the very
+    case a small model hits after a failed tool. Dropping it as "already spoken" is how
+    a give-up becomes dead air. A turn that DID answer must still drop it (no echo)."""
+    async def _t():
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.bus.outbound_events import StreamedResponseEvent
+        from nanobot.bus.queue import MessageBus
+        from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
+
+        from nanobot_channel_voice.channel import VoiceChannel
+
+        h = _build()
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = h.backend
+        spoken: list[str] = []
+
+        async def _speak(text: str) -> None:
+            spoken.append(text)
+
+        h.backend.speak_final = _speak  # type: ignore[method-assign]
+
+        def _final(content: str) -> OutboundMessage:
+            return OutboundMessage(
+                channel="voice", chat_id=channel.config.chat_id, content=content,
+                metadata={}, event=StreamedResponseEvent(),
+            )
+
+        # The turn spoke only a pre-tool status line, then the model went blank.
+        h.backend._cur_turn.answered = False
+        await channel.send(_final(EMPTY_FINAL_RESPONSE_MESSAGE))
+        assert spoken == [EMPTY_FINAL_RESPONSE_MESSAGE]
+        assert h.backend._metrics.counters.get("reply_unanswered_final") == 1
+
+        # The ordinary case: the answer WAS streamed, so the stamp is honest.
+        h.backend._cur_turn.answered = True
+        await channel.send(_final("It is sunny in Tokyo."))
+        assert spoken == [EMPTY_FINAL_RESPONSE_MESSAGE]  # not repeated
+
+        # Traces keep their old fate whatever else they carry.
+        h.backend._cur_turn.answered = False
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="thinking…",
+            metadata={"_streamed": True, "_progress": True},
+        ))
+        assert spoken == [EMPTY_FINAL_RESPONSE_MESSAGE]
+
+    _run(_t())
+
+
 def test_agent_initiated_sends_mark_the_turn_proactive():
     # cron/trigger turns copy their trigger stamp onto every outbound (core echoes
     # inbound metadata); the channel must mark the playback turn before speaking so

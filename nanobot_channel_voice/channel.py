@@ -15,6 +15,7 @@ from contextlib import suppress
 from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.outbound_events import StreamedResponseEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.runtime_context import RuntimeContextBlock
@@ -149,6 +150,24 @@ def _speakable(msg: OutboundMessage) -> bool:
     return not any(meta.get(k) for k in _TRACE_META)
 
 
+def _streamed_final(msg: OutboundMessage) -> bool:
+    """The turn's final, stamped "already delivered as deltas" — usually honest.
+
+    Core stamps it on the text it SUBSTITUTES for a blank model answer too
+    (``empty_final_response``, the max-iterations finalization), which was never streamed
+    at all: dropping that is how a small model's give-up becomes dead air. Only the
+    backend knows what the turn actually said, so it decides (see ``speak_unanswered``).
+    Either encoding may arrive — core derives the event for its own routing without
+    rewriting the message."""
+    meta = msg.metadata or {}
+    if any(meta.get(k) for k in _TRACE_META if k != "_streamed"):
+        return False  # a progress/tool/reasoning trace, not a reply
+    event = getattr(msg, "event", None)
+    return isinstance(event, StreamedResponseEvent) or (
+        event is None and bool(meta.get("_streamed"))
+    )
+
+
 def _agent_initiated(metadata: dict[str, Any] | None) -> bool:
     """An agent-initiated delivery: a cron or local-trigger turn copies its trigger
     stamp onto every outbound (core echoes inbound metadata verbatim). The user did
@@ -259,9 +278,9 @@ _DELEGATION_META = "_voice_delegation"
 class _DelegationCollector:
     """Collects one delegated nanobot turn's reply off the bus (supervisor mode); the
     first terminal the streaming contract produces resolves the future. Streaming ON:
-    deltas accumulate and ``_stream_end`` resolves, the final ``_streamed`` send being
-    swallowed upstream, never reaching the channel (see nanobot ``bus/outbound_events``).
-    Streaming OFF: a single final ``send`` resolves."""
+    deltas accumulate and ``_stream_end`` resolves; the final ``_streamed`` send DOES
+    reach the channel (the manager exempts it only from duplicate suppression) and is
+    ignored here, the future being done. Streaming OFF: a single final ``send`` resolves."""
 
     def __init__(self, metrics: VoiceMetrics) -> None:
         self._future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -1049,7 +1068,8 @@ class VoiceChannel(BaseChannel):
             # core is alive on this session: feed the deadman before filtering, so it
             # measures a silent core rather than a long tool run between segments.
             local.note_agent_activity()
-        if not _speakable(msg):
+        speakable = _speakable(msg)
+        if not speakable and not _streamed_final(msg):
             return
         turn = meta.get(TURN_META)
         if turn is not None and local.is_dead_turn(turn) and not _agent_initiated(meta):
@@ -1059,10 +1079,14 @@ class VoiceChannel(BaseChannel):
             # out, the gate would silently eat the reminder itself.
             return
         text = (msg.content or "").strip()
-        if text:
-            if _agent_initiated(meta):
-                local.note_proactive()
+        if not text:
+            return
+        if _agent_initiated(meta):
+            local.note_proactive()
+        if speakable:
             await local.speak_final(text)
+        else:
+            await local.speak_unanswered(text)
 
     async def send_delta(
         self,
