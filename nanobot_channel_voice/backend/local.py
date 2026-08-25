@@ -30,7 +30,7 @@ from nanobot_channel_voice.aio import (
     cancel_and_wait,
     cancel_task,
     put_drop_oldest,
-    wait_for_stall,
+    wait_until,
 )
 from nanobot_channel_voice.audio.pcm import (
     ding_pcm,
@@ -292,6 +292,19 @@ def _interrupt_marker(heard: str | None) -> str | None:
     )
 
 
+def _steer_marker(heard: str | None) -> str | None:
+    """The heard-up-to note for a mid-turn steer. NOT ``_interrupt_marker``: nothing was
+    cancelled, and a model told it was interrupted apologizes or starts the answer over."""
+    if heard is None:
+        return None
+    return (
+        "[voice event: the user spoke while you were working; they heard up to: "
+        f'"{_heard_tail(heard)}"]'
+        if heard
+        else "[voice event: the user spoke while you were working]"
+    )
+
+
 def _wake_note(heard: str | None) -> str:
     """The pending note a wake-word kill leaves for the NEXT publish (the wake
     itself publishes nothing) — same contract as a consumed stop's note."""
@@ -400,7 +413,8 @@ class _Turn:
     __slots__ = (
         "published_at", "chunk_await", "tts_first_pending", "await_first_token",
         "segment_spoke", "prologue_task", "midturn_task", "timeout_task", "base",
-        "last_activity", "dead", "token", "audible_at", "continuation_pending",
+        "last_activity", "last_audible", "dead", "token", "audible_at",
+        "continuation_pending",
         "md_counted", "md_carry", "segment_first",
         "spoke_text", "emitted_audio", "fallback_done", "proactive",
     )
@@ -420,6 +434,9 @@ class _Turn:
         self.timeout_task: asyncio.Task | None = None  # stalled-agent deadman
         self.base: str | None = None  # learned from the first delta's stream id
         self.last_activity = self.published_at  # any delta/segment end pushes this
+        # Words out (see _note_spoken). Separate from last_activity, which a working tool
+        # chain pushes forever and so can never measure dead air.
+        self.last_audible = self.published_at
         self.audible_at: float | None = None  # first audio frame emitted (adaptive hangover)
         # A resuming stream end passed: the next delta (the earliest observable resume
         # edge) re-anchors the metrics clock so tool time never lands in ttfa_ms.
@@ -1222,11 +1239,16 @@ class LocalBackend(TurnEventMixin):
                 # THINKING-base clip's steer must reach the inject rung, never a kill.
                 and self._canned_base is None
             ):
-                self._preempted = True
-                self._metrics.count("barge_in_early_confirm")
-                self._early_heard = await self._do_interrupt()
-                if wake_confirm:
-                    self._observe_wake_kill()
+                if self._cur_turn.continuation_pending and not wake_confirm:
+                    # Mid-tool: cut the status line, leave the verdict to the inject rung.
+                    # A wake hit still kills — being named IS a demand for the floor.
+                    await self._hush_midturn()
+                else:
+                    self._preempted = True
+                    self._metrics.count("barge_in_early_confirm")
+                    self._early_heard = await self._do_interrupt()
+                    if wake_confirm:
+                        self._observe_wake_kill()
             # else: the reply finished (drain won the race); the utterance still publishes.
         release, self._early_release = self._early_release, None
         if release is not None and not self._duck_pause and self._candidate_contested():
@@ -1610,26 +1632,28 @@ class LocalBackend(TurnEventMixin):
         cancel_task(self._ack_task)
         self._ack_task = asyncio.create_task(self._wake_ack(self._sink.epoch, matched))
 
-    def _reassure(self, matched: str | None = None) -> None:
-        """Answer a re-summon during THINKING without touching the query.
-        Prologue script first (an IDLE-style ack would invite a fresh command),
-        the wake ack phrase when none is configured. Rides the prologue task
-        slot so the reply's first delta cancels it like any filler."""
-        self._metrics.count("wake_reassure")
+    def _reassure(self, matched: str | None = None, *, metric: str = "wake_reassure") -> bool:
+        """Answer a re-summon or a steer during THINKING without touching the query.
+        Prologue script first (an IDLE-style ack would invite a fresh command), the wake
+        ack phrase when none is configured. Rides the prologue task slot so the reply's
+        first delta cancels it like any filler. The path counts either way; False means
+        this session has neither configured, so the caller owes the user a receipt."""
+        self._metrics.count(metric)
         if self._cfg.prologue.enabled and self._prologue_phrases:
             self._arm_prologue(initial_ms=0)
-            return
+            return True
         if (
             self._closing
             or self._tts is None
             or not self._cfg.wake.ack.enabled
             or not self._wake_ack_list
         ):
-            return
+            return False
         self._cancel_prologue()
         self._cur_turn.prologue_task = asyncio.create_task(
             self._wake_ack(self._sink.epoch, matched, base=VoiceState.THINKING)
         )
+        return True
 
     async def _wake_ack(
         self,
@@ -1681,9 +1705,7 @@ class LocalBackend(TurnEventMixin):
                 "wake {} ('{}')",
                 "ack" if base is VoiceState.IDLE else "reassure", text,
             )
-            self._echo.note_spoken(
-                text, hold_ms=self._sink.backlog_ms() + self._audio_ms(audio)
-            )
+            self._note_spoken(text, self._sink.backlog_ms() + self._audio_ms(audio))
             self._canned_base, self._canned_nonce = base, nonce
             await self._canned_playback(epoch, audio, base)
         except asyncio.CancelledError:
@@ -2358,20 +2380,26 @@ class LocalBackend(TurnEventMixin):
                 await self._orphaned_confirm("ack")
             return _summary("ack")
 
-        # Steering, not barge-in: onset AND verdict in THINKING with a healthy run means
-        # nothing was audible to talk over — inject instead of kill. Decided before the
-        # metrics anchor (an injection extends the RUNNING turn). Like the onset, the
-        # verdict joins the state beneath a canned clip: a filler or stall notice
-        # playing at verdict time must not turn a steer into a kill.
+        # Steering, not barge-in: a run that is still WORKING takes the utterance as a
+        # mid-turn injection instead of a kill. Decided before the metrics anchor (an
+        # injection extends the RUNNING turn). Like the onset, the verdict joins the state
+        # beneath a canned clip: a filler playing at verdict time is not a reply.
         verdict_state = self._turn
         if verdict_state is VoiceState.SPEAKING and self._canned_base is not None:
             verdict_state = self._canned_base
         inject = (
             interrupting
             and not preempted
-            and not pending.onset_speaking
-            and verdict_state is VoiceState.THINKING
             and not self._cur_turn.dead
+            and verdict_state in (VoiceState.THINKING, VoiceState.SPEAKING)
+            and (
+                # Inside a tool, so what plays (if anything) is a status line: cut the
+                # audio, never the run. Cleared by the first post-tool delta, after which
+                # talking over the ANSWER is a real barge-in again.
+                self._cur_turn.continuation_pending
+                # Or nothing audible to talk over in the first place.
+                or (verdict_state is VoiceState.THINKING and not pending.onset_speaking)
+            )
         )
 
         # Anchor at the TRUE end of speech, only for ACCEPTED utterances (a rejected echo/empty
@@ -2400,15 +2428,28 @@ class LocalBackend(TurnEventMixin):
             # live run's pending queue. The fresh token matters only if the run ends
             # first — the message then opens a normal turn whose final speaks.
             # Attention/wake bookkeeping is untouched: the same turn is still running.
+            # last_activity is NOT pushed: it measures the CORE, and a user who keeps
+            # asking would hold the deadman off a wedged turn for as long as they ask.
+            canned = self._canned_base is not None
+            if self._turn is VoiceState.SPEAKING:
+                await self._hush_midturn()
             self._clear_duck()
             self._metrics.count("midturn_injection")
-            self._cur_turn.last_activity = time.monotonic()  # a full budget to react
             notes: list[str] = []
             if self._pending_note is not None:
                 notes.append(self._pending_note)
                 self._pending_note = None
             await self._publish_text(text, unique_token(), tuple(notes))
-            self._arm_earcon()  # the steer gets the same capture receipt as a publish
+            # Core drains injections only at iteration boundaries, so the answer can be a
+            # whole tool call away: the steer needs a receipt now.
+            if canned:
+                # The cut clip is the receipt (as at the gated-mic wake); its script
+                # resumes mid-way rather than restarting on the same phrase.
+                self._arm_prologue(initial_ms=self._cfg.prologue.interval_ms, start_step=1)
+            elif not self._reassure(metric="midturn_reassure"):
+                # Nothing to say, so the ding is the receipt. Last, because every prologue
+                # arm sweeps pending earcons with it (see _cancel_prologue).
+                self._arm_earcon()
             return _summary("inject")
 
         killed, heard = await self._kill_live_reply(
@@ -2476,6 +2517,13 @@ class LocalBackend(TurnEventMixin):
         # playback is gone, so the lowered floor is the better estimate and re-adapts on its own.
         self._duck_onset = None
         self._duck_suspect = False
+        heard = self._take_heard(played)
+        await self._interrupt()
+        return heard
+
+    def _take_heard(self, played: float) -> str | None:
+        """Fold the sink's played-ms into heard TEXT and close the span ledger: every path
+        that cuts audio mid-sentence owes the agent the same account."""
         heard = None
         if self._pcm_out and self._cfg.barge_in.heard_marker:
             # played is stream-relative: subtract the segment's base (a reused filler stream's
@@ -2490,8 +2538,32 @@ class LocalBackend(TurnEventMixin):
             heard = f"{self._heard_prefix} {heard}".strip()
         self._spoken_spans.clear()
         self._heard_prefix = ""
-        await self._interrupt()
         return heard
+
+    async def _hush_midturn(self) -> None:
+        """``_do_interrupt``'s audio half with none of its turn-ending half: the user takes
+        the floor, the run keeps working.
+
+        What plays between a ``resuming`` end and the next delta is a status line, not the
+        answer — /stop-ping there is how a "let me try another way" chain dies in silence.
+        The boundary watch dies with the epoch, so the state flip happens here."""
+        self._cancel_prologue()
+        self._cancel_midturn()
+        played = await self._sink.flush()  # epoch++; restores level and pause gate
+        self._duck_onset = None  # VAD floor stays scaled, as in _do_interrupt
+        self._duck_suspect = False
+        heard = self._take_heard(played)
+        marker = _steer_marker(heard)
+        if marker is not None and self._pending_note is None:
+            self._pending_note = marker  # rides the steer's own publish
+        if heard:
+            # The turn lives on, so its heard-up-to ledger does too: a later kill must
+            # account for the words this cut already put in the air.
+            self._heard_prefix = heard
+        if self._turn is VoiceState.SPEAKING:
+            await self._set_turn(VoiceState.THINKING)  # tools still running; mic reopens
+        self._metrics.count("midturn_hush")
+        self._log.info("midturn steer: audio cut, run kept")
 
     def _heard_text(self, played_ms: float) -> str:
         """Map the sink's played-ms into the chunk texts the user actually heard:
@@ -2858,6 +2930,12 @@ class LocalBackend(TurnEventMixin):
         units is, so a fused zh stop run survives into PhraseMatcher whole."""
         return [t for t in tokens_of(text) if units_of(t) & fresh]
 
+    def _note_spoken(self, text: str, hold_ms: float) -> None:
+        """Words just went out: they must not read back as user speech, and they are
+        what ``stallNoticeS`` measures (a wordless earcon is a receipt, not an update)."""
+        self._echo.note_spoken(text, hold_ms=hold_ms)
+        self._cur_turn.last_audible = time.monotonic()
+
     def _judge_fresh(self, text: str, fresh: set[str]) -> str | None:
         """The shared confirm arm of both early-verdict sites (streaming partials, eager
         decode): "confirm" when the fresh evidence clears the bar — min words, or a full
@@ -3065,6 +3143,7 @@ class LocalBackend(TurnEventMixin):
             self._arm_midturn(spoke)
             return
         self._cur_turn.segment_spoke = False
+        self._cur_turn.continuation_pending = False
         self._schedule_drain()
 
     def _note_reply_markdown(self, text: str) -> None:
@@ -3089,11 +3168,12 @@ class LocalBackend(TurnEventMixin):
         # turn. Discard the buffered partial — the rare live collision loses a
         # fragment's words, which beats gluing them onto this text.
         self._chunker.flush()
-        # This send is its own delivery: the audibility ledger restarts (the IDLE
-        # placeholder is shared across unsolicited deliveries, so stale latches
-        # would swallow or double the fallback).
+        # This send is its own delivery, and the IDLE placeholder is shared across
+        # unsolicited ones: a stale ledger swallows the fallback, a stale steer latch
+        # reads a finished delivery as still working.
         turn = self._cur_turn
         turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
+        turn.continuation_pending = False
         self._note_reply_markdown(text)
         if _opens_with_wait_phrase(text):  # the whole message IS the delivery
             self._metrics.count("reply_wait_phrase")
@@ -3346,7 +3426,7 @@ class LocalBackend(TurnEventMixin):
         # Fed HERE, not at chunker feed: the eviction window runs from when the words
         # stop being AUDIBLE, hence backlog + this chunk's playtime. Earlier, and a long
         # reply's tail ages out mid-playback and reads back as user speech.
-        self._echo.note_spoken(text, hold_ms=self._sink.backlog_ms() + dur_ms)
+        self._note_spoken(text, self._sink.backlog_ms() + dur_ms)
         self._reply_tail = text  # the LAST segment judges sentence-attention's "?"
         self._cur_turn.emitted_audio = True  # the unvoiced-final fallback stands down
         await self._emit(self._audio_event(epoch, audio))
@@ -3579,12 +3659,12 @@ class LocalBackend(TurnEventMixin):
     def _arm_timeout(self) -> None:
         """Arm the stalled-agent deadman for the turn just published.
 
-        A voice channel must never end a turn in dead air, but killing healthy work is
-        worse: one silent ``agentTimeoutS`` speaks stallPhrase and re-arms; only a SECOND
-        silent budget /stops the run and speaks timeoutPhrase. Activity pushes
-        ``_Turn.last_activity`` — deltas, segment ends, and the channel's send() tap
-        (progress/tool events) — so tool chains die only when the core itself goes
-        silent. With streaming AND progress traffic both off nothing pushes it, so 2x
+        Two clocks, because dead air and a dead core are different failures.
+        ``last_audible`` (words out) drives the NOTICE at ``stallNoticeS``, which never
+        touches the run — a tool chain narrating nothing is still dead air.
+        ``last_activity`` (deltas, segment ends, the send() tap for progress/tool events)
+        drives the KILL at ``agentTimeoutS``: one silent budget warns, a SECOND /stops.
+        With streaming AND progress traffic both off nothing pushes activity, so 2x
         agentTimeoutS caps any turn: the accepted cost of recovering wedged ones."""
         self._cur_turn.cancel_timeout()
         if self._closing or self._cfg.agent_timeout_s is None:
@@ -3594,10 +3674,16 @@ class LocalBackend(TurnEventMixin):
     async def _timeout_watch(self, turn: _Turn) -> None:
         try:
             budget = float(self._cfg.agent_timeout_s)
+            quiet = self._cfg.stall_notice_s  # None: notices ride the core clock alone
             notified = False
             stamp = turn.last_activity
+
+            def _due() -> float:
+                core = turn.last_activity + budget
+                return min(turn.last_audible + quiet, core) if quiet else core
+
             while True:
-                await wait_for_stall(lambda: turn.last_activity, budget)
+                await wait_until(_due)
                 if self._closing or self._cur_turn is not turn:
                     return
                 if self._turn is VoiceState.IDLE:
@@ -3607,29 +3693,40 @@ class LocalBackend(TurnEventMixin):
                     # utterance: not a silent wedge. Re-arm rather than exit — a
                     # filler playing at the deadline must not strip the turn's only
                     # recovery (the pre-loop watch disarmed exactly there).
-                    stamp = turn.last_activity = time.monotonic()
+                    stamp = turn.last_activity = turn.last_audible = time.monotonic()
                     continue
+                dead_core = time.monotonic() - turn.last_activity >= budget
                 if notified and turn.last_activity != stamp:
-                    # The core came back after the notice (deltas, sends), then went
-                    # silent for a fresh budget: a NEW escalation, not the second
-                    # half of the old one — the kill always follows its own warning.
+                    # The core came back after the notice, then went silent for a fresh
+                    # budget: a NEW escalation — the kill always follows its own warning.
                     notified = False
-                if not notified:
+                if dead_core and notified:
+                    break
+                if dead_core:
                     notified = True
                     self._metrics.count("agent_turn_stall")
                     self._log.warning(
                         "agent turn stalled ({}s with no activity); speaking stall "
                         "notice, killing after another budget", int(budget),
                     )
-                    # Rides the prologue slot: the reply's first delta cancels it
-                    # like any filler, and its _settle never fights a live drain.
-                    self._cancel_prologue()
-                    self._cur_turn.prologue_task = asyncio.create_task(
-                        self._stall_notice(self._sink.epoch)
-                    )
                     stamp = turn.last_activity = time.monotonic()  # a full budget to the kill
-                    continue
-                break
+                else:
+                    # Working, just not saying anything: speak and back off, never kill.
+                    self._metrics.count("agent_turn_quiet")
+                    self._log.info(
+                        "agent turn audibly silent for {}s while the core works",
+                        int(quiet),
+                    )
+                    quiet = min(quiet * 2.0, budget)
+                # Rides the prologue slot: the reply's first delta cancels it
+                # like any filler, and its _settle never fights a live drain.
+                self._cancel_prologue()
+                self._cur_turn.prologue_task = asyncio.create_task(
+                    self._stall_notice(self._sink.epoch)
+                )
+                # A SKIPPED notice (user mid-utterance) must not spin the loop; a played
+                # one stamps this itself.
+                turn.last_audible = time.monotonic()
             self._log.warning(
                 "agent turn silent for another {}s; giving up and /stop-ping it",
                 int(budget),
@@ -3666,9 +3763,8 @@ class LocalBackend(TurnEventMixin):
                 or self._endpointer.in_speech  # never talk over the user
             ):
                 return
-            self._echo.note_spoken(
-                self._cfg.stall_phrase,
-                hold_ms=self._sink.backlog_ms() + self._audio_ms(audio),
+            self._note_spoken(
+                self._cfg.stall_phrase, self._sink.backlog_ms() + self._audio_ms(audio)
             )
             self._canned_base, self._canned_nonce = VoiceState.THINKING, nonce
             await self._canned_playback(epoch, audio, VoiceState.THINKING)
@@ -3978,9 +4074,7 @@ class LocalBackend(TurnEventMixin):
             # in the very speech the wait yields to.
             return False
         self._metrics.count("prologue_filler")
-        # Our own filler must not read back as user speech: half-duplex gates the mic via
-        # SPEAKING; soft-duplex needs the echo filter to know the words.
-        self._echo.note_spoken(text, hold_ms=self._sink.backlog_ms() + self._audio_ms(audio))
+        self._note_spoken(text, self._sink.backlog_ms() + self._audio_ms(audio))
         nonce = object()
         self._canned_base, self._canned_nonce = VoiceState.THINKING, nonce
         try:

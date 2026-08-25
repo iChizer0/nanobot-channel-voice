@@ -34,17 +34,23 @@ async def cancel_and_wait(task: asyncio.Task | None) -> None:
         pass
 
 
+async def wait_until(deadline: Callable[[], float]) -> None:
+    """Sleep until the MOVING ``deadline()`` (``time.monotonic`` domain) passes: recomputed
+    on every wake, so one waiter can watch several clocks (the ``min`` of their deadlines)."""
+    while True:
+        now = time.monotonic()
+        due = deadline()
+        if now >= due:
+            return
+        await asyncio.sleep(due - now)
+
+
 async def wait_for_stall(last_activity: Callable[[], float], budget_s: float) -> None:
     """Sleep until ``budget_s`` has passed since the MOVING ``last_activity()``
     stamp (``time.monotonic`` domain): activity pushes the stamp forward, so only
     a full budget of silence returns. A deadman, not a cap: the caller decides
     what recovery means."""
-    while True:
-        deadline = last_activity() + budget_s
-        now = time.monotonic()
-        if now >= deadline:
-            return
-        await asyncio.sleep(deadline - now)
+    await wait_until(lambda: last_activity() + budget_s)
 
 
 class Throttle:

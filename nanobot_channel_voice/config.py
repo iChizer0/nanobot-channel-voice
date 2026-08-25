@@ -985,17 +985,21 @@ class VoiceConfig(_VoiceBase):
     # Tail after playback drains before re-listening (local only; the cloud drain has no hangover).
     playback_hangover_ms: int = Field(default=250, ge=0)
 
-    # Stalled-agent deadman (local backend; cloud analog: realtime.turnTimeoutS), escalating:
-    # a published turn with NO activity for one budget speaks stallPhrase and re-arms; a second
-    # silent budget /stops the run and speaks timeoutPhrase. Activity = stream deltas, segment
-    # ends, AND any bus traffic for this chat (progress/tool events — the send() tap), so the
-    # deadman measures a silent core, not a slow tool; that tap needs core's
-    # channels.sendProgress left on (its default). 300 matches core's own ceilings (LLM
-    # timeout, subagent wait are 300 s): tighter kills turns core would still finish. None
-    # disables. Both phrases are spoken by the session TTS — localize them together, and
-    # never put a stop phrase inside one (validated): a just-spoken word is self-echo,
-    # so the invited command would be swallowed.
+    # Stalled-agent deadman (local backend; cloud analog: realtime.turnTimeoutS), on two
+    # clocks: "the user has heard nothing" and "the core is dead" are different failures.
+    # stallNoticeS = audible silence on a LIVE turn: speak stallPhrase, then double the
+    # interval (capped at agentTimeoutS) for the rest of the turn, never killing — a tool
+    # chain that stops narrating is dead air the core clock cannot see. None = notices on
+    # core silence only. agentTimeoutS = no bus traffic at all for this chat (deltas,
+    # segment ends, any send() — progress/tool events need core's channels.sendProgress,
+    # its default): one silent budget warns, a SECOND /stops the run and speaks
+    # timeoutPhrase. 300 matches core's own ceilings (LLM timeout, subagent wait): tighter
+    # kills turns core would still finish. None disables both clocks. Both phrases are
+    # spoken by the session TTS — localize them together, and never put a stop phrase
+    # inside one (validated): a just-spoken word is self-echo, so the invited command
+    # would be swallowed.
     agent_timeout_s: float | None = Field(default=300.0, gt=0)
+    stall_notice_s: float | None = Field(default=60.0, gt=0)
     stall_phrase: str = "Still working on it. This is taking longer than usual."
     timeout_phrase: str = "Sorry, I'm having trouble answering that. Please try again."
 

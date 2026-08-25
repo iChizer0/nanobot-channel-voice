@@ -5,6 +5,7 @@ false-candidate economics — through the REAL pipeline, not hand-built pendings
 from __future__ import annotations
 
 import asyncio
+import time
 
 from eval_harness import EvalConversation
 
@@ -15,6 +16,14 @@ _REPLY = "The weather in tokyo is sunny today. Tomorrow will be cloudy all day."
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+async def _until(pred, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition never held")
+        await asyncio.sleep(0.005)
 
 
 def test_plain_turn_full_lifecycle():
@@ -280,6 +289,180 @@ def test_unvoiced_final_speaks_the_fallback_notice():
             await c.agent_replies("This is voiced content.")
             await c.wait_state(VoiceState.IDLE)
             assert c.counter("reply_unvoiced_fallback") == 1
+
+    _run(_case())
+
+
+# ---- mid-turn steering: a working run must survive being talked to ----------
+
+
+def test_steer_over_a_status_line_keeps_the_run_working():
+    """The reply segment still draining after a `resuming` end is a pre-tool status
+    line, so talking over it is steering, not barge-in: the audio stops, the run does
+    not, and the utterance rides into the live turn. Killing here is what strands a
+    "that failed, let me try another way" chain in permanent silence."""
+    async def _case():
+        async with EvalConversation(earcons={"captured": True}) as c:
+            b = c.backend
+            await c.user_says("book me a table at eight")
+            await b.on_delta(
+                "The booking site rejected that request when I tried it a moment ago. "
+                "I am going to try a completely different way of getting that table. "
+                "Give me a little while longer and I will tell you how it goes."
+            )
+            await b.on_stream_end(resuming=True)          # more tools follow
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(100)                   # a few words audibly out
+            quiet_since = b._cur_turn.last_activity = time.monotonic() - 100.0
+            dings = c.counter("earcon_captured")  # the opening turn dinged too
+            await c.user_says("use the italian place on maple street")
+
+            assert c.interrupts == 0                      # NO /stop: the chain lives
+            assert c.counter("midturn_injection") == 1
+            assert c.counter("midturn_hush") == 1         # but the audio did stop
+            assert c.texts()[1] == "use the italian place on maple street"
+            [note] = c.notes()[1]
+            assert note.startswith("[voice event: the user spoke while you were working")
+            assert "The booking site" in note              # heard-up-to names real words
+            # Nothing configured to say anything, so the ding is the steer's receipt.
+            assert c.counter("midturn_reassure") == 1
+            await _until(lambda: c.counter("earcon_captured") == dings + 1)
+            await c.wait_state(VoiceState.THINKING)       # mic reopened, tools running
+            # User speech is not core liveness: a steer must not hold the deadman off
+            # a wedged turn for as long as the user keeps asking.
+            assert b._cur_turn.last_activity == quiet_since
+
+            # The continuation still speaks, into the same turn — and a real barge-in
+            # over THAT answer still kills, accounting for what the cut already aired.
+            await b.on_delta(
+                "Booked for eight at the italian place on maple street tonight. "
+                "They are holding the table by the window until a quarter past. "
+                "I will send the confirmation over to your phone as well."
+            )
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(100)
+            await c.user_says("cancel it, we will walk there")
+            assert c.interrupts == 1
+            [note] = c.notes()[2]
+            assert note.startswith("[voice event: you were interrupted mid-reply")
+            assert "The booking site" in note      # the hushed words are still accounted
+
+    _run(_case())
+
+
+def test_steer_rung_stops_at_the_answer():
+    """The widened rung is bounded by `continuation_pending`: once post-tool text
+    starts arriving, what plays IS the answer and talking over it is a real barge-in
+    again (kill + /stop + the interrupted-mid-reply marker)."""
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            await c.user_says("what is the weather")
+            await b.on_delta("Let me check.")
+            await b.on_stream_end(resuming=True)
+            await b.on_delta(_REPLY)                      # the answer: pending cleared
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(100)
+            await c.user_says("turn off the desk lamp")
+
+            assert c.interrupts == 1
+            assert c.counter("midturn_injection") == 0
+            [note] = c.notes()[1]
+            assert note.startswith("[voice event: you were interrupted mid-reply")
+
+    _run(_case())
+
+
+def test_a_terminal_clears_the_steer_latch():
+    """`continuation_pending` is a turn latch and the IDLE placeholder is shared, so every
+    terminal must clear it: a final arriving as a plain send after a tool boundary (the
+    tool_error path does exactly that) would otherwise leave the answer looking steerable,
+    and barge-in over it would never /stop."""
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            await c.user_says("check the weather")
+            await b.on_delta("Let me check.")
+            await b.on_stream_end(resuming=True)
+            await c.agent_replies(_REPLY)          # answer as a non-streamed final
+            assert not b._cur_turn.continuation_pending
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(100)
+            await c.user_says("turn off the desk lamp")
+
+            assert c.interrupts == 1
+            assert c.counter("midturn_injection") == 0
+
+    _run(_case())
+
+
+def test_a_steer_gets_an_audible_receipt():
+    """Core drains injections only at iteration boundaries, so the answer to a steer
+    can be a whole tool call away. With a filler script configured, the steer is
+    acknowledged out loud instead of leaving the earcon as its only sign."""
+    async def _case():
+        async with EvalConversation(
+            prologue={"enabled": True, "afterMs": 60000}, earcons={"captured": True},
+        ) as c:
+            b = c.backend
+            await c.user_says("check every room")
+            await b.on_delta(
+                "I am starting the sweep with the first room on the list right now. "
+                "There are four more rooms to check after this one is finished. "
+                "This will take me a little while, so please bear with me."
+            )
+            await b.on_stream_end(resuming=True)
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(100)
+            dings = c.counter("earcon_captured")
+            await c.user_says("skip the garage entirely")
+
+            assert c.counter("midturn_injection") == 1
+            assert c.counter("midturn_reassure") == 1
+            await c.wait_state(VoiceState.SPEAKING)       # the ack actually plays
+            assert c.counter("earcon_captured") == dings  # words replace the ding
+            assert c.interrupts == 0
+
+    _run(_case())
+
+
+def test_quiet_notice_speaks_while_the_core_is_busy():
+    """The audible clock, not the core clock: a tool chain pushes last_activity with
+    every progress event, so the old single-clock deadman could never speak during
+    exactly the dead air the user hears. The notice fires; nothing is killed."""
+    from nanobot_channel_voice.config import VoiceConfig
+
+    class _RecordingTts:
+        output_rate = 16000
+
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.requests: list[str] = []
+
+        async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            return await self.inner.synthesize(text)
+
+        async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+            self.requests.append(text)
+            return await self.inner.synthesize_pcm(text)
+
+    async def _case():
+        async with EvalConversation(agentTimeoutS=10.0, stallNoticeS=0.1) as c:
+            rec = _RecordingTts(c.backend._tts)
+            c.backend._tts = rec
+            stall = VoiceConfig().stall_phrase
+            await c.user_says("audit the whole house")
+            for _ in range(60):
+                # What a busy tool chain does to the CORE clock, every 20 ms.
+                c.backend.note_agent_activity()
+                await asyncio.sleep(0.02)
+                if stall in rec.requests:
+                    break
+            assert stall in rec.requests
+            assert c.counter("agent_turn_quiet") >= 1
+            assert c.counter("agent_turn_stall") == 0   # the core was never silent
+            assert c.interrupts == 0                    # and is never killed for it
 
     _run(_case())
 
