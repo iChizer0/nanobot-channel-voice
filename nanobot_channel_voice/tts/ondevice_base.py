@@ -159,8 +159,6 @@ class OnDeviceTtsAdapter(TtsAdapter):
             ) if p.size
         ]
         if len(parts) == 2:
-            # Interior seam, as in _synthesize_floats: the halves' own padding would
-            # otherwise bury _join_gap_s under ~700 ms of it.
             parts[0] = _edge_trim(parts[0], self.output_rate, tail=True)
             parts[1] = _edge_trim(parts[1], self.output_rate, lead=True)
             parts.insert(1, self._join_gap())

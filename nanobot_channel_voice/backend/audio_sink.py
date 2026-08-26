@@ -35,6 +35,8 @@ _STREAM_LEAD_MS = 240.0
 # reaction time.
 _DUCK_STREAM_LEAD_MS = 120.0
 _GAIN_BLOCK_MS = 20  # envelope granularity (one gain step per block)
+# A ~250 ms cue is audibly late behind an open this slow; below it, nobody notices.
+_SLOW_OPEN_MS = 80.0
 
 
 try:  # numpy ships with the [ondevice] extra; pure-python loops are the fallback
@@ -77,10 +79,9 @@ def trim_lead_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float 
 def trim_tail_silence(pcm: bytes, rate: int, *, cap_ms: float, threshold: float = 0.01) -> bytes:
     """Cap the TRAILING silence of raw S16_LE PCM at ``cap_ms``.
 
-    TTS pads every utterance with the same tail whatever the text ends with (measured
-    580-790 ms on matcha), so it is padding, never a rendered pause: on a canned clip it
-    holds the turn SPEAKING with the half-duplex mic gated, and on a reply chunk it becomes
-    a seam the words did not ask for. All-silent: unchanged.
+    The tail is the same whatever the text ends with (measured 580-790 ms on matcha), so it
+    is padding and never a rendered pause: it holds a canned clip's turn SPEAKING with the
+    half-duplex mic gated, and makes a reply chunk's seam. All-silent: unchanged.
     """
     n = len(pcm) & ~1
     if n == 0 or rate <= 0:
@@ -139,6 +140,7 @@ class AudioSink:
         # finished (drain included) so flush() can ALWAYS kill it.
         self._stream: PlaybackStream | None = None
         self._stream_open_t = 0.0
+        self._warned_slow_open = False
         self._bytes = 0
         # Bumped per FRESH stream: played_ms() restarts at 0, voiding earlier offsets.
         self._generation = 0
@@ -433,6 +435,19 @@ class AudioSink:
         if self._stream is stream:  # a concurrent flush may have taken it
             self._stream = None
 
+    def _note_open_cost(self, open_ms: float) -> None:
+        """A drain EOFs the stream, so every segment reopens the device; the shorter the
+        segment the more of it this is (a ~250 ms earcon most of all)."""
+        if open_ms < _SLOW_OPEN_MS or self._warned_slow_open:
+            return
+        self._warned_slow_open = True
+        self._log.warning(
+            "playback device open took {:.0f} ms and EVERY segment pays it: expect a late "
+            "earcon and a late first word. Check audio.playbackDevice — a plughw:/dmix path "
+            "rebuilds its conversion chain on each open.",
+            open_ms,
+        )
+
     def _spawn_reaper(self, stream: PlaybackStream) -> None:
         self._parked.add(stream)
 
@@ -502,7 +517,9 @@ class AudioSink:
                     self._stream = None
             stream = None
         if stream is None:
+            open_t0 = time.monotonic()
             stream = await self._sink.open_stream(rate)
+            self._note_open_cost((time.monotonic() - open_t0) * 1000.0)
             if epoch != self._epoch:
                 # flush()'s sweep cannot reach an unpublished handle; leaked, it would
                 # make an exclusive hw: device refuse the next turn's open.

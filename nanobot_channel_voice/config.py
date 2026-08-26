@@ -771,8 +771,9 @@ class WakeAckConfig(_VoiceBase):
     Keep phrases SHORT (≤ ~0.6 s spoken): the half-duplex mic is gated while one plays."""
 
     enabled: bool = False
-    # Rotated round-robin across summons. None = built-ins keyed to the TTS engine's language; a
-    # phrase the engine cannot speak synthesizes to silence (prewarm warns).
+    # Rotated round-robin across summons. None = built-ins keyed to the TTS engine's language,
+    # whatever script called it; a phrase the engine cannot speak synthesizes to silence
+    # (prewarm warns). A mixed-script list here is the one thing the summon's script routes.
     phrases: list[str] | None = None
 
 

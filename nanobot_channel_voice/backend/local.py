@@ -182,9 +182,7 @@ def _wake_ack_phrases(configured: list[str] | None, language: str | None) -> lis
     return _WAKE_ACK_BUILTINS.get(language or "", _WAKE_ACK_FALLBACK)
 
 
-# Ack language routing by the called name's script. Kana beats han (ja mixes both), han alone
-# reads zh; latin is en/de-ambiguous and defers to the TTS.
-_SCRIPT_ROWS = {"han": "zh", "kana": "ja", "hangul": "ko"}
+# Kana beats han: ja mixes both, so a han-only phrase is what reads zh.
 
 
 def _script_class(text: str) -> str | None:
@@ -517,15 +515,13 @@ _CUT_LOOKAHEAD = 16
 _CUT_SENT = set(".!?…。！？")
 _CUT_CLAUSE = set(",;:，、；：")
 
-# Seam silence, ms. The model pads EVERY utterance with the same tail whatever it ends with
-# (matcha: 590 ms after "。", after "，" and after a bare cut alike), so only the text can
-# size a seam. Targets are what it renders for that punctuation INSIDE one utterance.
+# Seam silence, ms. The model pads every utterance identically whatever it ends with
+# (matcha 590 ms after "。", "，" or a bare cut), so only the text can size a seam.
 _SEAM_LEAD_MS = 20.0
 _SEAM_SENT_MS = 140.0    # + the lead ~= the 164 ms it renders for an internal "。"
 _SEAM_CLAUSE_MS = 280.0  # + the lead ~= the 308 ms it renders for an internal "，"
 _SEAM_OPEN_MS = 40.0     # a budget cut mid-phrase: no boundary here to pause on
-# Closers ride with their sentence, in any order and spacing: the punctuation that sizes
-# the seam is underneath them.
+# Closers and spacing ride with the sentence; the punctuation sizing the seam is under them.
 _SEAM_CLOSERS = "\"')]}»”’」』】）〉》 \t\r\n"
 
 
@@ -1423,19 +1419,10 @@ class LocalBackend(TurnEventMixin):
         if dt < _WAKE_ATTACH_S:
             self._metrics.observe("wake_kill_ms", dt * 1000.0)
 
-    def _tts_speaks(self, lang: str) -> bool:
-        """Whether the session's TTS can voice *lang* (None declaration =
-        unrestricted, e.g. cloud adapters)."""
-        langs = getattr(self._tts, "spoken_languages", None)
-        if langs:
-            return lang in langs
-        single = getattr(self._tts, "spoken_language", None)
-        return single is None or single == lang
-
     def _ack_pool(self, matched: str | None) -> list[str]:
-        """Ack phrases for THIS summon: same-script entries win when the called name's script is
-        known; built-ins cross to the matched script's row only if the TTS can voice it (a
-        zh-only engine keeps the zh ack for an English summon)."""
+        """Ack phrases for THIS summon. The ack speaks the TTS's OWN language whatever script
+        called it — the list resolved from ``spoken_language`` at construction. A configured
+        mixed-script list is the one place the summon's script picks: listing both asks for it."""
         hint = _script_class(matched) if matched else self._wake_phrases_script
         return self._ack_pool_of(hint)
 
@@ -1444,19 +1431,11 @@ class LocalBackend(TurnEventMixin):
         if hint is None:
             return pool
         same = [p for p in pool if _script_class(p) == hint]
-        if same:
-            return same
-        if self._cfg.wake.ack.phrases is None:
-            row = _SCRIPT_ROWS.get(hint)
-            if row is not None and self._tts_speaks(row):
-                return _WAKE_ACK_BUILTINS[row]
-            if hint == "latin" and self._tts_speaks("en"):
-                return _WAKE_ACK_FALLBACK
-        return pool
+        return same or pool
 
     def _ack_reachable_texts(self) -> list[str]:
-        """Every ack a summon can pick: the resolved list plus each phrase script's crossover
-        pool, so prewarm covers the first cross-script summon."""
+        """Every ack a summon can pick: the resolved list, plus each phrase script's slice of a
+        long configured list, so prewarm covers a summon that routes past the first eight."""
         texts = list(self._wake_ack_list[:8])
         cfg = self._cfg.wake
         hints = {_script_class(p) for p in cfg.phrases + cfg.aliases}

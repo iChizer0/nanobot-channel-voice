@@ -565,27 +565,24 @@ _ZH_UNITS = ("元 块 角 美元 欧元 个 只 条 张 台 部 件 份 位 人 
              "天 小时 分钟 秒 周 度 米 公里 千米 厘米 毫米 里 克 千克 公斤 吨 升 毫升 斤 两 "
              "倍 成 折 分 平方米 亿 万 种 款 层 楼 步").split()
 _RE_ZH_TRIGGER = re.compile("(?:" + "|".join(_ZH_TRIGGERS) + r")[^0-9]{0,6}$")
-# Longest-first, or 公里 loses its first character to 里. The Latin branch mirrors what
-# _RE_EN_UNIT already lists: zh text writes "512MB" and "100km" too, and without it the
-# glue rule in _is_sequence reads those digit-wise. Two letters minimum, so an identifier
-# suffix (1080p, 4K, 5G) still reads as a sequence.
+# Longest-first, or 公里 loses its first character to 里. The Latin branch mirrors
+# _RE_EN_UNIT's: zh writes "512MB" too, and without it _is_sequence's glue rule reads those
+# digit-wise. Two letters minimum, so 1080p/4K/5G stay identifiers.
 _RE_ZH_UNIT = re.compile(
     r"^\s*(?:(?:" + "|".join(sorted(_ZH_UNITS, key=len, reverse=True)) + r")"
     r"|(?:[kmg]?hz|[kmgt]b|fps|dpi|bpm|km|cm|mm|kg|mg|ml|ms|kw)(?![a-z]))",
     re.I,
 )
 
-# Neither separator is silent: espeak NAMES them ("5-10" -> "five dash ten", "1/2" ->
-# "one slash two") and the zh lexicon drops them, fusing "5-10分钟" into 五十分钟.
-# "\s*%" as one optional unit, never a bare "\s*": a trailing "\s*" swallows the space
-# before the unit ("5-10 minutes" -> "5 to 10minutes").
+# Neither separator is silent: espeak names them ("five dash ten", "one slash two") and the
+# zh lexicon drops them, fusing "5-10分钟" into 五十分钟. "\s*%" is ONE optional unit — a bare
+# trailing "\s*" would eat the space before the unit ("5 to 10minutes").
 _RE_RANGE = re.compile(
     rf"(?<![\d{_HYPHENS}.])(\d+(?:\.\d+)?(?:\s*%)?)\s*[{_HYPHENS}~～]\s*"
     rf"(\d+(?:\.\d+)?(?:\s*%)?)(?![\d.])"
 )
-# Denominators a reader says as a fraction. Anything else (24/7, 16/9, 8/25) keeps its
-# literal reading rather than inventing "twenty fifths" -- and this is the guard that
-# keeps a bare M/D date out, which a spoken reply writes as "January 2" anyway.
+# Denominators a reader says as a fraction; 24/7, 16/9 and a bare M/D date keep their
+# literal reading rather than inventing "twenty fifths".
 _FRACTION_DENOMS = frozenset((2, 3, 4, 5, 6, 8, 10, 16))
 _RE_FRACTION = re.compile(r"(?<![\d./])(\d{1,2})/(\d{1,2})(?![\d/])")
 

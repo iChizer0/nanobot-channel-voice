@@ -323,3 +323,22 @@ def test_close_cue_is_the_receipt_pair_reversed():
     # first 50 ms oscillates ~1.5x faster than the receipt's.
     head = 16000 * 50 // 1000 * 2
     assert sign_changes(dong[:head]) > sign_changes(ding[:head]) * 1.2
+
+
+def test_a_slow_device_open_warns_once():
+    from loguru import logger as loguru_logger
+
+    from nanobot_channel_voice.audio.null import NullPlayback
+    from nanobot_channel_voice.backend.audio_sink import _SLOW_OPEN_MS, AudioSink
+
+    sink = AudioSink(NullPlayback(), mode="stream")
+    seen: list[str] = []
+    handle = loguru_logger.add(lambda m: seen.append(str(m)), level="WARNING")
+    try:
+        sink._note_open_cost(_SLOW_OPEN_MS - 1)   # unremarkable: silent
+        assert not seen
+        sink._note_open_cost(_SLOW_OPEN_MS + 50)
+        sink._note_open_cost(_SLOW_OPEN_MS + 90)  # every segment reopens: warn ONCE
+    finally:
+        loguru_logger.remove(handle)
+    assert len(seen) == 1 and "playback device open" in seen[0]

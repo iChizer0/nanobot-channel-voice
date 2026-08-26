@@ -820,19 +820,21 @@ def test_ack_prewarm_and_language_defaults():
     _run(_case())
 
 
-def test_ack_language_follows_the_called_name():
+def test_ack_language_follows_the_tts_not_the_called_name():
     async def _case():
         async with EvalConversation(
             playbackHangoverMs=1,
             **_wake("gate", phrases=["hey nanobot", "小娜"], ack={"enabled": True}),
         ) as conv:
-            await conv.user_says("小娜")
-            await _until(lambda: conv.counter("wake_ack") == 1)
-            assert "在呢。" in conv.backend._fillers  # zh row, not the en fallback
-            await conv.wait_state(VoiceState.IDLE)
-            await conv.user_says("hey nanobot")
-            await _until(lambda: conv.counter("wake_ack") == 2)
-            assert any(p in conv.backend._fillers for p in ("Yes?", "I'm here."))
+            spoken = set(conv.backend._wake_ack_list)
+            for phrase, n in (("小娜", 1), ("hey nanobot", 2)):
+                await conv.user_says(phrase)
+                await _until(lambda n=n: conv.counter("wake_ack") == n)
+                # Either summon acks in the engine's OWN language; a zh name never pulls
+                # a zh ack out of an engine resolved to another one.
+                assert set(conv.backend._fillers) & spoken
+                assert "在呢。" not in conv.backend._fillers
+                await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())
 
@@ -1547,19 +1549,16 @@ def test_learned_alias_summon_acks_in_the_called_language():
 # ---- ack pre-compute / cache coverage ----------------------------------------
 
 
-def test_prewarm_covers_the_crossover_ack():
-    """A mixed-script phrase set can route a summon to a builtin pool OUTSIDE
-    the resolved ack list; the first such ack must not pay synthesis inside
-    the very moment it masks."""
+def test_prewarm_covers_every_reachable_ack():
+    """The first ack must not pay synthesis inside the very moment it masks, so every
+    phrase a summon can route to has to be hot before the session opens."""
 
     async def _case():
         async with EvalConversation(
             **_wake("gate", phrases=["hey nanobot", "小娜"], ack={"enabled": True}),
         ) as conv:
             await conv.backend.prewarm_canned()
-            cached = set(conv.backend._fillers)
-            assert "在呢。" in cached  # the zh crossover row, hot
-            assert any(t and ord(t[0]) < 0x2E80 for t in cached)  # the base list too
+            assert set(conv.backend._ack_reachable_texts()) <= set(conv.backend._fillers)
 
     _run(_case())
 

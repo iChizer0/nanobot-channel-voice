@@ -564,7 +564,7 @@ def test_script_class_and_uniform_script():
     assert _uniform_script([]) is None
 
 
-def test_ack_pool_routes_by_the_called_name():
+def test_ack_pool_follows_the_tts_not_the_called_name():
     import asyncio
 
     from eval_harness import EvalConversation
@@ -574,53 +574,30 @@ def test_ack_pool_routes_by_the_called_name():
         _WAKE_ACK_FALLBACK,
     )
 
-    async def _pool(matched, *, phrases, tts_lang=None, tts_langs=None, ack=None):
-        wake = {"mode": "gate", "phrases": phrases, "ack": {"enabled": True}}
+    async def _pool(matched, *, resolved=None, ack=None):
+        wake = {"mode": "gate", "phrases": ["hey nanobot", "小娜"], "ack": {"enabled": True}}
         if ack is not None:
             wake["ack"]["phrases"] = ack
         async with EvalConversation(wake=wake) as conv:
             b = conv.backend
-            if tts_lang is not None:
-                b._tts.spoken_language = tts_lang
-            if tts_langs is not None:
-                b._tts.spoken_languages = tts_langs
+            if resolved is not None:
+                b._wake_ack_list = resolved  # as construction resolves spoken_language
             return b._ack_pool(matched)
 
     async def _t():
-        # Bilingual deployment, built-ins: the called name picks the row.
-        both = ["hey nanobot", "小娜"]
-        assert await _pool("小娜", phrases=both, tts_langs=("zh", "en")) == (
-            _WAKE_ACK_BUILTINS["zh"]
-        )
-        assert await _pool("hey nanobot", phrases=both, tts_langs=("zh", "en")) == (
-            _WAKE_ACK_FALLBACK
-        )
-        # Unrestricted TTS reaches every row (kana -> ja).
-        assert await _pool("ねえアシスタント", phrases=["ねえアシスタント"]) == (
-            _WAKE_ACK_BUILTINS["ja"]
-        )
-        # A zh-only engine must NOT cross to an English ack it cannot voice:
-        # honest zh beats silence for an English summon.
-        assert await _pool_zh_engine() == _WAKE_ACK_BUILTINS["zh"]
-        # Configured mixed list: same-script entries win, whole list otherwise.
+        zh, en = _WAKE_ACK_BUILTINS["zh"], _WAKE_ACK_FALLBACK
+        # The engine's own language answers BOTH summons: the called name's script never
+        # crosses languages, and the engine may not even voice the other one.
+        assert await _pool("小娜", resolved=zh) == zh
+        assert await _pool("hey nanobot", resolved=zh) == zh
+        assert await _pool("小娜", resolved=en) == en
+        assert await _pool("hey nanobot", resolved=en) == en
+        # A CONFIGURED mixed list is the one place the summon's script picks -- listing
+        # both languages is what asks for that; an unrouted summon keeps the whole list.
         mixed = ["在呢。", "I'm here."]
-        assert await _pool("小娜", phrases=both, ack=mixed) == ["在呢。"]
-        assert await _pool("hey nanobot", phrases=both, ack=mixed) == ["I'm here."]
-        assert await _pool(None, phrases=both, ack=mixed) == mixed
-        # Acoustic-only summon (no matched text): a uniform phrase set still routes.
-        assert await _pool(None, phrases=["小助手", "小娜"], tts_langs=("zh", "en")) == (
-            _WAKE_ACK_BUILTINS["zh"]
-        )
-
-    async def _pool_zh_engine():
-        # The list a zh-fixed engine resolves at construction is zh; a latin
-        # summon finds no same-script entry and no speakable crossover.
-        wake = {"mode": "gate", "phrases": ["hey nanobot", "小娜"], "ack": {"enabled": True}}
-        async with EvalConversation(wake=wake) as conv:
-            b = conv.backend
-            b._tts.spoken_language = "zh"
-            b._wake_ack_list = _WAKE_ACK_BUILTINS["zh"]  # as construction resolves for zh
-            return b._ack_pool("hey nanobot")
+        assert await _pool("小娜", ack=mixed) == ["在呢。"]
+        assert await _pool("hey nanobot", ack=mixed) == ["I'm here."]
+        assert await _pool(None, ack=mixed) == mixed
 
     asyncio.run(_t())
 
