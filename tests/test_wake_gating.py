@@ -1969,3 +1969,29 @@ def test_proactive_delivery_reopens_sentence_attention():
             assert conv.backend._wake_until <= _time.monotonic()
 
     _run(_case())
+
+
+def test_half_duplex_without_an_acoustic_tier_warns_that_wake_cannot_interrupt():
+    """audio.aec="auto" (the default) is half-duplex: the shell mutes the mic while the bot
+    speaks and the gated tap feeds the acoustic detector alone, so the text tier is deaf to
+    a barge-in. Silently, until this warning."""
+    from loguru import logger as loguru_logger
+
+    seen: list[str] = []
+
+    async def _case(**over):
+        handle = loguru_logger.add(lambda m: seen.append(str(m)), level="WARNING")
+        try:
+            async with EvalConversation(**over):
+                pass
+        finally:
+            loguru_logger.remove(handle)
+
+    _run(_case(aec="auto", **_wake("gate")))
+    assert any("cannot interrupt a reply" in m for m in seen)
+    seen.clear()
+    _run(_case(aec="soft", **_wake("gate")))  # open mic: the phrase is heard live
+    assert not any("cannot interrupt a reply" in m for m in seen)
+    seen.clear()
+    _run(_case(aec="auto", **_wake("off")))  # no wake word to lose
+    assert not any("cannot interrupt a reply" in m for m in seen)

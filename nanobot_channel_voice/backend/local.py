@@ -207,6 +207,18 @@ def _uniform_script(phrases: list[str]) -> str | None:
     return classes.pop() if len(classes) == 1 else None
 
 
+_SCRIPT_ROWS = {"han": "zh", "kana": "ja", "hangul": "ko"}
+
+
+def _canned_language(tts: object, wake_phrases: list[str]) -> str | None:
+    """Language for the built-in fillers and acks: what the ENGINE declares, and only where it
+    declares nothing (MMS below en, `say`, cloud adapters) the wake phrases' own script. An
+    English ack a zh-only engine cannot voice synthesizes to SILENCE, not to an ack."""
+    return getattr(tts, "spoken_language", None) or _SCRIPT_ROWS.get(
+        _uniform_script(wake_phrases) or ""
+    )
+
+
 # Contract-regression rates, never enforcement. Line-start markers anchor on a real separator,
 # never re.M's ^ (a delta begins mid-line, where ^ read "9 - ten" as a list); the separator set
 # matches the chunker's _line_start_at. _WAIT_PHRASES is stall-claims only.
@@ -586,12 +598,9 @@ class LocalBackend(TurnEventMixin):
     ):
         self._cfg = config
         self._tts = tts
-        self._prologue_phrases = _prologue_phrases(
-            config.prologue.phrases, getattr(tts, "spoken_language", None)
-        )
-        self._wake_ack_list = _wake_ack_phrases(
-            config.wake.ack.phrases, getattr(tts, "spoken_language", None)
-        )
+        canned_lang = _canned_language(tts, config.wake.phrases)
+        self._prologue_phrases = _prologue_phrases(config.prologue.phrases, canned_lang)
+        self._wake_ack_list = _wake_ack_phrases(config.wake.ack.phrases, canned_lang)
         self._ack_step = 0  # round-robin cursor
         self._ack_task: asyncio.Task | None = None
         self._fast_ack_task: asyncio.Task | None = None
@@ -770,6 +779,17 @@ class LocalBackend(TurnEventMixin):
                 wake_mode,
             )
             wake_mode = "off"
+        if wake_mode != "off" and not config.open_mic and wake_detector is None:
+            # Half-duplex MUTES the mic while the bot speaks, and the gated tap feeds the
+            # acoustic tier alone: the transcript tier never hears a syllable of the barge-in.
+            logger.warning(
+                "voice: wake.mode='{}' with audio.aec='{}' (half-duplex) and the text tier "
+                "only: the mic is MUTED while the bot speaks, so the wake word cannot "
+                "interrupt a reply — only start a turn between them. Set audio.aec to "
+                "soft/webrtc/hardware to keep the mic open, or wake.engine='openwakeword' "
+                "to hear through the playback.",
+                wake_mode, config.aec,
+            )
         if (
             wake_mode == "strict"
             and self._stt_stream is None

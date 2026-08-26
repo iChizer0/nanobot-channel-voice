@@ -564,6 +564,35 @@ def test_script_class_and_uniform_script():
     assert _uniform_script([]) is None
 
 
+def test_canned_language_infers_only_where_the_engine_declares_nothing():
+    from nanobot_channel_voice.backend.local import (
+        _PROLOGUE_BUILTINS,
+        _WAKE_ACK_BUILTINS,
+        _WAKE_ACK_FALLBACK,
+        _canned_language,
+        _prologue_phrases,
+        _wake_ack_phrases,
+    )
+
+    class _Tts:
+        def __init__(self, lang):
+            self.spoken_language = lang
+
+    # MMS below en, `say` and the cloud adapters declare nothing, and an English ack a
+    # zh-only engine cannot voice synthesizes to SILENCE: the wake phrases carry the language.
+    assert (zh := _canned_language(_Tts(None), ["小娜"])) == "zh"
+    assert _wake_ack_phrases(None, zh) == _WAKE_ACK_BUILTINS["zh"]
+    assert _prologue_phrases(None, zh) == _PROLOGUE_BUILTINS["zh"]
+    assert _canned_language(_Tts(None), ["ねえアシスタント"]) == "ja"
+    # A DECLARED language always wins: the summon's script never overrides the engine.
+    assert _canned_language(_Tts("zh"), ["hey nanobot"]) == "zh"
+    assert _canned_language(_Tts("en"), ["小娜"]) == "en"
+    # Nothing to infer from (latin is en/de-ambiguous, or no phrases): English fallback.
+    assert _canned_language(_Tts(None), ["hey nanobot"]) is None
+    assert _canned_language(_Tts(None), []) is None
+    assert _wake_ack_phrases(None, None) == _WAKE_ACK_FALLBACK
+
+
 def test_ack_pool_follows_the_tts_not_the_called_name():
     import asyncio
 
