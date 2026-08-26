@@ -511,16 +511,21 @@ def denoiser_bias(vocoder: VocoderSpec, strength: float) -> np.ndarray | None:
     return _bias_from_wav(wav, strength)
 
 
+# Static-split geometry when no sidecar declares it; the mel pair is LJSpeech's own fit,
+# a level error for any other model (see the build warning).
+_LJSPEECH_SIDE = {
+    "encoder_len": 200, "mel_len": 800, "mel_scale": 2.0661438, "mel_bias": -5.5238085,
+}
+
+
 def _probe_encoder_mask(
     encoder: OnDeviceModel, encoder_len: int, pad_id: int, token2id: dict[str, int]
 ) -> None:
-    """Does this runtime still honor ``x_length``? Same tokens, two different bucket tails:
-    a masking graph is bit-identical (measured on ONNX), one that lost the mask in conversion
-    reads the tail as speech — and a short phrase IS mostly tail (a 5-token ack fills 2.5% of
-    the bucket), which is how an ack goes silent while replies stay fine. The tiled fill makes
-    that survivable either way; this says which case the board is in."""
-    # 3 tokens = the shortest real input: the zh lexicon emits ONE token per hanzi, so a
-    # two-character ack ("在呢。") is 3 ids in a 200-slot bucket where "I'm here." is 10.
+    """Does this runtime still honor ``x_length``? Same ids, pad-vs-repeat tails: a masking
+    graph is bit-identical, one that lost the mask reads the tail as speech — and a short
+    phrase IS mostly tail. The repeat fill bounds that either way; this names which case
+    the board is in."""
+    # 3 = the shortest real input: the zh lexicon emits one token per hanzi.
     sample = [i for i in dict.fromkeys(token2id.values()) if i != pad_id][:3]
     if len(sample) < 2 or len(sample) >= encoder_len:
         return
@@ -535,7 +540,9 @@ def _probe_encoder_mask(
         logger.debug("matcha split: encoder mask probe skipped ({})", exc)
         return
     a, b = a[..., :len(sample)], b[..., :len(sample)]
-    scale = float(np.abs(a).max()) or 1.0
+    scale = float(np.abs(a).max())
+    if scale < 1e-3:
+        return  # these ids encode to ~nothing: no reference to judge a difference against
     if float(np.abs(a - b).max()) > 0.02 * scale:
         logger.warning(
             "voice: this matcha encoder does NOT honor x_length — the bucket tail reaches "
@@ -889,12 +896,11 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
 class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     """Static three-graph icefall Matcha: the host bridges durations -> alignment ->
     tiling -> denorm -> vocoding between fixed buckets (RKNN cannot express them).
-    Both the encoder and the decoder bucket is filled by REPEATING its content: the
-    decoder has no time mask at all, and the encoder's costs nothing where ``x_length``
-    is honored (byte-identical) while saving a short phrase where a converted graph drops
-    it — a 4-token ack would otherwise attend over ~190 pads. Extension picks the runtime,
-    so an .onnx triple validates the split off-board. Vocos (3 outputs, host ISTFT) or
-    waveform HiFi-GAN (1 output, denoised), classified by a probe."""
+    Encoder and decoder buckets REPEAT their content rather than pad: the decoder has no
+    time mask, and the encoder's repeat is free where ``x_length`` is honored and saves a
+    short phrase where conversion dropped it. Extension picks the runtime, so an .onnx
+    triple validates the split off-board. Vocos (3 outputs, host ISTFT) or waveform
+    HiFi-GAN (1 output, denoised), classified by a probe."""
 
     output_rate = _SAMPLE_RATE_DEFAULT
     _label = "Matcha-split"
@@ -967,14 +973,27 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         meta_path = cfg.meta_path or (
             p if (p := Path(cfg.encoder_path).with_name("meta.json")).is_file() else None  # type: ignore[arg-type]
         )
-        side: dict = {"encoder_len": 200, "mel_len": 800,
-                      "mel_scale": 2.0661438, "mel_bias": -5.5238085}
-        if meta_path:
-            side.update(json.loads(Path(meta_path).read_text(encoding="utf-8")))
+        declared_side: dict = (
+            json.loads(Path(meta_path).read_text(encoding="utf-8")) if meta_path else {}
+        )
+        side: dict = {**_LJSPEECH_SIDE, **declared_side}
         encoder_len = cfg.encoder_len or int(side["encoder_len"])
         mel_len = cfg.mel_len or int(side["mel_len"])
         mel_scale = cfg.mel_scale if cfg.mel_scale is not None else float(side["mel_scale"])
         mel_bias = cfg.mel_bias if cfg.mel_bias is not None else float(side["mel_bias"])
+        defaulted = [
+            name for key, name in (("mel_scale", "melScale"), ("mel_bias", "melBias"))
+            if getattr(cfg, key) is None and key not in declared_side
+        ]
+        if defaulted:
+            logger.warning(
+                "voice: matcha split has no {} of its own, so LJSpeech's is assumed (using "
+                "scale {}, bias {}). These denormalize into LOG-mel, where an offset error "
+                "MULTIPLIES amplitude — a wrong pair is correctly-shaped speech at the wrong "
+                "LEVEL, not a crash. Set tts.matcha.melScale / melBias, or a meta.json "
+                "beside the encoder carrying them.",
+                " or ".join(defaulted), mel_scale, mel_bias,
+            )
         if mel_len % 4:
             raise ValueError(
                 "tts.matcha.melLen must be a multiple of 4 (the decoder U-Net downsamples twice)"

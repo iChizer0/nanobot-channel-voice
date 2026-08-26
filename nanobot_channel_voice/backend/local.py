@@ -1458,7 +1458,27 @@ class LocalBackend(TurnEventMixin):
         called it — the list resolved from ``spoken_language`` at construction. A configured
         mixed-script list is the one place the summon's script picks: listing both asks for it."""
         hint = _script_class(matched) if matched else self._wake_phrases_script
-        return self._ack_pool_of(hint)
+        pool = self._ack_pool_of(hint)
+        # Measured-inaudible phrases leave the rotation: merely stepping past one comes
+        # back round to it, silencing every other summon.
+        live = [p for p in pool if p not in self._quiet_canned]
+        return live or self._ack_crossover(pool)
+
+    def _ack_crossover(self, pool: list[str]) -> list[str]:
+        """Every phrase *pool* offers measured inaudible: fall to another language the engine
+        DECLARES a row for, since a wrong-language ack beats no answer. A configured list is
+        left alone — the warning already named the phrase, and the words are the operator's."""
+        if self._cfg.wake.ack.phrases is not None:
+            return pool
+        for lang in getattr(self._tts, "spoken_languages", None) or ():
+            # Only a row we HAVE: an unknown language would map to the English fallback,
+            # which this engine may be equally unable to speak.
+            row = _WAKE_ACK_BUILTINS.get(lang) or (
+                _WAKE_ACK_FALLBACK if lang == "en" else None
+            )
+            if row and not self._quiet_canned.issuperset(row):
+                return row
+        return pool
 
     def _ack_pool_of(self, hint: str | None) -> list[str]:
         pool = self._wake_ack_list
@@ -1468,8 +1488,9 @@ class LocalBackend(TurnEventMixin):
         return same or pool
 
     def _ack_reachable_texts(self) -> list[str]:
-        """Every ack a summon can pick: the resolved list, plus each phrase script's slice of a
-        long configured list, so prewarm covers a summon that routes past the first eight."""
+        """Every ack a summon can pick BEFORE measurement: the resolved list, plus each phrase
+        script's slice of a long configured list, so prewarm covers a summon that routes past
+        the first eight. A pool that then proves mute reroutes; prewarm re-runs for that."""
         texts = list(self._wake_ack_list[:8])
         cfg = self._cfg.wake
         hints = {_script_class(p) for p in cfg.phrases + cfg.aliases}
@@ -1614,10 +1635,6 @@ class LocalBackend(TurnEventMixin):
             phrases = self._ack_pool(matched)
             text = phrases[self._ack_step % len(phrases)]
             audio = await self._synth_filler(text)
-            if not audio:
-                # This phrase is unvoiceable HERE: step past it, or a pool whose first entry
-                # the engine cannot speak answers every summon with silence, forever.
-                self._ack_step += 1
             state_ok = (
                 self._turn in (VoiceState.IDLE, VoiceState.CAPTURING)
                 if fast else self._turn is base
@@ -3774,7 +3791,8 @@ class LocalBackend(TurnEventMixin):
 
     async def _synth_filler(self, text: str) -> bytes:
         """Synthesize-and-cache one canned phrase, stored PLAYABLE (edge-trimmed, duck baked).
-        A clip that would not be HEARD is never cached: silence is a failure to retry."""
+        A clip that would not be HEARD is never cached: one bad synthesis must not become
+        a permanent phrase."""
         audio = self._fillers.get(text)
         if audio is not None:
             return audio
@@ -3789,10 +3807,12 @@ class LocalBackend(TurnEventMixin):
         return audio
 
     def _canned_audible(self, text: str, audio: bytes) -> bool:
-        """Whether a fresh canned clip will be heard at all. Non-empty near-silence passes
-        every downstream check and takes the turn SPEAKING for nothing — worth a warning and
-        a retry, since caching it would make one bad synthesis permanent."""
-        pcm = audio if self._pcm_out else wav_pcm(audio)[0]
+        """Whether a fresh canned clip will be heard at all: non-empty near-silence passes
+        every downstream check and takes the turn SPEAKING for nothing."""
+        pcm, rate = (
+            (audio, getattr(self._tts, "output_rate", 0) or 0)
+            if self._pcm_out else wav_pcm(audio)
+        )
         if audio and not pcm:
             return True  # unmeasurable blob; _prep_canned plays it as-is
         rms = pcm_rms(pcm) if pcm else 0.0
@@ -3800,16 +3820,15 @@ class LocalBackend(TurnEventMixin):
             return True
         if text not in self._quiet_canned:
             self._quiet_canned.add(text)
-            # peak vs rms separates a collapsed model (quiet throughout) from a duration
-            # blow-up (one blip in silence); the label says WHICH adapter produced it.
+            # peak vs rms separates a collapsed model from one blip in a long silence.
             self._log.warning(
                 "voice: {} synthesized canned phrase '{}' to {} — it will NOT be heard. "
-                "Retrying on next use, and the ack rotates to the next phrase; set "
-                "wake.ack.phrases/prologue.phrases this engine can speak.",
+                "It leaves the rotation; set wake.ack.phrases/prologue.phrases this engine "
+                "can speak.",
                 type(self._tts).__name__, text,
                 "nothing" if not pcm else (
                     f"near-silence (rms {rms:.4f}, peak {pcm_peak(pcm):.4f}, "
-                    f"{pcm_ms(len(pcm), getattr(self._tts, 'output_rate', 0)):.0f} ms)"
+                    f"{pcm_ms(len(pcm), rate):.0f} ms)"
                 ),
             )
         return False
@@ -3939,21 +3958,31 @@ class LocalBackend(TurnEventMixin):
             phrases += self._prologue_phrases[:8]
         if self._cfg.wake.ack.enabled:
             phrases += self._ack_reachable_texts()
+        if await self._prewarm_each(phrases) and self._cfg.wake.ack.enabled:
+            # The pool may have just proved mute: warm where a summon now actually routes.
+            await self._prewarm_each(self._ack_pool(None))
+
+    async def _prewarm_each(self, phrases: list[str]) -> bool:
+        """Synthesize each into the cache; False = stop warming (closing, a turn went live,
+        or synthesis raised). Clips that would be inaudible warn and stay uncached."""
         for text in phrases:
             if self._closing or self._turn is not VoiceState.IDLE:
-                return
+                return False
             try:
-                await self._synth_filler(text)  # unusable clips warn and stay uncached
+                await self._synth_filler(text)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - warmup is an optimization, never a gate
                 self._log.debug("canned prewarm failed for '{}': {}", text, exc)
-                return
+                return False
+        return True
 
     async def _play_filler(self, epoch: int, step: int) -> bool:
         """Speak escalation-script phrase ``step`` (clamped to the last). Returns whether
         the phrase was emitted, so a skip does not advance the script."""
-        phrases = self._prologue_phrases
+        # Measured-inaudible phrases leave the script: a skip does not advance it, so one
+        # would re-synthesize every interval and never speak.
+        phrases = [p for p in self._prologue_phrases if p not in self._quiet_canned]
         if not phrases:
             return False
         text = phrases[min(step, len(phrases) - 1)]

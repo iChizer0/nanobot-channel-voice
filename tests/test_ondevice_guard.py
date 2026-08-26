@@ -54,6 +54,17 @@ class _PaddedEngine(_AsciiEngine):
         return np.concatenate([pad, np.ones(len(text), dtype=np.float32), pad])
 
 
+class _QuietEngine(_AsciiEngine):
+    """Utterance-length output at the wrong LEVEL: what a mis-set mel scale/bias gives.
+    Long enough to be judged — the level check ignores sub-utterance fragments."""
+
+    peak = 0.03
+
+    def _synthesize_piece(self, text: str) -> np.ndarray:
+        self.spoken.append(text)
+        return np.full(int(0.5 * self.output_rate), self.peak, dtype=np.float32)
+
+
 def _warnings(fn) -> list[str]:
     messages: list[str] = []
     sink = loguru_logger.add(lambda m: messages.append(str(m)), level="WARNING")
@@ -173,3 +184,33 @@ def test_an_interior_budget_seam_drops_the_model_padding():
     assert 115 <= interior / engine.output_rate * 1000 <= 125
     # Outer edges are left alone: the backend sizes those against the NEXT chunk.
     assert loud[0] >= int(0.5 * engine.output_rate)
+
+
+def test_a_mis_scaled_engine_is_named_once_not_per_chunk():
+    """A level error crashes nothing and empties nothing — every downstream audibility,
+    duck and barge-in judgement just reads a signal that is not there."""
+    quiet = _QuietEngine()
+    said = _warnings(lambda: [quiet._synthesize_floats(t) for t in ("hello", "again")])
+    peaks = [m for m in said if "peaks at" in m]
+    assert len(peaks) == 1                       # the first audio only, not per chunk
+    assert "0.030" in peaks[0] and "stub" in peaks[0]
+
+    loud = _AsciiEngine()                        # peak 1.0: nothing to say
+    assert not [m for m in _warnings(lambda: loud._synthesize_floats("hello"))
+                if "peaks at" in m]
+
+    # An engine that produces NO audio is the empty case, already reported elsewhere.
+    empty = _QuietEngine()
+    empty.peak = 0.0
+    assert not [m for m in _warnings(lambda: empty._synthesize_floats("hello"))
+                if "peaks at" in m]
+
+
+def test_a_short_fragment_never_decides_the_level():
+    """A single soft word is not evidence of a mis-scaled model: the verdict waits for a
+    real utterance, and the engine stays unjudged until one arrives."""
+    quiet = _QuietEngine()
+    tiny = np.full(int(0.05 * quiet.output_rate), 0.03, dtype=np.float32)
+    assert not [m for m in _warnings(lambda: quiet._check_level(tiny)) if "peaks at" in m]
+    assert quiet._level_checked is False          # unjudged, not judged-and-cleared
+    assert [m for m in _warnings(lambda: quiet._synthesize_floats("hello")) if "peaks at" in m]

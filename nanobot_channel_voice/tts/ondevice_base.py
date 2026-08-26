@@ -26,6 +26,11 @@ from nanobot_channel_voice.tts.base import (
 # does not speak, and synthesizing is worse than skipping: Supertonic resolves unknown
 # ids to noise, MMS drops them (word salad) — a skip + WARNING names the misconfig.
 _MIN_SPEAKABLE = 0.5
+# Normal on-device TTS peaks near full scale (measured 0.38-0.98 across matcha rigs); an
+# engine an order of magnitude under that is mis-scaled, not quiet.
+_QUIET_PEAK = 0.1
+# Judge the level on real speech: a one-word fragment may be genuinely soft.
+_LEVEL_MIN_MS = 300.0
 
 # Padding to leave on an interior edge: enough for the engine's fade, too little to hear.
 _EDGE_KEEP_MS = 10.0
@@ -52,6 +57,9 @@ class OnDeviceTtsAdapter(TtsAdapter):
     _label: str = "on-device"
     _join_gap_s: float = 0.1
     _log = logger
+
+    # Class-level so an adapter that never calls super().__init__() still synthesizes.
+    _level_checked = False
 
     def __init__(self) -> None:
         # Warn once per character: a wrong-language reply repeats the same chars.
@@ -212,4 +220,24 @@ class OnDeviceTtsAdapter(TtsAdapter):
             )
         if not waves:
             return np.zeros(0, dtype=np.float32)
-        return np.concatenate(waves)
+        out = np.concatenate(waves)
+        self._check_level(out)
+        return out
+
+    def _check_level(self, wav: np.ndarray) -> None:
+        """One look at the first real utterance this engine produces (warmup, in practice).
+        Peaking this far down is mis-scaling, not quietness — for the static split, the mel
+        pair — and every audibility, duck and barge-in judgement below then reads a signal
+        that is not there."""
+        if self._level_checked or wav.size < (self.output_rate or 0) * _LEVEL_MIN_MS / 1000.0:
+            return
+        self._level_checked = True
+        peak = float(np.abs(wav).max())
+        if 0.0 < peak < _QUIET_PEAK:
+            self._log.warning(
+                "{} TTS output peaks at {:.3f} of full scale where normal speech is 0.4-1.0: "
+                "mis-scaled, not quiet. Short phrases (wake acks) will be inaudible and "
+                "replies faint. For the static split this is the mel pair — check "
+                "tts.matcha.melScale / melBias against this model's own export values.",
+                self._label, peak,
+            )

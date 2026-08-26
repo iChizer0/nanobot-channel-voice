@@ -13,7 +13,7 @@ import pytest
 from eval_harness import _FRAME, EvalConversation
 
 from nanobot_channel_voice.backend.base import VoiceState
-from nanobot_channel_voice.backend.local import LocalBackend
+from nanobot_channel_voice.backend.local import _WAKE_ACK_FALLBACK, LocalBackend
 from nanobot_channel_voice.echo_reject import SelfEchoFilter
 from nanobot_channel_voice.wake.base import WakeDetector
 
@@ -1689,9 +1689,63 @@ def test_the_ack_rotates_past_a_phrase_this_engine_cannot_voice():
             b._tts.synthesize_pcm = picky
             await b._wake_ack(b._sink.epoch)          # picks 'mute one': nothing to play
             assert conv.counter("wake_ack") == 0
-            await b._wake_ack(b._sink.epoch)          # rotated on: 'loud two' speaks
-            assert conv.counter("wake_ack") == 1
-            assert "loud two" in b._fillers
+            # Every summon after the measurement speaks: a rotation that merely stepped PAST
+            # the mute phrase would come back round to it and silence every other summon.
+            for n in range(1, 5):
+                await b._wake_ack(b._sink.epoch)
+                assert conv.counter("wake_ack") == n
+            assert b._tts.synthesize_pcm is picky
+            assert "mute one" not in b._fillers       # and it is never re-synthesized
+
+    _run(_case())
+
+
+class _BilingualTts:
+    """A zh+en engine that cannot voice its own zh acks: 2 hanzi is 3 tokens, and a
+    fixed-bucket runtime can lose text that short."""
+
+    output_rate = 16000
+    spoken_language = "zh"
+    spoken_languages = ("zh", "en")
+    probe_ok = True
+
+    async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+        if any(ord(c) >= 0x2E80 for c in text):
+            return bytes(3200)  # audible LENGTH, zero amplitude
+        return b"\x00\x40" * 1600
+
+
+def test_the_ack_crosses_languages_only_after_its_own_proves_mute():
+    """The ack follows the TTS's language by default. When every phrase in it measures
+    inaudible, a language the engine DECLARES beats answering a summon with nothing."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate", ack={"enabled": True})) as conv:
+            b = conv.backend
+            b._tts = _BilingualTts()
+            b._wake_ack_list = ["在呢。", "我在。"]
+            assert b._ack_pool(None) == ["在呢。", "我在。"]   # nothing proved yet
+            await b.prewarm_canned()
+            assert b._quiet_canned == {"在呢。", "我在。"}
+            assert b._ack_pool(None) == _WAKE_ACK_FALLBACK   # rerouted on measurement
+            assert set(_WAKE_ACK_FALLBACK) <= set(b._fillers)  # and warmed, not left cold
+
+    _run(_case())
+
+
+def test_a_configured_ack_list_is_never_substituted():
+    """Silence is bad; putting words in the operator's mouth is worse. An explicit list
+    stays theirs — the warning names the phrase and they choose the replacement."""
+
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", ack={"enabled": True, "phrases": ["在呢。"]}),
+        ) as conv:
+            b = conv.backend
+            b._tts = _BilingualTts()
+            await b.prewarm_canned()
+            assert b._quiet_canned == {"在呢。"}
+            assert b._ack_pool(None) == ["在呢。"]
 
     _run(_case())
 

@@ -91,6 +91,23 @@ def test_pcm_rms_measures_normalized_amplitude(monkeypatch):
     assert abs(pcm_rms(full) - with_np) < 1e-9
 
 
+def test_pcm_peak_separates_quiet_from_silence_around_a_blip(monkeypatch):
+    """rms alone cannot tell a mis-scaled engine from one blip in a long silence; the
+    canned-clip warning reports both, so peak has to agree across either backend."""
+    import nanobot_channel_voice.audio.pcm as pcm_mod
+    from nanobot_channel_voice.audio.pcm import pcm_peak, pcm_rms
+
+    assert pcm_peak(b"") == 0.0
+    assert pcm_peak(b"\x00" * 640) == 0.0
+    blip = struct.pack("<4h", 0, 0, -32768, 0)      # most-negative sample: abs() overflows i2
+    assert pcm_peak(blip) == 1.0
+    assert pcm_rms(blip) < 0.51                     # rms hides it, peak does not
+    assert pcm_peak(blip + b"\x7f") == 1.0          # odd trailing byte tolerated
+    with_np = pcm_peak(blip)
+    monkeypatch.setattr(pcm_mod, "_np", None)
+    assert pcm_peak(blip) == with_np
+
+
 # ---- quietest_split (wake-trim snap) ----------------------------------------
 
 def test_quietest_split_finds_the_dip():

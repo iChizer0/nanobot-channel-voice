@@ -241,3 +241,24 @@ def test_backend_resolves_builtins_when_phrases_omitted():
 
     b, _tts, _sink = _build()  # _FakeTts declares no spoken_language -> English builtins
     assert b._prologue_phrases == _PROLOGUE_FALLBACK
+
+
+def test_a_mute_filler_leaves_the_script_instead_of_retrying_forever():
+    """A skip does not advance the script, so a phrase that measures inaudible would be
+    re-synthesized on every interval and no filler would ever be heard."""
+
+    async def _t():
+        b, tts, sink = _build(phrases=["one", "two"])
+        events = await _started(b)
+        b._turn = VoiceState.THINKING
+        b._quiet_canned.add("one")
+        assert await b._play_filler(sink.epoch, 0) is True
+        assert tts.calls == ["two"]                 # 'one' is never asked for again
+        assert _spoken(events) == [_pcm("two")]
+        b._quiet_canned.add("two")
+        assert await b._play_filler(sink.epoch, 0) is False
+        assert tts.calls == ["two"]                 # nothing left: no synthesis at all
+        assert b._turn is VoiceState.THINKING       # and no flip to SPEAKING
+        await b.close()
+
+    asyncio.run(_t())
