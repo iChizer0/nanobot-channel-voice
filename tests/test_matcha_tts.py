@@ -1086,7 +1086,11 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
     assert tts._ids("你好七。") == [1, 3, 1, 4, 1, 5, 1, 2, 1]
     wav = tts._synthesize_piece("你好七。")
     assert wav.size == 9 * 256
-    encoder_inputs = dict(made[0].calls[0])
+    # calls[0:2] are the build-time mask probe (same ids, pad vs tiled tail).
+    probe_pad, probe_tiled = dict(made[0].calls[0]), dict(made[0].calls[1])
+    assert probe_pad["x_length"].tolist() == probe_tiled["x_length"].tolist()
+    assert not np.array_equal(probe_pad["x"], probe_tiled["x"])
+    encoder_inputs = dict(made[0].calls[-1])
     assert encoder_inputs["x_length"].tolist() == [9]
     assert encoder_inputs["x"][0, :9].tolist() == [1, 3, 1, 4, 1, 5, 1, 2, 1]
     # The tail REPEATS the phonemes, as the decoder tiles its own bucket: x_length masks it

@@ -511,6 +511,40 @@ def denoiser_bias(vocoder: VocoderSpec, strength: float) -> np.ndarray | None:
     return _bias_from_wav(wav, strength)
 
 
+def _probe_encoder_mask(
+    encoder: OnDeviceModel, encoder_len: int, pad_id: int, token2id: dict[str, int]
+) -> None:
+    """Does this runtime still honor ``x_length``? Same tokens, two different bucket tails:
+    a masking graph is bit-identical (measured on ONNX), one that lost the mask in conversion
+    reads the tail as speech — and a short phrase IS mostly tail (a 5-token ack fills 2.5% of
+    the bucket), which is how an ack goes silent while replies stay fine. The tiled fill makes
+    that survivable either way; this says which case the board is in."""
+    # 3 tokens = the shortest real input: the zh lexicon emits ONE token per hanzi, so a
+    # two-character ack ("在呢。") is 3 ids in a 200-slot bucket where "I'm here." is 10.
+    sample = [i for i in dict.fromkeys(token2id.values()) if i != pad_id][:3]
+    if len(sample) < 2 or len(sample) >= encoder_len:
+        return
+    x_len = np.array([len(sample)], dtype=np.int64)
+    padded = np.full((1, encoder_len), pad_id, dtype=np.int64)
+    padded[0, :len(sample)] = sample
+    tiled = np.resize(np.asarray(sample, dtype=np.int64), (1, encoder_len))
+    try:
+        a = np.asarray(encoder.run([("x", padded), ("x_length", x_len)])[0], dtype=np.float32)
+        b = np.asarray(encoder.run([("x", tiled), ("x_length", x_len)])[0], dtype=np.float32)
+    except Exception as exc:  # noqa: BLE001 - a probe must never fail the build
+        logger.debug("matcha split: encoder mask probe skipped ({})", exc)
+        return
+    a, b = a[..., :len(sample)], b[..., :len(sample)]
+    scale = float(np.abs(a).max()) or 1.0
+    if float(np.abs(a - b).max()) > 0.02 * scale:
+        logger.warning(
+            "voice: this matcha encoder does NOT honor x_length — the bucket tail reaches "
+            "the phonemes, so SHORT text (wake acks, prologue fillers) is mostly tail and "
+            "synthesizes badly or silent. The tail repeats the phonemes to bound this; if "
+            "short phrases still misbehave, re-export the encoder with the length mask."
+        )
+
+
 def denoise(wav: np.ndarray, bias: np.ndarray) -> np.ndarray:
     """Subtract ``bias`` in the magnitude domain, keeping the phase and the length."""
     hop = _DENOISE_STFT["hop_length"]
@@ -1017,6 +1051,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                         f"matcha split: graph input {name} is {list(shape)}, "
                         f"configured geometry wants {list(want)}"
                     )
+            _probe_encoder_mask(encoder, encoder_len, pad_id, token2id)
             # One zero-mel probe classifies the vocoder without graph introspection (RKNN
             # has none): 1 output = waveform (HiFi-GAN), 3 = Vocos. It also yields the
             # upsample factor and bias, and a graph that cannot run its bucket fails HERE.
