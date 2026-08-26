@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
+import pytest
 from eval_harness import _FRAME, EvalConversation
 
 from nanobot_channel_voice.backend.base import VoiceState
+from nanobot_channel_voice.backend.local import LocalBackend
+from nanobot_channel_voice.echo_reject import SelfEchoFilter
 from nanobot_channel_voice.wake.base import WakeDetector
 
 _REPLY = "Once upon a time there was a very long story that keeps going"
@@ -234,6 +238,46 @@ def test_own_reply_speaking_the_phrase_is_suppressed():
             assert conv.backend._wake_claimed is False  # no blessing left behind
 
     _run(_case())
+
+
+def test_the_veto_lets_go_once_the_phrase_is_out_of_earshot():
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            said = "You can always say hey nanobot to wake me"
+            await conv.user_says("hey nanobot introduce yourself")
+            await conv.agent_replies(said)
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(30)
+            conv.backend._echo.reset()               # re-note it as long since quiet
+            conv.backend._note_spoken(said, -5000.0)
+            conv.backend._wake_hit_at = time.monotonic()
+            conv.backend._wake_claimed = True
+            await conv.user_noise(speech_frames=0, silence_frames=3)
+            assert conv.counter("wake_echo_suppressed") == 0
+            assert conv.interrupts == 1              # the summon lands
+
+    _run(_case())
+
+
+def test_the_echo_horizon_spans_the_open_utterance_the_text_tier_reads():
+    cfg = SimpleNamespace(audio=SimpleNamespace(sample_rate=16000))
+    ep = SimpleNamespace(in_speech=False, pos=16000 * 2 * 8, open_pos=0)  # 8 s of capture
+    stub = SimpleNamespace(_endpointer=ep, _cfg=cfg)
+    assert LocalBackend._wake_echo_horizon(stub) == pytest.approx(3.0)  # earshot floor
+    ep.in_speech = True
+    assert LocalBackend._wake_echo_horizon(stub) == pytest.approx(8.0)
+
+
+def test_an_unmatchable_phrase_list_does_not_veto_every_acoustic_hit():
+    stub = SimpleNamespace(
+        _echo=SelfEchoFilter(), _wake_phrase=None, _wake_echo_horizon=lambda: 3.0,
+    )
+    stub._wake_phrases_text = ("!!!",)  # tokenizes to nothing: never evidence of echo
+    assert LocalBackend._wake_hit_echoed(stub) is False
+    stub._wake_phrases_text = ("hey nanobot",)
+    assert LocalBackend._wake_hit_echoed(stub) is False
+    stub._echo.note_spoken("say hey nanobot to wake me")
+    assert LocalBackend._wake_hit_echoed(stub) is True
 
 
 def test_wake_only_kill_arms_the_stop_grace_and_note():
@@ -1559,6 +1603,44 @@ def test_prewarm_covers_every_reachable_ack():
         ) as conv:
             await conv.backend.prewarm_canned()
             assert set(conv.backend._ack_reachable_texts()) <= set(conv.backend._fillers)
+
+    _run(_case())
+
+
+def test_a_skipped_ack_is_counted_and_the_fast_stamp_resets():
+    """Every other summon response logs; an ack eaten by a guard must not vanish without
+    a trace, and a fast bail must hand the ack back to the verdict rung."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate", ack={"enabled": True})) as conv:
+            b = conv.backend
+            b._fast_acked_at = time.monotonic()
+            await b._wake_ack(b._sink.epoch - 1, None, fast=True)  # stale epoch
+            assert conv.counter("wake_ack_skipped") == 1
+            assert conv.counter("wake_ack") == 0
+            assert b._fast_acked_at == float("-inf")
+
+    _run(_case())
+
+
+def test_prewarm_outlives_an_unspeakable_phrase():
+    """One silent phrase must not abandon the rest of the warmup: the acks behind it
+    still have to be hot for the first summon."""
+
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", ack={"enabled": True, "phrases": ["mute one", "loud two"]}),
+        ) as conv:
+            b = conv.backend
+            real = b._tts.synthesize_pcm
+
+            async def picky(text, *, voice=None):
+                return b"" if text == "mute one" else await real(text, voice=voice)
+
+            b._tts.synthesize_pcm = picky
+            await b.prewarm_canned()
+            assert "loud two" in b._fillers
+            assert "mute one" not in b._fillers
 
     _run(_case())
 

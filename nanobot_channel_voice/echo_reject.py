@@ -148,12 +148,14 @@ class SelfEchoFilter:
             and (u in self._protect or not self._absorbed(u, streams))
         }
 
-    def recent_text(self) -> str:
+    def recent_text(self, max_age_s: float | None = None) -> str:
         """The unexpired spoken texts, oldest first, joined: the ordered view the wake
-        echo veto searches. Loop-side only (evicts; ``fresh_words`` is the thread-safe
-        one)."""
+        echo veto searches. ``max_age_s`` narrows it to what stopped sounding that
+        recently (still playing = age 0). Loop-side only (evicts; ``fresh_words`` is the
+        thread-safe one)."""
         self._evict()
-        return " ".join(t for _, _, _, t in self._spoken)
+        cutoff = -float("inf") if max_age_s is None else time.monotonic() - max_age_s
+        return " ".join(t for deadline, _, _, t in self._spoken if deadline >= cutoff)
 
     def reset(self) -> None:
         self._spoken.clear()

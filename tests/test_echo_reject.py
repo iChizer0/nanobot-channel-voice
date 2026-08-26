@@ -45,6 +45,18 @@ def test_eviction_runs_from_audibility_not_feed_time(monkeypatch):
     assert f.is_self_echo("later words spoken") is True   # hold_ms kept it alive
 
 
+def test_recent_text_can_be_bounded_to_what_is_still_in_earshot(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(er.time, "monotonic", lambda: now[0])
+    f = SelfEchoFilter()
+    f.note_spoken("say hey nanobot to wake me")
+    f.note_spoken("and here is the rest of it", hold_ms=6000.0)
+    now[0] = 5.0  # the phrase went quiet 5 s ago; the tail is still playing
+    assert "nanobot" in f.recent_text()
+    assert "nanobot" not in f.recent_text(3.0)
+    assert "the rest of it" in f.recent_text(3.0)
+
+
 def test_reset_forgets_everything():
     f = SelfEchoFilter()
     f.note_spoken("something spoken")

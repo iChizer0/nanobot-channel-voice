@@ -123,6 +123,10 @@ _LEAK_REASONS = frozenset({"probe", "partial", "eager", "echo", "empty"})
 # trails the phrase's END, the onset precedes its START). An unconsumed hit goes stale.
 _WAKE_ATTACH_S = 2.5
 
+# Floor on the wake echo veto's lookback: TTS this recent may still sit in the acoustic
+# detector's analysis window (oww ~2 s) or in an under-read sink backlog.
+_WAKE_EARSHOT_S = 3.0
+
 # Fast-path ack pacing: the quiet bar outlasts inter-word gaps (~100-250 ms) yet beats the verdict
 # ack's hangover + STT floor (~1 s); quiet past the window is a same-breath COMMAND's hangover.
 _FAST_ACK_QUIET_S = 0.35
@@ -211,11 +215,15 @@ _SCRIPT_ROWS = {"han": "zh", "kana": "ja", "hangul": "ko"}
 
 
 def _canned_language(tts: object, wake_phrases: list[str]) -> str | None:
-    """Language for the built-in fillers and acks: what the ENGINE declares, and only where it
-    declares nothing (MMS below en, `say`, cloud adapters) the wake phrases' own script. An
-    English ack a zh-only engine cannot voice synthesizes to SILENCE, not to an ack."""
-    return getattr(tts, "spoken_language", None) or _SCRIPT_ROWS.get(
-        _uniform_script(wake_phrases) or ""
+    """Language for the built-in fillers and acks: what the ENGINE declares — its single
+    language, else a bilingual's PRIMARY — and only where it declares nothing (MMS below en,
+    `say`, cloud adapters) the wake phrases' own script. An English ack a zh-only engine
+    cannot voice synthesizes to SILENCE, not to an ack."""
+    langs = getattr(tts, "spoken_languages", None)
+    return (
+        getattr(tts, "spoken_language", None)
+        or (langs[0] if langs else None)
+        or _SCRIPT_ROWS.get(_uniform_script(wake_phrases) or "")
     )
 
 
@@ -1614,6 +1622,15 @@ class LocalBackend(TurnEventMixin):
                 or not state_ok
                 or not quiet  # never talk over the follow-up command
             ):
+                if not self._closing:
+                    # The one summon response that can die without a trace: name the guard.
+                    why = (
+                        "silence" if not audio
+                        else "epoch" if epoch != self._sink.epoch
+                        else "state" if not state_ok else "speech"
+                    )
+                    self._metrics.count("wake_ack_skipped")
+                    self._log.info("wake ack skipped ({})", why)
                 if fast:
                     # Nothing was spoken: the verdict rung must ack after all.
                     self._fast_acked_at = float("-inf")
@@ -2517,11 +2534,23 @@ class LocalBackend(TurnEventMixin):
         """Recently-spoken TTS literally SAYS a wake phrase: a hit now is very likely the bot
         hearing itself. Ordered-mention test, so a reply using the phrase's words APART does not
         lock the wake word out; unmatchable phrases fall back to unit containment."""
+        recent = self._echo.recent_text(self._wake_echo_horizon())
         if self._wake_phrase is not None:
-            return self._wake_phrase.present(self._echo.recent_text())
-        return any(
-            p and not self._echo.fresh_words(p) for p in self._wake_phrases_text
+            return self._wake_phrase.present(recent)
+        spoken = units_of(recent)
+        return any((u := units_of(p)) and u <= spoken for p in self._wake_phrases_text)
+
+    def _wake_echo_horizon(self) -> float:
+        """How far back spoken TTS can still be the CAUSE of a hit now. The acoustic tier judges
+        its analysis window, the text tier a transcript reaching back to the utterance onset;
+        either may have fired, so take the wider. Never the whole echo window: a reply that says
+        the bot's name would then gate every summon for as long as it is remembered."""
+        ep = self._endpointer
+        open_s = (
+            pcm_ms(ep.pos - ep.open_pos, self._cfg.audio.sample_rate) / 1000.0
+            if ep.in_speech else 0.0
         )
+        return max(_WAKE_EARSHOT_S, open_s)
 
     def _wake_strip_leaky(self, text: str) -> tuple[str | None, str]:
         """``WakePhrase.strip`` that also tolerates OUR OWN leaked words before the phrase. Only
@@ -3887,7 +3916,6 @@ class LocalBackend(TurnEventMixin):
                     "voice: canned phrase '{}' synthesized to silence (phrase not "
                     "speakable by this TTS engine?) — it will never play", text,
                 )
-                return
 
     async def _play_filler(self, epoch: int, step: int) -> bool:
         """Speak escalation-script phrase ``step`` (clamped to the last). Returns whether

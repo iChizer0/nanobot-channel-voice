@@ -575,8 +575,10 @@ def test_canned_language_infers_only_where_the_engine_declares_nothing():
     )
 
     class _Tts:
-        def __init__(self, lang):
+        def __init__(self, lang, langs=None):
             self.spoken_language = lang
+            if langs is not None:
+                self.spoken_languages = langs
 
     # MMS below en, `say` and the cloud adapters declare nothing, and an English ack a
     # zh-only engine cannot voice synthesizes to SILENCE: the wake phrases carry the language.
@@ -587,6 +589,10 @@ def test_canned_language_infers_only_where_the_engine_declares_nothing():
     # A DECLARED language always wins: the summon's script never overrides the engine.
     assert _canned_language(_Tts("zh"), ["hey nanobot"]) == "zh"
     assert _canned_language(_Tts("en"), ["小娜"]) == "en"
+    # A bilingual that declares no single language still declares a PRIMARY: the router
+    # (and any spoken_languages carrier) acks in it, never the English fallback.
+    assert _canned_language(_Tts(None, ("zh", "en")), ["hey nanobot"]) == "zh"
+    assert _canned_language(_Tts(None, ("en", "zh")), ["小娜"]) == "en"
     # Nothing to infer from (latin is en/de-ambiguous, or no phrases): English fallback.
     assert _canned_language(_Tts(None), ["hey nanobot"]) is None
     assert _canned_language(_Tts(None), []) is None
