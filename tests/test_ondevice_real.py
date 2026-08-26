@@ -145,6 +145,49 @@ def test_matcha_real_static_split_onnx():
     tts.release()
 
 
+def test_matcha_split_encoder_tiling_is_identical_where_the_mask_is_honored():
+    """The encoder bucket repeats the phonemes instead of padding. That is only safe if a
+    graph honoring ``x_length`` cannot see the tail — so prove it: byte-identical mu/logw."""
+    en = _MATCHA / "matcha-icefall-en_US-ljspeech"
+    _need(
+        _MATCHA / "matcha_encoder_200.onnx",
+        _MATCHA / "matcha_decoder_800.onnx",
+        _MATCHA / "vocos_800.onnx",
+        en / "tokens.txt",
+    )
+    _need_espeak()
+    import numpy as np
+
+    from nanobot_channel_voice.config import TtsConfig
+    from nanobot_channel_voice.tts import make_tts
+
+    tts = make_tts(TtsConfig.model_validate({
+        "provider": "matcha",
+        "matcha": {
+            "encoderPath": str(_MATCHA / "matcha_encoder_200.onnx"),
+            "decoderPath": str(_MATCHA / "matcha_decoder_800.onnx"),
+            "vocoderPath": str(_MATCHA / "vocos_800.onnx"),
+            "tokensPath": str(en / "tokens.txt"),
+        },
+    }))
+    try:
+        ids = tts._ids("Yes?")                      # the shortest thing we ever synthesize
+        n = len(ids)
+        assert n * 4 < tts._encoder_len             # pads would dominate the bucket
+        x_len = np.array([n], dtype=np.int64)
+        padded = np.full((1, tts._encoder_len), tts._pad_id, dtype=np.int64)
+        padded[0, :n] = ids
+        tiled = np.resize(np.asarray(ids, dtype=np.int64), (1, tts._encoder_len))
+        assert not np.array_equal(padded, tiled)    # the inputs really do differ
+        for a, b in zip(
+            tts._encoder.run([("x", padded), ("x_length", x_len)]),
+            tts._encoder.run([("x", tiled), ("x_length", x_len)]),
+        ):
+            assert np.array_equal(np.asarray(a)[..., :n], np.asarray(b)[..., :n])
+    finally:
+        tts.release()
+
+
 def test_matcha_real_zh_synthesis():
     zh = _MATCHA / "matcha-icefall-zh-baker"
     vocoder = _MATCHA / "vocos-22khz-univ.onnx"

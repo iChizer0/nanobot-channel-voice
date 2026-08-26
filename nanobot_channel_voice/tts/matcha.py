@@ -855,9 +855,12 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
 class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     """Static three-graph icefall Matcha: the host bridges durations -> alignment ->
     tiling -> denorm -> vocoding between fixed buckets (RKNN cannot express them).
-    The decoder needs a PERIODIC tail — its attention has no time mask. Extension picks
-    the runtime, so an .onnx triple validates the split off-board. Vocos (3 outputs,
-    host ISTFT) or waveform HiFi-GAN (1 output, denoised), classified by a probe."""
+    Both the encoder and the decoder bucket is filled by REPEATING its content: the
+    decoder has no time mask at all, and the encoder's costs nothing where ``x_length``
+    is honored (byte-identical) while saving a short phrase where a converted graph drops
+    it — a 4-token ack would otherwise attend over ~190 pads. Extension picks the runtime,
+    so an .onnx triple validates the split off-board. Vocos (3 outputs, host ISTFT) or
+    waveform HiFi-GAN (1 output, denoised), classified by a probe."""
 
     output_rate = _SAMPLE_RATE_DEFAULT
     _label = "Matcha-split"
@@ -1084,8 +1087,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             return self._overflow_retry(
                 text, f"needs {len(ids)} tokens > encoderLen {self._encoder_len}"
             )
-        x = np.full((1, self._encoder_len), self._pad_id, dtype=np.int64)
-        x[0, :len(ids)] = ids
+        x = np.resize(np.asarray(ids, dtype=np.int64), (1, self._encoder_len))
         x_length = np.array([len(ids)], dtype=np.int64)
         mu, logw = self._encoder.run([("x", x), ("x_length", x_length)])
         mu_up, total = self._length_regulator(mu, logw, len(ids))

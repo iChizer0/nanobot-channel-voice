@@ -20,6 +20,19 @@ def pcm_ms(nbytes: int, rate: int) -> float:
     return nbytes / (2 * rate) * 1000.0 if rate > 0 else 0.0
 
 
+def pcm_peak(pcm: bytes) -> float:
+    """Peak absolute amplitude of S16_LE PCM, normalized to 0..1. Separates a clip that is
+    quiet everywhere from one that is silence around a blip."""
+    if len(pcm) < 2:
+        return 0.0
+    if _np is not None:
+        a = _np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype="<i2")
+        return float(_np.abs(a.astype(_np.int32)).max()) / 32768.0 if a.size else 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm if len(pcm) % 2 == 0 else pcm[:-1])
+    return max((abs(v) for v in samples), default=0) / 32768.0
+
+
 def pcm_rms(pcm: bytes) -> float:
     """Root-mean-square amplitude of S16_LE PCM, normalized to 0..1."""
     if len(pcm) < 2:

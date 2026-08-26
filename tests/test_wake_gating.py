@@ -1671,6 +1671,31 @@ def test_an_inaudible_clip_is_never_cached_and_retries():
     _run(_case())
 
 
+def test_the_ack_rotates_past_a_phrase_this_engine_cannot_voice():
+    """A pool whose FIRST entry synthesizes silent must not answer every summon with
+    nothing: the cursor steps past it and the next summon speaks the one that works."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["mute one", "loud two"]}),
+        ) as conv:
+            b = conv.backend
+            real = b._tts.synthesize_pcm
+
+            async def picky(text, *, voice=None):
+                return b"" if text == "mute one" else await real(text, voice=voice)
+
+            b._tts.synthesize_pcm = picky
+            await b._wake_ack(b._sink.epoch)          # picks 'mute one': nothing to play
+            assert conv.counter("wake_ack") == 0
+            await b._wake_ack(b._sink.epoch)          # rotated on: 'loud two' speaks
+            assert conv.counter("wake_ack") == 1
+            assert "loud two" in b._fillers
+
+    _run(_case())
+
+
 def test_synth_filler_bakes_the_blob_duck_once():
     """Blob mode + duckDb: trims and the static attenuation live IN the cache,
     so a cache-hit ack pays a dict lookup, not per-play thread hops."""

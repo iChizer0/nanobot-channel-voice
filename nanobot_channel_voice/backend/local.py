@@ -36,6 +36,7 @@ from nanobot_channel_voice.audio.pcm import (
     dong_pcm,
     fade_tail_pcm,
     pcm_ms,
+    pcm_peak,
     pcm_rms,
     pcm_to_wav_bytes,
     quietest_split,
@@ -1613,6 +1614,10 @@ class LocalBackend(TurnEventMixin):
             phrases = self._ack_pool(matched)
             text = phrases[self._ack_step % len(phrases)]
             audio = await self._synth_filler(text)
+            if not audio:
+                # This phrase is unvoiceable HERE: step past it, or a pool whose first entry
+                # the engine cannot speak answers every summon with silence, forever.
+                self._ack_step += 1
             state_ok = (
                 self._turn in (VoiceState.IDLE, VoiceState.CAPTURING)
                 if fast else self._turn is base
@@ -3795,11 +3800,17 @@ class LocalBackend(TurnEventMixin):
             return True
         if text not in self._quiet_canned:
             self._quiet_canned.add(text)
+            # peak vs rms separates a collapsed model (quiet throughout) from a duration
+            # blow-up (one blip in silence); the label says WHICH adapter produced it.
             self._log.warning(
-                "voice: canned phrase '{}' synthesized to {} and will NOT be heard "
-                "(the engine voiced none of it — wrong language for this TTS?). Retrying "
-                "on next use; set wake.ack.phrases/prologue.phrases it can speak.",
-                text, "nothing" if not pcm else f"near-silence, rms {rms:.4f}",
+                "voice: {} synthesized canned phrase '{}' to {} — it will NOT be heard. "
+                "Retrying on next use, and the ack rotates to the next phrase; set "
+                "wake.ack.phrases/prologue.phrases this engine can speak.",
+                type(self._tts).__name__, text,
+                "nothing" if not pcm else (
+                    f"near-silence (rms {rms:.4f}, peak {pcm_peak(pcm):.4f}, "
+                    f"{pcm_ms(len(pcm), getattr(self._tts, 'output_rate', 0)):.0f} ms)"
+                ),
             )
         return False
 
