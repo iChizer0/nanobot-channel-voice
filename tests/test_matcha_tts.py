@@ -695,6 +695,9 @@ class _SplitFakeModel:
     def input_shape(self, _name):
         return None  # RKNN-like: geometry not introspectable
 
+    def input_specs(self):
+        return []  # RKNN-like: no input declarations either
+
     def metadata(self):
         return {}
 
@@ -741,6 +744,10 @@ def test_split_builds_declared_zh_en_dialect(monkeypatch, tmp_path):
     # then the period — RAW ids: the dialect trains without the blank interleave.
     assert tts._ids("你hi.") == [2, 3, 4, 1, 5]
     assert tts._synthesize_piece("你hi.").dtype == np.float32  # host bridge runs
+    # explicit mask input, hot over exactly the real ids
+    x_mask = dict(_SplitFakeModel.made[0].calls[-1])["x_mask"]
+    assert x_mask.shape == (1, 1, 200) and x_mask.dtype == np.float32
+    assert x_mask[0, 0, :5].tolist() == [1.0] * 5 and not x_mask[0, 0, 5:].any()
 
 
 def test_split_sidecar_declares_framing_and_a_stale_sidecar_contradicts(monkeypatch, tmp_path):
@@ -777,6 +784,76 @@ def test_split_sidecar_declares_framing_and_a_stale_sidecar_contradicts(monkeypa
         matcha.SplitMatchaTtsAdapter.from_config(
             cfg.model_copy(update={"tokens_path": str(zh_en_tokens)})
         )
+
+
+def test_split_refuses_a_pre_mask_encoder_graph(monkeypatch, tmp_path):
+    """An introspectable encoder that still wants x_length is a stale package: the
+    adapter always feeds the explicit x_mask now, and RKNN takes inputs positionally,
+    so running such a graph anyway would garble rather than error."""
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts import matcha
+
+    (tmp_path / "tokens.txt").write_text("_ 0\n^ 1\n$ 2\n 3\n. 4\nh 5\ni 6\n", encoding="utf-8")
+
+    class StaleModel(_SplitFakeModel):
+        def input_specs(self):
+            return [("x", [1, 200], "tensor(int64)"), ("x_length", [1], "tensor(int64)")]
+
+    _SplitFakeModel.made.clear()
+    monkeypatch.setattr(matcha, "OnDeviceModel", StaleModel)
+    monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_a, **_k: lambda _t: "hi")
+    with pytest.raises(ValueError, match="pre-x_mask export"):
+        matcha.SplitMatchaTtsAdapter.from_config(MatchaTtsConfig.model_validate({
+            "encoderPath": str(tmp_path / "encoder.onnx"),
+            "decoderPath": str(tmp_path / "decoder.onnx"),
+            "vocoderPath": str(tmp_path / "vocoder.onnx"),
+            "tokensPath": str(tmp_path / "tokens.txt"),
+            "encoderLen": 200, "melLen": 16,
+        }))
+
+
+def test_probe_flags_a_mask_leak_in_logw_alone():
+    """The RV1126B collapse shifted logw while mu stayed plausible; a probe that judged
+    only mu passed on the exact failure it exists to catch. It must name the output."""
+    from loguru import logger as loguru_logger
+
+    from nanobot_channel_voice.tts import matcha
+
+    class LeakyEncoder:
+        calls = 0
+
+        def run(self, _inputs):
+            LeakyEncoder.calls += 1
+            return [np.ones((1, 80, 16), np.float32),           # mu: tail-independent
+                    np.full((1, 1, 16), float(LeakyEncoder.calls), np.float32)]
+
+    said: list[str] = []
+    sink = loguru_logger.add(lambda m: said.append(str(m)), level="WARNING")
+    try:
+        matcha._probe_encoder_mask(LeakyEncoder(), 16, 0, {"a": 1, "b": 2, "c": 3})
+    finally:
+        loguru_logger.remove(sink)
+    assert any("does NOT honor x_mask" in m and "logw" in m for m in said)
+
+
+def test_probe_run_failure_warns_instead_of_hiding():
+    """RKNN feeds inputs positionally, so a stale x_length graph fails (or garbles) only
+    at run time — a probe that cannot run is the one build-time chance to say why."""
+    from loguru import logger as loguru_logger
+
+    from nanobot_channel_voice.tts import matcha
+
+    class StaleEncoder:
+        def run(self, _inputs):
+            raise RuntimeError("input shape mismatch")
+
+    said: list[str] = []
+    sink = loguru_logger.add(lambda m: said.append(str(m)), level="WARNING")
+    try:
+        matcha._probe_encoder_mask(StaleEncoder(), 16, 0, {"a": 1, "b": 2, "c": 3})
+    finally:
+        loguru_logger.remove(sink)
+    assert any("mask probe failed" in m and "re-export" in m for m in said)
 
 
 def test_espeak_data_dir_pins_the_models_own_voice_pack(monkeypatch, tmp_path):
@@ -997,6 +1074,9 @@ def test_matcha_split_meta_sidecar_fills_unset_fields_only(monkeypatch, tmp_path
         def input_shape(self, _name):
             return None  # RKNN-like: geometry not introspectable
 
+        def input_specs(self):
+            return []
+
         def metadata(self):
             return {}
 
@@ -1086,15 +1166,16 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
     assert tts._ids("你好七。") == [1, 3, 1, 4, 1, 5, 1, 2, 1]
     wav = tts._synthesize_piece("你好七。")
     assert wav.size == 9 * 256
-    # calls[0:2] are the build-time mask probe (same ids, pad vs tiled tail).
+    # calls[0:2] are the build-time mask probe (same ids and mask, pad vs tiled tail).
     probe_pad, probe_tiled = dict(made[0].calls[0]), dict(made[0].calls[1])
-    assert probe_pad["x_length"].tolist() == probe_tiled["x_length"].tolist()
+    assert np.array_equal(probe_pad["x_mask"], probe_tiled["x_mask"])
     assert not np.array_equal(probe_pad["x"], probe_tiled["x"])
     encoder_inputs = dict(made[0].calls[-1])
-    assert encoder_inputs["x_length"].tolist() == [9]
+    assert encoder_inputs["x_mask"].shape == (1, 1, 200)
+    assert float(encoder_inputs["x_mask"].sum()) == 9.0  # hot over the real ids only
     assert encoder_inputs["x"][0, :9].tolist() == [1, 3, 1, 4, 1, 5, 1, 2, 1]
-    # The tail REPEATS the phonemes, as the decoder tiles its own bucket: x_length masks it
-    # away where honored, and where a converted graph drops the mask a 9-token ack attends
+    # The tail REPEATS the phonemes, as the decoder tiles its own bucket: x_mask hides it
+    # where honored, and where a converted graph leaks past the mask a 9-token ack attends
     # over its own sounds instead of ~190 pads.
     assert encoder_inputs["x"].shape == (1, 200)
     assert encoder_inputs["x"][0, 9:18].tolist() == [1, 3, 1, 4, 1, 5, 1, 2, 1]
@@ -1277,6 +1358,9 @@ def test_matcha_split_waveform_vocoder_is_probed_and_denoised(monkeypatch, tmp_p
 
         def input_shape(self, _name):
             return None
+
+        def input_specs(self):
+            return []
 
         def metadata(self):
             return {}

@@ -147,7 +147,7 @@ def test_matcha_real_static_split_onnx():
 
 def test_matcha_split_encoder_tiling_is_identical_where_the_mask_is_honored():
     """The encoder bucket repeats the phonemes instead of padding. That is only safe if a
-    graph honoring ``x_length`` cannot see the tail — so prove it: byte-identical mu/logw."""
+    graph honoring ``x_mask`` cannot see the tail — so prove it: byte-identical mu/logw."""
     en = _MATCHA / "matcha-icefall-en_US-ljspeech"
     _need(
         _MATCHA / "matcha_encoder_200.onnx",
@@ -174,14 +174,15 @@ def test_matcha_split_encoder_tiling_is_identical_where_the_mask_is_honored():
         ids = tts._ids("Yes?")                      # the shortest thing we ever synthesize
         n = len(ids)
         assert n * 4 < tts._encoder_len             # pads would dominate the bucket
-        x_len = np.array([n], dtype=np.int64)
+        mask = np.zeros((1, 1, tts._encoder_len), dtype=np.float32)
+        mask[0, 0, :n] = 1.0
         padded = np.full((1, tts._encoder_len), tts._pad_id, dtype=np.int64)
         padded[0, :n] = ids
         tiled = np.resize(np.asarray(ids, dtype=np.int64), (1, tts._encoder_len))
         assert not np.array_equal(padded, tiled)    # the inputs really do differ
         for a, b in zip(
-            tts._encoder.run([("x", padded), ("x_length", x_len)]),
-            tts._encoder.run([("x", tiled), ("x_length", x_len)]),
+            tts._encoder.run([("x", padded), ("x_mask", mask)]),
+            tts._encoder.run([("x", tiled), ("x_mask", mask)]),
         ):
             assert np.array_equal(np.asarray(a)[..., :n], np.asarray(b)[..., :n])
     finally:

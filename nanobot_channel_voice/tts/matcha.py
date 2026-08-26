@@ -522,38 +522,56 @@ _LJSPEECH_SIDE = {
 }
 
 
+def _encoder_mask(encoder_len: int, hot: int) -> np.ndarray:
+    """The split encoder's ``x_mask``: ones over the ``hot`` real ids, zeros beyond."""
+    mask = np.zeros((1, 1, encoder_len), dtype=np.float32)
+    mask[0, 0, :hot] = 1.0
+    return mask
+
+
 def _probe_encoder_mask(
     encoder: OnDeviceModel, encoder_len: int, pad_id: int, token2id: dict[str, int]
 ) -> None:
-    """Does this runtime still honor ``x_length``? Same ids, pad-vs-repeat tails: a masking
-    graph is bit-identical, one that lost the mask reads the tail as speech — and a short
-    phrase IS mostly tail. The repeat fill bounds that either way; this names which case
-    the board is in."""
+    """Does this runtime still honor ``x_mask``? Same ids and mask, pad-vs-repeat tails: a
+    masking graph is bit-identical, one that lost the mask reads the tail as speech — and
+    a short phrase IS mostly tail. Judge both outputs: logw can shift while mu peaks stay
+    plausible."""
     # 3 = the shortest real input: the zh lexicon emits one token per hanzi.
     sample = [i for i in dict.fromkeys(token2id.values()) if i != pad_id][:3]
     if len(sample) < 2 or len(sample) >= encoder_len:
         return
-    x_len = np.array([len(sample)], dtype=np.int64)
+    mask = _encoder_mask(encoder_len, len(sample))
     padded = np.full((1, encoder_len), pad_id, dtype=np.int64)
     padded[0, :len(sample)] = sample
     tiled = np.resize(np.asarray(sample, dtype=np.int64), (1, encoder_len))
     try:
-        a = np.asarray(encoder.run([("x", padded), ("x_length", x_len)])[0], dtype=np.float32)
-        b = np.asarray(encoder.run([("x", tiled), ("x_length", x_len)])[0], dtype=np.float32)
+        a = encoder.run([("x", padded), ("x_mask", mask)])
+        b = encoder.run([("x", tiled), ("x_mask", mask)])
     except Exception as exc:  # noqa: BLE001 - a probe must never fail the build
-        logger.debug("matcha split: encoder mask probe skipped ({})", exc)
-        return
-    a, b = a[..., :len(sample)], b[..., :len(sample)]
-    scale = float(np.abs(a).max())
-    if scale < 1e-3:
-        return  # these ids encode to ~nothing: no reference to judge a difference against
-    if float(np.abs(a - b).max()) > 0.02 * scale:
         logger.warning(
-            "voice: this matcha encoder does NOT honor x_length — the bucket tail reaches "
-            "the phonemes, so SHORT text (wake acks, prologue fillers) is mostly tail and "
-            "synthesizes badly or silent. The tail repeats the phonemes to bound this; if "
-            "short phrases still misbehave, re-export the encoder with the length mask."
+            "voice: matcha split mask probe failed ({}) — a shape/name mismatch means "
+            "a pre-x_mask package; re-export the split.", exc,
         )
+        return
+    judged = False
+    for name, av, bv in zip(("mu", "logw"), a, b):
+        av = np.asarray(av, dtype=np.float32)[..., :len(sample)]
+        bv = np.asarray(bv, dtype=np.float32)[..., :len(sample)]
+        scale = float(np.abs(av).max())
+        if scale < 1e-3:
+            continue  # these ids encode to ~nothing: no reference to judge against
+        judged = True
+        if float(np.abs(av - bv).max()) > 0.02 * scale:
+            logger.warning(
+                "voice: this matcha encoder does NOT honor x_mask ({} shifts with the "
+                "bucket tail) — SHORT text (wake acks, fillers) is mostly tail and "
+                "synthesizes badly; the tiled tail bounds it, but re-export the encoder.",
+                name,
+            )
+            return
+    if not judged:
+        # all-zero output is itself a plausible garble mode — don't read as verified
+        logger.info("matcha split: mask probe inconclusive — probe ids encode to near-silence")
 
 
 def denoise(wav: np.ndarray, bias: np.ndarray) -> np.ndarray:
@@ -901,10 +919,12 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
     """Static three-graph icefall Matcha: the host bridges durations -> alignment ->
     tiling -> denorm -> vocoding between fixed buckets (RKNN cannot express them).
     Encoder and decoder buckets REPEAT their content rather than pad: the decoder has no
-    time mask, and the encoder's repeat is free where ``x_length`` is honored and saves a
-    short phrase where conversion dropped it. Extension picks the runtime, so an .onnx
-    triple validates the split off-board. Vocos (3 outputs, host ISTFT) or waveform
-    HiFi-GAN (1 output, denoised), classified by a probe."""
+    time mask, and the encoder's repeat is free where ``x_mask`` is honored and saves a
+    short phrase where conversion dropped it. The mask is an explicit float input — RKNN
+    miscompiles the in-graph int64 ``x_length`` chain at short input, so the exporter
+    moved it to the host. Extension picks the runtime, so an .onnx triple validates the
+    split off-board. Vocos (3 outputs, host ISTFT) or waveform HiFi-GAN (1 output,
+    denoised), classified by a probe."""
 
     output_rate = _SAMPLE_RATE_DEFAULT
     _label = "Matcha-split"
@@ -1066,6 +1086,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             # ONNX exposes static shapes (.rknn does not): catch geometry mismatch at build
             for model, name, want in (
                 (encoder, "x", (1, encoder_len)),
+                (encoder, "x_mask", (1, 1, encoder_len)),
                 (decoder, "mu_up", (1, 80, mel_len)),
                 (vocoder, "mels", (1, 80, mel_len)),
             ):
@@ -1075,6 +1096,14 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                         f"matcha split: graph input {name} is {list(shape)}, "
                         f"configured geometry wants {list(want)}"
                     )
+            # RKNN has no input names to check; the probe's failure path covers that side.
+            declared_inputs = {name for name, _shape, _type in encoder.input_specs()}
+            if declared_inputs and "x_mask" not in declared_inputs:
+                raise ValueError(
+                    f"matcha split: encoder declares {sorted(declared_inputs)} — a "
+                    "pre-x_mask export (in-graph x_length masking miscompiles short "
+                    "input on RKNN); re-export the split"
+                )
             _probe_encoder_mask(encoder, encoder_len, pad_id, token2id)
             # One zero-mel probe classifies the vocoder without graph introspection (RKNN
             # has none): 1 output = waveform (HiFi-GAN), 3 = Vocos. It also yields the
@@ -1147,10 +1176,10 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
                 text, f"needs {len(ids)} tokens > encoderLen {self._encoder_len}"
             )
         x = np.resize(np.asarray(ids, dtype=np.int64), (1, self._encoder_len))
-        x_length = np.array([len(ids)], dtype=np.int64)
+        x_mask = _encoder_mask(self._encoder_len, len(ids))
         mu, logw = (
             np.asarray(o, dtype=np.float32)
-            for o in self._encoder.run([("x", x), ("x_length", x_length)])
+            for o in self._encoder.run([("x", x), ("x_mask", x_mask)])
         )
         mu_up, total = self._length_regulator(mu, logw, len(ids))
         if total <= 0:
