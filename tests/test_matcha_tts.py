@@ -1102,8 +1102,8 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
 
 
 def test_a_silent_split_piece_names_the_stage_that_zeroed_it(monkeypatch, tmp_path):
-    """Four host-bridged stages sit between fixed buckets; a piece that comes out silent must
-    not leave the operator guessing which one produced audio-shaped nothing."""
+    """Four host-bridged stages sit between fixed buckets; a piece too quiet to hear must
+    not leave the operator guessing which one produced it."""
     from loguru import logger as loguru_logger
 
     from nanobot_channel_voice.config import MatchaTtsConfig
@@ -1131,11 +1131,11 @@ def test_a_silent_split_piece_names_the_stage_that_zeroed_it(monkeypatch, tmp_pa
     sink = loguru_logger.add(lambda m: said.append(str(m)), level="WARNING")
     try:
         assert not np.abs(tts._synthesize_piece("你好七。")).max()
-        tts._synthesize_piece("你好七。")   # a second silent piece stays quiet in the log
+        tts._synthesize_piece("你好七。")   # a second bad piece stays quiet in the log
     finally:
         loguru_logger.remove(sink)
 
-    reports = [m for m in said if "synthesized silence" in m]
+    reports = [m for m in said if "output peaks at" in m]
     assert len(reports) == 1                       # once per adapter, not per piece
     assert "vocoder peak 0.00000" in reports[0]    # names the stage that zeroed
     assert "encoder mu peak" in reports[0] and "9 mel frames" in reports[0]

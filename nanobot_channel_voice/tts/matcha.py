@@ -511,8 +511,10 @@ def denoiser_bias(vocoder: VocoderSpec, strength: float) -> np.ndarray | None:
     return _bias_from_wav(wav, strength)
 
 
-# A piece under this peak is silence, not quiet speech: report which stage produced it.
-_SILENT_PEAK = 1e-4
+# A piece under this peak will not be heard, whether it is digital silence or speech the
+# host denormalized into the wrong range: report which stage produced it. Half the shell's
+# audibility bar, so only a clear failure reports.
+_INAUDIBLE_PEAK = 0.05
 
 # Static-split geometry when no sidecar declares it; the mel pair is LJSpeech's own fit,
 # a level error for any other model (see the build warning).
@@ -1198,18 +1200,21 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         self, text: str, ids: list[int], total: int, mu: np.ndarray, mel: np.ndarray,
         voc: np.ndarray, wav: np.ndarray,
     ) -> np.ndarray:
-        """Fade the edges, and name the stage when a piece comes out silent: four host-bridged
-        stages sit between fixed buckets here and any one of them yields audio-shaped nothing.
-        Stage arrays, not peaks: nothing is measured unless a report is actually made."""
+        """Fade the edges, and name the stage when a piece comes out too quiet to hear: four
+        host-bridged stages sit between fixed buckets and any one of them yields audio-shaped
+        nothing. Stage arrays, not peaks: nothing is measured unless a report is made."""
         wav = self._edge_fade(wav)
-        if self._silence_reported or not wav.size or float(np.abs(wav).max()) >= _SILENT_PEAK:
+        peak = float(np.abs(wav).max()) if wav.size else 0.0
+        if self._silence_reported or not wav.size or peak >= _INAUDIBLE_PEAK:
             return wav
         self._silence_reported = True
         self._log.warning(
-            "Matcha-split synthesized silence for '{}' (ids={}, {} mel frames): encoder mu "
+            "Matcha-split output peaks at {:.4f} for '{}' (ids={}, {} mel frames): encoder mu "
             "peak {:.3f}, mel {:.2f}..{:.2f} using scale {} / bias {}, vocoder peak {:.5f}. "
             "mu~0 = encoder; a FLAT mel = decoder; mel spread but vocoder ~0 = vocoder; all "
-            "three healthy = the mel pair denormalizes into the wrong range.",
+            "three healthy = the mel pair denormalizes into the wrong range (this model's own "
+            "mel spans about -22..+5).",
+            peak,
             text, len(ids), total, float(np.abs(mu[..., :len(ids)]).max()),
             float(mel.min()), float(mel.max()), self._mel_scale, self._mel_bias,
             float(np.abs(voc).max()) if voc.size else 0.0,
