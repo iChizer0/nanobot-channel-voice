@@ -210,12 +210,36 @@ def test_a_mis_scaled_engine_is_named_once_per_language():
 def test_a_short_fragment_never_decides_the_level():
     """A single soft word is not evidence of a mis-scaled model: the verdict waits for a
     real utterance, and the engine stays unjudged until one arrives."""
-    quiet = _QuietEngine()
-    tiny = np.full(int(0.05 * quiet.output_rate), 0.03, dtype=np.float32)
-    assert not [m for m in _warnings(lambda: quiet._check_level(tiny)) if "peaks at" in m]
-    assert not quiet._level_checked               # unjudged, not judged-and-cleared
-    big = np.full(int(0.5 * quiet.output_rate), 0.03, dtype=np.float32)
-    assert [m for m in _warnings(lambda: quiet._check_level(big)) if "peaks at" in m]
+
+    class _Fragment(_QuietEngine):
+        def _synthesize_piece(self, text: str) -> np.ndarray:
+            return np.full(int(0.05 * self.output_rate), self.peak, dtype=np.float32)
+
+    tiny = _Fragment()
+    assert not [m for m in _warnings(lambda: asyncio.run(tiny.warmup())) if "peaks at" in m]
+    assert not tiny._level_checked                 # unjudged, not judged-and-cleared
+    assert [m for m in _warnings(lambda: asyncio.run(_QuietEngine().warmup()))
+            if "peaks at" in m]
+
+
+def test_a_short_only_collapse_is_named_apart_from_a_dead_leg():
+    """Measured on a converted matcha split: the warmup phrase (3 tokens) came out at 0.09
+    while whole replies were fine. Both read as one mis-scaled peak, and the fixes differ —
+    so the verdict re-measures the same leg on a long sentence before naming a cause."""
+
+    class _ShortOnly(_QuietEngine):
+        def _synthesize_piece(self, text: str) -> np.ndarray:
+            self.spoken.append(text)
+            loud = 0.9 if len(text) > 12 else 0.03
+            return np.full(int(0.5 * self.output_rate), loud, dtype=np.float32)
+
+    said = [m for m in _warnings(lambda: asyncio.run(_ShortOnly().warmup())) if "peaks at" in m]
+    assert len(said) == 1 and "SHORT input only" in said[0]
+    assert "0.030" in said[0] and "0.900" in said[0]     # both measurements, not one
+    assert "melScale" not in said[0]                     # that fix is for a dead leg
+
+    dead = [m for m in _warnings(lambda: asyncio.run(_QuietEngine().warmup())) if "peaks at" in m]
+    assert "every length" in dead[0] and "melScale" in dead[0]
 
 
 def test_each_declared_language_is_levelled_separately():

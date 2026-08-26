@@ -511,9 +511,8 @@ def denoiser_bias(vocoder: VocoderSpec, strength: float) -> np.ndarray | None:
     return _bias_from_wav(wav, strength)
 
 
-# A piece under this peak will not be heard, whether it is digital silence or speech the
-# host denormalized into the wrong range: report which stage produced it. Half the shell's
-# audibility bar, so only a clear failure reports.
+# A piece under this peak will not be heard: report which of the four bridged stages made
+# it. Half the shell's audibility bar, so only a clear failure reports.
 _INAUDIBLE_PEAK = 0.05
 
 # Static-split geometry when no sidecar declares it; the mel pair is LJSpeech's own fit,
@@ -1211,9 +1210,9 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         self._log.warning(
             "Matcha-split output peaks at {:.4f} for '{}' (ids={}, {} mel frames): encoder mu "
             "peak {:.3f}, mel {:.2f}..{:.2f} using scale {} / bias {}, vocoder peak {:.5f}. "
-            "mu~0 = encoder; a FLAT mel = decoder; mel spread but vocoder ~0 = vocoder; all "
-            "three healthy = the mel pair denormalizes into the wrong range (this model's own "
-            "mel spans about -22..+5).",
+            "mu~0 = encoder; a FLAT mel = decoder; a shifted mel FLOOR = the mel pair; the "
+            "floor right with the top squeezed toward it = the decoder under-produces, as a "
+            "converted graph does on short input; mel spread but vocoder ~0 = vocoder.",
             peak,
             text, len(ids), total, float(np.abs(mu[..., :len(ids)]).max()),
             float(mel.min()), float(mel.max()), self._mel_scale, self._mel_bias,

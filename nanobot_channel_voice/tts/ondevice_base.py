@@ -13,8 +13,9 @@ import asyncio
 import numpy as np
 from loguru import logger
 
-from nanobot_channel_voice.audio.pcm import wav_pcm
+from nanobot_channel_voice.audio.pcm import pcm_peak, wav_duration_ms, wav_pcm
 from nanobot_channel_voice.tts.base import (
+    CALIBRATION_TEXT,
     WARMUP_TEXT,
     TtsAdapter,
     floats_to_pcm,
@@ -37,13 +38,10 @@ _LEVEL_MIN_MS = 300.0
 _EDGE_KEEP_MS = 10.0
 
 
-def _wav_floats(wav: bytes) -> np.ndarray:
-    """A synthesized WAV back to floats, for measuring what warmup actually produced."""
-    pcm, _rate = wav_pcm(wav)
-    return (
-        np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        if pcm else np.zeros(0, dtype=np.float32)
-    )
+def _peak(wav: bytes) -> float:
+    """Peak of a synthesized WAV, 0..1. An unreadable or all-zero buffer reads 0.0: an
+    utterance of nothing is the failure this measures, not an empty case to skip."""
+    return pcm_peak(wav_pcm(wav)[0])
 
 
 def _edge_trim(
@@ -143,7 +141,13 @@ class OnDeviceTtsAdapter(TtsAdapter):
         levels = []
         for lang in dict.fromkeys(langs):
             wav = await self.synthesize(startup_text(WARMUP_TEXT, lang))
-            levels.append(f"{lang or 'default'}={self._check_level(_wav_floats(wav), lang):.3f}")
+            peak = _peak(wav)
+            levels.append(f"{lang or 'default'}={peak:.3f}")
+            if lang in self._level_checked or wav_duration_ms(wav) < _LEVEL_MIN_MS:
+                continue
+            self._level_checked = self._level_checked | {lang}
+            if peak < _QUIET_PEAK:
+                await self._report_quiet(lang, peak)
         self._log.info("{} TTS warm, peak {}", self._label, " ".join(levels))
 
     def _synthesize_sync(self, text: str) -> bytes:
@@ -236,21 +240,24 @@ class OnDeviceTtsAdapter(TtsAdapter):
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(waves)
 
-    def _check_level(self, wav: np.ndarray, lang: str | None = None) -> float:
-        """Peak of *wav*, warning once per language when this leg is mis-scaled rather than
-        quiet. A buffer of ZEROS counts: nothing else reports one, and it is a whole utterance
-        of nothing. Judged on a real utterance — a fragment may be genuinely soft."""
-        peak = float(np.abs(wav).max()) if wav.size else 0.0
-        too_short = wav.size < (self.output_rate or 0) * _LEVEL_MIN_MS / 1000.0
-        if lang in self._level_checked or too_short:
-            return peak
-        self._level_checked = self._level_checked | {lang}
-        if peak < _QUIET_PEAK:
+    async def _report_quiet(self, lang: str | None, peak: float) -> None:
+        """Name WHICH fault a mis-scaled warmup is: the warmup phrase is the shortest text
+        this system synthesizes (the zh lexicon emits one token per hanzi), so a long sentence
+        on the same leg separates a short-input collapse from a leg that never speaks."""
+        long_peak = _peak(await self.synthesize(startup_text(CALIBRATION_TEXT, lang)))
+        where = f" ({lang})" if lang else ""
+        if long_peak >= _QUIET_PEAK:
             self._log.warning(
-                "{} TTS{} peaks at {:.3f} of full scale where normal speech is 0.4-1.0: "
-                "mis-scaled or dead, not quiet. Short phrases (wake acks) will be inaudible "
-                "and replies faint. For the static split check tts.matcha.melScale / melBias "
-                "against this model's own export values.",
-                self._label, f" ({lang})" if lang else "", peak,
+                "{} TTS{} peaks at {:.3f} on a short phrase, {:.3f} on a long one (normal is "
+                "0.4-1.0): it collapses on SHORT input only, so replies sound fine while wake "
+                "acks and fillers are inaudible. On a converted split (TensorRT/RKNN) that is "
+                "the conversion, not the config: validate the graphs at ~3 tokens.",
+                self._label, where, peak, long_peak,
             )
-        return peak
+            return
+        self._log.warning(
+            "{} TTS{} peaks at {:.3f} short, {:.3f} long (normal is 0.4-1.0): this leg is "
+            "mis-scaled or dead at every length, not quiet. For the static split check "
+            "tts.matcha.melScale / melBias against this model's own export values.",
+            self._label, where, peak, long_peak,
+        )

@@ -3823,8 +3823,8 @@ class LocalBackend(TurnEventMixin):
             # peak vs rms separates a collapsed model from one blip in a long silence.
             self._log.warning(
                 "voice: {} synthesized canned phrase '{}' to {} — it will NOT be heard. "
-                "It leaves the rotation; set wake.ack.phrases/prologue.phrases this engine "
-                "can speak.",
+                "It leaves the rotation; set wake.ack.phrases / prologue.phrases to a LONGER "
+                "phrase, since an engine can be fine on replies and collapse on short input.",
                 type(self._tts).__name__, text,
                 "nothing" if not pcm else (
                     f"near-silence (rms {rms:.4f}, peak {pcm_peak(pcm):.4f}, "
