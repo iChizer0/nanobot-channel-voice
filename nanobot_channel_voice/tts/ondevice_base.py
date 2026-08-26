@@ -13,6 +13,7 @@ import asyncio
 import numpy as np
 from loguru import logger
 
+from nanobot_channel_voice.audio.pcm import wav_pcm
 from nanobot_channel_voice.tts.base import (
     WARMUP_TEXT,
     TtsAdapter,
@@ -34,6 +35,15 @@ _LEVEL_MIN_MS = 300.0
 
 # Padding to leave on an interior edge: enough for the engine's fade, too little to hear.
 _EDGE_KEEP_MS = 10.0
+
+
+def _wav_floats(wav: bytes) -> np.ndarray:
+    """A synthesized WAV back to floats, for measuring what warmup actually produced."""
+    pcm, _rate = wav_pcm(wav)
+    return (
+        np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        if pcm else np.zeros(0, dtype=np.float32)
+    )
 
 
 def _edge_trim(
@@ -58,8 +68,8 @@ class OnDeviceTtsAdapter(TtsAdapter):
     _join_gap_s: float = 0.1
     _log = logger
 
-    # Class-level so an adapter that never calls super().__init__() still synthesizes.
-    _level_checked = False
+    # Rebound, never mutated: an adapter that skips super().__init__() still synthesizes.
+    _level_checked: frozenset = frozenset()
 
     def __init__(self) -> None:
         # Warn once per character: a wrong-language reply repeats the same chars.
@@ -126,11 +136,15 @@ class OnDeviceTtsAdapter(TtsAdapter):
         return await asyncio.to_thread(self._synthesize_pcm_sync, text)
 
     async def warmup(self) -> None:
-        # Every declared language once: a bilingual model routes scripts through
-        # DIFFERENT sub-frontends, so a one-language warmup leaves the other cold.
+        # Every declared language once: a bilingual routes scripts through DIFFERENT
+        # sub-frontends, so one leg can be dead alone. Logged pass or fail — an absent
+        # warning is not evidence of health.
         langs = getattr(self, "spoken_languages", None) or (self.spoken_language,)
+        levels = []
         for lang in dict.fromkeys(langs):
-            await self.synthesize(startup_text(WARMUP_TEXT, lang))
+            wav = await self.synthesize(startup_text(WARMUP_TEXT, lang))
+            levels.append(f"{lang or 'default'}={self._check_level(_wav_floats(wav), lang):.3f}")
+        self._log.info("{} TTS warm, peak {}", self._label, " ".join(levels))
 
     def _synthesize_sync(self, text: str) -> bytes:
         try:
@@ -220,24 +234,23 @@ class OnDeviceTtsAdapter(TtsAdapter):
             )
         if not waves:
             return np.zeros(0, dtype=np.float32)
-        out = np.concatenate(waves)
-        self._check_level(out)
-        return out
+        return np.concatenate(waves)
 
-    def _check_level(self, wav: np.ndarray) -> None:
-        """One look at the first real utterance this engine produces (warmup, in practice).
-        Peaking this far down is mis-scaling, not quietness — for the static split, the mel
-        pair — and every audibility, duck and barge-in judgement below then reads a signal
-        that is not there."""
-        if self._level_checked or wav.size < (self.output_rate or 0) * _LEVEL_MIN_MS / 1000.0:
-            return
-        self._level_checked = True
-        peak = float(np.abs(wav).max())
-        if 0.0 < peak < _QUIET_PEAK:
+    def _check_level(self, wav: np.ndarray, lang: str | None = None) -> float:
+        """Peak of *wav*, warning once per language when this leg is mis-scaled rather than
+        quiet. A buffer of ZEROS counts: nothing else reports one, and it is a whole utterance
+        of nothing. Judged on a real utterance — a fragment may be genuinely soft."""
+        peak = float(np.abs(wav).max()) if wav.size else 0.0
+        too_short = wav.size < (self.output_rate or 0) * _LEVEL_MIN_MS / 1000.0
+        if lang in self._level_checked or too_short:
+            return peak
+        self._level_checked = self._level_checked | {lang}
+        if peak < _QUIET_PEAK:
             self._log.warning(
-                "{} TTS output peaks at {:.3f} of full scale where normal speech is 0.4-1.0: "
-                "mis-scaled, not quiet. Short phrases (wake acks) will be inaudible and "
-                "replies faint. For the static split this is the mel pair — check "
-                "tts.matcha.melScale / melBias against this model's own export values.",
-                self._label, peak,
+                "{} TTS{} peaks at {:.3f} of full scale where normal speech is 0.4-1.0: "
+                "mis-scaled or dead, not quiet. Short phrases (wake acks) will be inaudible "
+                "and replies faint. For the static split check tts.matcha.melScale / melBias "
+                "against this model's own export values.",
+                self._label, f" ({lang})" if lang else "", peak,
             )
+        return peak

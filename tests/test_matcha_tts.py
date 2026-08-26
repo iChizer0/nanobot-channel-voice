@@ -1101,6 +1101,47 @@ def test_matcha_split_uses_lexicon_frontend_for_zh(monkeypatch, tmp_path):
     tts.release()
 
 
+def test_a_silent_split_piece_names_the_stage_that_zeroed_it(monkeypatch, tmp_path):
+    """Four host-bridged stages sit between fixed buckets; a piece that comes out silent must
+    not leave the operator guessing which one produced audio-shaped nothing."""
+    from loguru import logger as loguru_logger
+
+    from nanobot_channel_voice.config import MatchaTtsConfig
+    from nanobot_channel_voice.tts import matcha
+
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text("  0\n_ 1\n。 2\nni3 3\nhao3 4\nqi1 5\n", encoding="utf-8")
+    lexicon = tmp_path / "lexicon.txt"
+    lexicon.write_text("你 ni3\n好 hao3\n七 qi1\n", encoding="utf-8")
+    made = _SplitFakeModel.made
+    made.clear()
+    monkeypatch.setattr(matcha, "OnDeviceModel", _SplitFakeModel)
+    monkeypatch.setattr(matcha, "make_ipa_phonemizer", lambda *_args, **_kw: str)
+    tts = matcha.SplitMatchaTtsAdapter.from_config(MatchaTtsConfig.model_validate({
+        "encoderPath": str(tmp_path / "encoder.rknn"),
+        "decoderPath": str(tmp_path / "decoder.rknn"),
+        "vocoderPath": str(tmp_path / "vocoder.rknn"),
+        "tokensPath": str(tokens), "lexiconPath": str(lexicon),
+        "encoderLen": 200, "melLen": 16,
+    }))
+    zeros = np.zeros((1, 513, 16), np.float32)
+    made[2].run = lambda _inputs: [zeros, zeros, zeros]  # vocoder emits nothing
+
+    said: list[str] = []
+    sink = loguru_logger.add(lambda m: said.append(str(m)), level="WARNING")
+    try:
+        assert not np.abs(tts._synthesize_piece("你好七。")).max()
+        tts._synthesize_piece("你好七。")   # a second silent piece stays quiet in the log
+    finally:
+        loguru_logger.remove(sink)
+
+    reports = [m for m in said if "synthesized silence" in m]
+    assert len(reports) == 1                       # once per adapter, not per piece
+    assert "vocoder peak 0.00000" in reports[0]    # names the stage that zeroed
+    assert "encoder mu peak" in reports[0] and "9 mel frames" in reports[0]
+    tts.release()
+
+
 # ---- denoiser and edge fades ------------------------------------------------
 
 

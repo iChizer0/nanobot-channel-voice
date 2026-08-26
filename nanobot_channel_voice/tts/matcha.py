@@ -511,6 +511,9 @@ def denoiser_bias(vocoder: VocoderSpec, strength: float) -> np.ndarray | None:
     return _bias_from_wav(wav, strength)
 
 
+# A piece under this peak is silence, not quiet speech: report which stage produced it.
+_SILENT_PEAK = 1e-4
+
 # Static-split geometry when no sidecar declares it; the mel pair is LJSpeech's own fit,
 # a level error for any other model (see the build warning).
 _LJSPEECH_SIDE = {
@@ -904,6 +907,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
 
     output_rate = _SAMPLE_RATE_DEFAULT
     _label = "Matcha-split"
+    _silence_reported = False  # class-level: an adapter built via __new__ still synthesizes
 
     def __init__(
         self,
@@ -1143,7 +1147,10 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             )
         x = np.resize(np.asarray(ids, dtype=np.int64), (1, self._encoder_len))
         x_length = np.array([len(ids)], dtype=np.int64)
-        mu, logw = self._encoder.run([("x", x), ("x_length", x_length)])
+        mu, logw = (
+            np.asarray(o, dtype=np.float32)
+            for o in self._encoder.run([("x", x), ("x_length", x_length)])
+        )
         mu_up, total = self._length_regulator(mu, logw, len(ids))
         if total <= 0:
             return np.zeros(0, dtype=np.float32)
@@ -1170,20 +1177,44 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         if self._stft is None:  # waveform vocoder: bucket wav, keep the real frames
             wav = np.asarray(self._vocoder.run([("mels", mel_in)])[0], dtype=np.float32)
             wav = wav.reshape(-1)[: total * self._voc_factor]
+            vocoded = wav  # denoise() returns a NEW array, so this keeps the vocoder stage
             if self._denoise_bias is not None:
                 wav = denoise(wav, self._denoise_bias)
-            return self._edge_fade(wav)
+            return self._finish(text, ids, total, mu, mel, vocoded, wav)
         mag, cos, sin = self._vocoder.run([("mels", mel_in)])
         n_fft, hop = self._stft["n_fft"], self._stft["hop_length"]
         # frames past total + n_fft/hop cannot touch a kept sample
         keep = min(self._mel_len, total + max(1, n_fft // hop))
+        mag = np.asarray(mag, dtype=np.float32)
         wav = istft(
-            np.asarray(mag, dtype=np.float32)[0, :, :keep],
+            mag[0, :, :keep],
             np.asarray(cos, dtype=np.float32)[0, :, :keep],
             np.asarray(sin, dtype=np.float32)[0, :, :keep],
             **self._stft,
         )
-        return self._edge_fade(wav[: total * hop])
+        return self._finish(text, ids, total, mu, mel, mag[0, :, :keep], wav[: total * hop])
+
+    def _finish(
+        self, text: str, ids: list[int], total: int, mu: np.ndarray, mel: np.ndarray,
+        voc: np.ndarray, wav: np.ndarray,
+    ) -> np.ndarray:
+        """Fade the edges, and name the stage when a piece comes out silent: four host-bridged
+        stages sit between fixed buckets here and any one of them yields audio-shaped nothing.
+        Stage arrays, not peaks: nothing is measured unless a report is actually made."""
+        wav = self._edge_fade(wav)
+        if self._silence_reported or not wav.size or float(np.abs(wav).max()) >= _SILENT_PEAK:
+            return wav
+        self._silence_reported = True
+        self._log.warning(
+            "Matcha-split synthesized silence for '{}' (ids={}, {} mel frames): encoder mu "
+            "peak {:.3f}, mel {:.2f}..{:.2f} using scale {} / bias {}, vocoder peak {:.5f}. "
+            "mu~0 = encoder; a FLAT mel = decoder; mel spread but vocoder ~0 = vocoder; all "
+            "three healthy = the mel pair denormalizes into the wrong range.",
+            text, len(ids), total, float(np.abs(mu[..., :len(ids)]).max()),
+            float(mel.min()), float(mel.max()), self._mel_scale, self._mel_bias,
+            float(np.abs(voc).max()) if voc.size else 0.0,
+        )
+        return wav
 
     def _overflow_retry(self, text: str, reason: str) -> np.ndarray:
         if len(text.strip()) <= 1:

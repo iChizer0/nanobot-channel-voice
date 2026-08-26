@@ -6,6 +6,8 @@ the two real ``_can_speak`` implementations.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -186,24 +188,23 @@ def test_an_interior_budget_seam_drops_the_model_padding():
     assert loud[0] >= int(0.5 * engine.output_rate)
 
 
-def test_a_mis_scaled_engine_is_named_once_not_per_chunk():
+def test_a_mis_scaled_engine_is_named_once_per_language():
     """A level error crashes nothing and empties nothing — every downstream audibility,
     duck and barge-in judgement just reads a signal that is not there."""
     quiet = _QuietEngine()
-    said = _warnings(lambda: [quiet._synthesize_floats(t) for t in ("hello", "again")])
+    said = _warnings(lambda: asyncio.run(quiet.warmup()))
     peaks = [m for m in said if "peaks at" in m]
-    assert len(peaks) == 1                       # the first audio only, not per chunk
-    assert "0.030" in peaks[0] and "stub" in peaks[0]
+    assert len(peaks) == 1 and "0.030" in peaks[0] and "stub" in peaks[0]
+    assert not [m for m in _warnings(lambda: asyncio.run(quiet.warmup())) if "peaks at" in m]
 
     loud = _AsciiEngine()                        # peak 1.0: nothing to say
-    assert not [m for m in _warnings(lambda: loud._synthesize_floats("hello"))
-                if "peaks at" in m]
+    assert not [m for m in _warnings(lambda: asyncio.run(loud.warmup())) if "peaks at" in m]
 
-    # An engine that produces NO audio is the empty case, already reported elsewhere.
-    empty = _QuietEngine()
-    empty.peak = 0.0
-    assert not [m for m in _warnings(lambda: empty._synthesize_floats("hello"))
-                if "peaks at" in m]
+    # A whole utterance of ZEROS is the case that matters most and nothing else reports it:
+    # the bytes are non-empty, so every length and duration check downstream is satisfied.
+    dead = _QuietEngine()
+    dead.peak = 0.0
+    assert [m for m in _warnings(lambda: asyncio.run(dead.warmup())) if "peaks at 0.000" in m]
 
 
 def test_a_short_fragment_never_decides_the_level():
@@ -212,5 +213,27 @@ def test_a_short_fragment_never_decides_the_level():
     quiet = _QuietEngine()
     tiny = np.full(int(0.05 * quiet.output_rate), 0.03, dtype=np.float32)
     assert not [m for m in _warnings(lambda: quiet._check_level(tiny)) if "peaks at" in m]
-    assert quiet._level_checked is False          # unjudged, not judged-and-cleared
-    assert [m for m in _warnings(lambda: quiet._synthesize_floats("hello")) if "peaks at" in m]
+    assert not quiet._level_checked               # unjudged, not judged-and-cleared
+    big = np.full(int(0.5 * quiet.output_rate), 0.03, dtype=np.float32)
+    assert [m for m in _warnings(lambda: quiet._check_level(big)) if "peaks at" in m]
+
+
+def test_each_declared_language_is_levelled_separately():
+    """A bilingual routes scripts through different sub-frontends, so one leg can be dead
+    while the other is fine — and a single one-shot check would miss whichever ran second."""
+
+    class _HalfDead(_QuietEngine):
+        spoken_languages = ("zh", "en")
+
+        def _can_speak(self, ch: str) -> bool:
+            return True                          # voiceable: this is the LEVEL path
+
+        def _synthesize_piece(self, text: str) -> np.ndarray:
+            loud = any(ord(c) < 0x2E80 for c in text)
+            return np.full(int(0.5 * self.output_rate), 0.9 if loud else 0.0, np.float32)
+
+    tts = _HalfDead()
+    said = _warnings(lambda: asyncio.run(tts.warmup()))
+    peaks = [m for m in said if "peaks at" in m]
+    assert len(peaks) == 1 and "(zh)" in peaks[0]   # named, and only the dead leg
+    assert tts._level_checked == {"zh", "en"}       # en was judged too, and passed
