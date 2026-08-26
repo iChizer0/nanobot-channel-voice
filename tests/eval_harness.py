@@ -52,6 +52,11 @@ class _FlagVad(Vad):
         pass
 
 
+# Speech-level amplitude: the backend drops canned clips that synthesize inaudible, so a
+# stand-in for speech has to be loud enough to BE speech.
+_VOICED = b"\x00\x40"
+
+
 class _ScriptTts(TtsAdapter):
     """Audio whose duration tracks the text, so played_ms maps into words."""
 
@@ -62,7 +67,7 @@ class _ScriptTts(TtsAdapter):
 
     async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
         ms = max(_FRAME_MS, _MS_PER_CHAR * len(text))
-        return b"\x01\x00" * int(_RATE / 1000 * ms)
+        return _VOICED * int(_RATE / 1000 * ms)
 
 
 class EvalConversation:

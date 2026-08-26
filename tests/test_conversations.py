@@ -272,7 +272,7 @@ def test_unvoiced_final_speaks_the_fallback_notice():
             # The fallback enqueues the WHOLE phrase (never chunked); "voiced" marks
             # the one ordinary reply this voice can speak.
             if text == fallback or "voiced" in text:
-                return b"\x01\x00" * 1600
+                return b"\x00\x40" * 1600
             return b""  # everything else is unspeakable for this voice
 
     async def _case():
@@ -582,7 +582,7 @@ def test_streamed_placeholder_delivery_resets_the_audibility_ledger():
 
         async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
             if text == fallback or "voiced" in text:
-                return b"\x01\x00" * 1600
+                return b"\x00\x40" * 1600
             return b""  # everything else is unspeakable for this voice
 
     async def _case():

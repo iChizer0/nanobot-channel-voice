@@ -21,8 +21,11 @@ class _SilentVad(Vad):
 
 
 def _pcm(text: str) -> bytes:
-    """Deterministic, phrase-distinct S16 payload so emitted audio names its phrase."""
-    return text.encode("utf-16-le") * 4
+    """Deterministic, phrase-distinct S16 payload so emitted audio names its phrase. The high
+    byte holds it at speech level: a clip that would be inaudible is dropped, not cached."""
+    return bytes(
+        0x40 if i % 2 else b for i, b in enumerate(text.encode("utf-16-le") * 4)
+    )
 
 
 class _FakeTts:

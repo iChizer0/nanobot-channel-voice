@@ -142,6 +142,10 @@ _CLOSE_ACK_MAX_ACTIVE_MS = 1300
 _EARCON_MAX_MS = 600
 _EARCON_MAX_FILE_B = 2_000_000  # refuse absurd files unread: ~10 s of 48 k stereo already
 
+# Audibility floor for a canned clip. The quietest real ack measured 0.018 rms, so below this
+# the engine voiced nothing: the clip is silence with a duration, not a quiet phrase.
+_CANNED_MIN_RMS = 0.005
+
 
 def _swallow_result(task: asyncio.Task) -> None:
     """Retrieve an abandoned decode's outcome: no "exception was never retrieved"."""
@@ -904,6 +908,7 @@ class LocalBackend(TurnEventMixin):
         # Raw-PCM output follows the SINK's mode (the channel derived it from the TTS adapter),
         # so we can never emit pcm into a blob sink or vice versa.
         self._pcm_out = sink.stream_mode
+        self._quiet_canned: set[str] = set()  # warned-once: clips that synthesized inaudible
         # Phrase -> audio, session-scoped: prewarm_canned() fills it (probe_ok only), else lazily.
         self._fillers: dict[str, bytes] = {}
         # Notification cues (earcons.*), built at init. None = off, or an unbuildable cue.
@@ -3764,17 +3769,39 @@ class LocalBackend(TurnEventMixin):
 
     async def _synth_filler(self, text: str) -> bytes:
         """Synthesize-and-cache one canned phrase, stored PLAYABLE (edge-trimmed, duck baked).
-        A transient failure is never cached as permanent silence."""
+        A clip that would not be HEARD is never cached: silence is a failure to retry."""
         audio = self._fillers.get(text)
-        if audio is None:
-            audio = await (
-                self._tts.synthesize_pcm(text) if self._pcm_out else self._tts.synthesize(text)
-            )
-            if audio:
-                audio = await asyncio.to_thread(self._prep_canned, audio)
-            if audio:
-                self._fillers[text] = audio
+        if audio is not None:
+            return audio
+        raw = await (
+            self._tts.synthesize_pcm(text) if self._pcm_out else self._tts.synthesize(text)
+        )
+        if not self._canned_audible(text, raw):
+            return b""
+        audio = await asyncio.to_thread(self._prep_canned, raw)
+        if audio:
+            self._fillers[text] = audio
         return audio
+
+    def _canned_audible(self, text: str, audio: bytes) -> bool:
+        """Whether a fresh canned clip will be heard at all. Non-empty near-silence passes
+        every downstream check and takes the turn SPEAKING for nothing — worth a warning and
+        a retry, since caching it would make one bad synthesis permanent."""
+        pcm = audio if self._pcm_out else wav_pcm(audio)[0]
+        if audio and not pcm:
+            return True  # unmeasurable blob; _prep_canned plays it as-is
+        rms = pcm_rms(pcm) if pcm else 0.0
+        if rms >= _CANNED_MIN_RMS:
+            return True
+        if text not in self._quiet_canned:
+            self._quiet_canned.add(text)
+            self._log.warning(
+                "voice: canned phrase '{}' synthesized to {} and will NOT be heard "
+                "(the engine voiced none of it — wrong language for this TTS?). Retrying "
+                "on next use; set wake.ack.phrases/prologue.phrases it can speak.",
+                text, "nothing" if not pcm else f"near-silence, rms {rms:.4f}",
+            )
+        return False
 
     async def _phrase_pcm(self, text: str, rate: int) -> bytes:
         """One calibration clip: the session TTS's own audio at capture rate."""
@@ -3905,17 +3932,12 @@ class LocalBackend(TurnEventMixin):
             if self._closing or self._turn is not VoiceState.IDLE:
                 return
             try:
-                audio = await self._synth_filler(text)
+                await self._synth_filler(text)  # unusable clips warn and stay uncached
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - warmup is an optimization, never a gate
                 self._log.debug("canned prewarm failed for '{}': {}", text, exc)
                 return
-            if not audio:
-                self._log.warning(
-                    "voice: canned phrase '{}' synthesized to silence (phrase not "
-                    "speakable by this TTS engine?) — it will never play", text,
-                )
 
     async def _play_filler(self, epoch: int, step: int) -> bool:
         """Speak escalation-script phrase ``step`` (clamped to the last). Returns whether

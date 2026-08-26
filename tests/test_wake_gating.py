@@ -1645,6 +1645,32 @@ def test_prewarm_outlives_an_unspeakable_phrase():
     _run(_case())
 
 
+def test_an_inaudible_clip_is_never_cached_and_retries():
+    """A clip that plays as nothing is a failed synthesis, not a phrase: caching it would
+    make one bad moment permanent while every later reply synthesizes fine."""
+
+    async def _case():
+        async with EvalConversation(
+            **_wake("gate", ack={"enabled": True, "phrases": ["hello there"]}),
+        ) as conv:
+            b = conv.backend
+            real = b._tts.synthesize_pcm
+            hush = [True]
+
+            async def maybe_hush(text, *, voice=None):
+                pcm = await real(text, voice=voice)
+                return bytes(len(pcm)) if hush[0] else pcm  # audible-length pure silence
+
+            b._tts.synthesize_pcm = maybe_hush
+            assert await b._synth_filler("hello there") == b""
+            assert "hello there" not in b._fillers      # not remembered as a phrase
+            hush[0] = False
+            assert await b._synth_filler("hello there")  # the retry gets real audio
+            assert "hello there" in b._fillers
+
+    _run(_case())
+
+
 def test_synth_filler_bakes_the_blob_duck_once():
     """Blob mode + duckDb: trims and the static attenuation live IN the cache,
     so a cache-hit ack pays a dict lookup, not per-play thread hops."""
