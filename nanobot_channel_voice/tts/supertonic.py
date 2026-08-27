@@ -199,6 +199,8 @@ class SupertonicTtsAdapter(OnDeviceTtsAdapter):
         model_kw = dict(
             core_mask=sc.core_mask, target=sc.target, device_id=sc.device_id,
             providers=sc.execution_providers, provider_options=sc.provider_options,
+            # prepack stays: int8 graphs, and synth speed is JIT-deadline-critical
+            profile="bulk", prepack=True,
         )
         with ExitStack() as models:
             graphs = [

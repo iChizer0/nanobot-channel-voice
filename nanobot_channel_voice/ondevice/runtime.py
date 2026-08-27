@@ -108,7 +108,14 @@ class OnDeviceModel:
         provider_options: list | None = None,
         intra_op_threads: int | None = None,
         rknn_input_permutation: tuple[int, ...] | None = None,
+        profile: str = "frame",
+        prepack: bool | None = None,
     ):
+        """``profile`` (ONNX only): ``"frame"`` = ORT defaults, for fixed-shape
+        per-frame sessions. ``"bulk"`` = per-utterance sessions: the CPU arena is off
+        (it ratchets to the largest input ever seen and never shrinks) and so is
+        weight pre-packing, unless ``prepack=True`` keeps it (int8 GEMMs decode
+        markedly slower unpacked; fp32 loses nothing)."""
         self._rknn: Any = None
         self._sess: Any = None
         self._released = False
@@ -145,6 +152,10 @@ class OnDeviceModel:
             opts.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
             opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
             opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+            if profile == "bulk":
+                opts.enable_cpu_mem_arena = False
+                if prepack is None or not prepack:
+                    opts.add_session_config_entry("session.disable_prepacking", "1")
             kwargs["sess_options"] = opts
             self._sess = onnxruntime.InferenceSession(path, **kwargs)
         else:

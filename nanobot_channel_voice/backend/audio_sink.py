@@ -37,6 +37,9 @@ _DUCK_STREAM_LEAD_MS = 120.0
 _GAIN_BLOCK_MS = 20  # envelope granularity (one gain step per block)
 # A ~250 ms cue is audibly late behind an open this slow; below it, nobody notices.
 _SLOW_OPEN_MS = 80.0
+# Producer-side backlog ceiling: playback is real time while blob-mode synthesis is
+# not, so an uncapped queue holds a whole reply's audio. Far above the JIT runway.
+MAX_BACKLOG_MS = 30_000.0
 
 
 try:  # numpy ships with the [ondevice] extra; pure-python loops are the fallback
@@ -146,6 +149,9 @@ class AudioSink:
         self._generation = 0
         self._rate = 0
         self._queued_ms = 0.0  # duration of queued-but-unwritten items (backlog_ms)
+        # Set whenever _queued_ms shrinks (item played, flush): wakes wait_backlog_below.
+        self._space = asyncio.Event()
+        self._space.set()
         # Drain (EOF) begun: unwritable, still killable; flush() kills BOTH.
         self._draining: PlaybackStream | None = None
         self._reapers: set[asyncio.Task] = set()  # detached natural-drain finishers
@@ -349,6 +355,8 @@ class AudioSink:
             self._worker = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
+        # A cancelled worker never debits again: release any parked producer now.
+        self._space.set()
         if self._worker is not None:
             self._worker.cancel()
             with suppress(asyncio.CancelledError, Exception):
@@ -377,6 +385,16 @@ class AudioSink:
             self._queued_ms += self._item_ms(audio)
         self._queue.put_nowait(audio)
 
+    async def wait_backlog_below(self, cap_ms: float = MAX_BACKLOG_MS) -> None:
+        """Producer-side backpressure: block until the queued backlog is under
+        ``cap_ms``. Cannot wedge — the worker debits as items play (real time) and
+        ``flush()`` zeroes the backlog outright, both waking waiters."""
+        while self._queued_ms > cap_ms:
+            self._space.clear()
+            if self._queued_ms <= cap_ms:  # a debit raced the clear
+                break
+            await self._space.wait()
+
     async def flush(self) -> int:
         """Barge-in: invalidate queued/in-flight audio and stop playback now.
         Returns ms actually heard on the current stream (for the cloud's
@@ -389,6 +407,7 @@ class AudioSink:
                 self._queue.task_done()
                 drained += 1
         self._queued_ms = 0.0
+        self._space.set()
         played = self.played_ms() if self._mode == "stream" else 0
         # Kill through OUR handles: valid mid-drain and for reaper-parked tails too.
         await self._kill_streams()
@@ -485,6 +504,7 @@ class AudioSink:
                     # Debit only what enqueue credited, else a dead item thins the
                     # NEXT turn's echo hold.
                     self._queued_ms = max(0.0, self._queued_ms - self._item_ms(item))
+                self._space.set()
                 self._queue.task_done()
                 if self._queue.empty():
                     self._idle.set()

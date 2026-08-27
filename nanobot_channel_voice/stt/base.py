@@ -179,8 +179,17 @@ def pcm_to_float_mono(pcm: bytes, src_rate: int, dst_rate: int):
     return np.interp(x, np.arange(len(audio)), audio).astype(np.float32)
 
 
-def read_token_table(path: str) -> dict[int, str]:
-    """Parse a sherpa-style ``<token> <id>`` tokens file into ``{id: token}``."""
+class DenseTokenTable(list):
+    """``{id: token}`` for the common dense case (ids 0..n-1), as a list: a 25k-entry
+    dict costs ~2 MB more than the strings it holds. Same read API as the dict."""
+
+    def get(self, idx: int, default: str = "") -> str:
+        return self[idx] if 0 <= idx < len(self) else default
+
+
+def read_token_table(path: str) -> dict[int, str] | DenseTokenTable:
+    """Parse a sherpa-style ``<token> <id>`` tokens file into ``{id: token}``
+    (a :class:`DenseTokenTable` when the ids are exactly 0..n-1)."""
     tokens: dict[int, str] = {}
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -191,6 +200,8 @@ def read_token_table(path: str) -> dict[int, str]:
     if not tokens:
         # An empty table decodes every utterance to "": a mute STT that looks healthy.
         raise ValueError(f"no tokens parsed from {path} (wrong format?)")
+    if len(tokens) == max(tokens) + 1 and min(tokens) == 0:
+        return DenseTokenTable(tokens[i] for i in range(len(tokens)))
     return tokens
 
 

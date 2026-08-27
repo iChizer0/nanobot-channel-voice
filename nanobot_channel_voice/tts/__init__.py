@@ -48,6 +48,17 @@ def _build_supertonic(cfg: TtsConfig) -> TtsAdapter:
     return SupertonicTtsAdapter.from_config(cfg.supertonic)
 
 
+def _same_file(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    import os
+
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _build_one_matcha(cfg, *, vocoder_share=None) -> TtsAdapter:
     from nanobot_channel_voice.tts.matcha import MatchaTtsAdapter, SplitMatchaTtsAdapter
 
@@ -76,15 +87,28 @@ def _build_matcha(cfg: TtsConfig) -> TtsAdapter:
             "+".join(primary.spoken_languages),  # type: ignore[attr-defined]
         )
     try:
-        # One vocoder session serves both when the dynamic engines name the same file;
-        # caller-decided, so a failed secondary build never tears down primary's session.
+        # One vocoder session serves both when the dynamic engines name the same file
+        # (samefile: two spellings of one path are one session); caller-decided, so a
+        # failed secondary build never tears down primary's session.
         share = (
             primary._vocoder  # type: ignore[union-attr]
             if cfg.matcha.acoustic_model_path and second.acoustic_model_path
-            and cfg.matcha.vocoder_path
-            and cfg.matcha.vocoder_path == second.vocoder_path
+            and cfg.matcha.vocoder_path and second.vocoder_path
+            and _same_file(cfg.matcha.vocoder_path, second.vocoder_path)
             else None
         )
+        if (
+            share is None
+            and cfg.matcha.acoustic_model_path and second.acoustic_model_path
+            and cfg.matcha.vocoder_path and second.vocoder_path
+            and getattr(primary, "_vocoder", None) is not None
+        ):
+            # Info, not warning: different vocoders may be the only valid pairing
+            # (rate mismatch) — the second session is a known cost, not an error.
+            logger.info(
+                "voice: tts.matcha.secondary loads its own vocoder session "
+                "(vocoderPath differs from the primary's)"
+            )
         secondary = _build_one_matcha(second, vocoder_share=share)
     except BaseException:
         primary.release()

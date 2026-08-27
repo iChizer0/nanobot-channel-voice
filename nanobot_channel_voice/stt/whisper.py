@@ -135,8 +135,10 @@ class WhisperOnDeviceStt(SttAdapter):
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
         )
         with ExitStack() as models:  # any failure below releases every loaded model
+            # Encoder runs once per utterance; the decoder runs PER TOKEN and keeps
+            # ORT defaults — bulk there is slower AND bigger (per-token malloc churn).
             encoder = models.enter_context(
-                OnDeviceModel(cfg.encoder_path, **model_kw)  # type: ignore[arg-type]
+                OnDeviceModel(cfg.encoder_path, profile="bulk", **model_kw)  # type: ignore[arg-type]
             )
             decoder = models.enter_context(
                 OnDeviceModel(cfg.decoder_path, **model_kw)  # type: ignore[arg-type]

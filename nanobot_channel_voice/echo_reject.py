@@ -115,6 +115,8 @@ class SelfEchoFilter:
         sink backlog + own duration) shifts the stamp so eviction runs from
         last-audible, not feed time — text streams far faster than it plays, and
         feed-time stamps let the bot barge in on its own tail."""
+        # Write-side eviction: the read side only runs when someone speaks back.
+        self._evict()
         units = units_of(text)
         if not units:
             return
@@ -141,7 +143,15 @@ class SelfEchoFilter:
         heard = units_of(transcript)
         if not heard:
             return set()
-        spoken, streams = self._spoken_view(list(self._spoken))
+        for _ in range(3):  # loop-side evict can mutate under the snapshot: retry
+            try:
+                entries = list(self._spoken)
+                break
+            except RuntimeError:
+                entries = None
+        if entries is None:
+            return set()  # "nothing fresh" = this poll is skipped, later ones re-run
+        spoken, streams = self._spoken_view(entries)
         return {
             u for u in heard
             if u not in spoken

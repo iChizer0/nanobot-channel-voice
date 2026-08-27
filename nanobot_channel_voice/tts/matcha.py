@@ -142,7 +142,7 @@ def load_lexicon(path: str, token2id: dict[str, int]) -> dict[str, list[int]]:
 
 def _load_lexicons(
     path: str, overrides_path: str | None, token2id: dict[str, int]
-) -> dict[str, list[int]]:
+) -> PackedLexicon:
     """Override entries win over the model lexicon."""
     word2ids = load_lexicon(path, token2id)
     if overrides_path:
@@ -154,7 +154,39 @@ def _load_lexicons(
                 overrides_path, len(dropped), " ".join(dropped[:8]),
             )
         word2ids |= overrides
-    return word2ids
+    return PackedLexicon(word2ids)
+
+
+class PackedLexicon:
+    """Read-only ``word -> token ids``, the id lists packed into one int32 array
+    (68k per-word Python lists cost several MB more than the ids they hold).
+    ``_index`` values encode ``start << 16 | length``."""
+
+    __slots__ = ("_index", "_ids")
+
+    def __init__(self, word2ids: dict[str, list[int]]):
+        self._index: dict[str, int] = {}
+        flat: list[int] = []
+        for word, ids in word2ids.items():
+            if len(ids) >= 1 << 16:  # length shares the int with start: keep it honest
+                raise ValueError(f"lexicon entry '{word}' has {len(ids)} ids (>= 2^16)")
+            self._index[word] = (len(flat) << 16) | len(ids)
+            flat.extend(ids)
+        self._ids = np.asarray(flat, dtype=np.int32)
+
+    def __contains__(self, word: str) -> bool:
+        return word in self._index
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, word: str) -> list[int]:
+        packed = self._index[word]
+        start = packed >> 16
+        return self._ids[start : start + (packed & 0xFFFF)].tolist()
 
 
 def add_blank(ids: list[int], pad_id: int) -> list[int]:
@@ -397,7 +429,7 @@ class LexiconFrontend:
 
     def __init__(
         self,
-        word2ids: dict[str, list[int]],
+        word2ids: dict[str, list[int]] | PackedLexicon,
         token2id: dict[str, int],
         english: EnglishToPinyin | EnglishToIpa | None = None,
         latin_space_id: int | None = None,
@@ -751,6 +783,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         model_kw = dict(
             core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
+            profile="bulk",
         )
         with ExitStack() as models:
             acoustic = models.enter_context(
@@ -1077,6 +1110,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         model_kw = dict(
             core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
+            profile="bulk",
         )
         with ExitStack() as models:
             encoder, decoder, vocoder = (

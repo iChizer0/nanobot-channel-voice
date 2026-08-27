@@ -152,6 +152,8 @@ export NANOBOT_VOICE_INDEX=https://example.com/voice-weights.json   # ONNX examp
 nanobot-voice sync                                                  # fetch every weights key the config names, sha256-verified
 ```
 
+On a small board (≤2 GB RAM), also export `MALLOC_ARENA_MAX=2` in the gateway's environment (e.g. the systemd unit): Python's worker threads otherwise each pull a glibc malloc arena that parks freed memory — measured −33 MB on top of the default stack's built-in session tuning, no performance cost.
+
 ### CPU
 
 SenseVoice STT (fast CTC, zh/yue/en/ja/ko) and Supertonic-3 TTS (31 languages, no zh), both ONNX on CPU.

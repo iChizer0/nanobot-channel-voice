@@ -145,6 +145,11 @@ def _load_connect():
 
 
 class RealtimeBackend(TurnEventMixin):
+    # The rx loop emits audio AND carries speech_started/tool/done events: parked on
+    # the sink backlog it would defer open-mic barge-in by the whole buffered reply
+    # (and starve the WS keepalive). The queue stays reply-bounded, epoch-dropped.
+    pace_output_audio = False
+
     def __init__(
         self,
         config: VoiceConfig,

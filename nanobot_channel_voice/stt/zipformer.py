@@ -37,6 +37,7 @@ from loguru import logger
 from nanobot_channel_voice.config import ZipformerSttConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel, check_deterministic
 from nanobot_channel_voice.stt.base import (
+    DenseTokenTable,
     SttAdapter,
     SttStream,
     pcm_to_float_mono,
@@ -95,7 +96,7 @@ class ZipformerOnDeviceStt(SttAdapter):
         encoder: OnDeviceModel,
         decoder: OnDeviceModel,
         joiner: OnDeviceModel,
-        tokens: dict[int, str],
+        tokens: dict[int, str] | DenseTokenTable,
         chunk_t: int,
         chunk_shift: int,
         context_size: int,
@@ -285,6 +286,9 @@ class ZipformerOnDeviceStt(SttAdapter):
             # Commit the cursor exactly HERE: earlier, a raising encoder would skip the
             # chunk with stale caches; later, a raising joiner would re-feed advanced ones.
             s.consumed += self._chunk_shift
+            # Frames below the cursor are never re-read (vstack copied the views);
+            # unpopped, knf retains the whole utterance. pop() keeps indices absolute.
+            s.fbank.pop(self._chunk_shift)
             self._greedy(s, np.asarray(named["encoder_out"])[0])
 
     def _greedy(self, s: _ZipformerStream, encoder_out: np.ndarray) -> None:

@@ -21,7 +21,7 @@ Methodology:
 from __future__ import annotations
 
 import time
-from collections import deque
+from array import array
 from dataclasses import dataclass, field
 
 # Ring bound; 4096 is well over what any percentile we will claim needs.
@@ -39,15 +39,27 @@ def _now_ms() -> float:
 
 
 class _Samples:
-    """Raw latency samples for one metric, with nearest-rank quantiles."""
+    """Raw latency samples for one metric, with nearest-rank quantiles.
 
-    __slots__ = ("_buf",)
+    A flat ``array("d")`` ring, not a deque of floats: the per-frame keys stay full
+    for the process lifetime and boxed floats cost ~4x the 8 bytes needed. Overwrite
+    order is irrelevant (summary() sorts); the threaded write race loses a sample,
+    never corrupts — the counter-bump contract."""
+
+    __slots__ = ("_buf", "_i")
 
     def __init__(self) -> None:
-        self._buf: deque[float] = deque(maxlen=_MAX_SAMPLES)
+        self._buf = array("d")
+        self._i = 0
 
     def add(self, ms: float) -> None:
-        self._buf.append(ms)
+        if len(self._buf) < _MAX_SAMPLES:
+            self._buf.append(ms)
+        else:
+            self._buf[self._i] = ms
+            # real length, not _MAX_SAMPLES: a boundary append race can overshoot by
+            # one, and every slot must stay reachable
+            self._i = (self._i + 1) % len(self._buf)
 
     def __len__(self) -> int:
         return len(self._buf)

@@ -78,6 +78,8 @@ class VoiceShell:
         self._capture = capture
         self._sink = sink
         self._backend = backend
+        # getattr: absent (older stubs) means local-shaped, where parking is safe.
+        self._pace_audio = getattr(backend, "pace_output_audio", True)
         # Half-duplex wake tap: a backend exposing push_gated_audio still hears gated
         # frames (wake detector only), so the wake word can barge in. Absent on cloud.
         self._gated_push = getattr(backend, "push_gated_audio", None)
@@ -259,6 +261,10 @@ class VoiceShell:
         if isinstance(event, StateHint):
             self._apply_state(event.state)
         elif isinstance(event, OutputAudio):
+            # Bounds the sink queue by stalling the emitter task, never the loop; a
+            # flush wakes it into the epoch drop. See VoiceBackend.pace_output_audio.
+            if self._pace_audio:
+                await self._sink.wait_backlog_below()
             self._sink.enqueue(event)
         elif isinstance(event, UserSpeechStarted):
             await self._cloud_barge_in()

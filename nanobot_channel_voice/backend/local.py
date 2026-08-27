@@ -592,6 +592,8 @@ def _cut_index(text: str, budget: int, floor: int) -> int:
 
 
 class LocalBackend(TurnEventMixin):
+    pace_output_audio = True  # audio is emitted by the TTS worker: safe to park
+
     def __init__(
         self,
         config: VoiceConfig,
@@ -892,7 +894,9 @@ class LocalBackend(TurnEventMixin):
         self._early_heard: str | None = None  # heard text at an EARLY confirm, consumed at close
 
         # Epoch tagged at enqueue: a chunk queued before a barge-in dies before synthesis.
-        self._tts_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+        # 512 chunks (~hours of speech) is a runaway-stream backstop, not pacing.
+        self._tts_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue(maxsize=512)
+        self._tts_overflow_warn = Throttle()
         self._tts_task: asyncio.Task | None = None
         self._drain_task: asyncio.Task | None = None
         # Per-char synth cost (ms) EMA for the JIT schedule; the worker's first chunk seeds it.
@@ -3138,7 +3142,16 @@ class LocalBackend(TurnEventMixin):
             self._metrics.observe(
                 "chunker_wait_ms", (time.monotonic() - self._cur_turn.published_at) * 1000.0
             )
-        self._tts_queue.put_nowait((self._sink.epoch, text))
+        try:
+            self._tts_queue.put_nowait((self._sink.epoch, text))
+        except asyncio.QueueFull:
+            # drop-newest: drop-oldest would garble the already-queued speech
+            self._metrics.count("tts_queue_overflow_dropped")
+            if self._tts_overflow_warn.ready():
+                self._log.warning(
+                    "TTS text queue full ({} chunks); dropping newest chunk",
+                    self._tts_queue.maxsize,
+                )
 
     async def _tts_worker(self) -> None:
         while True:

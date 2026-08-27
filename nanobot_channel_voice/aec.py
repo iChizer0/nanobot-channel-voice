@@ -40,7 +40,9 @@ class EchoCanceller:
             raise ValueError(f"AEC needs a sample rate divisible by 100, got {capture_rate}")
         self._rate = capture_rate
         self._frame_b = (capture_rate // 100) * 2  # 10 ms of S16_LE mono
-        self._pending: deque[tuple[float, bytes, int]] = deque()  # playout_at, pcm, rate
+        # playout_at, pcm, rate. maxlen = 30 s of 10 ms blocks: only process() drains
+        # this, and a dead capture path would otherwise let playback grow it forever.
+        self._pending: deque[tuple[float, bytes, int]] = deque(maxlen=3000)
         self._ref_carry = b""  # sub-10 ms remainder of the last reference push
         self._carry_rate = 0
         self._warned_rate = 0

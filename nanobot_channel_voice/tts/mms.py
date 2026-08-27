@@ -146,6 +146,7 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
         model_kw = dict(
             core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
+            profile="bulk",
         )
         with ExitStack() as models:
             encoder = models.enter_context(

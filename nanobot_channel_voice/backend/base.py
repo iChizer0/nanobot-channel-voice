@@ -144,6 +144,11 @@ class VoiceBackend(Protocol):
     # Capture rate is NOT here: the channel derives it from the provider profile /
     # device config when it builds the capture source, before any backend exists.
 
+    # May the shell park this backend's OutputAudio emitter on the sink backlog cap?
+    # True for a dedicated synthesis task (local); False when the emitter is the
+    # control plane (the realtime rx loop also carries barge-in and tool events).
+    pace_output_audio: bool
+
     async def start(
         self, *, instructions: str | None, tools: list[ToolDef], on_event: OnEvent
     ) -> None:

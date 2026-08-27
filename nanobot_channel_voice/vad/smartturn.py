@@ -40,6 +40,7 @@ class SmartTurnAnalyzer:
                 model_path, core_mask=core_mask, target=target, device_id=device_id,
                 providers=providers, provider_options=provider_options,
                 intra_op_threads=1,  # one core per consult: never contend with the frame path
+                profile="bulk",
             ))
             self._threshold = threshold
             self.window_bytes = 2 * WINDOW_SAMPLES  # consult-snapshot cap for the endpointer

@@ -34,7 +34,12 @@ from loguru import logger
 
 from nanobot_channel_voice.config import SenseVoiceSttConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
-from nanobot_channel_voice.stt.base import SttAdapter, pcm_to_float_mono, read_token_table
+from nanobot_channel_voice.stt.base import (
+    DenseTokenTable,
+    SttAdapter,
+    pcm_to_float_mono,
+    read_token_table,
+)
 
 SAMPLE_RATE = 16000
 _NUM_MEL_BINS = 80
@@ -126,7 +131,7 @@ class SenseVoiceOnDeviceStt(SttAdapter):
         self,
         *,
         model: OnDeviceModel,
-        tokens: dict[int, str],
+        tokens: dict[int, str] | DenseTokenTable,
         frontend: _Frontend,
         language_id: int,
         text_norm_id: int,
@@ -184,6 +189,8 @@ class SenseVoiceOnDeviceStt(SttAdapter):
                 sv.model_path,  # type: ignore[arg-type]
                 core_mask=sv.core_mask, target=sv.target, device_id=sv.device_id,
                 providers=sv.execution_providers, provider_options=sv.provider_options,
+                # arena-off kills the O(T^2) SAN-M ratchet; prepack stays (int8-common)
+                profile="bulk", prepack=True,
             ))
             adapter = cls(
                 model=model,
