@@ -108,11 +108,14 @@ def fold_punct_aliases(token2id: dict[str, int]) -> dict[str, int]:
 
 def _parse_lexicon(path: str, token2id: dict[str, int]) -> tuple[dict[str, list[int]], list[str]]:
     """``lexicon.txt``: ``<word> <phone>...`` per line, first spelling wins; a word with
-    any unknown phone is dropped (sherpa behaviour) and returned by name."""
+    any unknown phone is dropped (sherpa behaviour) and returned by name. ``#``-led
+    lines are comments (hand-authored overrides carry curation notes)."""
     word2ids: dict[str, list[int]] = {}
     dropped: list[str] = []
     with open(path, encoding="utf-8") as f:
         for line in f:
+            if line.lstrip().startswith("#"):
+                continue
             parts = line.split()
             if len(parts) < 2:
                 continue

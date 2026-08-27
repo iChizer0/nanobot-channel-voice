@@ -59,6 +59,13 @@ def test_load_lexicon_first_spelling_wins_and_oov_phones_drop(tmp_path):
     assert "坏" not in lex            # unknown phones drop the word (sherpa behaviour)
 
 
+def test_lexicon_comment_lines_are_skipped(tmp_path):
+    p = tmp_path / "overrides.txt"
+    p.write_text("# curation note: chang2 an4\n好 h ao3\n  # indented note\n", encoding="utf-8")
+    lex = load_lexicon(str(p), {"h": 1, "ao3": 2, "chang2": 3, "an4": 4})
+    assert lex == {"好": [1, 2]}  # notes never become a speakable "#" entry
+
+
 def test_lexicon_overrides_layer_over_the_model_lexicon(tmp_path):
     from nanobot_channel_voice.tts.matcha import _load_lexicons
 
@@ -70,6 +77,30 @@ def test_lexicon_overrides_layer_over_the_model_lexicon(tmp_path):
     lex = _load_lexicons(str(base), str(over), tokens)
     assert lex["抽空"] == [3, 2]      # new phrase entry wins greedy longest-match
     assert lex["空"] == [1]           # bad override phone drops; the model entry stays
+
+
+def test_longer_override_beats_the_greedy_two_plus_one(tmp_path):
+    """The 门把手 pattern: the model lexicon reads it 门把(ba4)+手; a 3-char override
+    entry wins greedy longest-match. And the armor pattern: a default-reading entry
+    (尊重) pins its boundary so a 2-char override (重来) cannot reach across it."""
+    from nanobot_channel_voice.tts.matcha import _load_lexicons
+
+    base = tmp_path / "lexicon.txt"
+    base.write_text(
+        "门 men2\n把 ba3\n手 shou3\n门把 men2 ba4\n把手 ba3 shou3\n"
+        "尊 zun1\n重 zhong4\n来 lai2\n", encoding="utf-8",
+    )
+    over = tmp_path / "overrides.txt"
+    over.write_text("门把手 men2 ba3 shou3\n重来 chong2 lai2\n尊重 zun1 zhong4\n", encoding="utf-8")
+    tokens = {"men2": 1, "ba3": 2, "ba4": 3, "shou3": 4,
+              "zun1": 5, "zhong4": 6, "chong2": 7, "lai2": 8}
+    fe = LexiconFrontend(_load_lexicons(str(base), str(over), tokens), tokens)
+    (seq,) = fe.sentences("门把手")
+    assert seq == [1, 2, 4]           # override, not 门把+手 = [1, 3, 4]
+    (seq,) = fe.sentences("重来")
+    assert seq == [7, 8]              # the override reads bare 重来 as chong2
+    (seq,) = fe.sentences("尊重来")
+    assert seq == [5, 6, 8]           # 尊重 pins the boundary: never 尊+重来
 
 
 def test_lexicon_overrides_require_a_lexicon():

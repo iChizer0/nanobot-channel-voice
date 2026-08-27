@@ -44,7 +44,7 @@ from nanobot_channel_voice.audio.pcm import (
     wav_duration_ms,
     wav_pcm,
 )
-from nanobot_channel_voice.chunker import SentenceChunker
+from nanobot_channel_voice.chunker import SentenceChunker, has_speech
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.dump import AudioDumper, default_dump_root
 from nanobot_channel_voice.echo_reject import SelfEchoFilter, units_of
@@ -83,6 +83,8 @@ _JIT_POLL_CAP_S = 0.25  # wait granularity: pause freeze / barge-in / fresh text
 _MPC_ALPHA = 0.3
 _MPC_MIN = 1e-3
 _GAP_COUNT_MIN_MS = 20.0  # dry spells under this are inaudible
+
+_CJK_FLOOR = 0x2E80  # same script split as echo_reject.py, wake/phrase.py, tts/router.py
 
 # AEC3 convergence budget, in ACCEPTED REFERENCE AUDIO not wall time: until then the residual
 # transcribes as "fresh words", so early-confirm holds back (the endpoint verdict still decides).
@@ -204,7 +206,7 @@ def _script_class(text: str) -> str | None:
             return "hangul"
         if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF:
             seen_han = True
-        elif cp < 0x2E80 and ch.isalpha():
+        elif cp < _CJK_FLOOR and ch.isalpha():
             seen_latin = True
     if seen_han:
         return "han"
@@ -251,14 +253,13 @@ def _opens_with_wait_phrase(text: str) -> bool:
     return text.lstrip(" \t\r\n\"'“”‘’(（[【").lower().startswith(_WAIT_PHRASES)
 
 
-_NOTE_CJK_FLOOR = 0x2E80  # same split as echo_reject.py, wake/phrase.py, tts/router.py
 
 
 def _heard_tail(heard: str, *, max_words: int = 12, max_cjk_chars: int = 20) -> str:
     """Bound a heard-up-to quote to its tail (the cut point is the only new information):
     words for Latin, characters for an unspaced CJK tail."""
     heard = " ".join(heard.split())
-    if any(ord(ch) >= _NOTE_CJK_FLOOR for ch in heard[-6:]):
+    if any(ord(ch) >= _CJK_FLOOR for ch in heard[-6:]):
         cut, tail = len(heard) > max_cjk_chars, heard[-max_cjk_chars:]
     else:
         parts = heard.split(" ")
@@ -535,10 +536,11 @@ def _scale_wav(wav_bytes: bytes, gain: float) -> bytes:
         return wav_bytes
 
 
-# How far past the budget a cut may reach for a word boundary: ~one long word, ~100 ms.
-_CUT_LOOKAHEAD = 16
+_CUT_LOOKAHEAD = 16  # reach past the budget for a Latin token end: ~one long word
+_CUT_MIN_TAIL = 6    # a smaller remainder is overhead-dominated: swallow it whole
 _CUT_SENT = set(".!?…。！？")
 _CUT_CLAUSE = set(",;:，、；：")
+_CUT_CLOSERS = set("\"')]}»”’」』】）〉》")  # ride with their sentence, as in the chunker
 
 # Seam silence, ms. The model pads every utterance identically whatever it ends with
 # (matcha 590 ms after "。", "，" or a bare cut), so only the text can size a seam.
@@ -559,36 +561,77 @@ def _seam_tail_ms(text: str) -> float:
     return _SEAM_CLAUSE_MS if ch in _CUT_CLAUSE else _SEAM_OPEN_MS
 
 
+def _boundary_ok(text: str, i: int) -> bool:
+    # Punct binds into a Latin token ("3.14", "1,234"); CJK on either side never binds.
+    if ord(text[i]) >= _CJK_FLOOR or i + 1 >= len(text):
+        return True
+    nxt = text[i + 1]
+    return not (nxt.isalnum() and ord(nxt) < _CJK_FLOOR)
+
+
+def _boundary_run_end(text: str, i: int) -> int:
+    """Cut index after the terminator at ``i``, extended over its cluster and closers
+    ("？！", "。」") — a stranded one heads the next piece as a phantom pause."""
+    j = i + 1
+    while j < len(text) and (text[j] in _CUT_SENT or text[j] in _CUT_CLOSERS):
+        j += 1
+    return j
+
+
+def _token_pair(text: str, j: int) -> bool:
+    """Do ``text[j-1:j+1]`` sit inside one Latin token (letters, digits, or the
+    digit-bound punctuation ``_boundary_ok`` refuses to cut)?"""
+
+    def tok(k: int) -> bool:
+        ch = text[k]
+        if ch.isalnum() and ord(ch) < _CJK_FLOOR:
+            return True
+        return (
+            ch in ".,:" and 0 < k < len(text) - 1
+            and text[k - 1].isdigit() and text[k + 1].isdigit()
+        )
+
+    return 0 < j < len(text) and tok(j - 1) and tok(j)
+
+
 def _cut_index(text: str, budget: int, floor: int) -> int:
-    """Cut for an over-budget chunk: last sentence end in [floor, budget], else clause
-    punctuation, else space, else the next word boundary just past it — TTS front-ends
-    terminate fragments, so a bad seam gets sentence-final prosody. Ranges INCLUDE ``floor``
-    (exclusive ones are empty at ``budget == floor``, and the slice lands mid-word); the
-    look-ahead overshoots by at most a word, which the 2x synthesis lead absorbs."""
-    window = min(len(text), budget)
-    for punct in (_CUT_SENT, _CUT_CLAUSE):
-        for i in range(window - 1, floor - 2, -1):
-            # ASCII punct binds to a following alnum ("3.14", "1,234"); CJK stands alone.
-            if text[i] in punct and (
-                ord(text[i]) >= 0x2E80 or i + 1 >= len(text) or not text[i + 1].isalnum()
-            ):
-                return i + 1
-    space = text.rfind(" ", max(0, floor - 1), window)
+    """Cut for an over-budget chunk, best boundary first (sentence > clause > space >
+    token edge > cap) — TTS front-ends terminate fragments, so a bad seam gets
+    sentence-final prosody. Searches span [floor//2, window + floor//2]: a half-floor
+    piece at a real boundary beats a floor-sized one cut mid-word, and overshoot up
+    to half the floor stays inside the 2x synthesis lead at any floor. Tails under
+    ``_CUT_MIN_TAIL`` within that reach are swallowed whole."""
+    window = min(len(text), max(1, budget))
+    lo = max(1, floor // 2)
+    reach = floor // 2
+
+    def swallow(cut: int) -> int:
+        if len(text) - cut < _CUT_MIN_TAIL and len(text) <= window + reach:
+            return len(text)
+        return cut
+
+    back = range(window - 1, lo - 2, -1)
+    ahead = range(window, min(len(text), window + reach))
+    for rng, punct in ((back, _CUT_SENT), (ahead, _CUT_SENT), (back, _CUT_CLAUSE)):
+        for i in rng:
+            if text[i] in punct and _boundary_ok(text, i):
+                return swallow(_boundary_run_end(text, i))
+    space = text.rfind(" ", max(0, lo - 1), window)
     if space > 0:
-        return space + 1
-    # Only a spaced script can be cut mid-word; CJK slices cleanly at any character,
-    # and one CJK "word" of look-ahead would be a second of unbudgeted speech.
-    if (
-        window < len(text)
-        and text[window - 1].isalnum()
-        and text[window].isalnum()
-        and ord(text[window]) < 0x2E80
-    ):
+        return swallow(space + 1)
+    if _token_pair(text, window):
+        # Reach to the crossing token's end, else retreat to its start: a severed
+        # token is read as two.
         nxt = text.find(" ", window)
-        end = len(text) if nxt < 0 else nxt  # no space left: a short tail goes whole
+        end = len(text) if nxt < 0 else nxt
         if end <= window + _CUT_LOOKAHEAD:
-            return min(end + 1, len(text))
-    return window
+            return swallow(min(end + 1, len(text)))
+        start = window
+        while start > 1 and _token_pair(text, start):
+            start -= 1
+        if lo <= start < window:  # token starts below lo: mid-token is unavoidable
+            return swallow(start)
+    return swallow(window)
 
 
 class LocalBackend(TurnEventMixin):
@@ -3206,24 +3249,31 @@ class LocalBackend(TurnEventMixin):
     def _take_piece(self, pending: list[str], budget: int) -> str:
         """Whole chunks greedily up to *budget*, CJK-aware separator between them; the head is
         cut inside only when it alone exceeds the budget (those seams cost prosody: counted),
-        never below the first-chunk floor."""
+        never below half the first-chunk floor."""
         head = pending[0]
         if len(head) > budget:
             cut = _cut_index(head, budget, self._cfg.chunker.min_chars_first)
+            if cut > budget:
+                self._metrics.count("tts_cut_extended")  # a boundary past the budget replaced a seam
             piece, rest = head[:cut].strip(), head[cut:].strip()
             if rest:
                 pending[0] = rest
                 self._metrics.count("tts_piece_split")
+                ch = head[cut - 1]
+                if not (ch.isspace() or ch in _CUT_CLOSERS or (
+                    (ch in _CUT_SENT or ch in _CUT_CLAUSE) and _boundary_ok(head, cut - 1)
+                )):  # no boundary served this cut (a digit-bound "." counts as none)
+                    self._metrics.count("tts_cut_blind")
                 return piece
-            pending.pop(0)  # the cut only shed whitespace: the whole head went
+            pending.pop(0)  # whitespace-only remainder, or the lookahead took it whole
             return piece
         parts = [pending.pop(0)]
         size = len(parts[0])
         while pending and size + len(pending[0]) <= budget:
             nxt = pending.pop(0)
             last = parts[-1]
-            # >= U+2E80 is CJK and up: those scripts take no space.
-            parts.append("" if (last[-1].isspace() or ord(last[-1]) >= 0x2E80) else " ")
+            # CJK scripts take no joining space.
+            parts.append("" if (last[-1].isspace() or ord(last[-1]) >= _CJK_FLOOR) else " ")
             parts.append(nxt)
             size += len(nxt)
         return "".join(parts)
@@ -3258,7 +3308,8 @@ class LocalBackend(TurnEventMixin):
             else:
                 mpc = max(mpc, _MPC_MIN)
                 floor = self._cfg.chunker.min_chars_first
-                # The ahead cap folded into WANT keeps release size == cut size.
+                # The ahead cap folded into WANT keeps release size ~= cut size
+                # (_cut_index may overshoot a boundary by at most floor // 2).
                 cap_chars = int(
                     (_SYNTH_AHEAD_CAP_S - _SYNTH_LEAD_MARGIN_S)
                     / _SYNTH_LEAD_SAFETY * 1000.0 / mpc
@@ -3294,6 +3345,14 @@ class LocalBackend(TurnEventMixin):
         """Shared synthesis tail of both worker paths (cost EMA, trim, spans, echo,
         metrics). False only when the epoch died during synthesis (the caller drops
         its remainder); empty audio returns True — the rest may still speak."""
+        if not has_speech(text):
+            # A pause the seam already carries: skip the (billable) synthesis, but the
+            # tail still judges sentence-attention's "?" and the unvoiced-final
+            # fallback stands down — deliberate silence is not an unspeakable reply.
+            self._metrics.count("tts_punct_piece_skipped")
+            self._reply_tail += text
+            self._cur_turn.emitted_audio = True
+            return True
         t0 = time.monotonic()
         if self._pcm_out:
             audio = await self._tts.synthesize_pcm(text)
@@ -3307,8 +3366,9 @@ class LocalBackend(TurnEventMixin):
             obs = synth_ms / len(text)
             ema = self._synth_mpc
             if ema is None:
-                self._synth_mpc = obs
-            else:
+                self._synth_mpc = obs  # any seed beats an unscheduled first pipeline
+            elif len(text) >= max(_CUT_MIN_TAIL, self._cfg.chunker.min_chars_first // 2):
+                # a shorter piece is overhead-dominated: not a speed sample
                 obs = min(max(obs, ema / 4.0), ema * 4.0)
                 self._synth_mpc = max(obs, (1.0 - _MPC_ALPHA) * ema + _MPC_ALPHA * obs)
         if epoch != self._sink.epoch:  # barged in during synthesis
@@ -3879,7 +3939,7 @@ class LocalBackend(TurnEventMixin):
             or (len(toks) >= 2 and floor[: len(toks)] == toks)
         ):
             return None
-        if all(ord(c) < 0x2E80 for c in rendered) and (
+        if all(ord(c) < _CJK_FLOOR for c in rendered) and (
             len(toks) == 1 and len(toks[0]) < 5
         ):
             return None  # a short latin word ("you") must never become a wake
@@ -3915,7 +3975,7 @@ class LocalBackend(TurnEventMixin):
         try:
             floor = tuple(tokens_of(await self._transcribe(b"\x00" * (2 * rate))))
             for phrase in cfg.phrases[:4]:
-                cjk = any(ord(c) >= 0x2E80 for c in phrase)
+                cjk = any(ord(c) >= _CJK_FLOOR for c in phrase)
                 for variant in (phrase, phrase + ("。" if cjk else ".")):
                     if self._closing or self._turn is not VoiceState.IDLE:
                         raise _AbandonCalibrationError

@@ -117,6 +117,14 @@ def test_first_chunk_floor_cuts_earlier_then_steady_floor_applies():
     assert c.feed("Another bit, ") == []
 
 
+def test_punct_only_chunk_keeps_the_first_chunk_floor():
+    c = SentenceChunker(min_chars=60, max_chars=240, min_chars_first=10)
+    # An emoji-only sentence sanitizes to bare punctuation: emitted, but not speech —
+    # the clause after it still cuts at min_chars_first, not min_chars.
+    assert c.feed("🎉！") == []  # terminator at the buffer end waits for the delta
+    assert c.feed("A tiny clause, ") == ["！", "A tiny clause,"]
+
+
 def test_max_chars_force_split_at_last_space():
     c = SentenceChunker(min_chars=10, max_chars=40)
     words = "word " * 20  # no sentence punctuation at all

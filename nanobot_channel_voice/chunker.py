@@ -53,6 +53,14 @@ _RE_UNSPEAKABLE = re.compile(
 )
 
 
+_SPEAKABLE_SYMBOLS = "%&+=@°$€£¥₹₽¢"  # kept by the whitelist above: TTS voices them as words
+
+
+def has_speech(text: str) -> bool:
+    """Anything a TTS would voice — pure punctuation/whitespace is a pause, not speech."""
+    return any(ch.isalnum() or ch in _SPEAKABLE_SYMBOLS for ch in text)
+
+
 def sanitize(text: str) -> str:
     """Best-effort markdown -> plain speakable text (+ speakable-charset pass)."""
     text = _RE_FENCE.sub(" ", text)
@@ -147,7 +155,8 @@ class SentenceChunker:
             text = sanitize(piece).strip()
             if text:
                 chunks.append(text)
-                self._spoke = True
+                # a punct-only chunk (emoji-only sentence) must not burn the TTFA floor
+                self._spoke = self._spoke or has_speech(text)
         return chunks
 
     def flush(self) -> str | None:
