@@ -7,6 +7,7 @@ A voice channel plugin for [nanobot](https://github.com/HKUDS/nanobot), talk to 
 - **Pluggable TTS**: OpenAI-compatible `/audio/speech` (cloud or a local server), on-device over ONNX/RKNN, or zero-dependency `espeak-ng`/`say`.
 - **Two on-device inference backends**: `.onnx` (CPU, or GPU/DLA on Jetson via the TensorRT/CUDA execution providers) and `.rknn` (Rockchip NPU). One `OnDeviceModel` dispatches on file extension, so the same adapter code drives both.
 - **Duck-then-confirm barge-in**: half-duplex mutes the mic while speaking, or the open-mic modes (hardware AEC, software AEC3, or none at all) duck the reply the moment you start talking, then confirm. A real interruption stops playback (with streaming STT, mid-sentence) and the agent is told how much of its reply you actually heard. An echo, a cough, or an "uh-huh" releases the duck and the reply continues.
+- **Wake word**: optional, off by default. Two tiers — a transcript-prefix match in any language the STT covers, plus an acoustic detector (openWakeWord) that hears through the bot's own playback. `gate` asks for the phrase on a cold start and then leaves follow-ups natural for a while; `strict` also makes the phrase the *only* thing that interrupts a reply, so a room full of other people never perturbs it. A summon can answer with a spoken ack or a wordless earcon.
 - **E2E speech-to-speech**: alternative backend, one WebSocket session to an OpenAI-Realtime-dialect provider does turn detection + ASR + reasoning + TTS, while the model's tool calls still route through nanobot's guarded tool registry.
 
 ```mermaid
@@ -19,7 +20,8 @@ flowchart TB
 
   subgraph listen["local backend · listen"]
     vad["VAD + endpointing<br/>energy · spectral · neural<br/>+ ML end-of-turn model"] --> stt
-    stt["STT<br/>cloud/LAN API, or<br/>on-device batch or streaming"]
+    stt["STT<br/>cloud/LAN API, or<br/>on-device batch or streaming"] --> wake
+    wake["wake gate · optional<br/>transcript phrase + acoustic<br/>detector; strict mode also<br/>owns barge-in"]
   end
 
   subgraph speak["local backend · speak"]
@@ -31,7 +33,7 @@ flowchart TB
 
   duplex -->|"backend: local"| vad
   duplex -->|"backend: a realtime provider"| s2s
-  stt -->|"utterance text"| agent
+  wake -->|"utterance text<br/>(wake phrase stripped)"| agent
   agent -->|"streamed reply"| chunker
   s2s -.->|"tool calls (guarded registry)"| agent
   tts -->|"reply audio"| sink
