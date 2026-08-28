@@ -106,6 +106,7 @@ STT and TTS on machines you control: any OpenAI-compatible Whisper server for tr
 - Core resolves transcription only through its fixed provider registry (`groq`, `openai`, `siliconflow`, ... - the generic `custom` slot is chat-only): repoint the `openai` entry at your server and give it any non-empty `apiKey`. If you also chat through real OpenAI, borrow another OpenAI-shaped slot (`siliconflow`) instead.
 - `tts.language` declares what the server's voice speaks - the channel cannot know.
 - If the server's PCM is not 24 kHz, set `tts.pcmSampleRate` to match or playback is pitch-shifted.
+- A non-default `tts.apiBase` is presumed free to synthesize through at startup (calibration probe, canned-phrase prewarm, wake-alias learning). If your compatible endpoint is metered - Azure, a LiteLLM proxy - set `"tts": { "probe": "off" }`; `"on"` opts a billed endpoint in deliberately.
 
 ```json
 {

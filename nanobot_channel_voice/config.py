@@ -513,6 +513,11 @@ class TtsConfig(_VoiceBase):
     # openai/openai_compat PER-ATTEMPT cap; the retry ladder is bounded at 2x this, so a wedged
     # server cannot hold the turn in SPEAKING.
     timeout_s: float = Field(default=60.0, gt=0)
+    # May startup run BILLABLE synthesis through this engine (calibration probe, canned-phrase
+    # prewarm, wake-alias learning)? "auto" trusts the engine: on-device always may, openai only
+    # with a non-default apiBase — which presumes any compatible endpoint is free/local, so set
+    # "off" for a METERED one (Azure, a LiteLLM proxy). "on" opts a cloud endpoint in.
+    probe: Literal["auto", "on", "off"] = "auto"
 
 
 class ChunkerConfig(_VoiceBase):

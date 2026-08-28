@@ -25,8 +25,16 @@ def _system_fallback(cfg: TtsConfig) -> TtsAdapter:
 def _build_openai(cfg: TtsConfig) -> TtsAdapter:
     from nanobot_channel_voice.tts.openai_compat import OpenAITtsAdapter
 
+    api_key = resolve_openai_key(cfg.api_key)
+    if not api_key and not cfg.api_base:
+        # Raise HERE so the one fallback policy engages (warn once, speak via system):
+        # built keyless against the billed default endpoint, every synthesis would 401.
+        raise ValueError(
+            "the default OpenAI endpoint needs tts.apiKey (or OPENAI_API_KEY); "
+            "a keyless server needs tts.apiBase pointing at it"
+        )
     return OpenAITtsAdapter(
-        api_key=resolve_openai_key(cfg.api_key),
+        api_key=api_key,
         api_base=cfg.api_base,
         model=cfg.model,
         voice=cfg.voice,
@@ -172,6 +180,8 @@ def make_tts(cfg: TtsConfig) -> TtsAdapter | None:
     if not cfg.enabled:
         return None
     adapter = _build(cfg)
+    if adapter is not None and cfg.probe != "auto":
+        adapter.probe_ok = cfg.probe == "on"  # fallback adapters included: operator intent
     if adapter is not None:
         declared = getattr(adapter, "spoken_language", None)
         if declared is None:

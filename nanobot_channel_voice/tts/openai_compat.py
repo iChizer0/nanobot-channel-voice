@@ -105,9 +105,6 @@ class OpenAITtsAdapter(TtsAdapter):
         text = text.strip()
         if not text:
             return b""
-        if not self._api_key and self._url == _DEFAULT_URL:
-            self._log.warning("OpenAI TTS needs an api key (tts.apiKey or OPENAI_API_KEY)")
-            return b""
 
         body = {
             "model": self._model,
@@ -135,9 +132,6 @@ class OpenAITtsAdapter(TtsAdapter):
             raise NotImplementedError("synthesize_pcm requires tts.audioFormat=pcm")
         text = text.strip()
         if not text:
-            return b""
-        if not self._api_key and self._url == _DEFAULT_URL:
-            self._log.warning("OpenAI TTS needs an api key (tts.apiKey or OPENAI_API_KEY)")
             return b""
         body = {
             "model": self._model,
