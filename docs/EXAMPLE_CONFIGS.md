@@ -4,10 +4,10 @@ Complete `~/.nanobot/config.json` files for common deployments, ready to copy an
 
 ## Foundation
 
-- API keys resolve config first, then environment: transcription through core's provider entry (`GROQ_API_KEY` in the examples), TTS and realtime from `tts.apiKey` / `realtime.apiKey` falling back to `OPENAI_API_KEY` - for *every* provider, so set keys explicitly when mixing vendors.
+- API keys resolve config first, then environment: transcription through core's provider entry (`GROQ_API_KEY` in the examples), TTS and realtime from `tts.apiKey` / `realtime.apiKey` falling back to `OPENAI_API_KEY` - for *every* provider, so set keys explicitly when mixing vendors. The default `stt.provider: "nanobot"` delegates to core's transcription: with no key behind it every utterance decodes to silence, so startup warns and the WebUI pipeline check reports it - the channel does not otherwise look unhealthy.
 - The default is half-duplex: the mic is muted while the bot speaks. To interrupt mid-reply, pick an open-mic mode; without echo cancellation your voice must acoustically out-compete the playback before the VAD triggers.
 - Long tool calls are masked by an agent-spoken status line, with opt-in canned filler (`prologue.enabled`) as the fallback.
-- If the configured TTS cannot be built, the channel degrades to `espeak-ng` with a warning rather than going silent - a robotic voice means read the log.
+- If the configured TTS cannot be built, the channel degrades to the system voice (`espeak-ng`, `say` on macOS) with a warning rather than going silent - a robotic voice means read the log.
 
 ## Pick audio devices
 
@@ -27,6 +27,8 @@ pcm.speaker { type dmix;   ipc_key 2049; slave { pcm "hw:0,0"; rate 48000; } }
 ```
 
 Retest with `-D plug:mic` and `-D plug:speaker` - exactly what the channel opens - then set them as `captureDevice` and `playbackDevice`. The `plug:` wrapper converts rate and format in software, so 16 kHz mono capture works at any native rate. The examples below assume these two names.
+
+The default `audio.backend: "alsa"` drives `arecord`/`aplay` subprocesses (capture asks for one period per VAD frame and a ~100 ms ring; under `dsnoop` the slave's own period geometry wins). `"pyalsa"` (`[pyalsa]` extra, needs `libasound2-dev` and a compiler to build) opens libasound in-process instead: the same devices, no pipes, and barge-in drops the playback buffer immediately rather than killing a process. `"null"` is the headless stand-in (see the end of this file).
 
 ## Cloud and LAN
 
@@ -518,7 +520,7 @@ Detection is two-tier; both feed the same gate:
 - **Transcript tier** (`phrases`, zero models): the phrase as a transcript prefix, in any language the STT can spell; stripped from the published turn. When the STT *mis-spells* an out-of-vocabulary name, three layers catch it in falling trust: `aliases` pins extra spellings, warmup calibration learns them automatically (`learnAliases` - the channel speaks each phrase with the session TTS, decodes it with the session STT, and registers the mis-renders; on-device STT only, logged loudly), and a phonetic consonant-skeleton match strips remaining latin near-misses - strip-only, from utterances that already passed on real evidence, so it can never open the gate or unlock strict.
 - **Acoustic tier** (`engine: "openwakeword"`): an openWakeWord ONNX head (~3.7 MB, one decision per 80 ms, `[ondevice]` extra) that hears through the bot's own playback, so a mid-reply hit is a high-precision interrupt. It reports where the phrase *ended* and that audio is cut from what STT decodes. Required whenever the STT cannot spell the phrase.
 
-In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays hot over the muted mic and a hit is the *only* barge-in. The contract is *phrase, beat, command* - the mic-reopen discards ~100-350 ms after the phrase, so a same-breath command can lose its first word (open-mic modes capture it cleanly). A reply that literally *speaks* a wake phrase never wakes the bot through its own leak.
+In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays hot over the muted mic and a hit is the *only* barge-in: with the transcript tier alone the wake word can start a turn between replies but never interrupt one, and startup warns about that pairing. The contract is *phrase, beat, command* - the mic-reopen discards ~100-350 ms after the phrase, so a same-breath command can lose its first word (open-mic modes capture it cleanly). A reply that literally *speaks* a wake phrase never wakes the bot through its own leak.
 
 **Spoken acknowledgment** (`wake.ack.enabled`): answers every bare summon ("hey nanobot" -> *"I'm here."*, "小娜" -> "在呢。") - otherwise the window opens in silence and the user cannot hear "listening" from "didn't hear you". In half-duplex the ack *is* the beat: wait for it, then speak. It speaks as early as the pipeline can know the summon is bare (acoustic tier + open mic: at the first quiet moment, ~350 ms after the phrase). `ack.phrases` overrides the language-keyed built-ins, rotated; keep them under ~0.6 s spoken, never containing a wake phrase. The language follows the *name that was called*, falling back to the TTS engine's. Channel-canned audio like the fillers: it yields to user speech and the agent never sees it.
 
@@ -576,7 +578,7 @@ When the logs show `false barge-in (empty)` / `(echo)` / `(probe)` streaks and y
 }
 ```
 
-Every endpointed capture segment lands under `~/.local/share/nanobot-voice/dumps/<session>/` (override: `debug.dumpDir`) as `utt-<id>-<verdict>.wav` - `<id>` matches the `utt #N:` log line, verdict is one of `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `gated`, `wake`, `interrupt`, `publish`. A `manifest.jsonl` carries one record per segment (id, verdict, duration, rms, STT cost, VAD confidence, ...; transcript only with `logTranscripts` on) for `jq` filtering before listening. With `aec: "webrtc"` each segment gets a `.raw.wav` twin of the same span *before* cancellation. Reading the pair:
+Every endpointed capture segment lands under `~/.local/share/nanobot-voice/dumps/<session>/` (override: `debug.dumpDir`) as `utt-<id>-<verdict>.wav` - `<id>` matches the `utt #N:` log line, verdict is one of `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `gated`, `wake`, `interrupt`, `inject`, `goal`, `publish`. A `manifest.jsonl` carries one record per segment (id, verdict, duration, rms, STT cost, VAD confidence, ...; transcript only with `logTranscripts` on) for `jq` filtering before listening, and an `index.html` viewer lists the session - serve the directory to browse it. With `aec: "webrtc"` each segment gets a `.raw.wav` twin of the same span *before* cancellation. Reading the pair:
 
 - TTS clearly audible in the **post-AEC** file (`.wav`) -> the canceller is not converging (check `audio.playoutDelayMs`, give it a few seconds of clean playback to adapt, or the device is looping audio somewhere AEC3 can't model).
 - TTS audible only in the **`.raw.wav`** twin, post-AEC quiet -> AEC is doing its job; the trigger is something else (VAD floor, room noise, a real voice).
@@ -585,6 +587,8 @@ Every endpointed capture segment lands under `~/.local/share/nanobot-voice/dumps
 Segments are recordings of the room - leave `dumpAudio` off outside debugging sessions. Disk use is capped (`debug.dumpMaxMb`, default 200); oldest sessions and segments prune first.
 
 For latency questions rather than by-ear ones, `debug.metricsIntervalS` (e.g. `30`) logs the in-process metrics snapshot - latency percentiles (`stt_ms`, `tts_synth_ms`, `ttfa_ms`, ...) and counters - as one JSON line on that cadence.
+
+Tool calls the voice turns make can be exported as OpenTelemetry spans (`telemetry.enabled`, `[otel]` extra; GenAI semantic conventions, so Langfuse / Phoenix / LangSmith read them). Names, timings and outcomes always flow; `telemetry.captureContent` opts the arguments in, since a voice tool call carries what the user just said. Voice latency itself stays in the in-process metrics above.
 
 ### Filler while the agent works
 
@@ -633,7 +637,9 @@ Local backend only (the realtime backends reason in the provider, not in nanobot
 
 ## Realtime
 
-Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback and routes the model's tool calls through nanobot's guarded `ToolRegistry` under `nanobot gateway`. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.
+Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.
+
+Tool calls are the caveat. The model's calls can route through nanobot's guarded `ToolRegistry` only when core hands the channel a tool gateway at construction, and the official nanobot does not - so on a stock install every realtime backend is **persona-only**: the model answers from its own knowledge, `realtime.toolMode` and `delegationTimeoutS` have no effect (startup says so when you set them), and the local backend remains the full agent. The tool wiring below is for a core build that passes the gateway.
 
 ### Minimal
 
@@ -659,7 +665,7 @@ Default gated barge-in: you interrupt after the bot finishes a phrase.
 }
 ```
 
-Other providers change `backend` and the `realtime` block only. For Qwen (Alibaba DashScope), tool calling needs the `qwen3.5` model (the `qwen3` default is persona-only), and outside mainland China add your workspace's international `realtime.baseUrl` from the DashScope console:
+Other providers change `backend` and the `realtime` block only. For Qwen (Alibaba DashScope), only the `qwen3.5` model speaks the tool-call exchange at all (the `qwen3` default cannot), and outside mainland China add your workspace's international `realtime.baseUrl` from the DashScope console:
 
 ```json
 "backend": "qwen",
@@ -670,7 +676,7 @@ Set the key explicitly rather than via `OPENAI_API_KEY`, which is the fallback f
 
 ### Supervisor with open-mic barge-in
 
-The robust-tools variant: the realtime model owns the conversation but delegates every reasoning and tool step to nanobot's full agent loop (`realtime.toolMode: "supervisor"`), with the software AEC (`[aec]` extra) keeping the mic open so you can cut it off mid-reply. `delegationTimeoutS` budgets the agent's tool work; `inputTranscriptionModel` turns on user-side transcripts.
+The robust-tools variant, on a core that passes the tool gateway: the realtime model owns the conversation but delegates every reasoning and tool step to nanobot's full agent loop (`realtime.toolMode: "supervisor"`), with the software AEC (`[aec]` extra) keeping the mic open so you can cut it off mid-reply. `delegationTimeoutS` budgets the agent's tool work; `inputTranscriptionModel` turns on user-side transcripts. On the official core the same file runs as an open-mic persona-only session - the AEC and barge-in parts still apply.
 
 ```json
 {
@@ -738,6 +744,7 @@ For CI, containers, or protocol work: the `null` backend captures nothing and di
 - Talking to the bot while it works no longer cancels it: an utterance that lands while a tool is running (including over the status line it spoke before the call) is injected into the live turn instead of /stop-ping it, so a multi-step recovery survives being encouraged, corrected, or asked for a progress check. Audio stops either way - the user has the floor - and the agent is told what was heard. Cancelling still works: a stop phrase, or the wake word in `strict`/`gate` mode, kills the run as before.
 - "no API key for realtime provider": set `realtime.apiKey`, or `OPENAI_API_KEY` - remembering it is the fallback for every provider.
 - "has no default endpoint": you picked `azure` (or a custom deployment) without `realtime.baseUrl`.
+- "realtime.toolMode=... has no effect": this core passes no tool gateway to plugin channels, so the realtime session is persona-only whatever the mode; use `backend: "local"` for tool use.
 - "cloud open-mic needs echo cancellation": `realtime.bargeIn: "aec"` needs `aec: "webrtc"`, `aec: "hardware"`, or `realtime.aecAvailable: true`; otherwise fall back to `"gated"`.
 - An "install the extra" hint despite `[realtime]` being installed: check for a stale `websockets` older than 13; the extra requires `websockets>=13`.
 - The bot cuts itself off every turn on a cloud backend: your hardware does not actually cancel echo; unset `realtime.aecAvailable` and use `aec: "webrtc"` or `"gated"` instead.
