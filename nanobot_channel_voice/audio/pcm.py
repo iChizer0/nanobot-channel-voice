@@ -128,41 +128,76 @@ def wav_pcm(blob: bytes) -> tuple[bytes, int]:
     except Exception:  # noqa: BLE001 - malformed input reads as no audio
         return b"", 0
     if channels > 1:
-        samples = array.array("h", pcm)
-        mono = array.array(
-            "h",
-            (
-                sum(samples[i : i + channels]) // channels
-                for i in range(0, len(samples) - channels + 1, channels)
-            ),
-        )
-        pcm = mono.tobytes()
+        usable = len(pcm) // (2 * channels) * (2 * channels)
+        if _np is not None:
+            frames = _np.frombuffer(pcm[:usable], dtype="<i2").reshape(-1, channels)
+            pcm = (frames.sum(axis=1, dtype=_np.int32) // channels).astype("<i2").tobytes()
+        else:
+            samples = array.array("h", pcm[:usable])
+            pcm = array.array(
+                "h",
+                (
+                    sum(samples[i : i + channels]) // channels
+                    for i in range(0, len(samples), channels)
+                ),
+            ).tobytes()
     return pcm, rate
 
 
+def _antialias_taps(src_rate: int, dst_rate: int) -> list[float]:
+    """Hann-windowed sinc lowpass at ``0.45 * dst_rate``, ODD length so the group delay
+    is a whole sample and the filtered stream stays time-aligned."""
+    # Floor 31: at ratios near 1 the transition band is narrowest, and 9-17 taps left
+    # only -10 dB just above the new Nyquist; 31+ gives -20 dB or better.
+    n = min(63, max(31, int(8 * src_rate / dst_rate))) | 1
+    fc = 0.45 * dst_rate / src_rate
+    mid = (n - 1) // 2
+    taps = []
+    for k in range(n):
+        t = k - mid
+        sinc = 2 * fc if t == 0 else math.sin(2 * math.pi * fc * t) / (math.pi * t)
+        taps.append(sinc * (0.5 - 0.5 * math.cos(2 * math.pi * k / (n - 1))))
+    total = sum(taps)
+    return [v / total for v in taps]
+
+
 def resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
-    """Linear-interpolation resample of S16_LE mono (no low-pass filter): fine
-    for STT front ends and short cues, not for program audio."""
+    """Linear-interpolation resample of S16_LE mono.
+
+    Downsampling is lowpass-filtered first: bare interpolation folds every above-Nyquist
+    component straight into the speech band (20 kHz lands on 2 kHz at 44.1k -> 22.05k).
+    """
     if src_rate == dst_rate or src_rate <= 0 or dst_rate <= 0 or len(pcm) < 4:
         return pcm
-    src = array.array("h", pcm[: len(pcm) & ~1])
-    n_out = int(len(src) * dst_rate / src_rate)
+    n_in = (len(pcm) & ~1) // 2
+    n_out = int(n_in * dst_rate / src_rate)
+    if n_out < 1:
+        return b""
+    taps = _antialias_taps(src_rate, dst_rate) if dst_rate < src_rate else None
+    step = src_rate / dst_rate
     if _np is not None:
-        x = _np.arange(n_out, dtype=_np.float64) * (src_rate / dst_rate)
-        i = _np.minimum(x.astype(_np.int64), len(src) - 2)
+        values = _np.frombuffer(pcm[: n_in * 2], dtype="<i2").astype(_np.float32)
+        if taps is not None:
+            # Edge padding, not zeros: a zero-padded convolution fades both ends.
+            padded = _np.pad(values, len(taps) // 2, mode="edge")
+            values = _np.convolve(padded, _np.asarray(taps, dtype=_np.float32), mode="valid")
+        x = _np.arange(n_out, dtype=_np.float64) * step
+        i = _np.minimum(x.astype(_np.int64), n_in - 2)
         # Clamped with the taps: past the last pair an unclamped weight EXTRAPOLATES,
         # which wraps int16 on a loud final sample.
-        frac = _np.minimum(x - i, 1.0)
-        s = _np.frombuffer(src, dtype=_np.int16).astype(_np.float64)
-        out = s[i] * (1.0 - frac) + s[i + 1] * frac
-        return out.astype(_np.int16).tobytes()
+        frac = _np.minimum(x - i, 1.0).astype(_np.float32)
+        out = values[i] + (values[i + 1] - values[i]) * frac
+        return _np.clip(out, -32768.0, 32767.0).astype(_np.int16).tobytes()
+    # No numpy = the cloud-only install, where this resamples short cues: the O(N*taps)
+    # pure-Python filter would cost ~50 ms per second of audio on the loop, so skip it.
+    values = array.array("h", pcm[: n_in * 2])
     out = array.array("h", bytes(2 * n_out))
-    step = src_rate / dst_rate
     for j in range(n_out):
         x = j * step
-        i = min(int(x), len(src) - 2)
+        i = min(int(x), n_in - 2)
         frac = min(1.0, x - i)  # see the numpy path
-        out[j] = int(src[i] * (1.0 - frac) + src[i + 1] * frac)
+        raw = values[i] + (values[i + 1] - values[i]) * frac
+        out[j] = max(-32768, min(32767, int(raw)))
     return out.tobytes()
 
 

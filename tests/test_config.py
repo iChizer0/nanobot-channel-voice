@@ -433,3 +433,72 @@ def test_notice_phrases_must_not_contain_stop_phrases():
         VoiceConfig(timeoutPhrase="出错了，说停止可以取消。")
     VoiceConfig(stallPhrase="An unstoppable effort continues.")  # word-bounded
     VoiceConfig()  # the shipped defaults are self-consistent
+
+
+def test_every_16k_only_engine_is_rate_checked_at_parse_time():
+    """Same trap as the neural VADs, three more engines wide: smartturn, openWakeWord
+    and zipformer all demand 16 kHz and all degraded at runtime behind one log line
+    (silence-only endpointing, transcript-only wake, a hard start() raise)."""
+    oww = {"melPath": "/m.onnx", "embeddingPath": "/e.onnx", "modelPath": "/h.onnx"}
+    for section in (
+        {"vad": {"turn": {"engine": "smartturn"}}},
+        {"wake": {"mode": "gate", "phrases": ["hi"], "engine": "openwakeword",
+                  "openwakeword": oww}},
+        {"stt": {"provider": "zipformer"}},
+    ):
+        with pytest.raises(ValidationError, match="cannot run at"):
+            VoiceConfig.model_validate({**section, "audio": {"sampleRate": 48000}})
+        VoiceConfig.model_validate({**section, "audio": {"sampleRate": 16000}})
+    # wake.engine is only a claim while the gate is on: mode="off" ignores it.
+    VoiceConfig.model_validate(
+        {"wake": {"engine": "openwakeword"}, "audio": {"sampleRate": 48000}}
+    )
+
+
+def test_empty_allow_from_is_rejected():
+    """[] denies every speaker and voice has no pairing flow to recover through, so
+    core's materialized list filler would leave a healthy-looking, deaf channel."""
+    with pytest.raises(ValidationError, match="denies every speaker"):
+        VoiceConfig.model_validate({"allowFrom": []})
+    assert VoiceConfig().allow_from == ["*"]
+    assert VoiceConfig.model_validate({"allowFrom": ["me"]}).allow_from == ["me"]
+
+
+def test_transcription_gap_reports_an_unusable_delegate():
+    """stt.provider='nanobot' hands every utterance to core, whose failure path returns
+    '' — indistinguishable from silence. The gap string is what start() and the WebUI
+    check speak; an unrecognized core shape yields None rather than a false alarm."""
+    import nanobot_channel_voice.config as voice_config
+
+    class _Eff:
+        enabled, configured, provider = True, False, "groq"
+
+    monkey = {"resolve_transcription_config": lambda _cfg: _Eff(),
+              "load_config": lambda: object()}
+    import sys
+    import types
+
+    fake_tr = types.ModuleType("nanobot.audio.transcription")
+    fake_tr.resolve_transcription_config = monkey["resolve_transcription_config"]
+    fake_loader = types.ModuleType("nanobot.config.loader")
+    fake_loader.load_config = monkey["load_config"]
+    real = (sys.modules.get("nanobot.audio.transcription"),
+            sys.modules.get("nanobot.config.loader"))
+    sys.modules["nanobot.audio.transcription"] = fake_tr
+    sys.modules["nanobot.config.loader"] = fake_loader
+    try:
+        assert "no API key" in (voice_config.transcription_gap() or "")
+        _Eff.configured = True
+        assert voice_config.transcription_gap() is None
+        _Eff.enabled = False
+        assert "disabled" in (voice_config.transcription_gap() or "")
+        fake_tr.resolve_transcription_config = None  # a core without the seam
+        assert voice_config.transcription_gap() is None
+    finally:
+        for name, mod in zip(
+            ("nanobot.audio.transcription", "nanobot.config.loader"), real, strict=True
+        ):
+            if mod is not None:
+                sys.modules[name] = mod
+            else:
+                del sys.modules[name]

@@ -152,9 +152,14 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     the section resolved to (backend, engines, devices)."""
     from nanobot.channels.contracts import ChannelValidationContext
 
+    import nanobot_channel_voice.config as voice_config
+
     manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
     ctx = ChannelValidationContext()
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")  # silence the key nudges
+    # The pipeline row reads the LIVE install's transcription config; pin it so the
+    # rows below describe the section under test, not this machine.
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
 
     # local: the schema row names the backend, the pipeline check the resolved
     # engine trio + the file home, the devices row the PCMs + the export command
@@ -184,6 +189,17 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     assert "fall back" in pipeline["message"]
     assert "vad.firered.modelPath" in pipeline["message"]
     assert out["can_enable"] is True  # warn stays non-blocking
+
+    # stt.provider='nanobot' with nothing behind it decodes every utterance to "",
+    # which the pipeline cannot tell from silence: the check must say so, not pass
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: "there is no API key")
+    pipeline = _check_ids(manifest._validate({"enabled": True}, ctx))["pipeline"]
+    assert pipeline["status"] == "warn"
+    assert "heard as silence" in pipeline["message"]
+    # an on-device engine takes core transcription off the path, so no such row
+    section = {"stt": {"provider": "sensevoice"}}
+    assert "silence" not in _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
 
     # an unfetched weights key warns with the exact fetch remedy; downloading
     # stays a deliberate CLI act (terminal progress + Ctrl-C)

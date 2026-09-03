@@ -140,7 +140,7 @@ def test_publish_commits_and_retargets_the_endpointer():
 
 def test_turn_model_raises_the_adaptive_floor_above_consult():
     """hangoverMinMs below consultMs would silently disable the turn model: the
-    floor is clamped to consultMs + one frame, with the ceiling untouched."""
+    floor is clamped to consultMs + one frame."""
     from nanobot_channel_voice.audio.null import NullPlayback
     from nanobot_channel_voice.backend.audio_sink import AudioSink
     from nanobot_channel_voice.backend.local import LocalBackend
@@ -175,3 +175,57 @@ def test_turn_model_raises_the_adaptive_floor_above_consult():
     assert backend._endpointer._hangover_frames == 260 // 20
     assert backend._endpointer._consult_frames == 240 // 20
     assert backend._adaptive._min == 260.0
+
+
+def test_the_raised_floor_carries_the_ceiling_with_it():
+    """A hangoverMs under the consult tier is a legal config: left as the ceiling it clamps
+    the first learned value straight back below the raised floor, re-silencing the model."""
+    from nanobot_channel_voice.audio.null import NullPlayback
+    from nanobot_channel_voice.backend.audio_sink import AudioSink
+    from nanobot_channel_voice.backend.local import LocalBackend, _PendingUtterance
+
+    class _FakeAnalyzer:
+        window_bytes = 16000 * 8 * 2
+        last_probability = 0.5
+
+        def assess(self, pcm: bytes) -> bool:
+            return False
+
+        def release(self) -> None:
+            pass
+
+    cfg = VoiceConfig.model_validate({
+        "vad": {
+            "hangoverMs": 200, "hangoverMinMs": 150,
+            "turn": {"engine": "smartturn", "consultMs": 240},
+        },
+    })
+    published = []
+
+    async def transcribe(pcm: bytes) -> str:
+        return "hello there"
+
+    async def publish(text: str, token: str, notes: tuple[str, ...] = ()) -> None:
+        published.append(text)
+
+    async def interrupt() -> None:
+        pass
+
+    backend = LocalBackend(
+        cfg, vad=_SilentVad(), tts=None,
+        sink=AudioSink(NullPlayback(), mode="blob"),
+        transcribe=transcribe, publish_text=publish, interrupt=interrupt,
+        turn_analyzer=_FakeAnalyzer(),
+    )
+    assert backend._adaptive._min == 260.0
+    assert backend._adaptive._max == 260.0  # never under the floor it must respect
+
+    pending = _PendingUtterance(
+        pcm=b"\x00" * 3200, eager=None, closed_reason="silence",
+        closed_at=0.0, silence_ms=100, learn_ms=100.0,
+    )
+    asyncio.run(backend._on_utterance(pending))
+    assert published
+    assert backend._adaptive.value_ms() == 260
+    ep = backend._endpointer
+    assert ep._consult_frames < ep._hangover_frames  # the consult mark still fires

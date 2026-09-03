@@ -176,6 +176,7 @@ def _pipeline_check(cfg: Any, check: Any) -> dict[str, Any]:
     carries no engine fields, so this row is where the selection becomes visible); "warn"
     when a selected engine would silently fall back at start."""
     from nanobot_channel_voice import stt, tts, vad, wake
+    from nanobot_channel_voice.config import transcription_gap
     from nanobot_channel_voice.engines import preflight
 
     parts = [f"vad.engine='{cfg.vad.engine}'", f"stt.provider='{cfg.stt.provider}'"]
@@ -216,6 +217,13 @@ def _pipeline_check(cfg: Any, check: Any) -> dict[str, Any]:
         )
         if reason
     ]
+    # Delegated STT with nothing behind it decodes every utterance to "", which the
+    # pipeline cannot tell from silence: the channel would start and hear nothing.
+    if cfg.stt.provider == "nanobot" and (gap := transcription_gap()) is not None:
+        degraded.append(
+            f"stt 'nanobot' delegates to nanobot's transcription, but {gap}, so every "
+            "utterance would be heard as silence"
+        )
     message = (
         f"{', '.join(parts)}: engines and their models are configured under "
         "channels.voice.{vad,stt,tts} in config.json."

@@ -24,6 +24,10 @@ import math
 import unicodedata
 from collections.abc import Sequence
 
+from nanobot_channel_voice.stt.base import DenseTokenTable
+
+TokenTable = dict[int, str] | DenseTokenTable
+
 # Whisper multilingual language order (base/tiny/medium family, n_vocab 51865); the
 # token id is ``<|startoftranscript|>(50258) + 1 + index``: en=50259, ja=50266.
 LANGUAGES: tuple[str, ...] = (
@@ -171,7 +175,7 @@ def token_scripts(text: str) -> frozenset[str]:
     return frozenset(s for s in (_char_script(c) for c in text) if s)
 
 
-def suppressed_token_ids(vocab: dict[str, str], codes: Sequence[str]) -> tuple[int, ...]:
+def suppressed_token_ids(vocab: TokenTable, codes: Sequence[str]) -> tuple[int, ...]:
     """Token ids to block so output stays inside the DECODABLE language set. ``()``
     when ``codes`` is empty (feature off). Never suppresses specials (``>= _EOT``,
     including EOT and the timestamps the decode loop relies on), script-neutral tokens,
@@ -183,11 +187,8 @@ def suppressed_token_ids(vocab: dict[str, str], codes: Sequence[str]) -> tuple[i
         allowed |= _LANGUAGE_SCRIPTS.get(code.lower(), _ALWAYS_ALLOWED_SCRIPTS)
 
     blocked: list[int] = []
-    for key, token in vocab.items():
-        try:
-            token_id = int(key)
-        except ValueError:
-            continue
+    items = enumerate(vocab) if isinstance(vocab, list) else vocab.items()
+    for token_id, token in items:
         if token_id >= _EOT or not token:
             continue
         scripts = token_scripts(byte_level_decode(token))
@@ -225,10 +226,10 @@ _B64_ALPHABET = frozenset(
 )
 
 
-def _reject_reencoded_vocab(vocab: dict[str, str], path: str) -> None:
+def _reject_reencoded_vocab(vocab: dict[int, str], path: str) -> None:
     checked = 0
     for i in range(256):  # low ids are single bytes in every true encoding
-        token = vocab.get(str(i))
+        token = vocab.get(i)
         if not token:
             continue
         checked += 1
@@ -244,31 +245,43 @@ def _reject_reencoded_vocab(vocab: dict[str, str], path: str) -> None:
         )
 
 
-def read_vocab(vocab_path: str) -> dict[str, str]:
+def _densify(vocab: dict[int, str], path: str) -> TokenTable:
+    """Ids 0..n-1 hold as a list: the id keys of a 50k-entry dict cost ~4 MB, retained
+    for the session. Empty is refused: it would decode every utterance to "" — a mute
+    STT that looks healthy."""
+    if not vocab:
+        raise ValueError(f"whisper vocab {path!r} yielded no <id> <token> entries")
+    if len(vocab) == max(vocab) + 1 and min(vocab) == 0:
+        return DenseTokenTable(vocab[i] for i in range(len(vocab)))
+    return vocab
+
+
+def read_vocab(vocab_path: str) -> TokenTable:
     """Load ``{id: byte_level_token}`` from an ORIGINAL tokenizer artifact: ``*.tiktoken``
     (``base64(token_bytes) rank`` per line), HF ``vocab.json`` (``{token_string: id}``,
     already byte-level), or flat byte-level ``<id> <token>`` text."""
     if vocab_path.endswith(".tiktoken"):
-        vocab: dict[str, str] = {}
+        vocab: dict[int, str] = {}
         with open(vocab_path, encoding="utf-8") as f:
             for line in f:
                 parts = line.split()
                 if len(parts) != 2:
                     continue
                 token_bytes = base64.b64decode(parts[0])
-                vocab[parts[1]] = "".join(_BYTE_ENCODER[b] for b in token_bytes)
-        return vocab
+                vocab[int(parts[1])] = "".join(_BYTE_ENCODER[b] for b in token_bytes)
+        return _densify(vocab, vocab_path)
     if vocab_path.endswith(".json"):
         with open(vocab_path, encoding="utf-8") as f:
             raw = json.load(f)
-        return {str(i): token for token, i in raw.items()}
+        return _densify({int(i): token for token, i in raw.items()}, vocab_path)
     vocab = {}
     with open(vocab_path, encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split(" ")
-            vocab[parts[0]] = parts[1] if len(parts) >= 2 else ""
+            if parts[0].lstrip("-").isdigit():
+                vocab[int(parts[0])] = parts[1] if len(parts) >= 2 else ""
     _reject_reencoded_vocab(vocab, vocab_path)
-    return vocab
+    return _densify(vocab, vocab_path)
 
 
 # ---- byte-level BPE (GPT-2 / tiktoken) --------------------------------------

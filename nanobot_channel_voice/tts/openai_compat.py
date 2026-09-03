@@ -118,10 +118,8 @@ class OpenAITtsAdapter(TtsAdapter):
         if not data:
             return b""
         if self._format == "pcm":
-            if data.startswith(_COMPRESSED_MAGIC):
-                self._log.warning("TTS ignored response_format=pcm and sent encoded audio; dropping")
-                return b""
-            return pcm_to_wav_bytes(data, self._pcm_sample_rate)
+            pcm, rate = self._as_pcm(data)
+            return pcm_to_wav_bytes(pcm, rate) if pcm else b""  # the blob carries its rate
         if not is_wav(data):
             self._log.warning("TTS returned non-WAV data for response_format=wav; dropping")
             return b""
@@ -140,29 +138,36 @@ class OpenAITtsAdapter(TtsAdapter):
             "response_format": "pcm",
         }
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        pcm = await self._post(body, headers)
-        if pcm.startswith(_COMPRESSED_MAGIC):
+        return self._as_pcm(await self._post(body, headers))[0]
+
+    def _as_pcm(self, data: bytes) -> tuple[bytes, int]:
+        """A ``response_format=pcm`` body as ``(bare S16 mono, rate)``, or ``(b"", rate)``
+        when it is not audio this sink can play. Both entry points share it: the same
+        servers lie. The rate is the WAV's own when the server sent one."""
+        rate = self._pcm_sample_rate
+        if data.startswith(_COMPRESSED_MAGIC):
             # No decoder here; streamed raw it would be sustained full-scale noise.
             self._log.warning("TTS ignored response_format=pcm and sent encoded audio; dropping")
-            return b""
-        if is_wav(pcm):
+            return b"", rate
+        if is_wav(data):
             # Streamed raw, the 44-byte RIFF header is a click: strip the container.
             self._log.warning("TTS returned WAV for response_format=pcm; stripping container")
             try:
-                with wave.open(io.BytesIO(pcm), "rb") as w:
+                with wave.open(io.BytesIO(data), "rb") as w:
                     if w.getsampwidth() != 2 or w.getnchannels() != 1:
                         self._log.warning("...and it isn't S16 mono; dropping the chunk")
-                        return b""
-                    if w.getframerate() != self._pcm_sample_rate:
+                        return b"", rate
+                    rate = w.getframerate()
+                    if rate != self._pcm_sample_rate:
                         self._log.warning(
-                            "...at {} Hz (expected {}); playback will be off-speed",
-                            w.getframerate(), self._pcm_sample_rate,
+                            "...at {} Hz (expected {}); a pcm stream plays it off-speed",
+                            rate, self._pcm_sample_rate,
                         )
-                    pcm = w.readframes(w.getnframes())
+                    data = w.readframes(w.getnframes())
             except Exception:  # noqa: BLE001 - lied twice: not even valid WAV
-                return b""
+                return b"", rate
         # An odd byte count (truncated response) misaligns every later S16 sample.
-        return pcm[: len(pcm) & ~1]
+        return data[: len(data) & ~1], rate
 
     @staticmethod
     async def _backoff(attempt: int, deadline: float) -> None:

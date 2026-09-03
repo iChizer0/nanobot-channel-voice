@@ -36,6 +36,30 @@ def resolve_openai_key(explicit: str | None) -> str | None:
     return explicit or os.environ.get("OPENAI_API_KEY")
 
 
+def transcription_gap() -> str | None:
+    """Why core's transcription layer cannot transcribe, or None when it can.
+
+    ``stt.provider="nanobot"`` delegates every utterance to it, and a failure there returns
+    ``""`` — indistinguishable from silence, so an unconfigured layer is a channel that
+    hears nothing while reporting healthy. Returns None when core's shape is unrecognized.
+    """
+    try:
+        from nanobot.audio.transcription import resolve_transcription_config
+        from nanobot.config.loader import load_config
+
+        cfg = resolve_transcription_config(load_config())
+    except Exception:  # noqa: BLE001 - a core without this seam simply gets no check
+        return None
+    if not cfg.enabled:
+        return "nanobot's transcription is disabled (transcription.enabled)"
+    if not cfg.configured:
+        return (
+            f"nanobot's transcription provider '{cfg.provider}' has no API key "
+            f"(providers.{cfg.provider}.apiKey, or its environment variable)"
+        )
+    return None
+
+
 def parse_import_blob(raw: Any) -> dict[str, Any]:
     """Parse the WebUI ``importJson`` paste into a plain section dict: the bare
     ``channels.voice`` object, or one still wrapped in ``{"channels": {"voice": ...}}`` /
@@ -1008,20 +1032,39 @@ class VoiceConfig(_VoiceBase):
         return merged
 
     @model_validator(mode="after")
-    def _vad_engine_supports_rate(self) -> VoiceConfig:
-        """An EXPLICITLY configured neural VAD must run at the configured capture rate: statically
-        knowable, and the runtime alternative is a silent downgrade to the energy fallback."""
-        rate = self.audio.sample_rate
-        supported = {
-            "firered": (16000,),
-            "silero": (8000, 16000),
-            "webrtc": (8000, 16000, 32000, 48000),
-        }.get(self.vad.engine)
-        if supported is not None and rate not in supported:
+    def _allow_from_is_not_empty(self) -> VoiceConfig:
+        """An empty list denies everyone, and voice has no pairing flow to recover through:
+        the mic would publish nothing while the channel reports healthy."""
+        if not self.allow_from:
             raise ValueError(
-                f"vad.engine='{self.vad.engine}' cannot run at audio.sampleRate={rate} "
-                f"(supported: {', '.join(map(str, supported))}); change the rate or the engine"
+                "allowFrom is empty, which denies every speaker and leaves the channel "
+                'deaf with no way to pair; use ["*"] (the default) or list sender ids'
             )
+        return self
+
+    @model_validator(mode="after")
+    def _engines_support_rate(self) -> VoiceConfig:
+        """Every EXPLICITLY selected engine must run at the configured capture rate:
+        statically knowable, and the runtime alternative is a silent downgrade (the energy
+        VAD, silence-only endpointing, transcript-only wake) behind one log line."""
+        rate = self.audio.sample_rate
+        selected = (
+            ("vad.engine", self.vad.engine,
+             {"firered": (16000,), "silero": (8000, 16000),
+              "webrtc": (8000, 16000, 32000, 48000)}),
+            ("vad.turn.engine", self.vad.turn.engine, {"smartturn": (16000,)}),
+            ("wake.engine", self.wake.engine if self.wake.mode != "off" else "off",
+             {"openwakeword": (16000,)}),
+            ("stt.provider", self.stt.provider, {"zipformer": (16000,)}),
+        )
+        for key, engine, table in selected:
+            supported = table.get(engine)
+            if supported is not None and rate not in supported:
+                raise ValueError(
+                    f"{key}='{engine}' cannot run at audio.sampleRate={rate} "
+                    f"(supported: {', '.join(map(str, supported))}); "
+                    "change the rate or the engine"
+                )
         return self
 
     @property

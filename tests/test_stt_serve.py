@@ -353,3 +353,47 @@ def test_concurrent_requests_never_overlap_the_decode():
         assert adapter.overlapped is False  # the singleton decoded strictly one at a time
 
     run(_with_server(case))
+
+
+def test_the_file_part_is_a_view_not_a_second_copy_of_the_upload():
+    """Regression: the part was materialized with bytes(payload) while _handle still held
+    the body, so one 32 MB upload sat resident twice (x4 in flight)."""
+    import gc
+    import tracemalloc
+
+    payload = wav_bytes(frames=16000 * 60)  # ~1.9 MB, well over any allocator slack
+    ctype, body = _multipart(payload)
+    del payload
+    gc.collect()
+
+    tracemalloc.start()
+    part, name = serve_mod._multipart_file(ctype, body)
+    live, _ = tracemalloc.get_traced_memory()
+    pcm, rate = serve_mod._plain_wav_pcm(part)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert isinstance(part, memoryview)
+    assert part.obj is body  # the part IS the body's storage, not a duplicate of it
+    assert live < len(body) // 4  # nothing upload-sized was allocated
+    assert rate == 16000 and len(pcm) == 2 * 16000 * 60
+    # Peak is the RETURNED audio and nothing else: wave reads through the view, so no
+    # BytesIO copy of the upload.
+    assert peak < len(pcm) * 1.5
+
+
+def test_view_file_honours_the_raw_io_contract():
+    import io
+    import os
+
+    import pytest
+
+    from nanobot_channel_voice.stt.serve import _ViewFile
+
+    f = _ViewFile(memoryview(b"abcdefgh"))
+    with pytest.raises(ValueError):
+        f.seek(0, 5)
+    buffered = io.BufferedReader(_ViewFile(memoryview(b"abcdefgh")))  # readinto path
+    assert buffered.read(3) == b"abc" and buffered.read() == b"defgh"
+    f.seek(-2, os.SEEK_END)
+    assert f.read() == b"gh"

@@ -328,3 +328,60 @@ def test_warmup_speaks_the_engine_language():
     adapter = Adapter.__new__(Adapter)
     asyncio.run(adapter.warmup())
     assert calls == ["好的。"]  # English "Okay." would be zero lexicon tokens: no warm at all
+
+
+# ---- STT resampling ---------------------------------------------------------
+
+
+def test_long_downsample_is_blockwise_and_matches_the_whole_signal_answer():
+    """Regression: the whole-signal rfft promoted to complex128 and peaked at ~20x the
+    PCM (+568 MB for a 300 s 44.1 kHz upload). Blocks must tile the same answer."""
+    np = pytest.importorskip("numpy")
+    from nanobot_channel_voice.stt.base import _RESAMPLE_BLOCK_S, _fft_resample, pcm_to_float_mono
+
+    rate, dst, secs = 44100, 16000, int(_RESAMPLE_BLOCK_S * 4)  # several blocks
+    t = np.arange(rate * secs) / rate
+    chirp = np.sin(2 * np.pi * (200 + (t / secs) * 7000) * t) * 0.6
+    pcm = (chirp * 32767).astype("<i2").tobytes()
+
+    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    n = int(round(len(audio) * dst / rate))
+    whole = _fft_resample(np, audio, n).astype(np.float32)
+    blocked = pcm_to_float_mono(pcm, rate, dst)
+
+    assert len(blocked) == n
+    diff = np.abs(whole - blocked)
+    # The two edges wrap differently (each block wraps its own tail, not the file's);
+    # everything between must agree, seams included.
+    assert diff[200:-200].max() < 2e-3
+    assert float(np.sqrt((diff * diff).mean())) < 2e-3
+
+
+def test_blockwise_downsample_stays_time_aligned_at_a_clipped_block():
+    """Regression: a trailing remainder inside the margin clipped the last full block's
+    input off the resample grid, warping it by up to a period (9 ms at 44.1k -> 16k)."""
+    np = pytest.importorskip("numpy")
+    from nanobot_channel_voice.stt.base import (
+        _RESAMPLE_BLOCK_S,
+        _RESAMPLE_MARGIN_S,
+        pcm_to_float_mono,
+    )
+
+    rate, dst = 44100, 16000
+    core = int(_RESAMPLE_BLOCK_S * rate)
+    total = 4 * core + int(_RESAMPLE_MARGIN_S * rate) // 2  # remainder inside (0, margin]
+    for pos in (3 * core + 12345, 4 * core - 5000):
+        x = np.zeros(total, dtype=np.int16)
+        x[pos] = 20000
+        out = pcm_to_float_mono(x.tobytes(), rate, dst)
+        assert abs(int(np.argmax(np.abs(out))) - pos * dst / rate) < 1.0
+
+
+def test_short_downsample_stays_on_the_single_block_path():
+    np = pytest.importorskip("numpy")
+    from nanobot_channel_voice.stt.base import _fft_resample, pcm_to_float_mono
+
+    pcm = (np.sin(np.arange(48000) * 0.05) * 16000).astype("<i2").tobytes()
+    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    whole = _fft_resample(np, audio, 16000).astype(np.float32)
+    assert np.allclose(whole, pcm_to_float_mono(pcm, 48000, 16000), atol=1e-6)

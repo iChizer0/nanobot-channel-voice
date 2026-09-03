@@ -119,3 +119,35 @@ def test_dead_arecord_is_diagnosed_once(tmp_path):
         assert len([m for m in messages if "arecord ended" in m]) == 1
 
     asyncio.run(asyncio.wait_for(_case(), timeout=15.0))
+
+
+def test_arecord_argv_pins_the_capture_ring(tmp_path):
+    """Without --period-size/--buffer-size, alsa-utils defaults to a 500 ms buffer and a
+    125 ms period, so frames reach the endpointer in 125 ms bursts."""
+    stub = tmp_path / "argv_arecord"
+    out = tmp_path / "argv.txt"
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {out}\nsleep 5\n')
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    async def _case():
+        cap = AlsaCapture("null", 16000, 20, arecord_path=str(stub))
+        await cap.start()
+        try:
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if out.exists() and out.read_text():
+                    break
+        finally:
+            await cap.stop()
+        return out.read_text().split()
+
+    argv = asyncio.run(asyncio.wait_for(_case(), timeout=15.0))
+    assert "--period-size" in argv and argv[argv.index("--period-size") + 1] == "320"
+    # 5 periods of 20 ms: one frame of granularity, 100 ms of overrun headroom.
+    assert argv[argv.index("--buffer-size") + 1] == "1600"
+
+
+def test_capture_ring_scales_with_a_short_frame(tmp_path):
+    cap = AlsaCapture("null", 16000, 10)
+    assert (cap._period_frames, cap._periods) == (160, 10)  # still ~100 ms
+

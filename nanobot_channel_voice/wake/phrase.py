@@ -11,6 +11,7 @@ alphabet rules as :mod:`..phrases`. Spaced-script tokens also end on a word boun
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Callable, Iterable
 
 from nanobot_channel_voice.phrases import FILLER_WORDS, _segments, tokens_of
@@ -32,6 +33,40 @@ _SEP_RE = re.compile(r"^[\s,.!?;:…、，。．！？；：]+")
 # Same split the chunker uses: from ideographs/kana/hangul up, mid-run matches are
 # legitimate.
 _CJK_FLOOR = 0x2E80
+
+
+def _nfkc(s: str) -> str:
+    return unicodedata.normalize("NFKC", s)
+
+
+def _fold(text: str) -> tuple[str, list[int]]:
+    """``(folded, source_index)``: the alphabet ``tokens_of`` uses (NFKC + lower), so a
+    fullwidth STT rendering matches an ASCII phrase. Folded per SEGMENT, a segment being
+    the shortest run whose NFKC is not the concatenation of its parts (halfwidth kana +
+    voiced mark, NFD combining marks): callers slice the ORIGINAL text, and the map has one
+    entry per folded char plus a terminator."""
+    out: list[str] = []
+    source: list[int] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = start + 1
+        while end < n and _nfkc(text[start:end + 1]) != _nfkc(text[start:end]) + _nfkc(text[end]):
+            end += 1
+        piece = _nfkc(text[start:end]).lower()
+        out.append(piece)
+        source += [start] * len(piece)
+        start = end
+    source.append(n)
+    return "".join(out), source
+
+
+def _after(source: list[int], end: int) -> int:
+    """Original offset just past folded position ``end``; a match ending inside one
+    source char's expansion (㍿ -> 株式会社) consumes the whole char."""
+    while end < len(source) - 1 and source[end] == source[end - 1]:
+        end += 1
+    return source[end]
 
 
 def _lead_ok(prefix: str, extra: Callable[[str], bool] | None = None) -> bool:
@@ -123,7 +158,8 @@ class FuzzyWake:
         soft-only content word: "...bot you"); ``(None, text)`` otherwise. Hesitation
         fillers may precede and are consumed with the match. Runs on the raw text, so
         the remainder keeps its original spelling."""
-        words = list(re.finditer(r"\w+", text, re.UNICODE))
+        folded, source = _fold(text)
+        words = list(re.finditer(r"\w+", folded, re.UNICODE))
         lead_max = 0
         for m in words[:3]:
             if m.group().casefold() in _LEAD_OK:
@@ -147,7 +183,7 @@ class FuzzyWake:
                             best = cand
         if best is None:
             return None, text
-        return best[2], _SEP_RE.sub("", text[best[3]:])
+        return best[2], _SEP_RE.sub("", text[_after(source, best[3]):])
 
 
 class WakePhrase:
@@ -187,10 +223,11 @@ class WakePhrase:
     def present(self, text: str) -> bool:
         """A wake phrase occurs ANYWHERE in *text* (``strip``'s word-boundary rules, no
         leading demand): the mention test the wake echo veto runs against spoken TTS."""
+        folded, _ = _fold(text)
         return any(
-            _clean_start(text, m.start()) and _clean_end(text, m.end())
+            _clean_start(folded, m.start()) and _clean_end(folded, m.end())
             for _, pat in self._patterns
-            for m in pat.finditer(text)
+            for m in pat.finditer(folded)
         )
 
     def strip(
@@ -201,13 +238,14 @@ class WakePhrase:
         wins) and the text after it, separators stripped; ``(None, text)`` otherwise.
         One ``search()`` per pattern suffices: any occurrence after a rejected one has
         non-acceptable content in front."""
+        folded, source = _fold(text)
         best, best_phrase = None, None
         for phrase, pat in self._patterns:
-            m = pat.search(text)
+            m = pat.search(folded)
             if (
                 m is None
-                or not _clean_end(text, m.end())
-                or not _lead_ok(text[: m.start()], extra_lead)
+                or not _clean_end(folded, m.end())
+                or not _lead_ok(folded[: m.start()], extra_lead)
             ):
                 continue
             if best is None or m.start() < best.start() or (
@@ -216,4 +254,4 @@ class WakePhrase:
                 best, best_phrase = m, phrase
         if best is None:
             return None, text
-        return best_phrase, _SEP_RE.sub("", text[best.end():])
+        return best_phrase, _SEP_RE.sub("", text[_after(source, best.end()):])

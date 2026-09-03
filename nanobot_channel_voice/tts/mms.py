@@ -179,7 +179,10 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
         return ch.lower() in self._vocab
 
     def _piece_budget(self) -> int:
-        return max(1, (self._max_length - 1) // 2)  # 2 ids per char + 1 closer
+        # The encoder ceiling only (2 ids per char + 1 closer). The decoder window is
+        # fixed and a proportional budget cannot fit an AFFINE frame count (~3.7/char
+        # + 48): a smaller budget cost every sentence a pass, the rare overrun costs one.
+        return max(1, (self._max_length - 1) // 2)
 
     def _synthesize_piece(self, text: str) -> np.ndarray:
         input_ids, attention_mask = preprocess_input(text, self._max_length, self._vocab)
@@ -194,9 +197,10 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
         )
         window = 2 * self._max_length
         if real_len > window:
-            # duration outruns the FIXED decoder window; the char budget bounds input only
+            # Duration outruns the FIXED decoder window; the char budget bounds input
+            # only. Re-cut where the prediction says the head fits (10 % slack).
             if len(text.strip()) > 1:
-                return self._halve_and_retry(text)
+                return self._halve_and_retry(text, frac=min(0.5, 0.9 * window / real_len))
             self._log.warning("MMS: single unsplittable piece exceeds the decoder window")
             real_len = window  # crop: partial speech beats silence for one word
         waveform = self._decoder.run(

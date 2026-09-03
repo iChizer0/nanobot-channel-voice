@@ -143,3 +143,89 @@ def test_capture_flush_drains_the_handoff_queue():
         assert await cap.flush() == 0
 
     asyncio.run(_case())
+
+
+class _StubAlsaAudio:
+    """Enough of the alsaaudio module surface for the open paths."""
+
+    PCM_PLAYBACK = 0
+    PCM_CAPTURE = 1
+    PCM_NORMAL = 0
+    PCM_FORMAT_S16_LE = "S16_LE"
+
+    def __init__(self):
+        self.opens: list[dict] = []
+
+    def PCM(self, **kwargs):  # noqa: N802 - mirrors the alsaaudio name
+        self.opens.append(kwargs)
+        return _InstrumentedPcm()
+
+
+@contextmanager
+def _stub_alsaaudio():
+    import sys
+
+    stub = _StubAlsaAudio()
+    previous = sys.modules.get("alsaaudio")
+    sys.modules["alsaaudio"] = stub
+    try:
+        yield stub
+    finally:
+        if previous is None:
+            del sys.modules["alsaaudio"]
+        else:
+            sys.modules["alsaaudio"] = previous
+
+
+def test_playback_ring_covers_the_sinks_write_ahead():
+    """libasound defaults to 4 periods: at a ~20 ms period that is an 80 ms ring, a
+    third of the write-ahead the sink paces to, so any hiccup between blocks underruns."""
+    from nanobot_channel_voice.audio.pyalsa import _PLAYBACK_LEAD_MS, PyAlsaPlayback
+
+    async def _case():
+        with _stub_alsaaudio() as stub:
+            await PyAlsaPlayback("null").open_stream(24000)
+        return stub.opens[0]
+
+    opened = asyncio.run(_case())
+    assert opened["periodsize"] == 480  # 20 ms
+    assert opened["periods"] == 12
+    assert opened["periodsize"] * opened["periods"] / 24000 * 1000 >= _PLAYBACK_LEAD_MS
+
+
+def test_capture_push_survives_a_loop_closed_under_the_reader():
+    """The reader thread pushes OUTSIDE its device-error guard: an unguarded
+    call_soon_threadsafe on a closed loop killed the thread with a bare traceback."""
+    import threading
+
+    from nanobot_channel_voice.audio.pyalsa import PyAlsaCapture
+
+    class _Pcm:
+        def read(self):
+            time.sleep(0.005)
+            return 320, b"\x00" * 640
+
+    cap = PyAlsaCapture("null", 16000, 20)
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(asyncio.sleep(0))
+    cap._loop = loop
+    cap._queue = asyncio.Queue(maxsize=50)
+    cap._pcm = _Pcm()
+    cap._running = True
+
+    crashes: list[str] = []
+    previous_hook = threading.excepthook
+    threading.excepthook = lambda a: crashes.append(a.exc_type.__name__)
+    try:
+        thread = threading.Thread(target=cap._reader, daemon=True)
+        thread.start()
+        time.sleep(0.05)
+        loop.close()  # the gateway loop goes away under the reader
+        thread.join(2.0)
+    finally:
+        threading.excepthook = previous_hook
+
+    assert not thread.is_alive()
+    assert crashes == []
+    assert cap._running is False  # the reader stopped itself, no deaf-mic spin
+

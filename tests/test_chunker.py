@@ -125,6 +125,60 @@ def test_punct_only_chunk_keeps_the_first_chunk_floor():
     assert c.feed("A tiny clause, ") == ["！", "A tiny clause,"]
 
 
+def test_ordered_list_markers_never_become_chunks():
+    c = SentenceChunker(min_chars=60, max_chars=240, min_chars_first=24)
+    # The marker's "." looked like a sentence end: every item cost a "1." chunk of its
+    # own (a synthesis call, a seam, and sentence-final prosody on the digit). Voiced as
+    # "one," instead: the number stays, since "42. That is..." is indistinguishable.
+    assert collect(c, "Here is the plan.\n", "1. Buy the milk.\n", "2. Call the plumber.\n") == [
+        "Here is the plan.", "1, Buy the milk.", "2, Call the plumber.",
+    ]
+    # A reply that OPENS with a list: its first chunk is what TTFA latches on.
+    c = SentenceChunker(min_chars=60, max_chars=240, min_chars_first=24)
+    assert collect(c, "1. Check the oil.\n2. Top up the coolant.\n")[0] == "1, Check the oil."
+    # A sentence that opens with a number is not a list item and loses nothing.
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert collect(c, "42. That is the answer to everything.") == [
+        "42, That is the answer to everything.",
+    ]
+
+
+def test_a_bare_number_sentence_keeps_its_digits():
+    # The ordered marker needs a SAME-LINE space after it, so "42." stays speech.
+    c = SentenceChunker(min_chars=10, max_chars=240, min_chars_first=6)
+    assert collect(c, "42.") == ["42."]
+
+
+def test_abbreviations_and_initialisms_do_not_end_a_sentence():
+    c = SentenceChunker(min_chars=60, max_chars=240, min_chars_first=24)
+    # "We met Dr." with sentence-final prosody plus a 140 ms seam, mid-name.
+    assert collect(c, "We met Dr. Smith and Mr. Jones at 5 p.m. in the lobby.") == [
+        "We met Dr. Smith and Mr. Jones at 5 p.m. in the lobby.",
+    ]
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert c.feed("The U.S. team won. Next.") == ["The U.S. team won."]
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert c.feed("Ms. Smith arrived. Next.") == ["Ms. Smith arrived."]
+
+
+def test_lowercase_lookalikes_still_end_a_sentence():
+    # "st"/"ms" bind only as capitalised titles: an ordinal or a unit ends its sentence.
+    for text, first in (
+        ("He came in 1st. Then he rested.", "He came in 1st."),
+        ("It took 250 ms. Then it ran.", "It took 250 ms."),
+    ):
+        c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+        assert c.feed(text) == [first]
+
+
+def test_the_dot_guards_still_end_ordinary_sentences():
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    # Neither an abbreviation nor an initialism: the cut stands.
+    assert c.feed("The answer is no. Next question.") == ["The answer is no."]
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert c.feed("It costs 3.14 dollars. Really.") == ["It costs 3.14 dollars."]
+
+
 def test_max_chars_force_split_at_last_space():
     c = SentenceChunker(min_chars=10, max_chars=40)
     words = "word " * 20  # no sentence punctuation at all

@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from nanobot_channel_voice.tts.espeak import BATCH_SEP
+
 # Mandarin letter readings as (syllable, preferred tone) sequences; resolution tries
 # the tone ladder then the toneless twin, and a letter with any unresolvable syllable
 # is dropped at build.
@@ -137,7 +139,7 @@ class EnglishToPinyin:
         if len(fresh) < 2:
             return
         try:
-            lines = self._phonemize("\n".join(fresh)).splitlines()
+            lines = self._phonemize(BATCH_SEP.join(fresh)).splitlines()
         except Exception:  # noqa: BLE001 - the per-word path reports instead
             return
         if len(lines) != len(fresh):

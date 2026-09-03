@@ -15,7 +15,7 @@ from nanobot_channel_voice.config import VoiceConfig, WakeConfig  # noqa: E402
 from nanobot_channel_voice.wake import make_wake_detector  # noqa: E402
 from nanobot_channel_voice.wake import openwakeword as oww_mod  # noqa: E402
 from nanobot_channel_voice.wake.openwakeword import OpenWakeWord  # noqa: E402
-from nanobot_channel_voice.wake.phrase import WakePhrase  # noqa: E402
+from nanobot_channel_voice.wake.phrase import FuzzyWake, WakePhrase  # noqa: E402
 
 # ---- transcript tier: WakePhrase --------------------------------------------
 
@@ -670,3 +670,39 @@ def test_wake_phrase_pair_entries_report_the_display():
     assert wp.strip("嘿难道爸今天天气") == ("hey nanobot", "今天天气")
     assert wp.present("嘿难道爸")
     assert wp.strip("hey nanobot hello") == ("hey nanobot", "hello")
+
+
+def test_compatibility_forms_still_summon():
+    """Regression: patterns were built from NFKC-folded tokens but matched against the RAW
+    transcript, so a fullwidth rendering (zh/ja ASR with ITN) missed the summon AND left
+    the phrase in the published text."""
+    wake = WakePhrase(["hey nanobot"])
+    assert wake.strip("ｈｅｙ　ｎａｎｏｂｏｔ 天气") == ("hey nanobot", "天气")
+    bare = WakePhrase(["nanobot"])
+    assert bare.present("I said Ｎａｎｏｂｏｔ once")
+    assert not bare.present("nanobots")  # the word-boundary rule survives folding
+    # The remainder is sliced from the ORIGINAL text: spelling and case are preserved.
+    assert wake.strip("Hey Nanobot, Weather?") == ("hey nanobot", "Weather?")
+    assert FuzzyWake(["hey nanobot"]).strip_head("ｈｅ ｎｉｎｅ ｏｂｔ 天气") == (
+        "hey nanobot", "天气",
+    )
+
+
+def test_composed_forms_fold_as_one_alphabet():
+    """Regression: folding per CHARACTER never composed a halfwidth kana with its voiced
+    mark (or an NFD base with its accent), so the pattern's NFKC form could not match."""
+    import unicodedata
+
+    assert WakePhrase(["ナノボット"]).strip("ﾅﾉﾎﾞｯﾄ 天気は") == ("ナノボット", "天気は")
+    nfd = unicodedata.normalize("NFD", "café")
+    assert WakePhrase(["café"]).strip(nfd + " order one") == ("café", "order one")
+    # A match ending inside one source char's expansion consumes the whole char.
+    assert WakePhrase(["株式"]).strip("㍿の件です") == ("株式", "の件です")
+
+
+def test_a_phrase_configured_in_a_compatibility_form_matches_itself():
+    """Regression: tokens_of folded the CONFIGURED phrase too, so a fullwidth entry
+    matched only the ASCII spelling and never the form it was written in."""
+    wake = WakePhrase(["ｎａｎｏｂｏｔ"])
+    assert wake.strip("ｎａｎｏｂｏｔ weather")[0] == "ｎａｎｏｂｏｔ"  # display stays as written
+    assert wake.strip("nanobot weather")[0] == "ｎａｎｏｂｏｔ"

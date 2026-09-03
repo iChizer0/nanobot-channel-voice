@@ -127,6 +127,8 @@ class SttHttpServer:
                 body = await asyncio.wait_for(
                     self._read_body(reader, headers), timeout=_BODY_TIMEOUT_S
                 )
+                # A view into body, never a copy: the part IS most of the body, so
+                # residency stays at 1x the upload instead of 2x.
                 audio, filename = _multipart_file(headers.get("content-type", ""), body)
                 pcm, rate = await self._ingest(audio, filename)
                 async with self._lock:
@@ -223,14 +225,14 @@ class SttHttpServer:
 
     # ---- audio ingest -------------------------------------------------------
 
-    async def _ingest(self, audio: bytes, filename: str) -> tuple[bytes, int]:
+    async def _ingest(self, audio: memoryview, filename: str) -> tuple[bytes, int]:
         """Any uploaded container -> (S16_LE mono PCM, rate) for the adapter."""
         wav = _plain_wav_pcm(audio)
         if wav is not None:
             return wav
         return await self._ffmpeg_pcm(audio, filename)
 
-    async def _ffmpeg_pcm(self, audio: bytes, filename: str) -> tuple[bytes, int]:
+    async def _ffmpeg_pcm(self, audio: memoryview, filename: str) -> tuple[bytes, int]:
         if shutil.which("ffmpeg") is None:
             raise _HttpError(
                 415, "Unsupported Media Type",
@@ -274,7 +276,7 @@ class SttHttpServer:
         )
 
 
-def _write_fd(fd: int, data: bytes) -> None:
+def _write_fd(fd: int, data: memoryview) -> None:
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
 
@@ -292,12 +294,13 @@ def _disposition(head: bytes) -> str:
     return ""
 
 
-def _multipart_file(content_type: str, body: bytes) -> tuple[bytes, str]:
-    """The ``file`` part of an OpenAI-shape multipart upload -> (bytes, filename).
+def _multipart_file(content_type: str, body: bytes) -> tuple[memoryview, str]:
+    """The ``file`` part of an OpenAI-shape multipart upload -> (view, filename).
 
-    Boundary split over a memoryview, NOT the stdlib ``email`` parser: measured at
-    seconds of CPU and ~11x transient RSS for a 30 MB upload, on the loop that also runs
-    capture and barge-in; and its ``BytesIO`` path newline-translates the bytes."""
+    A VIEW, never a copy: the part is most of the body, so materializing it doubles the
+    upload's residency. Boundary split by hand, NOT the stdlib ``email`` parser: measured
+    at seconds of CPU and ~11x transient RSS for a 30 MB upload, on the loop that also
+    runs capture and barge-in; and its ``BytesIO`` path newline-translates the bytes."""
     if "multipart/form-data" not in content_type.lower():
         raise _HttpError(
             400, "Bad Request", "expected multipart/form-data (the OpenAI transcription shape)"
@@ -308,7 +311,7 @@ def _multipart_file(content_type: str, body: bytes) -> tuple[bytes, str]:
     if cursor < 0:
         raise _HttpError(400, "Bad Request", "unparseable multipart body")
     view = memoryview(body)
-    fallback: tuple[bytes, str] | None = None
+    fallback: tuple[memoryview, str] | None = None
     while body[cursor + len(delim):cursor + len(delim) + 2] != b"--":  # not the closing delimiter
         head_end = body.find(b"\r\n\r\n", cursor)
         if head_end < 0:
@@ -323,20 +326,57 @@ def _multipart_file(content_type: str, body: bytes) -> tuple[bytes, str]:
             continue
         filename = params.get("filename") or "upload"
         if params.get("name") == "file":
-            return bytes(payload), filename
+            return payload, filename
         if params.get("filename") and fallback is None:
-            fallback = (bytes(payload), filename)  # tolerate a client naming the part oddly
+            fallback = (payload, filename)  # tolerate a client naming the part oddly
     if fallback is not None:
         return fallback
     raise _HttpError(400, "Bad Request", "multipart body carries no 'file' part")
 
 
-def _plain_wav_pcm(data: bytes) -> tuple[bytes, int] | None:
+class _ViewFile(io.RawIOBase):
+    """Seekable reader over a memoryview: ``wave`` needs a file object, and handing it an
+    ``io.BytesIO`` would copy the whole upload to make one."""
+
+    def __init__(self, view: memoryview):
+        self._view = view
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence not in (os.SEEK_SET, os.SEEK_CUR, os.SEEK_END):
+            raise ValueError(f"invalid whence ({whence})")
+        base = (0, self._pos, len(self._view))[whence]
+        self._pos = min(max(0, base + offset), len(self._view))
+        return self._pos
+
+    def readinto(self, buf) -> int:
+        n = min(len(buf), len(self._view) - self._pos)
+        buf[:n] = self._view[self._pos : self._pos + n]
+        self._pos += n
+        return n
+
+    def read(self, size: int = -1) -> bytes:
+        end = len(self._view) if size is None or size < 0 else min(len(self._view), self._pos + size)
+        chunk = bytes(self._view[self._pos : end])
+        self._pos = end
+        return chunk
+
+
+def _plain_wav_pcm(data: memoryview) -> tuple[bytes, int] | None:
     """S16 WAV -> (mono PCM, native rate) without ffmpeg; None if not that."""
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         return None
     try:
-        with wave.open(io.BytesIO(data), "rb") as w:
+        with wave.open(_ViewFile(data), "rb") as w:
             channels = w.getnchannels()
             if w.getsampwidth() != 2 or channels not in (1, 2):
                 return None  # exotic widths/layouts: let ffmpeg do it properly

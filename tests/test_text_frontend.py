@@ -180,6 +180,59 @@ def test_space_digit_sequences_is_engine_native():
     assert space_digit_sequences("Termin am 2026-08-19", "de") == "Termin am 2 0 2 6, 0 8, 1 9"
 
 
+def test_espeak_path_renders_clocks_and_grouped_amounts_to_words():
+    from nanobot_channel_voice.tts.text_frontend import space_digit_sequences
+
+    # Regression: with neither pass in front of the sequence rules, the leading-zero
+    # rule shredded the "00" of a clock and every "000" group of a grouped amount —
+    # espeak then read "12:0 0" as "twelve COLON zero zero" and "1,0 0 0,0 0 0" as
+    # seven separate digits instead of "one million".
+    assert space_digit_sequences("at 12:00") == "at twelve o'clock"
+    assert space_digit_sequences("meeting at 9:00 am") == "meeting at nine o'clock am"
+    assert space_digit_sequences("the time is 08:30") == "the time is eight thirty"
+    assert space_digit_sequences("it was 1,000,000") == "it was one million"
+    assert space_digit_sequences("3,000 and 40,000") == "three thousand and forty thousand"
+    assert space_digit_sequences("1,020,300") == "one million twenty thousand three hundred"
+    # A grouped decimal goes whole (grouped alone stranded ".56" as "dot five six");
+    # a plain decimal stays engine-native, as every other bare number here.
+    assert space_digit_sequences("It costs $1,234.56.") == (
+        "It costs one thousand two hundred thirty four point five six dollars."
+    )
+    assert space_digit_sequences("Rate 1,000.25 per unit.") == (
+        "Rate one thousand point two five per unit."
+    )
+    assert space_digit_sequences("about 3.14 here") == "about 3.14 here"
+    # h:mm:ss is read whole; half-read, espeak voiced the remaining colon.
+    assert space_digit_sequences("Duration 1:30:45.") == "Duration one thirty forty five."
+    assert space_digit_sequences("at 12:00:00 UTC") == "at twelve zero zero UTC"
+    # Other languages have no word table on this path and keep the neutral spacing.
+    assert space_digit_sequences("um 12:00", "de") == "um 12:0 0"
+
+
+def test_mms_overflow_splits_in_proportion_to_the_predicted_overrun():
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    from nanobot_channel_voice.tts.mms import MmsTtsAdapter
+
+    # The budget bounds the ENCODER input (2 ids per char + 1 closer); the decoder window
+    # is fixed, so the ~1 in 8 sentence that overruns it is re-cut where the prediction
+    # says it fits, not blindly halved (a smaller budget cost every sentence a pass).
+    tts = MmsTtsAdapter.__new__(MmsTtsAdapter)
+    tts._max_length = 200
+    assert tts._piece_budget() == 99
+    tts.output_rate = 16000
+    tts._join_gap_s = 0.06
+    seen: list[str] = []
+    tts._synthesize_piece = lambda text: (seen.append(text), np.ones(160, np.float32))[1]
+    text = "one two three four five six seven eight nine ten"
+    tts._halve_and_retry(text, frac=0.8)
+    assert seen == ["one two three four five six seven eight", "nine ten"]
+    seen.clear()
+    tts._halve_and_retry(text)  # default: the midpoint
+    assert seen == ["one two three four five", "six seven eight nine ten"]
+
+
 def test_huge_digit_runs_are_read_out():
     # Phone-number/id territory: scale words would be absurd; read the digits.
     out = verbalize_numbers_en("call 8005551212000")

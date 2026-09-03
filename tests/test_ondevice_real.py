@@ -90,6 +90,36 @@ def test_mms_real_synthesis_wav_and_pcm():
     assert len(pcm) > 16000  # > 0.5 s of 16 kHz S16_LE
 
 
+def test_mms_real_overrun_is_recut_where_it_fits():
+    """The FIXED 2*max_length-frame window, not the encoder token count, is the binding
+    ceiling for ~1 sentence in 8 at the budget; the re-cut must land the head inside the
+    window on its first retry, and ordinary sentences must not be split at all."""
+    _need(_MMS / "mms_tts_eng_encoder_200.onnx", _MMS / "mms_tts_eng_decoder_200.onnx")
+    from nanobot_channel_voice.config import MmsTtsConfig
+    from nanobot_channel_voice.tts.base import split_for_budget
+    from nanobot_channel_voice.tts.mms import MmsTtsAdapter
+
+    tts = MmsTtsAdapter.from_config(MmsTtsConfig(
+        encoder_path=str(_MMS / "mms_tts_eng_encoder_200.onnx"),
+        decoder_path=str(_MMS / "mms_tts_eng_decoder_200.onnx"),
+    ))
+    pieces: list[str] = []
+    inner = tts._synthesize_piece
+    tts._synthesize_piece = lambda text: (pieces.append(text), inner(text))[1]
+    try:
+        plain = "Well, the short answer is yes, although there are a few caveats."
+        assert split_for_budget(tts._normalize(plain), tts._piece_budget()) == [plain]
+        long = (
+            "Your flight leaves at seven forty in the morning, so please leave the house "
+            "by five thirty."
+        )
+        asyncio.run(tts.synthesize_pcm(long))
+        # One overrun, one re-cut (2 pieces), nothing recursed: at most 3 passes.
+        assert len(pieces) <= 3, pieces
+    finally:
+        tts.release()
+
+
 def test_matcha_real_official_embedded_vocoder():
     """The preferred artifact: python -m matcha.onnx.export with the vocoder embedded
     (scales input, wav output, built-in symbol table - no side files at all)."""

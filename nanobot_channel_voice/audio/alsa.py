@@ -21,6 +21,10 @@ from nanobot_channel_voice.audio.base import (
 _PIPE = asyncio.subprocess.PIPE
 _DEVNULL = asyncio.subprocess.DEVNULL
 
+# Ring depth for a capture device, in ms. alsa-utils otherwise defaults to a 500 ms
+# buffer and a 125 ms period, so frames reach the endpointer in 125 ms bursts.
+_CAPTURE_RING_MS = 100
+
 
 async def _terminate(proc: asyncio.subprocess.Process | None) -> None:
     """Kill *proc* and reap it, but never block the loop indefinitely."""
@@ -75,6 +79,9 @@ class AlsaCapture(CaptureSource):
         # frame_ms; half a period separates them and bounds the whole flush.
         self._flush_step_s = frame_ms / 2000.0
         self._flush_cap = sample_rate * 2 * 10  # never spin past ~10 s of backlog
+        # One period IS one frame, so capture granularity matches the endpointer's.
+        self._period_frames = max(1, sample_rate * frame_ms // 1000)
+        self._periods = max(4, -(-_CAPTURE_RING_MS // frame_ms))
         self._bin = arecord_path
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr: _StderrTail | None = None
@@ -89,6 +96,8 @@ class AlsaCapture(CaptureSource):
             "-c", "1",
             "-r", str(self._sample_rate),
             "-t", "raw",
+            "--period-size", str(self._period_frames),
+            "--buffer-size", str(self._period_frames * self._periods),
         ]
         self._eof_logged = False
         self._proc = await asyncio.create_subprocess_exec(

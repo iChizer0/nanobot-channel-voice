@@ -27,6 +27,15 @@ from nanobot_channel_voice.audio.base import (
 # WAV sample width (bytes) -> ALSA format name, resolved by getattr at use time.
 _WIDTH_TO_FORMAT = {1: "PCM_FORMAT_U8", 2: "PCM_FORMAT_S16_LE", 4: "PCM_FORMAT_S32_LE"}
 
+# The sink writes this far ahead of the wall clock; a ring shallower than the
+# write-ahead underruns on any hiccup between blocks (libasound's default is 4 periods).
+_PLAYBACK_LEAD_MS = 240
+
+
+def _playback_periods(rate: int, periodsize: int) -> int:
+    period_ms = max(1, periodsize * 1000 // max(1, rate))
+    return max(4, -(-_PLAYBACK_LEAD_MS // period_ms))
+
 
 class PyAlsaCapture(CaptureSource):
     def __init__(self, device: str, sample_rate: int, frame_ms: int):
@@ -112,8 +121,13 @@ class PyAlsaCapture(CaptureSource):
 
     def _push(self, data: bytes) -> None:
         loop = self._loop
-        if loop is not None:
+        if loop is None:
+            return
+        try:
             loop.call_soon_threadsafe(self._enqueue, data)
+        except RuntimeError:
+            # The loop closed under the reader thread; stop instead of dying mid-frame.
+            self._running = False
 
     def _enqueue(self, data: bytes) -> None:
         if self._queue is not None:
@@ -214,6 +228,7 @@ class PyAlsaPlayback(PlaybackSink):
                 channels=channels,
                 format=getattr(alsaaudio, fmt_name),
                 periodsize=periodsize,
+                periods=_playback_periods(rate, periodsize),
             )
         except Exception as exc:  # noqa: BLE001
             self._log.warning("pyalsa open failed: {}", exc)
@@ -254,6 +269,7 @@ class PyAlsaPlayback(PlaybackSink):
     def _open_stream_blocking(self, rate: int):
         import alsaaudio
 
+        periodsize = max(64, rate // 50)  # ~20 ms
         return alsaaudio.PCM(
             type=alsaaudio.PCM_PLAYBACK,
             mode=alsaaudio.PCM_NORMAL,
@@ -261,7 +277,8 @@ class PyAlsaPlayback(PlaybackSink):
             rate=rate,
             channels=1,
             format=alsaaudio.PCM_FORMAT_S16_LE,
-            periodsize=max(64, rate // 50),
+            periodsize=periodsize,
+            periods=_playback_periods(rate, periodsize),
         )
 
     # ---- lifecycle ----------------------------------------------------------
@@ -301,6 +318,7 @@ class _PyAlsaPlaybackStream(PlaybackStream):
         self._killing = False
         self._dead = False
         self._death_logged = False
+        self._short_logged = False
 
     @property
     def dead(self) -> bool:
@@ -318,7 +336,13 @@ class _PyAlsaPlaybackStream(PlaybackStream):
             if self._dead:
                 return
             try:
-                self._pcm.write(data)
+                written = self._pcm.write(data)
+                if written is not None and 0 <= written * 2 < len(data) and not self._short_logged:
+                    # libasound re-prepares on an xrun and discards the rest of the block.
+                    self._short_logged = True
+                    logger.bind(component="pyalsa").warning(
+                        "playback underrun: {} of {} frames written", written, len(data) // 2
+                    )
             except Exception as exc:  # noqa: BLE001
                 # A barge-in raises here too (kill()'s drop deliberately lands while we
                 # hold the io-lock), so _killing/_closed mean "not a device failure".

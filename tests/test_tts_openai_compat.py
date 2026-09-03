@@ -135,11 +135,23 @@ def test_pcm_mode_strips_a_wav_lie_and_rejects_bad_geometry():
         return httpx.Response(200, content=pcm_to_wav_bytes(frames, 24000))
 
     assert _run(_synth(_adapter(wav_handler, fmt="pcm"), pcm=True)) == frames
+    # Blob mode takes the same body: unstripped, the inner 44-byte RIFF header played
+    # as ~22 full-scale samples at the head of every chunk.
+    assert _run(_synth(_adapter(wav_handler, fmt="pcm"))) == pcm_to_wav_bytes(frames, 24000)
+
+    # A WAV at another rate: the pcm stream cannot fix it, but the blob carries the
+    # WAV's OWN rate so the sink plays it at speed.
+    def slow_handler(request):
+        return httpx.Response(200, content=pcm_to_wav_bytes(frames, 22050))
+
+    assert _run(_synth(_adapter(slow_handler, fmt="pcm"))) == pcm_to_wav_bytes(frames, 22050)
+    assert _run(_synth(_adapter(slow_handler, fmt="pcm"), pcm=True)) == frames
 
     def stereo_handler(request):
         return httpx.Response(200, content=pcm_to_wav_bytes(frames, 24000, channels=2))
 
     assert _run(_synth(_adapter(stereo_handler, fmt="pcm"), pcm=True)) == b""
+    assert _run(_synth(_adapter(stereo_handler, fmt="pcm"))) == b""
 
 
 def test_pcm_mode_trims_a_torn_trailing_byte():
@@ -148,6 +160,9 @@ def test_pcm_mode_trims_a_torn_trailing_byte():
 
     # An odd byte count misaligns every later S16 sample in the stream.
     assert _run(_synth(_adapter(handler, fmt="pcm"), pcm=True)) == b"\x01\x02\x03\x04"
+    assert _run(_synth(_adapter(handler, fmt="pcm"))) == pcm_to_wav_bytes(
+        b"\x01\x02\x03\x04", 24000
+    )
 
 
 def test_pcm_format_synthesize_wraps_to_wav_at_the_declared_rate():

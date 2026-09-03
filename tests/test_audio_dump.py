@@ -361,3 +361,71 @@ def test_blip_manifest_carries_close_snapshot(tmp_path):
     assert blip["active_ms"] == 120
     assert blip["close"] == "silence" and blip["silence_ms"] == 600
     assert "prob_mean" not in blip  # scripted VAD exposes no probability
+
+
+def test_close_does_not_hang_behind_a_wedged_writer(tmp_path, monkeypatch):
+    """A byte budget alone never refuses the close sentinel, so a dead disk would hold
+    teardown for the full join timeout; the depth cap keeps the old escape."""
+    import threading
+    import time
+
+    import nanobot_channel_voice.dump as dump_mod
+
+    monkeypatch.setattr(dump_mod, "_QUEUE_DEPTH", 2)
+    d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
+    block = threading.Event()
+    d._write_one = lambda *a, **k: block.wait(10.0)  # the writer never comes back
+    try:
+        for _ in range(4):
+            d.submit("empty", b"\x00" * 320, None)
+        t0 = time.monotonic()
+        d.close()
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        block.set()
+
+
+def test_submit_backlog_is_bounded_in_bytes_not_segments(tmp_path, monkeypatch):
+    """The in-flight bound is RAM, so it must count the pre-AEC twin too: a per-segment
+    depth held ~2x the intended budget once a raw tap was wired."""
+    import threading
+
+    import nanobot_channel_voice.dump as dump_mod
+
+    monkeypatch.setattr(dump_mod, "_QUEUE_BYTES", 8000)
+    d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
+    block = threading.Event()
+    original = d._write_one
+    d._write_one = lambda *a, **k: (block.wait(5.0), original(*a, **k))[1]  # stall the writer
+    try:
+        # 3000 B of pcm + 3000 B of twin fills 6000 of the 8000 B budget.
+        d.submit("empty", b"\x00" * 3000, b"\x00" * 3000)
+        # The next pair would exceed it and is dropped rather than queued.
+        d.submit("empty", b"\x00" * 3000, b"\x00" * 3000)
+        assert d._queued_bytes <= 8000
+    finally:
+        block.set()
+        d.close()
+    # Exactly one pair reached disk; the dropped one never allocated a slot.
+    assert sorted(p.name for p in d.dir.glob("*.wav")) == [
+        "utt-0001-empty.raw.wav", "utt-0001-empty.wav"
+    ]
+
+
+def test_written_segments_give_their_budget_back(tmp_path, monkeypatch):
+    """The budget is in-flight RAM, not a lifetime quota: a drained segment must free
+    its slot or dumping stops after the first few utterances of a long session."""
+    import time
+
+    import nanobot_channel_voice.dump as dump_mod
+
+    monkeypatch.setattr(dump_mod, "_QUEUE_BYTES", 8000)
+    d = AudioDumper(tmp_path, 16000, 10 * 1024 * 1024)
+    for _ in range(6):  # 18000 B total, 2.25x the budget, drained one at a time
+        d.submit("empty", b"\x00" * 3000)
+        deadline = time.monotonic() + 5.0
+        while d._queued_bytes and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert d._queued_bytes == 0  # the write gave the slot back
+    d.close()
+    assert len(list(d.dir.glob("*.wav"))) == 6

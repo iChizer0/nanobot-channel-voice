@@ -15,7 +15,6 @@ from contextlib import suppress
 from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.bus.outbound_events import StreamedResponseEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.runtime_context import RuntimeContextBlock
@@ -32,6 +31,7 @@ from nanobot_channel_voice.config import (
     VoiceConfig,
     consume_import_json,
     resolve_openai_key,
+    transcription_gap,
 )
 from nanobot_channel_voice.context_tool import (
     VoiceContextBridge,
@@ -124,7 +124,7 @@ _VOICE_CMD_META = "_voice_cmd"
 # Trace flags older cores stamp on outbound metadata; newer cores moved the semantics onto
 # the typed ``OutboundMessage.event``. BOTH checked: neither alone covers every core.
 _TRACE_META = (
-    "_streamed",        # already spoken via send_delta
+    "_streamed",        # already spoken via send_delta; core also drops these before send()
     "_progress",
     "_tool_hint",
     "_reasoning",
@@ -144,21 +144,6 @@ def _speakable(msg: OutboundMessage) -> bool:
         return False
     meta = msg.metadata or {}
     return not any(meta.get(k) for k in _TRACE_META)
-
-
-def _streamed_final(msg: OutboundMessage) -> bool:
-    """The turn's final, stamped "already delivered as deltas" — usually honest: core also
-    stamps it on text it SUBSTITUTES for a blank answer (``empty_final_response``, the
-    max-iterations finalization), never streamed at all, and dropping that is dead air. The
-    backend, which knows what the turn said, decides (``speak_unanswered``). Either
-    encoding may arrive."""
-    meta = msg.metadata or {}
-    if any(meta.get(k) for k in _TRACE_META if k != "_streamed"):
-        return False  # a progress/tool/reasoning trace, not a reply
-    event = getattr(msg, "event", None)
-    return isinstance(event, StreamedResponseEvent) or (
-        event is None and bool(meta.get("_streamed"))
-    )
 
 
 def _agent_initiated(metadata: dict[str, Any] | None) -> bool:
@@ -257,15 +242,16 @@ def _voice_context_blocks(
 
 # Stamped on a delegated ask_nanobot request; the AgentLoop echoes inbound metadata onto
 # the turn's FINAL send (a /stop-ped delegation can finish minutes later with a bare final
-# send). Mismatch => straggler; absent => accept.
+# send). The token must match: an unstamped delivery into this chat is someone else's
+# turn (a cron fire, a message-tool send), never the delegation's answer.
 _DELEGATION_META = "_voice_delegation"
 
 
 class _DelegationCollector:
     """Collects one delegated nanobot turn's reply off the bus (supervisor mode); the first
     terminal resolves the future. Streaming ON: deltas accumulate, ``_stream_end`` resolves,
-    the final ``_streamed`` send (which DOES reach the channel) is ignored. OFF: one final
-    ``send`` resolves."""
+    the turn's final never reaches a channel (core drops it). OFF: one final ``send``
+    resolves."""
 
     def __init__(self, metrics: VoiceMetrics) -> None:
         self._future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -414,8 +400,12 @@ class VoiceChannel(BaseChannel):
                 self._stt = None  # the provider does ASR; never load on-device models
                 shell, instructions, tools = await self._build_cloud()
             elif kind == "local":
-                self._stt = make_stt(self.config.stt)
-                shell, instructions, tools = self._build_local()
+                # Off the loop: a dozen ORT/RKNN session loads inline would freeze the
+                # gateway (every other channel, cron, the WebUI) for the whole build.
+                # Nothing here binds to a loop — Queue/Event bind lazily on first use.
+                self._stt = await asyncio.to_thread(make_stt, self.config.stt)
+                self._warn_if_transcription_unconfigured()
+                shell, instructions, tools = await asyncio.to_thread(self._build_local)
             else:
                 # Refuse loudly: falling through to local would run the wrong brain.
                 raise RuntimeError(f"voice backend kind '{kind}' is not implemented")
@@ -490,13 +480,6 @@ class VoiceChannel(BaseChannel):
                 "stt decode window ({:.0f}s) is under vad.maxUtteranceMs ({}); longer "
                 "utterances are decoded in window-sized pieces cut at the quietest gap",
                 window / 1000, self.config.vad.max_utterance_ms,
-            )
-        if self.config.stt.provider == "zipformer" and self.config.audio.sample_rate != 16000:
-            # The streaming path feeds capture frames unresampled (only batch resamples),
-            # so another rate yields time-stretched garbage.
-            raise RuntimeError(
-                "stt.provider='zipformer' requires audio.sampleRate=16000 "
-                f"(configured: {self.config.audio.sample_rate})"
             )
         capture, sink_dev = make_audio(self.config.audio)
         vad = make_vad(self.config.vad, self.config.audio.sample_rate, self.config.audio.frame_ms)
@@ -693,12 +676,25 @@ class VoiceChannel(BaseChannel):
         the realtime model sequences; ``"supervisor"`` declares ONE (``ask_nanobot``)
         delegating the whole request, so multi-step planning leaves the weak model."""
         gw = self._tool_gateway
-        if gw is None or not supported:
-            if gw is not None and not supported:
-                self.logger.info(
-                    "voice: provider '{}' does not support the tool-call seam; persona-only",
-                    self.config.backend,
-                )
+        if gw is None:
+            # No core passes one today. A toolMode the user SET is inert: say so, or a
+            # supervisor session looks like a plain chatbot that forgot how to delegate.
+            level = (
+                "warning" if "tool_mode" in self.config.realtime.model_fields_set else "info"
+            )
+            getattr(self.logger, level)(
+                "voice: realtime.toolMode='{}' has no effect — this nanobot build passes no "
+                "tool gateway to plugin channels (VoiceChannel.wants_tool_gateway is "
+                "unread), so the session is persona-only: no nanobot tools, no ask_nanobot "
+                "delegation. Use backend='local' for the full agent.",
+                tool_mode,
+            )
+            return [], None
+        if not supported:
+            self.logger.info(
+                "voice: provider '{}' does not support the tool-call seam; persona-only",
+                self.config.backend,
+            )
             return [], None
 
         if tool_mode == "supervisor":
@@ -859,12 +855,15 @@ class VoiceChannel(BaseChannel):
         tts_ms_per_char: float | None = None
         local.hold_hop_accounting(True)  # probes only: the IDLE wait above stays accounted
         try:
-            if self._stt is not None:
+            # A streaming adapter decodes during capture and never calls transcribe(), so
+            # timing it would describe a path this pipeline does not take.
+            if self._stt is not None and not getattr(self._stt, "streaming", False):
+                rate = self.config.audio.sample_rate
                 t0 = time.monotonic()
-                # Fixed-cost probe: 1 s of silence (16 kHz * 2 B). For a fixed-window model
-                # (whisper) this IS the decode floor; length-proportional engines
+                # Fixed-cost probe: 1 s of silence at the capture rate. For a fixed-window
+                # model (whisper) this IS the decode floor; length-proportional engines
                 # underestimate long utterances.
-                await self._stt.transcribe(b"\x00" * 32000, 16000)
+                await self._stt.transcribe(b"\x00" * (2 * rate), rate)
                 stt_ms = (time.monotonic() - t0) * 1000.0
             tts = self._tts_adapter
             # probe_ok is False on cloud adapters: no startup billing, and a cloud RTF
@@ -913,6 +912,20 @@ class VoiceChannel(BaseChannel):
                         separators=(",", ":"),
                     ),
                 )
+
+    def _warn_if_transcription_unconfigured(self) -> None:
+        """``stt.provider="nanobot"`` with nothing behind it is a deaf channel that still
+        reports healthy: every utterance decodes to ``""`` and is dropped as silence."""
+        if self._stt is not None or self.config.stt.provider != "nanobot":
+            return  # on-device: loaded, or its own build warning already named the gap
+        gap = transcription_gap()
+        if gap is not None:
+            self.logger.warning(
+                "voice: stt.provider='nanobot' delegates every utterance to nanobot's "
+                "transcription, but {} — the channel will start and hear NOTHING. Configure "
+                "it, or set stt.provider to an on-device engine.",
+                gap,
+            )
 
     def _drop_bridge(self) -> None:
         """Stop serving context for this channel instance. Identity-checked: a late
@@ -1010,10 +1023,16 @@ class VoiceChannel(BaseChannel):
         # streaming one, first wins. Only OUR session chat qualifies: a delivery routed
         # elsewhere (cron) must not resolve it.
         meta = msg.metadata or {}
-        if self._pending_delegation is not None and msg.chat_id == self.config.chat_id:
-            echoed = meta.get(_DELEGATION_META)
-            if echoed is not None and echoed != self._pending_delegation.token:
-                return  # a stopped PREVIOUS delegation's late reply, not our answer
+        if msg.chat_id != self.config.chat_id:
+            # One speaker, one chat: a delivery addressed elsewhere (the message tool takes
+            # an arbitrary channel/chat) must neither be spoken nor touch this turn's state.
+            return
+        if self._pending_delegation is not None:
+            if meta.get(_DELEGATION_META) != self._pending_delegation.token:
+                # Another turn's reply (a straggler, a cron fire), not our answer. Logged:
+                # a core that stopped echoing the stamp would show up as a silent hang.
+                self.logger.debug("voice: unstamped delivery ignored while delegating")
+                return
             if _speakable(msg):
                 text = (msg.content or "").strip()
                 if text:
@@ -1022,12 +1041,10 @@ class VoiceChannel(BaseChannel):
         local = self._local()
         if local is None:
             return
-        if msg.chat_id == self.config.chat_id:
-            # ANY traffic for our chat proves the core is alive on this session: feed the
-            # deadman BEFORE filtering, so it measures a silent core, not a long tool run.
-            local.note_agent_activity()
-        speakable = _speakable(msg)
-        if not speakable and not _streamed_final(msg):
+        # ANY traffic for our chat proves the core is alive on this session: feed the
+        # deadman BEFORE filtering, so it measures a silent core, not a long tool run.
+        local.note_agent_activity()
+        if not _speakable(msg):
             return
         turn = meta.get(TURN_META)
         if turn is not None and local.is_dead_turn(turn) and not _agent_initiated(meta):
@@ -1040,10 +1057,7 @@ class VoiceChannel(BaseChannel):
             return
         if _agent_initiated(meta):
             local.note_proactive()
-        if speakable:
-            await local.speak_final(text)
-        else:
-            await local.speak_unanswered(text)
+        await local.speak_final(text)
 
     async def send_delta(
         self,
@@ -1059,7 +1073,9 @@ class VoiceChannel(BaseChannel):
         # parameters is load-bearing: an override without them fails every delta. Supervisor
         # mode accumulates the delegated reply here; a resuming end is only a tool boundary,
         # so resolving there would truncate to the pre-tool status line.
-        if self._pending_delegation is not None and chat_id == self.config.chat_id:
+        if chat_id != self.config.chat_id:
+            return  # addressed elsewhere; see send()
+        if self._pending_delegation is not None:
             if not self._pending_delegation.accepts_stream(stream_id):
                 return  # a stopped PREVIOUS turn's queued straggler, not our answer
             if stream_end:
@@ -1073,7 +1089,7 @@ class VoiceChannel(BaseChannel):
         local = self._local()
         if local is None:
             return
-        if _agent_initiated(metadata) and chat_id == self.config.chat_id:
+        if _agent_initiated(metadata):
             # A cron/trigger turn streaming into this chat: mark BEFORE the delta plays,
             # so the settle re-opens attention.
             local.note_proactive()

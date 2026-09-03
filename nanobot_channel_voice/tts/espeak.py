@@ -16,6 +16,10 @@ from loguru import logger
 
 _TIMEOUT_S = 10.0
 
+# Batch separator: espeak clauses on punctuation, not on newlines, so a bare "\n"
+# join comes back as ONE line and every batch degrades to per-item calls.
+BATCH_SEP = ",\n"
+
 # speak_lib.h constants
 _AUDIO_OUTPUT_SYNCHRONOUS = 2
 _INITIALIZE_DONT_EXIT = 0x8000  # bad data path otherwise exit(1)s the process

@@ -36,6 +36,8 @@ _LEVEL_MIN_MS = 300.0
 
 # Padding to leave on an interior edge: enough for the engine's fade, too little to hear.
 _EDGE_KEEP_MS = 10.0
+_EDGE_THRESHOLD = 0.01       # above this a sample is content, not utterance padding
+_EDGE_THRESHOLD_PCM = 327    # the same threshold in S16 units
 
 
 def _peak(wav: bytes) -> float:
@@ -44,18 +46,35 @@ def _peak(wav: bytes) -> float:
     return pcm_peak(wav_pcm(wav)[0])
 
 
+def _content_span(
+    loud: np.ndarray, rate: int, *, lead: bool, tail: bool
+) -> tuple[int, int]:
+    """(lo, hi) around the content of a per-sample "is content" mask, keeping
+    ``_EDGE_KEEP_MS`` on each trimmed side."""
+    idx = np.flatnonzero(loud)
+    if idx.size == 0:
+        return 0, loud.size
+    keep = int(rate * _EDGE_KEEP_MS / 1000.0)
+    lo = max(0, int(idx[0]) - keep) if lead else 0
+    hi = min(loud.size, int(idx[-1]) + 1 + keep) if tail else loud.size
+    return lo, hi
+
+
 def _edge_trim(
     wav: np.ndarray, rate: int, *, lead: bool = False, tail: bool = False
 ) -> np.ndarray:
     """Drop the model's utterance padding from an INTERIOR budget-split edge, so that
     ``_join_gap_s`` is the seam rather than a garnish on ~700 ms of it."""
-    idx = np.flatnonzero(np.abs(wav) > 0.01)
-    if idx.size == 0:
-        return wav
-    keep = int(rate * _EDGE_KEEP_MS / 1000.0)
-    lo = max(0, int(idx[0]) - keep) if lead else 0
-    hi = min(wav.size, int(idx[-1]) + 1 + keep) if tail else wav.size
+    lo, hi = _content_span(np.abs(wav) > _EDGE_THRESHOLD, rate, lead=lead, tail=tail)
     return wav[lo:hi]
+
+
+def edge_trim_pcm(pcm: bytes, rate: int, *, lead: bool = False, tail: bool = False) -> bytes:
+    """:func:`_edge_trim` over raw S16_LE mono, for seams that never leave byte form."""
+    samples = np.frombuffer(pcm[: len(pcm) & ~1], dtype="<i2")
+    loud = (samples > _EDGE_THRESHOLD_PCM) | (samples < -_EDGE_THRESHOLD_PCM)
+    lo, hi = _content_span(loud, rate, lead=lead, tail=tail)
+    return pcm[2 * lo : 2 * hi]
 
 
 class OnDeviceTtsAdapter(TtsAdapter):
@@ -169,11 +188,11 @@ class OnDeviceTtsAdapter(TtsAdapter):
     def _join_gap(self) -> np.ndarray:
         return np.zeros(int(self._join_gap_s * self.output_rate), dtype=np.float32)
 
-    def _halve_and_retry(self, text: str) -> np.ndarray:
-        """Halve at the space (or midpoint) nearest the middle and synthesize both:
-        for fixed-window overflows. Callers own the unsplittable single-char case."""
+    def _halve_and_retry(self, text: str, frac: float = 0.5) -> np.ndarray:
+        """Cut at the space (or the point) nearest ``frac`` of the text and synthesize
+        both: for fixed-window overflows. Callers own the unsplittable single-char case."""
         text = text.strip()
-        mid = (len(text) + 1) // 2
+        mid = min(len(text) - 1, max(1, round(len(text) * frac)))
         left = text.rfind(" ", 1, mid)
         right = text.find(" ", mid, len(text) - 1)
         cands = [c for c in (left, right) if c > 0]

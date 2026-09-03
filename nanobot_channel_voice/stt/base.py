@@ -12,6 +12,7 @@ import abc
 import os
 import tempfile
 from contextlib import suppress
+from math import gcd
 from pathlib import Path
 
 from loguru import logger
@@ -153,28 +154,70 @@ async def transcribe_chunked(adapter: SttAdapter, pcm: bytes, sample_rate: int) 
     return _join_pieces([await adapter.transcribe(piece, sample_rate) for piece in pieces])
 
 
+# Downsample block geometry. A whole-signal rfft promotes float32 to complex128 and
+# peaks at ~20x the PCM, which a multi-minute upload cannot afford; each block is
+# resampled with margins that are then discarded, so every kept span had full context.
+_RESAMPLE_BLOCK_S = 10.0
+_RESAMPLE_MARGIN_S = 0.5
+
+
+def _fft_resample(np, audio, n_out: int):
+    """Spectrum truncated at the new Nyquist = brick-wall anti-alias."""
+    spec = np.fft.rfft(audio)[: n_out // 2 + 1]
+    # irfft(.., n) divides by n while the forward rfft was unnormalized, so the
+    # shorter round trip scales amplitude by len(audio)/n; undo it.
+    return np.fft.irfft(spec, n_out) * (n_out / len(audio))
+
+
+def _downsample(np, audio, src_rate: int, dst_rate: int, n: int):
+    ratio = gcd(src_rate, dst_rate)
+    down, up = src_rate // ratio, dst_rate // ratio
+    core = down * max(1, int(_RESAMPLE_BLOCK_S * src_rate) // down)
+    margin = down * max(1, int(_RESAMPLE_MARGIN_S * src_rate) // down)
+    total = len(audio)
+    if total <= core + 2 * margin:
+        return _fft_resample(np, audio, n).astype(np.float32)
+    out = np.empty(n, dtype=np.float32)
+    start = 0
+    while start < total:
+        # Block boundaries stay on multiples of ``down``, so every kept span maps to an
+        # exact output range and the blocks tile the output without a seam.
+        last = start + core >= total
+        lo, hi = max(0, start - margin), total if last else min(total, start + core + margin)
+        if not last:
+            # A clipped margin must keep hi - lo on the resample grid, or the block's
+            # ratio drifts and its content lands up to a period off at the seam.
+            hi = lo + (hi - lo) // down * down
+        at = start // down * up
+        head = (start - lo) // down * up
+        body = (n - at) if last else core // down * up
+        if body <= 0:
+            break
+        tail = 0 if last else (hi - start - core) // down * up
+        block = _fft_resample(np, audio[lo:hi], head + body + tail)
+        out[at : at + body] = block[head : head + body]
+        start += core
+    return out
+
+
 def pcm_to_float_mono(pcm: bytes, src_rate: int, dst_rate: int):
     """Decode S16_LE mono PCM to float32 in [-1, 1], resampled to ``dst_rate``.
 
-    Downsampling MUST go through the frequency domain (spectrum truncated at the new
-    Nyquist = brick-wall anti-alias): linear interpolation folds 8-24 kHz energy into
-    the speech band on a 48k -> 16k capture and measurably degrades recognition.
-    Upsampling stays linear: no aliasing risk, cheaper.
+    Downsampling MUST go through the frequency domain: linear interpolation folds
+    8-24 kHz energy into the speech band on a 48k -> 16k capture and measurably degrades
+    recognition. Upsampling stays linear: no aliasing risk, cheaper.
     """
     import numpy as np  # lazy: keeps this module import-safe without numpy
 
-    audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    # One buffer, not astype()-then-divide: the intermediate is the size of the input.
+    audio = np.multiply(np.frombuffer(pcm, dtype="<i2"), 1.0 / 32768.0, dtype=np.float32)
     if src_rate == dst_rate or not len(audio):
         return audio
     n = int(round(len(audio) * dst_rate / src_rate))
     if n <= 0:
         return audio[:0]
     if dst_rate < src_rate:
-        spec = np.fft.rfft(audio)
-        spec = spec[: n // 2 + 1]
-        # irfft(.., n) divides by n while the forward rfft was unnormalized, so
-        # the shorter round trip scales amplitude by len(audio)/n; undo it.
-        return (np.fft.irfft(spec, n) * (n / len(audio))).astype(np.float32)
+        return _downsample(np, audio, src_rate, dst_rate, n)
     x = np.linspace(0.0, len(audio), n, endpoint=False)
     return np.interp(x, np.arange(len(audio)), audio).astype(np.float32)
 

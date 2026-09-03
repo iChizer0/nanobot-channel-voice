@@ -42,7 +42,14 @@ def test_degree_fold_keeps_temperatures_whole_across_the_split():
 # ---- the router adapter -----------------------------------------------------
 
 
+_LEAD_MS, _TAIL_MS = 300.0, 400.0  # the utterance padding a real matcha piece carries
+_PAUSE_MS = 230.0  # a model-voiced comma, measured on zh-baker
+
+
 class _Eng(TtsAdapter):
+    """S16 mono content wrapped in the padding every on-device engine emits, so a
+    seam trim is measurable."""
+
     output_rate = 22050
 
     def __init__(self, lang: str, tag: str):
@@ -51,13 +58,28 @@ class _Eng(TtsAdapter):
         self.calls: list[str] = []
         self.warmed = False
         self.released = False
+        self.body = b"\x00\x40" if lang == "zh" else b"\x00\x20"  # who spoke what
+
+    def samples(self, ms: float) -> int:
+        return int(self.output_rate * ms / 1000.0)
+
+    def body_samples(self, text: str) -> int:
+        return self.samples(10.0 * len(text))
 
     async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
         return b""
 
+    def tail_ms(self, text: str) -> float:
+        # The model voices a comma as a pause on top of its padding.
+        return _TAIL_MS + (_PAUSE_MS if text.rstrip()[-1:] in ",，" else 0.0)
+
     async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
         self.calls.append(text)
-        return f"[{self._tag}:{text}]".encode()
+        if not text:
+            return b""
+        return (b"\x00\x00" * self.samples(_LEAD_MS)
+                + self.body * self.body_samples(text)
+                + b"\x00\x00" * self.samples(self.tail_ms(text)))
 
     async def warmup(self) -> None:
         self.warmed = True
@@ -66,27 +88,87 @@ class _Eng(TtsAdapter):
         self.released = True
 
 
+def _silences(pcm: bytes, rate: int) -> list[float]:
+    """Interior silent runs, in ms."""
+    from array import array
+
+    samples = array("h")
+    samples.frombytes(pcm)
+    runs, i = [], 0
+    while i < len(samples):
+        if abs(samples[i]) <= 327:
+            j = i
+            while j < len(samples) and abs(samples[j]) <= 327:
+                j += 1
+            if 0 < i and j < len(samples):
+                runs.append((j - i) / rate * 1000.0)
+            i = j
+        else:
+            i += 1
+    return runs
+
+
 def test_router_dispatches_runs_with_continuation_hints():
     zh, en = _Eng("zh", "zh"), _Eng("en", "en")
     r = ScriptRoutedTts(zh, en)
     assert r.spoken_languages == ("zh", "en") and r.output_rate == 22050
-    # Non-final fragments carry a continuation comma (clause contour + voiced
-    # pause AT THE ENGINE), so the join is plain concatenation, no silent gap.
-    out = asyncio.run(r.synthesize_pcm("你好，请打开WiFi设置。"))
-    assert out == "[zh:你好，请打开，][en:WiFi,][zh:设置。]".encode()
+    # Non-final fragments carry a continuation comma: the clause contour and the
+    # pause are the ENGINE's, so the join needs no synthetic silence.
+    asyncio.run(r.synthesize_pcm("你好，请打开WiFi设置。"))
+    assert zh.calls == ["你好，请打开，", "设置。"] and en.calls == ["WiFi,"]
     # A fragment already ending in pause punctuation is not double-hinted.
-    assert asyncio.run(r.synthesize_pcm("你好。OK")) == "[zh:你好。][en:OK]".encode()
+    zh.calls.clear(), en.calls.clear()
+    asyncio.run(r.synthesize_pcm("你好。OK"))
+    assert zh.calls == ["你好。"] and en.calls == ["OK"]
     # Single-run text passes through untouched, whatever the language order.
-    flipped = ScriptRoutedTts(_Eng("en", "en"), _Eng("zh", "zh"))
-    assert asyncio.run(flipped.synthesize_pcm("你好。")) == "[zh:你好。]".encode()
-    assert asyncio.run(flipped.synthesize_pcm("42!")) == b"[en:42!]"  # primary takes neutral
+    fzh, fen = _Eng("zh", "zh"), _Eng("en", "en")
+    flipped = ScriptRoutedTts(fen, fzh)
+    asyncio.run(flipped.synthesize_pcm("你好。"))
+    asyncio.run(flipped.synthesize_pcm("42!"))  # primary takes neutral
+    assert fzh.calls == ["你好。"] and fen.calls == ["42!"]
     # ... whichever slot the primary is: a digits-only chunk must speak the
     # session's main language, not whichever engine happens to be Latin.
-    assert asyncio.run(r.synthesize_pcm("338!")) == b"[zh:338!]"
+    zh.calls.clear(), en.calls.clear()
+    asyncio.run(r.synthesize_pcm("338!"))
+    assert zh.calls == ["338!"] and not en.calls
 
     asyncio.run(r.warmup())
     r.release()
     assert zh.warmed and en.warmed and zh.released and en.released
+
+
+def test_script_seams_drop_the_lead_padding_and_keep_the_comma_pause():
+    zh, en = _Eng("zh", "zh"), _Eng("en", "en")
+    r = ScriptRoutedTts(zh, en)
+    rate = r.output_rate
+    out = asyncio.run(r.synthesize_pcm("你好，请打开WiFi设置。"))
+    keep = zh.samples(10.0)
+    calls = ["你好，请打开，", "WiFi,", "设置。"]  # zh, en, zh
+    bodies = sum(zh.body_samples(t) for t in calls)
+    tails = sum(zh.samples(zh.tail_ms(t)) for t in calls)
+    # A script switch is not an utterance boundary: the lead padding of every part after
+    # the first goes (10 ms kept). Tails STAY: they carry the comma pause the hint bought.
+    assert len(out) == 2 * (zh.samples(_LEAD_MS) + bodies + 2 * keep + tails)
+    seams = _silences(out, rate)
+    assert len(seams) == 2
+    for gap in seams:
+        assert _PAUSE_MS <= gap <= _TAIL_MS + _PAUSE_MS + 11.0  # pause kept, lead gone
+    # The parts play in text order: zh body, en body, zh body.
+    markers = [s for s in array_of(out) if s in (0x4000, 0x2000)]
+    order = [m for i, m in enumerate(markers) if i == 0 or markers[i - 1] != m]
+    assert order == [0x4000, 0x2000, 0x4000]
+    # A single run is one utterance: its own padding is not a seam and stays.
+    solo = asyncio.run(r.synthesize_pcm("你好。"))
+    assert len(solo) == 2 * (zh.samples(_LEAD_MS) + zh.body_samples("你好。")
+                             + zh.samples(_TAIL_MS))
+
+
+def array_of(pcm: bytes) -> list[int]:
+    from array import array
+
+    samples = array("h")
+    samples.frombytes(pcm)
+    return list(samples)
 
 
 def test_router_rejects_incoherent_pairs():

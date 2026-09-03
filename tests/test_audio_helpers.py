@@ -144,6 +144,65 @@ def test_quietest_split_pure_python_path_matches(monkeypatch):
     assert quietest_split(pcm, RATE) == with_np
 
 
+# ---- resample_pcm -----------------------------------------------------------
+
+def sine_pcm(freq_hz: float, rate: int, n: int, amp: int = 16000) -> bytes:
+    np = pytest.importorskip("numpy")
+    t = np.arange(n) / rate
+    return (np.sin(2 * np.pi * freq_hz * t) * amp).astype("<i2").tobytes()
+
+
+def band_rms(pcm: bytes) -> float:
+    np = pytest.importorskip("numpy")
+    x = np.frombuffer(pcm, "<i2").astype(np.float64) / 32768.0
+    return float(np.sqrt(np.mean(x * x)))
+
+
+def test_resample_downsampling_rejects_above_nyquist_energy():
+    """Regression: bare linear interpolation folded 20 kHz onto 2 kHz at full amplitude
+    when a 44.1 kHz cue was resampled for a 22.05 kHz device."""
+    from nanobot_channel_voice.audio.pcm import resample_pcm
+
+    hiss = resample_pcm(sine_pcm(20000, 44100, 44100), 44100, 22050)
+    speech = resample_pcm(sine_pcm(1000, 44100, 44100), 44100, 22050)
+    assert len(hiss) == len(speech) == 22050 * 2
+    assert band_rms(hiss) < 0.01           # unfiltered decimation left ~0.35
+    assert 0.3 < band_rms(speech) < 0.4    # in-band content passes at amplitude
+    # Just above the new Nyquist is the hard region (a short filter left only -10 dB
+    # there): 12 kHz must lose >= 20 dB at the ratios the plugin actually uses.
+    for src in (22050, 24000):
+        near = resample_pcm(sine_pcm(12000, src, src), src, 16000)
+        assert band_rms(near) < 0.035  # 0.35 * 10 ** (-20 / 20)
+
+
+def test_resample_upsampling_is_unfiltered_and_length_exact():
+    from nanobot_channel_voice.audio.pcm import resample_pcm
+
+    up = resample_pcm(tone(100), RATE, RATE * 2)
+    assert len(up) == 400
+    assert 0.45 < band_rms(up) < 0.55  # a constant-amplitude tone is not attenuated
+
+
+def test_resample_pure_python_path_tracks_numpy(monkeypatch):
+    import nanobot_channel_voice.audio.pcm as pcm_mod
+    from nanobot_channel_voice.audio.pcm import resample_pcm
+
+    np = pytest.importorskip("numpy")
+    # Upsampling is the shared (unfiltered) path; downsampling without numpy skips the
+    # anti-alias filter on purpose (cloud-only installs, short cues), so only lengths
+    # are compared there.
+    src = sine_pcm(3000, 16000, 1600) + sine_pcm(5000, 16000, 1600)
+    with_np = resample_pcm(src, 16000, 24000)
+    down_np = resample_pcm(src, 16000, 8000)
+    monkeypatch.setattr(pcm_mod, "_np", None)
+    pure = resample_pcm(src, 16000, 24000)
+    assert len(pure) == len(with_np)
+    a = np.frombuffer(pure, "<i2").astype(np.int32)
+    b = np.frombuffer(with_np, "<i2").astype(np.int32)
+    assert int(np.abs(a - b).max()) <= 2  # float32 vs float64 rounding only
+    assert len(resample_pcm(src, 16000, 8000)) == len(down_np)
+
+
 # ---- WAV codec --------------------------------------------------------------
 
 def test_pcm_to_wav_bytes_roundtrip():
@@ -176,6 +235,21 @@ def test_write_temp_wav_leaves_no_file_behind_when_the_write_fails(monkeypatch, 
     with pytest.raises(OSError):
         write_temp_wav(tone(50), RATE)
     assert not list(tmp_path.iterdir())  # mkstemp's empty file must be reaped
+
+
+def test_wav_pcm_downmix_paths_match(monkeypatch):
+    """The stereo downmix runs on the loop while an earcon is shaped; the numpy path
+    must land on the same samples as the array loop it replaced."""
+    import nanobot_channel_voice.audio.pcm as pcm_mod
+    from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes, wav_pcm
+
+    np = pytest.importorskip("numpy")
+    frames = np.random.RandomState(0).randint(-32768, 32767, 4000).astype("<i2")
+    blob = pcm_to_wav_bytes(frames.tobytes(), 44100, channels=2)
+    with_np = wav_pcm(blob)
+    monkeypatch.setattr(pcm_mod, "_np", None)
+    assert wav_pcm(blob) == with_np
+    assert with_np[1] == 44100 and len(with_np[0]) == 4000  # 2000 stereo frames
 
 
 # ---- split_for_budget -------------------------------------------------------

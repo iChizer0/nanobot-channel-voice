@@ -127,9 +127,9 @@ def test_cloud_barge_in_ignores_tombstone():
 def test_late_reply_from_stopped_delegation_cannot_resolve_next():
     """Regression: with bus streaming OFF, a /stop-ped delegation's turn can
     finish late and its bare final send used to resolve the NEXT delegation
-    with the previous question's answer. The request now carries a token the
-    AgentLoop echoes back; a mismatch is swallowed, absence keeps the old
-    accept-everything behavior (same philosophy as accepts_stream)."""
+    with the previous question's answer. The request carries a token the
+    AgentLoop echoes onto its final, so only an exact match resolves: an
+    unstamped delivery into this chat is another turn's, never our answer."""
     from nanobot.bus.events import OutboundMessage
 
     from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel
@@ -146,6 +146,7 @@ def test_late_reply_from_stopped_delegation_cannot_resolve_next():
         class _Stub:
             config = _Cfg()
             _pending_delegation = current
+            logger = __import__("loguru").logger
 
         def reply(text: str, **meta) -> OutboundMessage:
             return OutboundMessage(
@@ -158,10 +159,73 @@ def test_late_reply_from_stopped_delegation_cannot_resolve_next():
         await VoiceChannel.send(_Stub(), reply("real answer", **{_DELEGATION_META: current.token}))
         assert await current.result() == "real answer"
 
+        # An unstamped delivery into the same chat (a cron fire, a message-tool send)
+        # is somebody else's turn: it must not be read aloud as the delegated answer.
         tokenless = _DelegationCollector(m)
         _Stub._pending_delegation = tokenless
-        await VoiceChannel.send(_Stub(), reply("untagged answer"))
-        assert await tokenless.result() == "untagged answer"
+        await VoiceChannel.send(_Stub(), reply("your 3pm reminder"))
+        assert not tokenless._future.done()
+
+    run(_case())
+
+
+def test_foreign_chat_delivery_is_neither_spoken_nor_collected():
+    """One speaker, one chat: the message tool takes an arbitrary channel/chat, so a
+    delivery addressed elsewhere must not be spoken, resolve a delegation, or touch the
+    live turn's deadman/ledger."""
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.channel import VoiceChannel
+    from nanobot_channel_voice.config import VoiceConfig
+
+    async def _case():
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        spoken: list[str] = []
+        deltas: list[str] = []
+        touched: list[str] = []
+
+        class _Local:
+            def note_agent_activity(self): touched.append("deadman")
+            def note_proactive(self): touched.append("proactive")
+            def is_dead_turn(self, token): return False
+            async def speak_final(self, text): spoken.append(text)
+            async def on_delta(self, delta, stream_id=None): deltas.append(delta)
+            async def on_stream_end(self, *, resuming, stream_id=None): touched.append("end")
+
+        channel._local = lambda: _Local()  # type: ignore[method-assign]
+        foreign = "voice:somewhere-else"
+        assert foreign != channel.config.chat_id
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=foreign, content="Your bank code is 4711.",
+        ))
+        await channel.send_delta(foreign, "secret ", None, stream_id="voice:x:1:0")
+        await channel.send_delta(foreign, "", None, stream_id="voice:x:1:0", stream_end=True)
+        assert (spoken, deltas, touched) == ([], [], [])
+
+        # A delegation in flight must not collect it either.
+        collector = _DelegationCollector(VoiceMetrics())
+        channel._pending_delegation = collector
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=foreign, content="not our answer",
+        ))
+        assert not collector._future.done()
+
+        # The session's own chat, stamped with the live token, still resolves.
+        from nanobot_channel_voice.channel import _DELEGATION_META
+
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="ours",
+            metadata={_DELEGATION_META: collector.token},
+        ))
+        assert await collector.result() == "ours"
+
+        # ...and with no delegation pending it is spoken.
+        channel._pending_delegation = None
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="said aloud",
+        ))
+        assert spoken == ["said aloud"]
 
     run(_case())
 
@@ -193,3 +257,53 @@ def test_tool_boundary_does_not_latch_first_token():
         assert (await c.result()).strip() == "the answer"
 
     asyncio.run(_t())
+
+
+def test_missing_tool_gateway_says_the_tool_mode_is_inert():
+    """No shipped core passes a tool gateway to a plugin channel, so a configured
+    toolMode silently produced a persona-only session: zero tools, no ask_nanobot, and
+    not one log line saying why."""
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.channel import VoiceChannel
+    from nanobot_channel_voice.config import VoiceConfig
+
+    async def _case():
+        cfg = VoiceConfig.model_validate(
+            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+        )
+        channel = VoiceChannel(cfg, MessageBus())
+        assert channel._tool_gateway is None  # nothing in core supplies one
+        warned: list[str] = []
+
+        infos: list[str] = []
+
+        class _Log:
+            def info(self, msg, *a): infos.append(msg.format(*a))
+            def warning(self, msg, *a): warned.append(msg.format(*a))
+
+        channel.logger = _Log()  # type: ignore[assignment]
+        tools, exec_tool = await channel._cloud_tools(True, "supervisor")
+        assert (tools, exec_tool) == ([], None)
+        assert len(warned) == 1
+        assert "toolMode='supervisor'" in warned[0]
+        assert "persona-only" in warned[0]
+        # The DEFAULT toolMode was never asked for: every cloud start must not warn.
+        quiet = VoiceChannel(
+            VoiceConfig.model_validate({"backend": "openai", "realtime": {"apiKey": "k"}}),
+            MessageBus(),
+        )
+        quiet.logger = _Log()  # type: ignore[assignment]
+        warned.clear()
+        assert await quiet._cloud_tools(True, "direct") == ([], None)
+        assert warned == [] and len(infos) == 1
+
+        # With a gateway wired the mode works and stays quiet.
+        channel._tool_gateway = object()
+        warned.clear()
+        tools, exec_tool = await channel._cloud_tools(True, "supervisor")
+        assert [t.name for t in tools] == ["ask_nanobot"]
+        assert exec_tool == channel._delegate_to_nanobot  # a fresh bound method each access
+        assert warned == []
+
+    run(_case())

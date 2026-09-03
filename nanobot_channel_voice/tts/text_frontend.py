@@ -135,6 +135,9 @@ def _ordinal_words(n: int) -> str:
 
 def _time_words(m: re.Match) -> str:
     hour, minute = int(m.group(1)), int(m.group(2))
+    second = m.group(3)
+    if second is not None:  # h:mm:ss is a duration/timestamp: read all three fields
+        return f"{_int_words(hour)} {_int_words(minute)} {_int_words(int(second))}"
     if minute == 0:
         return f"{_int_words(hour)} o'clock"
     if minute < 10:
@@ -145,12 +148,14 @@ def _time_words(m: re.Match) -> str:
 # Multi-dot runs are addresses and versions. The decimal rules match only the FIRST
 # dot, so without this "192.168.1.1" keeps a literal "." the engine cannot voice.
 _RE_DOTTED = re.compile(r"(?<!\d)\d+(?:\.\d+){2,}(?!\d)")
-_RE_TIME = re.compile(r"\b(\d{1,2}):([0-5]\d)\b")
+# Optional seconds, like the zh twin: a half-read "one thirty:45" voices the colon.
+_RE_TIME = re.compile(r"\b(\d{1,2}):([0-5]\d)(?::([0-5]\d))?(?!\d)")
 _GROUPED = r"\d{1,3}(?:,\d{3})+"  # the thousands-separator grammar, shared by every amount pattern
 _RE_GROUPED = re.compile(rf"\b{_GROUPED}\b")
 # Lookaround anchors, not \b: a glued unit ("3.5kg") is still a decimal, and \b
 # between digit and letter never fires.
 _RE_DECIMAL = re.compile(rf"(?<!\d)({_GROUPED}|\d+)\.(\d+)(?!\d)")
+_RE_GROUPED_DECIMAL = re.compile(rf"(?<!\d)({_GROUPED})\.(\d+)(?!\d)")
 _RE_ORDINAL = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
 # Amount-aware like the zh twin, and run BEFORE decimal/grouped: those passes eat
 # the digits and strand a "%" no char vocab can voice.
@@ -718,8 +723,8 @@ def _read_sequences(
 def space_digit_sequences(text: str, language: str | None = "en") -> str:
     """Sequences re-spaced into single digits, for an engine that owns its own number
     grammar (espeak names spaced digits in every voice). English also renders dates,
-    currency and degrees to words — dates fully, so the sequence pass cannot re-shred
-    them; other languages keep the language-neutral spacing."""
+    clock times, currency, grouped amounts and degrees to words — fully, so the sequence
+    pass cannot re-shred them; other languages keep the language-neutral spacing."""
     if not _RE_INT.search(text):
         return text
     text = _RE_ISO_T.sub(" ", text)
@@ -731,6 +736,13 @@ def space_digit_sequences(text: str, language: str | None = "en") -> str:
         text = _fractions(_ranges(text, "en"), "en")
         text = _sub_padded(_RE_CURRENCY, text, _en_currency)
         text = _RE_DEGREES.sub(_en_degrees, text)
+        # Clock and grouped amounts to WORDS before the sequence pass, or its
+        # leading-zero rule shreds "12:00" and each "000" group of "1,000,000". A grouped
+        # decimal goes whole ("1,234.56"), or the grouped pass strands ".56"; a plain
+        # decimal ("3.14") stays engine-native.
+        text = _RE_TIME.sub(_time_words, text)
+        text = _sub_padded(_RE_GROUPED_DECIMAL, text, _en_amount_words)
+        text = _RE_GROUPED.sub(lambda m: _int_words(int(m.group().replace(",", ""))), text)
     return _read_sequences(
         text, "en" if en else "", lambda run: " ".join(run), _en_year_split if en else None
     )

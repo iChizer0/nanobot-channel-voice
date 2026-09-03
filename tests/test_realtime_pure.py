@@ -11,6 +11,8 @@ import base64
 
 import pytest
 
+from nanobot_channel_voice.aio import cancel_and_wait
+from nanobot_channel_voice.audio.base import PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend import openai_realtime as rt
 from nanobot_channel_voice.backend.audio_sink import AudioSink
@@ -130,6 +132,29 @@ def b64(pcm: bytes) -> str:
     return base64.b64encode(pcm).decode("ascii")
 
 
+def make_sending_backend(sink: AudioSink) -> tuple[rt.RealtimeBackend, list[dict]]:
+    backend = rt.RealtimeBackend(VoiceConfig(), sink=sink, profile=PROFILES["openai"])
+    sent: list[dict] = []
+
+    async def record(payload):
+        sent.append(payload)
+
+    async def on_event(e):
+        pass
+
+    backend._send = record
+    backend._on_event = on_event
+    return backend, sent
+
+
+async def publish_stream(sink: AudioSink, ms: int = 1000, rate: int = 24000) -> None:
+    """Give the sink a live stream, so played_ms()/stream_generation are real."""
+    await sink.start()
+    sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=b"\x00" * (rate * 2 * ms // 1000),
+                             rate=rate))
+    await sink.wait_idle()
+
+
 def hints(events) -> list[VoiceState]:
     return [e.state for e in events if isinstance(e, StateHint)]
 
@@ -178,6 +203,7 @@ def test_double_barge_in_truncates_the_item_once():
             "response_id": "r1",
             "item": {"type": "message", "id": "item-1"},
         })
+        await publish_stream(backend._sink)  # the item's audio opens the stream it stamped
         await backend.barge_in(1500)
         await backend.barge_in(0)  # sink already flushed: played_ms restarted
         truncates = [p for p in sent if p["type"] == "conversation.item.truncate"]
@@ -185,6 +211,311 @@ def test_double_barge_in_truncates_the_item_once():
         assert truncates[0]["item_id"] == "item-1"
         assert truncates[0]["audio_end_ms"] == 1500
         await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_truncate_base_restarts_with_a_fresh_stream():
+    """Turn N's drain is still playing out when turn N+1 starts, so response.created
+    parks the old handle: played_ms() still reads it, but the new item's audio opens a
+    FRESH stream whose clock starts at 0. Basing on the parked stream truncated every
+    such turn at audio_end_ms=0, wiping audio the user actually heard."""
+
+    class _SlowDrain(PlaybackStream):
+        def __init__(self):
+            self.gate = asyncio.Event()
+
+        async def write(self, pcm: bytes) -> None:
+            await asyncio.sleep(0)
+
+        async def drain(self) -> None:
+            await self.gate.wait()  # a real device plays its tail out here
+
+        async def kill(self) -> None:
+            self.gate.set()
+
+    class _SlowDrainPlayback(NullPlayback):
+        def __init__(self):
+            self.opened = 0
+
+        async def open_stream(self, rate: int) -> PlaybackStream:
+            self.opened += 1
+            return _SlowDrain()
+
+    async def _run():
+        playback = _SlowDrainPlayback()
+        sink = AudioSink(playback, mode="stream")
+        backend, sent = make_sending_backend(sink)
+
+        # Turn 1 plays 1 s, completes, and its drain parks inside stream.drain().
+        await backend._handle_event(_created("r1"))
+        await publish_stream(sink)
+        await backend._handle_event(
+            {"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await asyncio.sleep(0.05)
+
+        # Turn 2: the cancelled drain parks turn 1's handle, still the one played_ms reads.
+        await backend._handle_event(_created("r2"))
+        await asyncio.sleep(0.05)
+        stale = sink.played_ms()
+        assert stale > 0  # the parked stream's clock, not turn 2's
+        await backend._handle_event({
+            "type": "response.output_item.added",
+            "response_id": "r2",
+            "item": {"type": "message", "id": "item-2"},
+        })
+        # Only the sink backlog, never the parked stream's elapsed clock.
+        assert backend._item_base_played < stale
+
+        sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=b"\x00" * 48000, rate=24000))
+        await sink.wait_idle()
+        assert playback.opened == 2
+
+        await backend.barge_in(await sink.flush())
+        truncates = [p for p in sent if p["type"] == "conversation.item.truncate"]
+        assert len(truncates) == 1 and truncates[0]["audio_end_ms"] > 0
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_stream_reopen_under_the_item_skips_the_truncate():
+    """The device dying mid-item makes the sink reopen, restarting played_ms() at 0
+    under a base measured on the old stream: the truncate must be skipped, not sent at
+    0. Over-remembering is the safe direction."""
+
+    class _Dies(PlaybackStream):
+        def __init__(self):
+            self.is_dead = False
+
+        @property
+        def dead(self) -> bool:
+            return self.is_dead
+
+        async def write(self, pcm: bytes) -> None:
+            await asyncio.sleep(0)
+
+        async def drain(self) -> None:
+            pass
+
+        async def kill(self) -> None:
+            pass
+
+    class _DyingPlayback(NullPlayback):
+        def __init__(self):
+            self.streams: list[_Dies] = []
+
+        async def open_stream(self, rate: int) -> PlaybackStream:
+            self.streams.append(_Dies())
+            return self.streams[-1]
+
+    async def _run():
+        playback = _DyingPlayback()
+        sink = AudioSink(playback, mode="stream")
+        backend, sent = make_sending_backend(sink)
+
+        await backend._handle_event(_created("r1"))
+        await publish_stream(sink)
+        await backend._handle_event({
+            "type": "response.output_item.added",
+            "response_id": "r1",
+            "item": {"type": "message", "id": "item-1"},
+        })
+        gen = sink.stream_generation
+        assert backend._item_gen == gen and backend._item_base_played > 0
+
+        playback.streams[-1].is_dead = True  # device gone; the sink reopens on the next write
+        sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=b"\x00" * 48000, rate=24000))
+        await sink.wait_idle()
+        assert sink.stream_generation == gen + 1
+
+        await backend.barge_in(await sink.flush())
+        assert not [p for p in sent if p["type"] == "conversation.item.truncate"]
+        assert backend._metrics.counters.get("truncate_skipped_stale_stream") == 1
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_congested_uplink_cannot_stall_a_control_frame(monkeypatch):
+    """websockets' drain() waits forever past its write high-water mark, and barge_in
+    sends from the rx loop: unbounded, one stuck audio append froze barge-in and every
+    later server event behind the send lock."""
+    monkeypatch.setattr(rt, "_SEND_TIMEOUT_S", 0.1)
+
+    class _CongestedWs:
+        def __init__(self):
+            self.unblock = asyncio.Event()
+            self.sent = 0
+
+        async def send(self, data):
+            self.sent += 1
+            if self.sent == 1:
+                await self.unblock.wait()  # TCP backpressure
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        backend, _ = make_sending_backend(sink)
+        del backend._send  # the real _send: this test is about the wire path
+        ws = _CongestedWs()
+        backend._ws = ws
+        backend._ready.set()
+        backend._sender_task = asyncio.create_task(backend._sender_loop())
+
+        await publish_stream(sink)  # a live stream, so barge_in reaches the wire
+        await backend._handle_event(_created("r1"))
+        await backend._handle_event({
+            "type": "response.output_item.added",
+            "response_id": "r1",
+            "item": {"type": "message", "id": "item-1"},
+        })
+
+        await backend.push_audio(b"\x00" * 640)
+        await asyncio.sleep(0.01)  # the sender is now parked inside ws.send
+        assert ws.sent == 1
+
+        await asyncio.wait_for(backend.barge_in(1500), timeout=1.0)  # must not hang
+        assert ws.sent == 2  # the truncate goes out as soon as the append is abandoned
+
+        ws.unblock.set()
+        backend._closing = True
+        await cancel_and_wait(backend._sender_task)
+        backend._sender_task = None
+        backend._ws = None
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_slow_send_is_committed_not_lost_so_tool_bookkeeping_runs(monkeypatch):
+    """websockets writes the frame before its first await, so a send that outlives the
+    budget still reaches the server: treating it as lost skipped the call's bookkeeping
+    and _maybe_respond, and the turn died with the result delivered."""
+    monkeypatch.setattr(rt, "_SEND_TIMEOUT_S", 0.05)
+
+    class _StuckWs:
+        def __init__(self):
+            self.payloads: list[str] = []
+            self.unblock = asyncio.Event()
+
+        async def send(self, data):
+            self.payloads.append(data)  # committed to the transport ...
+            await self.unblock.wait()   # ... but drain() never returns
+
+    async def _run():
+        backend, _ = make_sending_backend(AudioSink(NullPlayback(), mode="stream"))
+        del backend._send
+        ws = _StuckWs()
+        backend._ws = ws
+        backend._ready.set()
+        backend._active_response_id = "r1"
+        backend._session_calls.add("c1")
+        backend._call_to_response["c1"] = "r1"
+        backend._tools_pending["r1"] = {"c1"}
+        await asyncio.wait_for(backend.submit_tool_result("c1", "ok"), 2.0)
+        assert "c1" not in backend._session_calls
+        assert not backend._tools_pending.get("r1")
+        assert any('"function_call_output"' in p for p in ws.payloads)
+        ws.unblock.set()
+        backend._ws = None
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_response_cancel_names_the_response_on_the_ga_dialect():
+    """A cancel delayed by a congested uplink lands on whatever is active THEN; unnamed,
+    it would kill the successor response."""
+    ga = rt.RealtimeBackend(
+        VoiceConfig(), sink=AudioSink(NullPlayback(), mode="stream"), profile=PROFILES["openai"],
+    )
+    assert ga._cancel_frame("r1") == {"type": "response.cancel", "response_id": "r1"}
+    beta = rt.RealtimeBackend(
+        VoiceConfig(), sink=AudioSink(NullPlayback(), mode="stream"), profile=PROFILES["qwen"],
+    )
+    assert beta._cancel_frame("r1") == {"type": "response.cancel"}
+
+
+def test_truncate_debits_backlog_the_sink_dropped():
+    """The base counts queued backlog; audio the overflow valve later dropped never played,
+    so the item started that much earlier than the base says."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        backend, sent = make_sending_backend(sink)
+        await publish_stream(sink)
+        await backend._handle_event(_created("r1"))
+        await backend._handle_event({
+            "type": "response.output_item.added",
+            "response_id": "r1",
+            "item": {"type": "message", "id": "item-1"},
+        })
+        base = backend._item_base_played
+        sink._dropped_ms += 500.0  # the valve fired after the item was added
+        await backend.barge_in(1500)
+        truncate = [p for p in sent if p["type"] == "conversation.item.truncate"]
+        assert truncate and truncate[0]["audio_end_ms"] == max(0, int(1500 - (base - 500)))
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_watchdog_settles_to_idle_even_when_recovery_raises():
+    """The deadman is the last recovery: dying inside it strands a gated mic in
+    SPEAKING, and the task exception would surface only at GC."""
+
+    async def _run():
+        cfg = VoiceConfig.model_validate({"realtime": {"turnTimeoutS": 0.01}})
+        backend = rt.RealtimeBackend(
+            cfg, sink=AudioSink(NullPlayback(), mode="stream"), profile=PROFILES["openai"],
+        )
+        hints_seen: list = []
+
+        async def on_event(e):
+            hints_seen.append(e)
+            raise RuntimeError("dispatch blew up")  # the StateHint dispatch dies too
+
+        backend._on_event = on_event
+        backend._turn = VoiceState.SPEAKING
+        backend._arm_watchdog()
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if backend._watchdog_task.done():
+                break
+        assert backend._watchdog_task.done()
+        assert backend._watchdog_task.exception() is None  # not left for the GC to report
+        assert backend._turn is VoiceState.IDLE
+        assert [type(e).__name__ for e in hints_seen] == ["Error", "StateHint"]
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_close_lets_the_callers_cancellation_through():
+    """nanobot cancels channel.stop() from above; swallowing that CancelledError would
+    let teardown run on as if nothing happened."""
+
+    async def _run():
+        backend, _ = make_sending_backend(AudioSink(NullPlayback(), mode="stream"))
+        started = asyncio.Event()
+
+        async def _park():
+            started.set()
+            await asyncio.Event().wait()
+
+        backend._rx_task = asyncio.create_task(_park())
+        await started.wait()
+
+        closer = asyncio.create_task(backend.close())
+        await asyncio.sleep(0)
+        closer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closer
+        assert backend._rx_task is None or backend._rx_task.cancelled()
 
     asyncio.run(_run())
 
@@ -369,7 +700,7 @@ def test_stop_transcript_cancels_the_live_ack_response():
         await b._handle_event(_created("r1"))  # the ack response is already live
         epoch = b._sink.epoch
         await b._handle_event(_stop_t())
-        assert {"type": "response.cancel"} in sent
+        assert {"type": "response.cancel", "response_id": "r1"} in sent
         assert "r1" in b._cancelled_responses
         assert b._sink.epoch > epoch  # queued ack audio flushed
         assert b._turn is VoiceState.IDLE
@@ -389,7 +720,7 @@ def test_stop_transcript_before_the_response_suppresses_it_at_birth():
         await b._handle_event(_stop_t())  # no response yet: window armed
         assert b._turn is VoiceState.IDLE
         await b._handle_event(_created("r2"))  # the ack arrives late...
-        assert {"type": "response.cancel"} in sent  # ...and dies at birth
+        assert {"type": "response.cancel", "response_id": "r2"} in sent  # ...dies at birth
         assert "r2" in b._cancelled_responses
         assert b._turn is VoiceState.IDLE  # never THINKING
         await b.close()

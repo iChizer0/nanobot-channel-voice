@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
 from nanobot_channel_voice.tts.base import TtsAdapter
+from nanobot_channel_voice.tts.ondevice_base import edge_trim_pcm
 from nanobot_channel_voice.tts.text_frontend import fold_degree_marks
 
 _CJK_LANGS = frozenset({"zh", "ja", "ko"})
@@ -103,7 +104,12 @@ class ScriptRoutedTts(TtsAdapter):
             pcm = await self._engine(cjk).synthesize_pcm(run)
             if pcm:
                 parts.append(pcm)
-        return b"".join(parts)
+        # A script switch is not an utterance boundary: the LEAD padding of every part
+        # after the first goes (~0.3 s on zh). Tails stay: they hold the model-voiced
+        # pause the _hint comma bought. Both engines share output_rate.
+        return b"".join(
+            edge_trim_pcm(pcm, self.output_rate, lead=i > 0) for i, pcm in enumerate(parts)
+        )
 
     def _engine(self, cjk: bool) -> TtsAdapter:
         return self._cjk if cjk else self._latin

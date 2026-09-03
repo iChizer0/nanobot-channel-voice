@@ -18,6 +18,18 @@ _CJK_TERM = "。！？"
 # terminator would orphan a 」/" at the head of the next chunk.
 _CLOSERS = "\"')]}»”’」』】）〉》"
 _SECONDARY = ",;:，、；："
+_CJK_FLOOR = 0x2E80  # same script split as echo_reject.py, wake/phrase.py, tts/router.py
+
+# A "." these follow is part of a token, not a sentence end: cutting there gives the
+# fragment sentence-final prosody and a seam pause mid-name. Titles bind only when
+# capitalised, so "1st." and "250 ms." still end their sentences.
+_ABBREV_CAP = frozenset({
+    "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st", "mt", "fig", "inc", "ltd", "co",
+    "ave", "sgt", "capt", "dept",
+})
+_ABBREV_ANY = frozenset({"vs", "etc", "approx"})
+# Ordered-list marker, line-anchored by the caller: "1." heads an item, never a sentence.
+_RE_ORDERED = re.compile(r"[ \t]{0,3}\d{1,3}[.)](?=[ \t])")
 
 # Line-start anchored (<=3 spaces of indent), as in the streaming fence drop: two ```
 # runs mid-sentence are prose, and an unanchored regex would eat the words between.
@@ -37,6 +49,10 @@ _RE_STAGE = re.compile(
 )
 _RE_HEADER = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
 _RE_BULLET = re.compile(r"(?m)^\s{0,3}[-*+]\s+")
+# An ordered marker is voiced as "one," not dropped: "42. That is the answer" at a line
+# start is indistinguishable from an item, and deleting it loses the number. The marker
+# demands a SAME-LINE space, so a bare "42." answer is untouched.
+_RE_ORDERED_MARK = re.compile(r"(?m)^(\s{0,3}\d{1,3})[.)]([ \t]+)")
 _RE_QUOTE = re.compile(r"(?m)^\s{0,3}>\s?")
 _RE_WS = re.compile(r"[ \t]+")
 
@@ -71,6 +87,7 @@ def sanitize(text: str) -> str:
     text = _RE_EMPHASIS.sub(r"\2", text)
     text = _RE_HEADER.sub("", text)
     text = _RE_BULLET.sub("", text)
+    text = _RE_ORDERED_MARK.sub(r"\1,\2", text)
     text = _RE_QUOTE.sub("", text)
     text = text.replace("|", " ")
     text = text.translate(_SMART_PUNCT)
@@ -80,14 +97,33 @@ def sanitize(text: str) -> str:
     return text
 
 
-def _primary_cut(buf: str) -> int:
+def _dot_binds(buf: str, i: int) -> bool:
+    """Is the "." at ``i`` inside a token? True for the closing dot of a dotted initialism
+    ("p.m.", "U.S.") and for a known abbreviation; both read as sentence ends to the bare
+    terminator rule. Bounded lookback: the alphabet's longest entry is 6 letters."""
+    if i >= 2 and buf[i - 2] == "." and buf[i - 1].isalpha() and buf[i - 1].isascii():
+        return True
+    k = i
+    while k > max(0, i - 7) and buf[k - 1].isalpha() and ord(buf[k - 1]) < _CJK_FLOOR:
+        k -= 1
+    tok = buf[k:i]
+    return tok.lower() in _ABBREV_ANY or (tok[:1].isupper() and tok.lower() in _ABBREV_CAP)
+
+
+def _primary_cut(buf: str, line_start: bool) -> int:
     """Index of the first sentence boundary (the terminator, extended over any
     closer run), or -1. A terminator or closer run touching the buffer end holds
     for the next delta to finish it; ``flush()`` covers stream end."""
+    marker_end = -1
+    if line_start:
+        m = _RE_ORDERED.match(buf)
+        marker_end = m.end() - 1 if m else -1
     for i, ch in enumerate(buf):
         if ch == "\n":
             return i
         if ch not in _CJK_TERM and ch not in _ASCII_TERM:
+            continue
+        if ch == "." and (i == marker_end or _dot_binds(buf, i)):
             continue
         j = i + 1
         # …over closers AND further CJK terminators: "？！" is one boundary, not
@@ -131,6 +167,8 @@ class SentenceChunker:
         self._first_min = min(self._min, max(1, min_chars_first)) if min_chars_first else self._min
         self._spoke = False  # a chunk was emitted since the last flush()
         self._buf = ""
+        # Does _buf start a line? Only there can "1." be a list marker rather than a number.
+        self._buf_line_start = True
         # Fenced code is dropped INCREMENTALLY, before cutting: the "\n" primary cut
         # splits a streamed fence long before sanitize()'s whole-fence regex matches.
         self._raw = ""  # not yet classified
@@ -152,6 +190,7 @@ class SentenceChunker:
             if cut is None:
                 break
             piece, self._buf = self._buf[: cut + 1], self._buf[cut + 1 :]
+            self._buf_line_start = piece.endswith(("\n", "\r"))
             text = sanitize(piece).strip()
             if text:
                 chunks.append(text)
@@ -172,6 +211,7 @@ class SentenceChunker:
         self._prev_char = ""
         text = sanitize(self._buf).strip()
         self._buf = ""
+        self._buf_line_start = True
         return text or None
 
     def _line_start_at(self, text: str, i: int) -> bool:
@@ -238,7 +278,7 @@ class SentenceChunker:
         buf = self._buf
         if not buf:
             return None
-        cut = _primary_cut(buf)
+        cut = _primary_cut(buf, self._buf_line_start)
         if cut != -1 and cut < self._max:
             return cut
         if len(buf) >= self._max:

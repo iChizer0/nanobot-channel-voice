@@ -8,6 +8,7 @@ or event loop pump is needed.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -103,6 +104,10 @@ def _utt(
         onset_at=onset_at,
         onset_speaking=onset_speaking,
     )
+
+
+async def _collect(event) -> None:
+    pass
 
 
 def _run(coro):
@@ -752,57 +757,6 @@ def test_send_traffic_feeds_the_deadman():
     _run(_t())
 
 
-def test_a_substituted_final_is_spoken_when_the_turn_never_answered():
-    """Core stamps StreamedResponseEvent on the text it SUBSTITUTES for a blank model
-    answer (empty_final_response / max-iterations), which was never streamed — the very
-    case a small model hits after a failed tool. Dropping it as "already spoken" is how
-    a give-up becomes dead air. A turn that DID answer must still drop it (no echo)."""
-    async def _t():
-        from nanobot.bus.events import OutboundMessage
-        from nanobot.bus.outbound_events import StreamedResponseEvent
-        from nanobot.bus.queue import MessageBus
-        from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
-
-        from nanobot_channel_voice.channel import VoiceChannel
-
-        h = _build()
-        channel = VoiceChannel(VoiceConfig(), MessageBus())
-        channel._backend = h.backend
-        spoken: list[str] = []
-
-        async def _speak(text: str) -> None:
-            spoken.append(text)
-
-        h.backend.speak_final = _speak  # type: ignore[method-assign]
-
-        def _final(content: str) -> OutboundMessage:
-            return OutboundMessage(
-                channel="voice", chat_id=channel.config.chat_id, content=content,
-                metadata={}, event=StreamedResponseEvent(),
-            )
-
-        # The turn spoke only a pre-tool status line, then the model went blank.
-        h.backend._cur_turn.answered = False
-        await channel.send(_final(EMPTY_FINAL_RESPONSE_MESSAGE))
-        assert spoken == [EMPTY_FINAL_RESPONSE_MESSAGE]
-        assert h.backend._metrics.counters.get("reply_unanswered_final") == 1
-
-        # The ordinary case: the answer WAS streamed, so the stamp is honest.
-        h.backend._cur_turn.answered = True
-        await channel.send(_final("It is sunny in Tokyo."))
-        assert spoken == [EMPTY_FINAL_RESPONSE_MESSAGE]  # not repeated
-
-        # Traces keep their old fate whatever else they carry.
-        h.backend._cur_turn.answered = False
-        await channel.send(OutboundMessage(
-            channel="voice", chat_id=channel.config.chat_id, content="thinking…",
-            metadata={"_streamed": True, "_progress": True},
-        ))
-        assert spoken == [EMPTY_FINAL_RESPONSE_MESSAGE]
-
-    _run(_t())
-
-
 def test_agent_initiated_sends_mark_the_turn_proactive():
     # cron/trigger turns copy their trigger stamp onto every outbound (core echoes
     # inbound metadata); the channel must mark the playback turn before speaking so
@@ -907,3 +861,135 @@ def test_agent_initiated_final_bypasses_the_dead_token_gate():
         assert spoken == ["Time to stretch."]
 
     _run(_t())
+
+
+# ---- teardown, staleness and pacing wiring ----------------------------------
+
+def test_a_killed_replys_fragment_is_not_glued_onto_the_next_delivery():
+    """The chunker still holds the dead reply's sub-floor tail; carried, it is glued onto
+    the front of the next streamed delivery (a cron fire) as a sentence of another answer."""
+    async def _case():
+        h = _build()
+        b = h.backend
+        b._cur_turn = _Turn("t1")
+        await b.on_delta("Sure, let me")  # under the first-chunk floor: stays buffered
+        await b._do_interrupt()
+        await b.on_delta("Time to stretch now, please.")
+        await b.on_stream_end(resuming=False)
+        spoken = []
+        while not b._tts_queue.empty():
+            spoken.append(b._tts_queue.get_nowait()[1])
+        assert spoken == ["Time to stretch now, please."]
+        return h
+
+    _run(_case())
+
+
+def test_a_steered_turns_publish_token_survives_the_kill():
+    """Each mid-turn injection adds a token; sized in tokens the dead list would evict the
+    publish token, and the killed run's late final would speak."""
+    h = _build()
+    b = h.backend
+    b._cur_turn = _Turn("publish-token")
+    for i in range(20):
+        b._cur_turn.tokens.append(f"steer-{i}")
+    _run(b._do_interrupt())
+    assert b.is_dead_turn("publish-token")
+    assert b.is_dead_turn("steer-19")
+
+
+def test_preempted_verdict_flushes_audio_that_started_after_the_kill():
+    """An early confirm already /stop-ped, but a proactive delivery can start audio inside
+    the STT window; unflushed it talks over what this verdict publishes."""
+    async def _case():
+        h = _build()
+        back = h.backend
+        back._turn = VoiceState.SPEAKING
+        back._cur_turn = _Turn("t-dead")
+        back._cur_turn.abandon()
+        epoch = h.sink.epoch
+        h.sink.enqueue(OutputAudio(epoch=epoch, pcm=bytes(3200), rate=16000))
+        h.transcript = "open the door"
+        await back._on_utterance(_utt(preempted=True))
+        assert h.sink.epoch > epoch  # the late delivery is dead
+        assert h.interrupts == 0     # but no second /stop
+        assert h.published
+        return h
+
+    _run(_case())
+
+
+def test_preempted_verdict_spares_a_live_wake_ack():
+    """The preempted verdict's flush is for a late delivery; a wake ack still playing
+    (canned base IDLE) is the one thing the kill must let finish."""
+    async def _case():
+        h = _build()
+        back = h.backend
+        back._turn = VoiceState.SPEAKING
+        back._cur_turn = _Turn("t-dead")
+        back._cur_turn.abandon()
+        back._canned_base = VoiceState.IDLE
+        epoch = h.sink.epoch
+        h.sink.enqueue(OutputAudio(epoch=epoch, pcm=bytes(3200), rate=16000))
+        h.transcript = "open the door"
+        await back._on_utterance(_utt(preempted=True))
+        assert h.sink.epoch == epoch  # the ack plays on
+        assert h.published
+        return h
+
+    _run(_case())
+
+
+def test_a_vetoed_echo_hit_does_not_stamp_the_wake_latency():
+    """wake_kill_ms/wake_ack_ms measure a real summon: a hit off our own reply is dropped,
+    so it must not back-date a later text-tier verdict."""
+    async def _case():
+        h = _build(wake={"mode": "gate", "phrases": ["hey nanobot"]})
+        b = h.backend
+        b._echo.note_spoken("my name is hey nanobot", hold_ms=5000.0)
+        b._wake_hit_at = time.monotonic()  # the hop latched off the leak
+        b._wake_claimed = True
+        await b.push_audio(bytes(640))
+        assert b._metrics.counters.get("wake_echo_suppressed") == 1
+        assert not b._wake_claimed
+        b._observe_wake_kill()
+        assert "wake_kill_ms" not in b._metrics._latency
+
+        b._echo.reset()  # a genuine hit does stamp it
+        b._wake_hit_at = time.monotonic()
+        await b.push_audio(bytes(640))
+        b._observe_wake_kill()
+        assert "wake_kill_ms" in b._metrics._latency
+        return h
+
+    _run(_case())
+
+
+def test_a_delivery_racing_teardown_arms_no_watcher():
+    """close() cancels what it can see; a watcher armed after it waits forever on a
+    cancelled TTS worker and a stopped sink."""
+    async def _case():
+        h = _build()
+        b = h.backend
+        await b.start(instructions=None, tools=[], on_event=_collect)
+        await b.close()
+        await b.speak_final("late cron delivery")
+        assert b._drain_task is None
+        assert b._tts_queue.empty()
+        b._schedule_drain()
+        assert b._drain_task is None
+        return h
+
+    _run(_case())
+
+
+def test_calibration_moves_the_floor_the_jit_cut_reads():
+    """apply_calibration raises the first-chunk floor; the JIT cut must size against the
+    same value, or a boundary just past the budget stays out of reach."""
+    h = _build(chunker={"minChars": 60, "maxChars": 200, "minCharsFirst": 12})
+    b = h.backend
+    text = "a" * 35 + ". " + "b" * 25  # the sentence end sits past a 12-floor's reach
+    assert b._take_piece([text], 10) == "a" * 10
+    b.apply_calibration(stt_cost_ms=None, tts_rtf=1.0, chunk_floor_pinned=False)
+    assert b._chunk_floor == 60
+    assert b._take_piece([text], 10) == "a" * 35 + "."

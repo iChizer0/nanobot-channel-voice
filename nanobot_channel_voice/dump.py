@@ -32,7 +32,11 @@ from loguru import logger
 from nanobot_channel_voice.aio import Throttle
 from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_rms
 
-_QUEUE_DEPTH = 16  # segments in flight; a 30 s max utterance is ~1 MB, so <=~16 MB held
+# Bytes of PCM allowed in flight; a segment plus its pre-AEC twin both count, so the
+# held RAM is this whatever the utterance length or whether a raw tap is wired. The
+# depth cap only exists so a wedged writer (dead disk) refuses the close sentinel.
+_QUEUE_BYTES = 16 * 1024 * 1024
+_QUEUE_DEPTH = 256
 # Head span for the manifest/log rms: bounds the pass, matches the summary line's cap.
 _RMS_HEAD_S = 1.0
 
@@ -74,6 +78,8 @@ class AudioDumper:
         self._queue: queue.Queue[
             tuple[str, bytes, bytes | None, int | None, dict | None] | None
         ] = queue.Queue(maxsize=_QUEUE_DEPTH)
+        self._queued_bytes = 0
+        self._bytes_lock = threading.Lock()
         self._drop_warn = Throttle()
         self._thread = threading.Thread(
             target=self._writer, name="voice-dump", daemon=True
@@ -97,11 +103,22 @@ class AudioDumper:
         extra manifest fields."""
         if not pcm:
             return
+        size = len(pcm) + len(raw or b"")
+        with self._bytes_lock:
+            if self._queued_bytes + size > _QUEUE_BYTES:
+                if self._drop_warn.ready():
+                    self._log.warning(
+                        "audio dump backlogged; dropping a '{}' segment", verdict
+                    )
+                return
+            self._queued_bytes += size
         try:
             self._queue.put_nowait((verdict, pcm, raw, seq, meta))
         except queue.Full:
+            with self._bytes_lock:
+                self._queued_bytes -= size
             if self._drop_warn.ready():
-                self._log.warning("audio dump backlogged; dropping a '{}' segment", verdict)
+                self._log.warning("audio dump writer stalled; dropping a '{}' segment", verdict)
 
     def close(self) -> None:
         """Stop accepting work and drain what is queued (writes are ms-scale)."""
@@ -130,6 +147,9 @@ class AudioDumper:
                     self._write_one(*item)
                 except Exception as exc:  # noqa: BLE001 - diagnostics must never kill audio
                     self._log.warning("audio dump write failed: {}", exc)
+                finally:
+                    with self._bytes_lock:
+                        self._queued_bytes -= len(item[1]) + len(item[2] or b"")
         finally:
             if self._manifest is not None:
                 with suppress(Exception):

@@ -404,8 +404,8 @@ def test_a_blank_terminal_does_not_end_the_turn():
 
 def test_a_give_up_turn_says_so_instead_of_going_silent():
     """End to end through the backend: status line, tool, blank model answer, then core's
-    substitute. It must be spoken exactly once and settle the turn — the round-4 field
-    report was this whole sequence ending in dead air."""
+    substitute. Core streams nothing in that last segment, so the substitute arrives as an
+    ordinary final and must be spoken and settle the turn, not end in dead air."""
     async def _case():
         from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
@@ -418,12 +418,10 @@ def test_a_give_up_turn_says_so_instead_of_going_silent():
             await b.on_stream_end(resuming=False)      # the model returned nothing
             assert not b._cur_turn.answered
 
-            await b.speak_unanswered(EMPTY_FINAL_RESPONSE_MESSAGE)   # what send() does
+            await b.speak_final(EMPTY_FINAL_RESPONSE_MESSAGE)  # what send() does
+            await c.wait_state(VoiceState.SPEAKING)
             await c.wait_state(VoiceState.IDLE)
-            assert c.counter("reply_unanswered_final") == 1
-            assert b._cur_turn.answered                # and the turn is answered now
-            await b.speak_unanswered(EMPTY_FINAL_RESPONSE_MESSAGE)   # a straggler
-            assert c.counter("reply_unanswered_final") == 1
+            assert b._cur_turn.answered                # the turn is answered now
 
     _run(_case())
 
@@ -645,3 +643,25 @@ def test_dead_stream_residue_never_glues_onto_a_final():
             assert not any("Partial" in t for t in rec.requests)
 
     _run(_case())
+
+
+def test_transcription_gap_warning_is_only_for_the_delegating_provider():
+    """A failed on-device build also leaves the adapter None, and it has already logged
+    its own warning; naming 'nanobot' there contradicts the user's config."""
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.channel import VoiceChannel
+    from nanobot_channel_voice.config import VoiceConfig
+
+    warned: list[str] = []
+
+    class _Log:
+        def warning(self, msg, *a): warned.append(msg.format(*a))
+
+    channel = VoiceChannel(
+        VoiceConfig.model_validate({"stt": {"provider": "whisper"}}), MessageBus(),
+    )
+    channel.logger = _Log()  # type: ignore[assignment]
+    channel._stt = None  # the on-device build failed
+    channel._warn_if_transcription_unconfigured()
+    assert warned == []

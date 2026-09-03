@@ -338,3 +338,112 @@ def test_empty_partial_polls_release_a_stale_candidate():
         return h
 
     _run(_case())
+
+
+# ---- min-filter blips -------------------------------------------------------
+
+def _blip(b, vad, tag: int = 1):
+    """Onset-confirming but under-length speech, then the closing hangover."""
+    frame = bytes((tag, 0)) * 320
+
+    async def _go():
+        vad.script = [True] * 7  # >= startFrames (5), < minUtteranceMs (10 frames)
+        for _ in range(7):
+            await b.push_audio(frame)
+        assert b._turn is VoiceState.CAPTURING
+        for _ in range(32):
+            await b.push_audio(bytes((tag + 1, 0)) * 320)
+
+    return _go()
+
+
+def test_a_rejected_blip_settles_capturing_back_to_idle():
+    """The onset flips IDLE -> CAPTURING before the min filter judges; no _on_utterance
+    runs for a blip, so without an explicit settle CAPTURING stands indefinitely."""
+    async def _case():
+        vad = _ScriptedVad()
+        h = _build(vad, mode="duck")
+        for _ in range(3):  # a noisy room is a run of them
+            await _blip(h.backend, vad)
+            assert h.backend._turn is VoiceState.IDLE
+        return h
+
+    _run(_case())
+
+
+def test_a_blip_inside_a_queued_utterances_window_leaves_capturing_alone():
+    """CAPTURING at onset can mean a PREVIOUS utterance is still decoding; settling it
+    would flip the state under that turn and teach the adaptive hangover a bogus pause."""
+    async def _case():
+        vad = _ScriptedVad()
+        h = _build(vad, mode="duck")
+        h.backend._worker_decoding = True  # the worker's final decode is in flight
+        await _blip(h.backend, vad)
+        assert h.backend._turn is VoiceState.CAPTURING
+        h.backend._worker_decoding = False
+        await _blip(h.backend, vad)
+        assert h.backend._turn is VoiceState.IDLE
+        return h
+
+    _run(_case())
+
+
+def test_a_rejected_blip_settles_capturing_on_the_streaming_path():
+    async def _case():
+        vad = _ScriptedVad()
+        h = _build(vad, mode="duck", stt_stream=_FakeSttStream())
+        await _blip(h.backend, vad)
+        assert h.backend._turn is VoiceState.IDLE
+        return h
+
+    _run(_case())
+
+
+class _RecordingHandle:
+    def __init__(self, log: list[int]) -> None:
+        self._log = log
+
+    def accept(self, pcm: bytes) -> None:
+        self._log.append(pcm[0])
+
+    def partial(self) -> str:
+        return ""
+
+    def finish(self) -> str:
+        return ""
+
+
+class _RecordingSttStream:
+    streaming = True
+
+    def __init__(self) -> None:
+        self.handles: list[list[int]] = []
+
+    def stream_start(self) -> _RecordingHandle:
+        log: list[int] = []
+        self.handles.append(log)
+        return _RecordingHandle(log)
+
+
+def test_a_rejected_blip_drops_the_pre_onset_ring():
+    """The endpointer clears its own pre-trigger on a reject; the STT replay ring must go
+    with it, or the rejected audio (and what preceded it) leads the NEXT utterance."""
+    async def _case():
+        vad = _ScriptedVad()
+        stt = _RecordingSttStream()
+        h = _build(vad, mode="duck", stt_stream=stt)
+        b = h.backend
+        for _ in range(25):  # idle: fills the ring with tag 1
+            await b.push_audio(bytes((1, 0)) * 320)
+        await _blip(b, vad, tag=2)  # tag 2 speech, tag 3 hangover
+        assert len(stt.handles) == 1
+        for _ in range(4):  # the real utterance's own pre-roll
+            await b.push_audio(bytes((4, 0)) * 320)
+        vad.script = [True] * 15
+        for _ in range(15):
+            await b.push_audio(bytes((5, 0)) * 320)
+        assert len(stt.handles) == 2
+        assert not ({1, 2} & set(stt.handles[1]))
+        return h
+
+    _run(_case())

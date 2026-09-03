@@ -20,7 +20,7 @@ from loguru import logger
 
 from nanobot_channel_voice.config import MatchaTtsConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
-from nanobot_channel_voice.tts.espeak import make_ipa_phonemizer
+from nanobot_channel_voice.tts.espeak import BATCH_SEP, make_ipa_phonemizer
 from nanobot_channel_voice.tts.ondevice_base import OnDeviceTtsAdapter
 from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
 from nanobot_channel_voice.tts.text_frontend import (
@@ -314,7 +314,7 @@ class EspeakFrontend:
         """One call per batch (espeak emits one clause per line); a line-count mismatch
         falls back to per-clause calls."""
         if len(clauses) > 1:
-            lines = self._phonemize("\n".join(clauses)).splitlines()
+            lines = self._phonemize(BATCH_SEP.join(clauses)).splitlines()
             if len(lines) == len(clauses):
                 return lines
         return [self._phonemize(c) for c in clauses]
@@ -377,6 +377,7 @@ class EnglishToIpa:
         self._token2id = token2id
         self._phonemize = phonemize
         self._cache: dict[str, list[int]] = {}
+        self._failed: set[str] = set()  # words espeak failed on once; a second failure caches
 
     def _fold_ids(self, ipa: str) -> list[int]:
         ipa = _LANG_SWITCH_RE.sub("", ipa)
@@ -397,7 +398,7 @@ class EnglishToIpa:
         if len(fresh) < 2:
             return
         try:
-            lines = self._phonemize("\n".join(fresh)).splitlines()
+            lines = self._phonemize(BATCH_SEP.join(fresh)).splitlines()
         except Exception:  # noqa: BLE001 - the per-word path reports instead
             return
         if len(lines) != len(fresh):
@@ -410,7 +411,14 @@ class EnglishToIpa:
         if ids is None:
             try:
                 ids = self._put(word, self._fold_ids(self._phonemize(word)))
-            except Exception:  # noqa: BLE001 - espeak hiccup drops the word, not the chunk
+                self._failed.discard(word)
+            except Exception as exc:  # noqa: BLE001
+                # One retry, then cache the drop: a transient hiccup must not mute the
+                # word for the process, a dead espeak must not respawn per occurrence.
+                if word in self._failed:
+                    return self._put(word, [])
+                self._failed.add(word)
+                logger.warning("espeak failed on {!r} ({}); dropping it this once", word, exc)
                 return []
         return ids
 

@@ -697,11 +697,13 @@ class LocalBackend(TurnEventMixin):
             if hangover_floor < tier_floor:
                 logger.warning(
                     "voice: {} ({}) undercuts vad.turn.consultMs ({}); raising {} to "
-                    "{} ms so the turn model can fire",
+                    "{} ms so the turn model can fire{}",
                     "vad.hangoverMinMs" if adaptive else "vad.hangoverMs", hangover_floor,
                     config.vad.turn.consult_ms,
                     "the adaptive floor" if adaptive else "the endpointing hangover",
                     tier_floor,
+                    f", and its ceiling with it (vad.hangoverMs {config.vad.hangover_ms})"
+                    if adaptive and config.vad.hangover_ms < tier_floor else "",
                 )
                 hangover_floor = tier_floor
         if eager_ms and eager_ms >= hangover_floor:
@@ -727,7 +729,9 @@ class LocalBackend(TurnEventMixin):
             consult_cap_bytes=getattr(turn_analyzer, "window_bytes", 0),
         )
         self._adaptive = (
-            AdaptiveHangover(hangover_floor, config.vad.hangover_ms)
+            # The ceiling rides the raised floor: a lower one would clamp the learned value
+            # back under the consult tier and re-silence the turn model.
+            AdaptiveHangover(hangover_floor, max(hangover_floor, config.vad.hangover_ms))
             if config.vad.hangover_min_ms is not None else None
         )
         self._eager_ms = eager_ms
@@ -764,6 +768,9 @@ class LocalBackend(TurnEventMixin):
         self._chunker = SentenceChunker(
             config.chunker.min_chars, config.chunker.max_chars, config.chunker.min_chars_first
         )
+        # First-chunk floor IN EFFECT: calibration may raise it, and the JIT sizing must size
+        # against the same value the chunker emits at.
+        self._chunk_floor = config.chunker.min_chars_first
         # Open-mic ducking floor: stream mode ducks toward it DYNAMICALLY while a candidate
         # interrupt is live; blob mode can't change gain mid-chunk, so it pre-bakes the gain.
         duck_db = config.duck_db if self._open_mic else 0.0
@@ -875,6 +882,9 @@ class LocalBackend(TurnEventMixin):
         # Last hit and its loop-side consumption watermark; hop-thread writes are GIL-atomic.
         self._wake_hit_at = float("-inf")
         self._wake_seen_at = float("-inf")
+        # Stamped only once a hit survives the echo veto: the wake latency metrics measure
+        # real summons, and a vetoed self-echo hit must not back-date the next one.
+        self._wake_hit_vetted_at = float("-inf")
         self._wake_claimed = False  # the hit is bound to the OPEN utterance; dies at close/reset
         # Acoustic hit position in the endpointer's stream coordinate (bytes), None before the
         # first hit. Monotonic, so a stale value lies BEFORE any later buffer and trims nothing.
@@ -952,7 +962,9 @@ class LocalBackend(TurnEventMixin):
         # Tokens of KILLED turns (barge-in / timeout), for send()'s stale-reply gate. A merely
         # superseded turn is NOT here: core may coalesce a queued follow-up into its running
         # turn, and that combined reply must speak.
-        self._dead_tokens: deque[str] = deque(maxlen=8)
+        # Sized for TURNS, not tokens: a steered turn contributes one token per injection, and
+        # evicting its publish token would let the killed run's late final speak.
+        self._dead_tokens: deque[str] = deque(maxlen=64)
         # Raw-PCM output follows the SINK's mode (the channel derived it from the TTS adapter),
         # so we can never emit pcm into a blob sink or vice versa.
         self._pcm_out = sink.stream_mode
@@ -1072,9 +1084,10 @@ class LocalBackend(TurnEventMixin):
                 # minChars. Slow TTS grows the floor so the reply never gaps after chunk 1.
                 floor = math.ceil(1.2 * tts_rtf * cfg.min_chars)
                 eff = max(cfg.min_chars_first, min(cfg.min_chars, floor))
-                if eff != cfg.min_chars_first:
+                if eff != self._chunk_floor:
                     self._chunker.set_first_floor(eff)
-                    parts.append(f"minCharsFirst {cfg.min_chars_first}->{eff}")
+                    parts.append(f"minCharsFirst {self._chunk_floor}->{eff}")
+                    self._chunk_floor = eff
         if stt_cost_ms is not None:
             parts.append(f"stt~{stt_cost_ms:.0f}ms")
             window = max(0, self._hangover_floor - self._eager_ms)
@@ -1150,6 +1163,7 @@ class LocalBackend(TurnEventMixin):
                 self._metrics.count("wake_echo_suppressed")
                 self._log.info("wake hit suppressed (own reply speaks the phrase)")
             else:
+                self._wake_hit_vetted_at = self._wake_hit_at
                 self._touch_wake()
                 score = getattr(self._wake_detector, "last_score", None)
                 self._log.info(
@@ -1319,6 +1333,7 @@ class LocalBackend(TurnEventMixin):
                 self._dump_blip()
                 self._release_duck("blip")  # rejected by the min filter mid-candidate
                 await self._orphan_if_confirmed("blip")
+                await self._settle_blip()
             return
         eager_pcm = self._endpointer.take_eager()
         if eager_pcm is not None:
@@ -1348,6 +1363,7 @@ class LocalBackend(TurnEventMixin):
             self._dump_blip()
             self._release_duck("blip")
             await self._orphan_if_confirmed("blip")
+            await self._settle_blip()
         if utterance is not None:
             eager = self._eager_task if self._eager_valid else None
             if eager is not None and not self._endpointer.eager_covered:
@@ -1494,9 +1510,9 @@ class LocalBackend(TurnEventMixin):
         self._arm_wake_ack()
 
     def _observe_wake_kill(self) -> None:
-        """Hit-latch -> audio-stopped latency (``wake_kill_ms``). Recency-guarded:
+        """Vetted-hit -> audio-stopped latency (``wake_kill_ms``). Recency-guarded:
         text-tier verdict matches carry no hit stamp."""
-        dt = time.monotonic() - self._wake_hit_at
+        dt = time.monotonic() - self._wake_hit_vetted_at
         if dt < _WAKE_ATTACH_S:
             self._metrics.observe("wake_kill_ms", dt * 1000.0)
 
@@ -1714,7 +1730,7 @@ class LocalBackend(TurnEventMixin):
                 self._metrics.count("wake_ack")
                 if fast:
                     self._metrics.count("wake_ack_fast")  # committed, not merely probed
-                dt = time.monotonic() - self._wake_hit_at
+                dt = time.monotonic() - self._wake_hit_vetted_at
                 if dt < _WAKE_ATTACH_S:
                     # Recency-guarded like wake_kill_ms: text-tier matches carry no stamp.
                     self._metrics.observe("wake_ack_ms", dt * 1000.0)
@@ -1765,6 +1781,7 @@ class LocalBackend(TurnEventMixin):
             self._metrics.count("wake_echo_suppressed")
             self._log.info("wake hit suppressed (own reply speaks the phrase)")
             return
+        self._wake_hit_vetted_at = self._wake_hit_at
         self._touch_wake()
         score = getattr(self._wake_detector, "last_score", None)
         self._log.info(
@@ -1794,6 +1811,18 @@ class LocalBackend(TurnEventMixin):
         preempted, _ = self._take_confirm_latches()
         if preempted:
             await self._orphaned_confirm(reason)
+
+    async def _settle_blip(self) -> None:
+        """The onset flipped IDLE -> CAPTURING before the min filter judged the blip; no
+        _on_utterance runs for one, so without this CAPTURING stands until the next accepted
+        turn (deaf state hint, no vad_start, every later onset reads as a fast resume).
+        A queued or decoding PREVIOUS utterance still owns CAPTURING: leave it."""
+        if (
+            self._turn is VoiceState.CAPTURING
+            and self._utt_queue.empty()
+            and not self._worker_decoding
+        ):
+            await self._set_turn(VoiceState.IDLE)
 
     def _push_with_model_close(self, pcm: bytes) -> bytes | None:
         """One frame through the endpointer, honoring a pending COMPLETE verdict: a verdict
@@ -1938,6 +1967,9 @@ class LocalBackend(TurnEventMixin):
                 elif prev_speech and utterance is None:
                     self._stt_live = None  # blip rejected by the min filter: abandon its stream
                     self._stt_restarted = False
+                    # The endpointer cleared its own pre-trigger: a ring still holding the
+                    # rejected audio would replay it as the NEXT utterance's pre-roll.
+                    self._recent.clear()
                 elif not prev_speech:
                     self._recent.append(pcm)  # idle: keep pre-onset context warm
             return utterance, (time.monotonic() - t0) * 1000.0
@@ -2057,15 +2089,31 @@ class LocalBackend(TurnEventMixin):
             # Nothing will publish the dropped utterance: without this, CAPTURING stands forever.
             await self._set_turn(VoiceState.IDLE)
 
+    def _task_slots(self, turn: _Turn) -> list[asyncio.Task]:
+        return [
+            t for t in (
+                self._eager_task, self._utt_task, turn.prologue_task, turn.midturn_task,
+                turn.timeout_task, self._tts_task, self._drain_task, self._consult_task,
+                self._ack_task, self._fast_ack_task, self._earcon_task, self._attention_task,
+            ) if t is not None
+        ]
+
     async def close(self) -> None:
         self._closing = True
         self._eager_valid = False
-        for task in (self._eager_task, self._utt_task, self._cur_turn.prologue_task,
-                     self._cur_turn.midturn_task, self._cur_turn.timeout_task,
-                     self._tts_task, self._drain_task, self._consult_task,
-                     self._ack_task, self._fast_ack_task, self._earcon_task,
-                     self._attention_task):
-            await cancel_and_wait(task)
+        # Re-read the slots each pass: a task cancelled here can arm another before it exits,
+        # and one left running outlives the workers and devices it awaits. The turn is
+        # snapshotted once so a replacement mid-teardown cannot hide the original's tasks;
+        # done tasks stay in the sweep so cancel_and_wait retrieves their exceptions.
+        turn = self._cur_turn
+        for _ in range(4):
+            tasks = self._task_slots(turn)
+            for task in tasks:
+                await cancel_and_wait(task)
+            if all(t.done() for t in self._task_slots(turn)):
+                break
+        else:
+            self._log.warning("close: a backend task re-armed itself past the teardown sweep")
         self._consult_task = None
         self._eager_task = self._utt_task = self._cur_turn.prologue_task = None
         self._cur_turn.midturn_task = self._cur_turn.timeout_task = None
@@ -2489,6 +2537,9 @@ class LocalBackend(TurnEventMixin):
         self._reject_started_before_ns = time.time_ns()
         self._dead_tokens.extend(self._cur_turn.tokens)
         self._cur_turn.abandon()
+        # The killed reply's half-built chunk dies with it: kept, it would be glued onto
+        # whatever speaks next (a cron delivery, the timeout notice).
+        self._chunker.flush()
         # Left running, the dead turn's drain watcher would wake on a transient queue-empty
         # moment and drain the SUCCESSOR turn's live stream (wiping its heard-up-to spans).
         cancel_task(self._drain_task)
@@ -2941,8 +2992,16 @@ class LocalBackend(TurnEventMixin):
             cancel_task(self._drain_task)
             await self._sink.flush()
             return False, heard
-        if not interrupting or preempted:
-            return preempted, heard
+        if preempted:
+            # The early confirm already /stop-ped and flushed, but audio can have started
+            # since (a proactive delivery lands mid-STT): stop that too, or it talks over
+            # whatever this verdict publishes. A live wake ack (_canned_base IDLE) plays on.
+            if self._canned_base is None and self._sink.backlog_ms() > 0:
+                cancel_task(self._drain_task)
+                await self._sink.flush()
+            return True, heard
+        if not interrupting:
+            return False, heard
         if not self._cur_turn.dead:
             heard = await self._do_interrupt()
         else:
@@ -3130,6 +3189,8 @@ class LocalBackend(TurnEventMixin):
     async def speak_final(self, text: str) -> None:
         """A non-streamed final assistant message (streaming disabled / fallback /
         an unsolicited delivery — cron reply, message-tool send)."""
+        if self._closing:
+            return  # a bus delivery racing teardown: the workers that would speak it are gone
         self._cancel_prologue()
         self._cancel_midturn()
         # A final while a segment is open: the stream died without its end marker (core's
@@ -3163,16 +3224,6 @@ class LocalBackend(TurnEventMixin):
         if tail:
             self._tts_enqueue(tail)
         self._schedule_drain()
-
-    async def speak_unanswered(self, text: str) -> None:
-        """Core's substitute for a final the model never produced (see the channel's
-        ``_streamed_final``), spoken only when this turn said nothing of its own: without it a
-        blank reply after a failed tool reads as a dead device."""
-        if self._cur_turn.answered:
-            return  # the turn answered; that stamp was honest
-        self._metrics.count("reply_unanswered_final")
-        self._log.warning("turn produced no answer of its own; speaking core's notice")
-        await self.speak_final(text)
 
     # ---- TTS stage + drain --------------------------------------------------
 
@@ -3252,7 +3303,7 @@ class LocalBackend(TurnEventMixin):
         never below half the first-chunk floor."""
         head = pending[0]
         if len(head) > budget:
-            cut = _cut_index(head, budget, self._cfg.chunker.min_chars_first)
+            cut = _cut_index(head, budget, self._chunk_floor)
             if cut > budget:
                 self._metrics.count("tts_cut_extended")  # a boundary past the budget replaced a seam
             piece, rest = head[:cut].strip(), head[cut:].strip()
@@ -3307,7 +3358,7 @@ class LocalBackend(TurnEventMixin):
                 budget = sum(map(len, pending))
             else:
                 mpc = max(mpc, _MPC_MIN)
-                floor = self._cfg.chunker.min_chars_first
+                floor = self._chunk_floor
                 # The ahead cap folded into WANT keeps release size ~= cut size
                 # (_cut_index may overshoot a boundary by at most floor // 2).
                 cap_chars = int(
@@ -3367,7 +3418,7 @@ class LocalBackend(TurnEventMixin):
             ema = self._synth_mpc
             if ema is None:
                 self._synth_mpc = obs  # any seed beats an unscheduled first pipeline
-            elif len(text) >= max(_CUT_MIN_TAIL, self._cfg.chunker.min_chars_first // 2):
+            elif len(text) >= max(_CUT_MIN_TAIL, self._chunk_floor // 2):
                 # a shorter piece is overhead-dominated: not a speed sample
                 obs = min(max(obs, ema / 4.0), ema * 4.0)
                 self._synth_mpc = max(obs, (1.0 - _MPC_ALPHA) * ema + _MPC_ALPHA * obs)
@@ -3439,6 +3490,9 @@ class LocalBackend(TurnEventMixin):
         self._cancel_midturn()
         self._cur_turn.cancel_timeout()
         cancel_task(self._drain_task)
+        self._drain_task = None
+        if self._closing:
+            return  # a watcher armed during teardown waits forever on a cancelled TTS worker
         self._drain_task = asyncio.create_task(self._drain_watch(self._sink.epoch))
 
     def _audio_event(self, epoch: int, audio: bytes) -> OutputAudio:

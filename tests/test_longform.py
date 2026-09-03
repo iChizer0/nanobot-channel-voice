@@ -105,4 +105,6 @@ def test_adapter_window_declarations():
 
     assert SttAdapter.max_decode_ms is None
     assert SenseVoiceOnDeviceStt.max_decode_ms == 30_000
-    assert ZipformerOnDeviceStt.max_decode_ms is None  # streaming: length-immune
+    # A transducer is streamed internally on the batch path too (frames pop as they are
+    # encoded), so no window: a cut would only reset the encoder caches mid-word.
+    assert ZipformerOnDeviceStt.max_decode_ms is None

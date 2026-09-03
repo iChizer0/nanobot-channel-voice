@@ -11,6 +11,7 @@ import pytest
 np = pytest.importorskip("numpy")
 
 from nanobot_channel_voice.chunker import sanitize  # noqa: E402
+from nanobot_channel_voice.tts.espeak import BATCH_SEP  # noqa: E402
 from nanobot_channel_voice.tts.matcha import (  # noqa: E402
     EnglishToIpa,
     EspeakFrontend,
@@ -168,10 +169,10 @@ def _en_frontend(ipa_by_clause: dict[str, str]):
         {"_": 0, "^": 1, "$": 2, " ": 3, ",": 8, ".": 10, "!": 4,
          "h": 20, "ə": 59, "l": 24, "ˈ": 120, "o": 27, "ʊ": 100, "w": 35, "d": 17}
     )
-    # Newline-batched like real espeak: one output line per input clause.
+    # Batched like real espeak: one output line per clause the separator ends.
     fe = EspeakFrontend(
         tokens,
-        phonemize=lambda text: "\n".join(ipa_by_clause[c] for c in text.split("\n")),
+        phonemize=lambda text: "\n".join(ipa_by_clause[c] for c in text.split(BATCH_SEP)),
     )
     return fe, tokens
 
@@ -225,7 +226,7 @@ def test_clause_batch_falls_back_on_line_count_mismatch():
 
     fe = EspeakFrontend(tokens, phonemize=phonemize)
     assert fe.sentences("one, two.") == [[1, 8, 0, 2, 10]]
-    assert calls == ["one\ntwo", "one", "two"]
+    assert calls == [BATCH_SEP.join(("one", "two")), "one", "two"]
 
 
 def test_espeak_language_switch_flags_are_stripped():
@@ -310,6 +311,56 @@ def test_english_to_ipa_drops_the_word_on_espeak_failure():
     assert EnglishToIpa({"h": 1}, phonemize=boom).word_ids("hello") == []
 
 
+def test_english_to_ipa_caches_the_drop_after_an_espeak_failure():
+    from nanobot_channel_voice.tts.matcha import EnglishToIpa
+
+    # Uncached, a failing espeak respawns (and re-times-out, 10 s a piece) for every
+    # occurrence of the word; cached on the FIRST failure, one transient hiccup muted
+    # the word for the process. One retry, then the drop is cached.
+    calls: list[str] = []
+
+    def boom(word: str) -> str:
+        calls.append(word)
+        raise OSError("espeak died")
+
+    e2i = EnglishToIpa({"h": 1}, phonemize=boom)
+    assert [e2i.word_ids("hello") for _ in range(4)] == [[], [], [], []]
+    assert calls == ["hello", "hello"]
+    # A hiccup that clears on the retry leaves no trace.
+    flaky = iter([OSError("busy"), "h"])
+
+    def once(word: str) -> str:
+        item = next(flaky)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    e2i = EnglishToIpa({"h": 1}, phonemize=once)
+    assert e2i.word_ids("hi") == []
+    assert e2i.word_ids("hi") == [1]
+    assert e2i.word_ids("hi") == [1]  # cached, no third call
+
+
+def test_english_words_prime_in_one_espeak_call_for_pinyin():
+    """The zh tier batches on the same separator; a "\\n" join never clause-broke."""
+    from nanobot_channel_voice.tts.pinyin_english import EnglishToPinyin
+
+    tokens = {s: i for i, s in enumerate(["he1", "lou1", "ban1", "ei1", "bi4"])}
+    ipa = {"hello": "həlˈoʊ", "ban": "bˈæn"}
+    calls: list[str] = []
+
+    def phonemize(text: str) -> str:
+        calls.append(text)
+        return "\n".join(ipa[w] for w in text.split(BATCH_SEP))
+
+    eng = EnglishToPinyin(tokens, phonemize=phonemize)
+    eng.prime(["hello", "ban"])
+    assert calls == [BATCH_SEP.join(("hello", "ban"))]
+    assert eng.word_ids("hello") == [tokens["he1"], tokens["lou1"]]
+    assert eng.word_ids("ban") == [tokens["ban1"]]
+    assert len(calls) == 1  # both served from the primed cache
+
+
 def test_english_words_prime_in_one_espeak_call():
     """Subprocess espeak spawns per call: a fresh English clause must batch."""
     from nanobot_channel_voice.tts.matcha import EnglishToIpa
@@ -320,15 +371,49 @@ def test_english_words_prime_in_one_espeak_call():
 
     def phonemize(text: str) -> str:
         calls.append(text)
-        return "\n".join(ipa[w] for w in text.split("\n"))
+        return "\n".join(ipa[w] for w in text.split(BATCH_SEP))
 
     fe = LexiconFrontend({}, tokens, english=EnglishToIpa(tokens, phonemize),
                          latin_space_id=9)
     (seq,) = fe.sentences("hi ho。")
     assert seq == [1, 2, 9, 1, 3, 9, 8]
-    assert calls == ["hi\nho"]          # one batch, no per-word spawns
+    batch = BATCH_SEP.join(("hi", "ho"))
+    assert calls == [batch]             # one batch, no per-word spawns
     fe.sentences("ho hi。")
-    assert calls == ["hi\nho"]          # everything served from the cache
+    assert calls == [batch]             # everything served from the cache
+
+
+def test_real_espeak_emits_one_line_per_batched_item():
+    """espeak clauses on PUNCTUATION, not newlines: a "\\n"-joined batch comes back as
+    ONE line, so every batch degraded to a subprocess per clause and per word."""
+    import shutil
+
+    exe = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not exe:
+        pytest.skip("no espeak-ng binary")
+    from nanobot_channel_voice.tts.espeak import make_ipa_phonemizer
+
+    phonemize = make_ipa_phonemizer("en-us")
+    items = ["hello", "world", "github", "status"]
+    assert len(phonemize("\n".join(items)).splitlines()) == 1
+    assert len(phonemize(BATCH_SEP.join(items)).splitlines()) == len(items)
+
+    calls: list[str] = []
+
+    def counted(text: str) -> str:
+        calls.append(text)
+        return phonemize(text)
+
+    tokens = fold_punct_aliases(official_token2id())
+    fe = EspeakFrontend(tokens, phonemize=counted)
+    text = "Sure, I can do that, but first, let me check the calendar."
+    batched = fe.sentences(text)
+    assert len(calls) == 1                      # 4 clauses, one spawn
+
+    fe._phonemize_clauses = lambda clauses: [counted(c) for c in clauses]
+    calls.clear()
+    assert fe.sentences(text) == batched        # ids identical to the per-clause path
+    assert len(calls) == 4
 
 
 def test_prime_recovers_per_word_when_espeak_reclauses():
@@ -345,7 +430,8 @@ def test_prime_recovers_per_word_when_espeak_reclauses():
     e2i = EnglishToIpa({"h": 1, "i": 2, "O": 3}, phonemize)
     e2i.prime(["hi", "ho"])
     assert e2i.word_ids("hi") == [1, 2] and e2i.word_ids("ho") == [1, 3]
-    assert calls == ["hi\nho", "hi", "ho"]  # batch rejected, per-word correct
+    # batch rejected, per-word correct
+    assert calls == [BATCH_SEP.join(("hi", "ho")), "hi", "ho"]
 
 
 def test_lexicon_inserts_the_latin_space_like_sherpa():

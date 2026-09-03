@@ -18,6 +18,7 @@ from nanobot_channel_voice.config import WhisperSttConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
 from nanobot_channel_voice.stt.base import SttAdapter, pcm_to_float_mono
 from nanobot_channel_voice.stt.whisper_tokenizer import (
+    TokenTable,
     byte_level_decode,
     detect_language,
     language_token,
@@ -42,7 +43,16 @@ TRANSCRIBE = 50359     # <|transcribe|>
 NOTIMESTAMPS = 50363   # <|notimestamps|>
 TIMESTAMP_BEGIN = 50364
 MAX_TOKENS = 12        # decoder context window (the exported decoder is fixed at this)
-MAX_DECODE_STEPS = 448  # cap: a model that never emits EOT must not hang the daemon
+# Step cap: a model that never emits EOT must not hang the daemon. Scaled to the audio
+# actually in the window (one token per 8 mel frames = 80 ms is already faster than
+# speech), with a floor so a short window can still finish a sentence.
+_STEPS_PER_MEL_FRAME = 8
+_MIN_DECODE_STEPS = 48
+# Loop trap: a window this long, wholly periodic at a period up to the max (so every
+# period shows >= 3 full repeats), is a greedy loop -- whisper repeats a PHRASE ("thank
+# you very much." is 5 tokens). Shorter windows bail on a repeated shopping-list triple.
+_LOOP_WINDOW = 30
+_LOOP_MAX_PERIOD = 10
 
 
 def load_mel_filters(path: str) -> np.ndarray:
@@ -71,6 +81,14 @@ def log_mel_spectrogram(audio: np.ndarray, mel_filters: np.ndarray) -> np.ndarra
     return log_spec.astype(np.float32)
 
 
+def _loop_period(recent: list[tuple[int, str]]) -> int:
+    """Shortest period at which a FULL loop window repeats, else 0."""
+    if len(recent) < _LOOP_WINDOW:
+        return 0
+    ids = [i for i, _ in recent]
+    return next((k for k in range(1, _LOOP_MAX_PERIOD + 1) if ids[k:] == ids[:-k]), 0)
+
+
 class WhisperOnDeviceStt(SttAdapter):
     decoder_family = "attention"
 
@@ -79,7 +97,7 @@ class WhisperOnDeviceStt(SttAdapter):
         *,
         encoder: OnDeviceModel,
         decoder: OnDeviceModel,
-        vocab: dict[str, str],
+        vocab: TokenTable,
         mel_filters: np.ndarray,
         lang_token: int,
         chunk_length: int,
@@ -105,6 +123,9 @@ class WhisperOnDeviceStt(SttAdapter):
         # Encoder time dim; from_config prefers the export's own when it declares one.
         self._max_frames = max_frames or chunk_length * 100
         self.max_decode_ms = self._max_frames * 10  # mel hop = 10 ms at 16 kHz
+        self._max_steps = max(
+            _MIN_DECODE_STEPS, self._max_frames // _STEPS_PER_MEL_FRAME
+        )
         self._log = logger.bind(component="stt-whisper")
 
     @classmethod
@@ -260,7 +281,7 @@ class WhisperOnDeviceStt(SttAdapter):
         lang_token = self._lang_token
         tokens = self._window(lang_token)
         tokens_str = ""
-        recent: list[int] = []  # last emitted TEXT tokens, for the repetition bail
+        recent: list[tuple[int, str]] = []  # last emitted TEXT tokens, for the loop bail
         pop_id = MAX_TOKENS
         steps = 0
         suppressed_hits = 0
@@ -268,7 +289,7 @@ class WhisperOnDeviceStt(SttAdapter):
         detect_pending = bool(self._candidates)
 
         while True:
-            if steps >= MAX_DECODE_STEPS:
+            if steps >= self._max_steps:
                 hit_cap = True  # only exit that truncates; EOT and the bail are clean
                 break
             steps += 1
@@ -293,7 +314,7 @@ class WhisperOnDeviceStt(SttAdapter):
 
             next_token, suppressed = self._pick_token(out[0, -1])
             suppressed_hits += suppressed
-            next_token_str = self._vocab.get(str(next_token), "")
+            next_token_str = self._vocab.get(next_token, "")
             tokens.append(next_token)
 
             if next_token == EOT:
@@ -313,19 +334,22 @@ class WhisperOnDeviceStt(SttAdapter):
                 # the flat vocab carries their literal strings, so a greedy <|nospeech|>
                 # on noise would reach the agent as user speech.
                 tokens_str += next_token_str
-                # Repetition trap (music, hum): eight IDENTICAL consecutive text tokens
-                # never occur in real speech; bail and shed the looping tail.
-                recent.append(next_token)
-                if len(recent) > 8:
+                recent.append((next_token, next_token_str))
+                if len(recent) > _LOOP_WINDOW:
                     del recent[0]
-                if len(recent) == 8 and len(set(recent)) == 1:
-                    self._log.warning("greedy decode stuck repeating; bailing early")
-                    if next_token_str:  # [:-0] would wipe the whole transcript
-                        tokens_str = tokens_str[: -8 * len(next_token_str)]
+                period = _loop_period(recent)
+                if period:
+                    self._log.warning(
+                        "greedy decode stuck repeating (period {}); bailing early", period
+                    )
+                    # Keep the first two repeats: "milk, eggs, bread" said twice is speech.
+                    shed = sum(len(s) for _, s in recent[2 * period:])
+                    if shed:  # [:-0] would wipe the whole transcript
+                        tokens_str = tokens_str[:-shed]
                     break
 
         if hit_cap:
-            self._log.warning("decode hit the {}-step cap; truncating", MAX_DECODE_STEPS)
+            self._log.warning("decode hit the {}-step cap; truncating", self._max_steps)
         if suppressed_hits:
             # A steady stream means the decodable set is too narrow for what is said.
             self._log.debug(
