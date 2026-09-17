@@ -70,6 +70,15 @@ class RealtimeProfile:
     model_capability_overrides: dict[str, dict[str, bool | int]] = field(default_factory=dict)
     # Vendor-required session keys outside the common schema, merged into the beta session.
     session_extras: dict = field(default_factory=dict)
+    # beta only: the turn_detection value that hands turn boundaries to the CLIENT (the
+    # gated uplink's manual-turn mode). None = the OpenAI shape (``turn_detection: null``);
+    # GLM names its client mode instead.
+    manual_turn_detection: dict | None = None
+    # GA extensions (xAI): ``session.reasoning.effort`` (realtime.reasoningEffort), and
+    # ``session.resumption.enabled`` + ``?conversation_id=`` replay across reconnects, the
+    # history kept this long after the last turn (0 = no such replay).
+    supports_reasoning_effort: bool = False
+    resumption_ttl_s: float = 0.0
 
     @staticmethod
     def _longest_prefix_match(mapping: dict[str, _V], model: str | None) -> _V | None:
@@ -137,17 +146,24 @@ PROFILES: dict[str, RealtimeProfile] = {
         input_rate=24000,
         output_rate=24000,
     ),
-    # xAI Grok Voice. Emits input_audio_transcription.updated (CUMULATIVE) instead of
-    # the OpenAI *.completed event, so InputTranscript stays silent here.
+    # xAI Grok Voice: $0.08 per audio minute flat (+$0.004 per text item), so only the
+    # gated uplink's park saves anything. Transcripts (inputTranscriptionModel
+    # "grok-transcribe") stream as input_audio_transcription.updated (CUMULATIVE, replaces
+    # .delta); whether .completed also fires is unverified, so InputTranscript may stay
+    # silent here.
     "xai": RealtimeProfile(
         key="xai",
         dialect="ga",
         default_base_url="wss://api.x.ai/v1/realtime",
+        # The alias repointed to grok-voice-think-fast-2.0 on 2026-08-05 ($0.05 -> $0.08 per
+        # minute, reasoning on by default); pin a versioned name for stability.
         default_model="grok-voice-latest",
         default_voice="ara",  # xAI voices: ara/eve/leo/rex/sal, or an 8-char custom id
-        input_rate=24000,
+        input_rate=16000,   # documented PCM rate; = the gated capture rate, no resample
         output_rate=24000,
         voice_in_session_root=True,  # session.voice, not session.audio.output.voice
+        supports_reasoning_effort=True,
+        resumption_ttl_s=30 * 60.0,
     ),
     # Azure OpenAI Realtime (GA endpoint): realtime.baseUrl = your resource URL,
     # realtime.model = the deployment name. Preview (?api-version=) endpoints are NOT
@@ -223,6 +239,7 @@ PROFILES: dict[str, RealtimeProfile] = {
         needs_response_create_after_tools=True,
         # GLM requires beta_fields.chat_mode in session.update (default audio).
         session_extras={"beta_fields": {"chat_mode": "audio"}},
+        manual_turn_detection={"type": "client_vad"},
     ),
     # StepFun step-audio realtime. Emits an extra response.thinking.delta stream
     # (ignored).

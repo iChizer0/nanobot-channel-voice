@@ -682,3 +682,181 @@ def test_openwakeword_fixture_hits_with_both_frontends():
     hit_b, score_b = run(mel_filters_path=str(_OWW / "mel_filters.npy"))
     assert hit_a and hit_b  # an unseeded mel window misses this fixture entirely
     assert abs(score_a - score_b) < 1e-3
+
+
+# ---- gated uplink on the real detectors: what leaves the device ---------------
+# The offline half of the "SBC as smart speaker" validation: silero + openWakeWord
+# drive GatedUplink over a scripted room, a fake cloud records what went up, and
+# uplink_ms / capture_ms is the number the provider bills.
+
+
+def _room(*parts, rate: int = 16000, seed: int = 3) -> bytes:
+    """Clips (bytes) and seconds of noise floor (float, ~-66 dBFS) concatenated."""
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    out = []
+    for part in parts:
+        if isinstance(part, bytes):
+            out.append(part)
+        else:
+            n = int(part * rate)
+            out.append((rng.standard_normal(n) * 16).astype("<i2").tobytes())
+    return b"".join(out)
+
+
+class _FakeCloud:
+    """A ManualTurnBackend that answers every committed turn at once."""
+
+    pace_output_audio = False
+
+    def __init__(self):
+        self.calls: list = []
+        self.on_event = None
+
+    async def start(self, *, instructions, tools, on_event):
+        self.on_event = on_event
+
+    async def push_audio(self, pcm):
+        self.calls.append(("push", pcm))
+
+    async def begin_activity(self):
+        from nanobot_channel_voice.backend.base import StateHint, VoiceState
+
+        self.calls.append(("begin",))
+        await self.on_event(StateHint(VoiceState.CAPTURING))
+
+    async def end_activity(self, *, commit=True):
+        from nanobot_channel_voice.backend.base import StateHint, VoiceState
+
+        self.calls.append(("end", commit))
+        if commit:
+            await self.on_event(StateHint(VoiceState.THINKING))
+        await self.on_event(StateHint(VoiceState.IDLE))
+
+    async def park(self):
+        self.calls.append(("park",))
+
+    async def barge_in(self, played_ms):
+        pass
+
+    async def submit_tool_result(self, call_id, output):
+        pass
+
+    async def close(self):
+        pass
+
+    def commits(self) -> int:
+        return sum(1 for c in self.calls if c == ("end", True))
+
+    def uploaded(self) -> bytes:
+        return b"".join(c[1] for c in self.calls if c[0] == "push")
+
+
+class _AudioClock:
+    """Stands in for the gate's ``time`` module: the attention window is wall-clock,
+    and the room plays back far faster than real time here."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+async def _run_gate(mode: str, room: bytes, *, window_s: float, monkeypatch):
+    from nanobot_channel_voice.audio.null import NullPlayback
+    from nanobot_channel_voice.backend import gated
+    from nanobot_channel_voice.backend.audio_sink import AudioSink
+    from nanobot_channel_voice.backend.gated import GatedUplink
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.vad import make_vad
+    from nanobot_channel_voice.vad.silero import SileroVad
+    from nanobot_channel_voice.wake import make_wake_detector
+
+    # The board config, minus the key: a cloud brain behind local ears.
+    cfg = VoiceConfig.model_validate({
+        "backend": "gemini",
+        "realtime": {"uplink": mode, "idleParkS": 0},
+        "vad": {"engine": "silero", "silero": {"modelPath": str(_SILERO)}},
+        "wake": {
+            "mode": "gate", "phrases": ["hey mycroft"], "engine": "openwakeword",
+            "windowS": window_s,
+            "openwakeword": {
+                "melPath": str(_OWW / "melspectrogram.onnx"),
+                "embeddingPath": str(_OWW / "embedding_model.onnx"),
+                "modelPath": str(_OWW / "hey_mycroft_v0.1.onnx"),
+            },
+        },
+    })
+    frame_ms = cfg.audio.frame_ms
+    vad = make_vad(cfg.vad, 16000, frame_ms)
+    assert isinstance(vad, SileroVad)
+    wake = make_wake_detector(cfg.wake, 16000, frame_ms)
+    assert wake is not None
+    cloud = _FakeCloud()
+    gate = GatedUplink(
+        cloud, config=cfg, sink=AudioSink(NullPlayback(), mode="stream"), vad=vad,
+        wake_detector=wake, capture_rate=16000, uplink_rate=16000, open_mic=False,
+    )
+
+    async def on_event(e):
+        pass
+
+    clock = _AudioClock()
+    monkeypatch.setattr(gated, "time", clock)
+    await gate.start(instructions=None, tools=[], on_event=on_event)
+    step = 16000 * 2 * frame_ms // 1000
+    try:
+        for i in range(0, len(room) - step + 1, step):
+            clock.now += frame_ms / 1000.0
+            await gate.push_audio(room[i:i + step])
+    finally:
+        await gate.close()  # releases both detectors
+    return cloud, gate._metrics.snapshot()["counters"]
+
+
+def test_gated_uplink_real_detectors_upload_only_the_summoned_command(monkeypatch):
+    """uplink="wake": the phrase opens the window, the command after it goes up, the
+    room's silence and the speech after the window lapses do not."""
+    _need(_SILERO, _OWW / "melspectrogram.onnx", _OWW / "embedding_model.onnx",
+          _OWW / "hey_mycroft_v0.1.onnx", _OWW / "hey_mycroft_test.wav",
+          _WHISPER / "test_en.wav")
+    with wave.open(str(_OWW / "hey_mycroft_test.wav")) as w:
+        phrase = w.readframes(w.getnframes())  # 0.95 s
+    with wave.open(str(_WHISPER / "test_en.wav")) as w:
+        command = w.readframes(w.getnframes())  # 5.86 s of speech
+    # summon, beat, command, a lapse longer than the window, unsummoned speech.
+    room = _room(2.0, phrase, 0.6, command, 5.0, command, 1.0)
+    cloud, m = asyncio.run(_run_gate("wake", room, window_s=3.0, monkeypatch=monkeypatch))
+
+    assert m.get("wake_hit") == 1
+    assert cloud.commits() == 1  # the summoned command; the bare summon commits nothing
+    assert m.get("gate_bare_summon") == 1  # the hit adopted the phrase's own utterance
+    assert m.get("uplink_utterances", 0) >= 1
+    assert m.get("gate_dropped_onsets", 0) >= 1  # the unsummoned repeat
+    # Engaged vs wall clock: one command (+ preroll and hangover) out of a ~21 s room.
+    ratio = m["uplink_ms"] / m["capture_ms"]
+    assert abs(m["capture_ms"] - len(room) * 1000 // 32000) <= 20
+    assert 0.2 <= ratio <= 0.45, (m["uplink_ms"], m["capture_ms"])
+    assert len(cloud.uploaded()) < len(phrase) + len(command) + 32000  # never both commands
+
+
+def test_gated_uplink_real_detectors_vad_mode_uploads_every_utterance(monkeypatch):
+    """uplink="vad": no summon needed; every endpointed utterance goes up, the silence
+    (the bulk of the room) does not."""
+    _need(_SILERO, _OWW / "melspectrogram.onnx", _OWW / "embedding_model.onnx",
+          _OWW / "hey_mycroft_v0.1.onnx", _OWW / "hey_mycroft_test.wav",
+          _WHISPER / "test_en.wav")
+    with wave.open(str(_OWW / "hey_mycroft_test.wav")) as w:
+        phrase = w.readframes(w.getnframes())
+    with wave.open(str(_WHISPER / "test_en.wav")) as w:
+        command = w.readframes(w.getnframes())
+    room = _room(2.0, phrase, 0.6, command, 5.0, command, 1.0)
+    cloud, m = asyncio.run(_run_gate("vad", room, window_s=3.0, monkeypatch=monkeypatch))
+
+    assert cloud.commits() >= 3  # the phrase is speech too here
+    assert "wake_hit" not in m  # the detector is not even run in vad mode
+    speech_ms = (len(phrase) + 2 * len(command)) * 1000 // 32000
+    assert speech_ms <= m["uplink_ms"] <= speech_ms + 3 * 1000  # + preroll/hangover per utterance
+    assert m["uplink_ms"] / m["capture_ms"] < 0.8

@@ -633,11 +633,11 @@ Local backend only (the realtime backends reason in the provider, not in nanobot
 - Matched **anywhere** in the utterance, since the commitment usually trails the task ("find me a flight and *keep working on it* until it's booked"). Keep phrases explicit multi-word promises for that reason; `[]` turns the feature off.
 - The whole sentence is published as the objective — the model consolidates it via `create_goal`, and closes it with `update_goal` when the work completes, is cancelled, or is genuinely blocked. Saying "cancel that" reaches the model normally.
 - A goal phrase is never injected mid-turn: core dispatches a command inline rather than queueing it, so a live run is stopped first and the goal turn owns the session. Metric `goal_command`.
-- Goal turns legitimately run long. `agentTimeoutS` still caps them (core lifts its own LLM wall timeout for a goal, we do not), and `stallNoticeS` is what keeps the wait audible.
+- Goal turns legitimately run long. `agentTimeoutS` still caps them (core bounds a model call only by its stream-idle timeout, never by wall clock), and `stallNoticeS` is what keeps the wait audible.
 
 ## Realtime
 
-Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, or `"stepfun"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider profile fixes the rates.
+Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, `"stepfun"` or `"gemini"` (`[realtime]` extra) and the provider replaces the whole local pipeline: turn detection + ASR + reasoning + TTS in one WebSocket session, while the plugin keeps capture/playback. Cloud-only: not a privacy or offline path. Do not set `audio.sampleRate`; the provider fixes the rates.
 
 Tool calls are the caveat. The model's calls can route through nanobot's guarded `ToolRegistry` only when core hands the channel a tool gateway at construction, and the official nanobot does not - so on a stock install every realtime backend is **persona-only**: the model answers from its own knowledge, `realtime.toolMode` and `delegationTimeoutS` have no effect (startup says so when you set them), and the local backend remains the full agent. The tool wiring below is for a core build that passes the gateway.
 
@@ -706,6 +706,72 @@ The robust-tools variant, on a core that passes the tool gateway: the realtime m
 
 With hardware or OS echo cancellation, replace `"aec": "webrtc"` with `"realtime": { "aecAvailable": true, ... }` and drop the `[aec]` extra. The persona replaces style only; never mention tools in it.
 
+### xAI Grok Voice
+
+`backend: "xai"` speaks the OpenAI GA dialect plus xAI's extensions. `grok-voice-latest` follows the vendor's newest model (`grok-voice-think-fast-2.0` since August 2026 - pin the versioned name for stability). The model deliberates before every answer by default; the plugin sends `reasoningEffort: "none"` unless you set `"high"`, because a spoken reply should not wait on it and the supervisor mode reasons in nanobot anyway. Session resumption is always on: the conversation survives a reconnect and a gated-uplink park (the vendor keeps the history for 30 minutes after the last turn), so `idleParkS` costs only the reconnect. Billing is $0.08 per audio minute whether anyone speaks, which makes `uplink: "wake"` with parking the one lever that helps. Capture runs at 16 kHz. Input transcripts (`inputTranscriptionModel: "grok-transcribe"`) stream as cumulative updates the plugin does not surface; whether the final `completed` event the transcript log and stop phrases key on also arrives is unverified on xAI.
+
+```json
+"backend": "xai",
+"realtime": { "model": "grok-voice-think-fast-2.0", "voice": "eve", "apiKey": "xai-...", "reasoningEffort": "high" }
+```
+
+### Gemini Live
+
+`backend: "gemini"` speaks the Live API's own protocol (`gemini-3.8-live` by default; `gemini-3.8-live-extended-thinking` for background reasoning with `thinkingLevel`). The key is `realtime.apiKey` or `GEMINI_API_KEY` / `GOOGLE_API_KEY` - never the OpenAI fallback. Voices are Gemini's prebuilt names (`Kore` default). Tool calls are declared non-blocking (the extended-thinking model requires it and narrates its own waiting; the base model keeps talking while the tool runs), the supervisor's answer interrupts, a direct tool's result waits for the model to go idle. `proactiveAudio: true` lets the model decide whether speech was for it - permanently on for extended thinking - so an unanswered utterance is normal there, not a fault. Session resumption and context-window compression are always on (the socket lives ~10 min, an audio-only session 15 min without them); a resumption handle older than the vendor's two hours is dropped, so a device parked overnight starts a fresh conversation instead of failing to reconnect. No playback-aligned truncation exists on this protocol: after a barge-in the model remembers what it sent, not what you heard.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "backend": "gemini",
+      "audio": { "captureDevice": "plug:mic", "playbackDevice": "plug:speaker" },
+      "realtime": {
+        "model": "gemini-3.8-live-extended-thinking",
+        "thinkingLevel": "low",
+        "voice": "Kore",
+        "apiKey": "AIza..."
+      }
+    }
+  }
+}
+```
+
+### Gated uplink (local ears, cloud brain)
+
+By default every mic frame streams to the provider and its VAD finds the turns (`realtime.uplink: "server"`). That is billed the way the provider bills *listening*: the token-metered vendors charge silence like speech, xAI and GLM charge the connected minute, so an always-on device pays around the clock. `uplink: "vad"` keeps the endpointing on the device - the neural VAD (`vad.engine` silero/firered, `[ondevice]` extra) uploads only speech with its pre-roll and trailing pause, the provider runs in manual-turn mode, and Smart Turn (`vad.turn`) closes turns early as it does locally. `uplink: "wake"` adds the acoustic wake word (`wake.engine: "openwakeword"`; the transcript tier needs an STT the cloud session does not have): speech uploads only inside the attention window a hit opens (`wake.mode`, `wake.attention`, `wake.windowS` mean what they mean locally), and after `idleParkS` (default 60) of idle the socket is closed and reconnected on the next summon - the only lever that helps on flat-per-minute vendors. Capture runs at 16 kHz for the detectors and is upsampled for 24 kHz providers. Barge-in is the local onset (with `bargeIn: "aec"`) or the wake word over the gated mic; `wake.ack` is not spoken here (no local TTS), the turn-receipt earcon (`earcons.captured`) is the summon receipt.
+
+```json
+{
+  "channels": {
+    "voice": {
+      "enabled": true,
+      "backend": "openai",
+      "audio": { "captureDevice": "plug:mic", "playbackDevice": "plug:speaker" },
+      "vad": { "engine": "silero", "silero": { "modelPath": "model/silero_vad.onnx" } },
+      "wake": {
+        "mode": "gate",
+        "phrases": ["hey jarvis"],
+        "engine": "openwakeword",
+        "openwakeword": {
+          "melPath": "model/mel.onnx",
+          "embeddingPath": "model/embedding.onnx",
+          "modelPath": "model/hey_jarvis_v0.1.onnx"
+        }
+      },
+      "earcons": { "captured": true },
+      "realtime": {
+        "uplink": "wake",
+        "idleParkS": 120,
+        "apiKey": "sk-..."
+      }
+    }
+  }
+}
+```
+
+The metrics snapshot reports `uplink_ms` against `capture_ms` - the ratio is the bill. A summon with nothing after it opens the window and costs no turn (`gate_bare_summon`); the command belongs after the phrase, in the same breath or after a beat. A network outage at summon time drops that utterance and parks the socket again (`reconnect_parked`) rather than ending the session; the next utterance reconnects.
+
 ## Headless
 
 ### No audio hardware
@@ -742,10 +808,11 @@ For CI, containers, or protocol work: the `null` backend captures nothing and di
 - The agent answers once and stops instead of persisting: this is how an ordinary nanobot turn ends — a model reply with no tool call is the final answer, whatever it promises in prose. Core only enforces continuation in sustained-goal mode; use a goal phrase (above) for tasks that must run to completion. The voice block also asks for a retry and an outcome ("If a step fails, try another way, and always say how it ended"), but that is a request, not a mechanism, and small models ignore it. Two related core settings worth knowing: `agents.defaults.failOnToolError` (default `true`) kills a **spawned subagent** on its first tool error, so delegated work gives up harder than the main turn; and a tool that *raises* returns a bare `Error: ...` to the model with none of the "try a different approach" hint that error-shaped tool *results* get.
 - The agent says it will retry and then never reports back: check the gateway log for `Empty response on turn N ... retrying` / `... attempting finalization`. Those lines mean the MODEL returned nothing after its tool step; core substitutes "I completed the tool steps but couldn't produce a final answer" and delivers it as an ordinary final, which the channel speaks like any other reply. Frequent hits are a model-capability signal, not a pipeline fault: a small local model with no trained tool-calling narrates the intention and then gives up. Use a model with native tool-calling for the agent (STT/TTS can stay local), and put an explicit retry directive in `channels.voice.context` if you want the attempt narrated.
 - Talking to the bot while it works no longer cancels it: an utterance that lands while a tool is running (including over the status line it spoke before the call) is injected into the live turn instead of /stop-ping it, so a multi-step recovery survives being encouraged, corrected, or asked for a progress check. Audio stops either way - the user has the floor - and the agent is told what was heard. Cancelling still works: a stop phrase, or the wake word in `strict`/`gate` mode, kills the run as before.
-- "no API key for realtime provider": set `realtime.apiKey`, or `OPENAI_API_KEY` - remembering it is the fallback for every provider.
+- "no API key for realtime provider": set `realtime.apiKey`, or `OPENAI_API_KEY` - remembering it is the fallback for every OpenAI-dialect provider; `gemini` reads `GEMINI_API_KEY` / `GOOGLE_API_KEY` instead.
 - "has no default endpoint": you picked `azure` (or a custom deployment) without `realtime.baseUrl`.
 - "realtime.toolMode=... has no effect": this core passes no tool gateway to plugin channels, so the realtime session is persona-only whatever the mode; use `backend: "local"` for tool use.
 - "cloud open-mic needs echo cancellation": `realtime.bargeIn: "aec"` needs `aec: "webrtc"`, `aec: "hardware"`, or `realtime.aecAvailable: true`; otherwise fall back to `"gated"`.
+- "needs a neural VAD" / "needs the acoustic wake detector": a gated uplink refuses the runtime fallbacks (energy VAD, transcript-only wake) because they would upload on noise or never upload; fix the `vad.silero` / `wake.openwakeword` weights the earlier warning names, or set `realtime.uplink: "server"`.
 - An "install the extra" hint despite `[realtime]` being installed: check for a stale `websockets` older than 13; the extra requires `websockets>=13`.
 - The bot cuts itself off every turn on a cloud backend: your hardware does not actually cancel echo; unset `realtime.aecAvailable` and use `aec: "webrtc"` or `"gated"` instead.
 - Frequent `false barge-in (...)` log lines and you can't tell leak from real sound: set `debug.dumpAudio: true` and listen to the verdict-named segments (see "Debugging false barge-in by ear" above).

@@ -196,13 +196,50 @@ def test_unknown_keys_are_rejected_loudly():
     assert VadConfig.model_validate({"hangoverMs": 700}).hangover_ms == 700
 
 
-def test_gemini_is_not_a_valid_backend():
+def test_gemini_fields_parse():
+    cfg = VoiceConfig.model_validate({
+        "backend": "gemini",
+        "realtime": {"thinkingLevel": "low", "proactiveAudio": True},
+    })
+    assert cfg.backend == "gemini" and cfg.realtime.thinking_level == "low"
+    assert cfg.realtime.proactive_audio is True
     with pytest.raises(ValidationError):
-        VoiceConfig.model_validate({"backend": "gemini"})
+        VoiceConfig.model_validate({"realtime": {"thinkingLevel": "max"}})
+
+
+def test_xai_reasoning_effort_parses():
+    cfg = VoiceConfig.model_validate({"backend": "xai", "realtime": {"reasoningEffort": "high"}})
+    assert cfg.realtime.reasoning_effort == "high"
+    assert VoiceConfig().realtime.reasoning_effort == "none"
+    with pytest.raises(ValidationError):
+        VoiceConfig.model_validate({"realtime": {"reasoningEffort": "medium"}})
+
+
+def test_gated_uplink_refuses_the_static_fallback_engines():
+    base = {"backend": "openai", "realtime": {"uplink": "vad"}}
+    with pytest.raises(ValidationError, match="neural VAD"):
+        VoiceConfig.model_validate(base)  # energy VAD: opens on any noise
+    assert VoiceConfig.model_validate({**base, "vad": {"engine": "silero"}}).realtime.uplink == "vad"
+    wake = {"backend": "openai", "realtime": {"uplink": "wake"}, "vad": {"engine": "silero"}}
+    with pytest.raises(ValidationError, match="wake.mode"):
+        VoiceConfig.model_validate(wake)
+    with pytest.raises(ValidationError, match="openwakeword"):
+        VoiceConfig.model_validate({**wake, "wake": {"mode": "gate", "phrases": ["hi bot"]}})
+    ok = VoiceConfig.model_validate({
+        **wake, "wake": {"mode": "gate", "phrases": ["hi bot"], "engine": "openwakeword"},
+    })
+    assert ok.realtime.uplink == "wake" and ok.realtime.idle_park_s == 60.0
+    # The local backend ignores realtime.*: no engine demand there.
+    assert VoiceConfig.model_validate({"realtime": {"uplink": "wake"}}).backend == "local"
+
+
+def test_server_vad_field_is_gone():
+    with pytest.raises(ValidationError):
+        VoiceConfig.model_validate({"realtime": {"serverVad": False}})
 
 
 def test_backend_accepts_exactly_the_dialect_family():
-    for name in ("local", "openai", "xai", "azure", "qwen", "glm", "stepfun"):
+    for name in ("local", "openai", "xai", "azure", "qwen", "glm", "stepfun", "gemini"):
         assert VoiceConfig.model_validate({"backend": name}).backend == name
     with pytest.raises(ValidationError):
         VoiceConfig.model_validate({"backend": "openai_realtime"})  # alias removed

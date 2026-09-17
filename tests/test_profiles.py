@@ -91,4 +91,6 @@ def test_backend_literal_stays_in_sync_with_profiles():
     from nanobot_channel_voice.config import VoiceConfig
 
     literal = set(get_args(VoiceConfig.model_fields["backend"].annotation))
-    assert literal == {"local"} | set(PROFILES)
+    # "gemini" is its own protocol (backend/gemini_live.py), not a profile.
+    assert literal == {"local", "gemini"} | set(PROFILES)
+    assert backend_kind("gemini") == "gemini"

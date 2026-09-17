@@ -14,6 +14,10 @@
 
 Event membership is OPTIONAL; the only hard ordering guarantees are on ``TurnDone`` and
 ``ToolCall``.
+* A CLOUD backend may also implement :class:`ManualTurnBackend`: the gated uplink
+  (``backend/gated.py``) then owns turn boundaries with the on-device VAD/wake word and
+  the backend only does what the server's VAD events did. Probed by ``hasattr``, like the
+  shell's ``push_gated_audio`` tap.
 """
 
 from __future__ import annotations
@@ -179,3 +183,27 @@ class VoiceBackend(Protocol):
     async def close(self) -> None:
         """Tear down tasks / connections. Idempotent. Sets a closing flag checked before any
         reconnect and before every ``on_event`` dispatch."""
+
+
+@runtime_checkable
+class ManualTurnBackend(Protocol):
+    """The extra a cloud backend needs under the gated uplink (``realtime.uplink`` != server).
+    The gate calls these in place of the server VAD events the backend no longer receives;
+    every state transition those events drove happens here instead."""
+
+    async def begin_activity(self) -> None:
+        """The gate saw speech onset (frames follow via ``push_audio``). Do what the server's
+        speech_started did: CAPTURING, ``UserSpeechStarted`` when a reply is live (the shell
+        then flushes and calls ``barge_in``), arm the watchdog. Reconnect first if parked;
+        raise if that fails, and the gate drops the utterance."""
+
+    async def end_activity(self, *, commit: bool = True) -> None:
+        """The gate closed the utterance. ``commit``: what speech_stopped did, then hand the
+        turn to the model (commit + response.create, or the vendor's activity end). Not
+        ``commit``: the audio was a blip or a bare summon — discard it server-side and settle
+        to IDLE without a response."""
+
+    async def park(self) -> None:
+        """Idle: close the socket, keep the session config; the next ``begin_activity``
+        reconnects (with the vendor's resumption where it has one). Idempotent."""
+

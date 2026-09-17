@@ -580,13 +580,14 @@ class PrologueConfig(_VoiceBase):
 
 
 class RealtimeConfig(_VoiceBase):
-    """Shared settings for the OpenAI-Realtime **dialect family** of e2e speech-to-speech
-    backends (``backend`` = openai / xai / azure / qwen / glm / stepfun).
+    """Shared settings for the e2e speech-to-speech backends: the OpenAI-Realtime dialect
+    family (``backend`` = openai / xai / azure / qwen / glm / stepfun) and Gemini Live
+    (``backend`` = gemini).
 
     Cloud-only: the provider does ASR + reasoning + TTS in one WebSocket session; the plugin
     owns mic capture + playback and routes tool calls to nanobot where supported. Audio rate is
-    provider-fixed (24 kHz mostly, 16 kHz input for Qwen/GLM) and comes from the profile, NOT
-    from ``AudioConfig.sample_rate``.
+    provider-fixed (24 kHz OpenAI/Azure, 16 kHz input for xAI/Qwen/GLM/Gemini; 16 kHz capture
+    under a gated ``uplink``, upsampled) and never read from ``AudioConfig.sample_rate``.
     """
 
     # None => the provider profile's default. Override for a pinned model, a self-hosted /
@@ -608,10 +609,33 @@ class RealtimeConfig(_VoiceBase):
     #                  answer. Robust multi-step use, costing a ~1-2s delegation the mandatory
     #                  filler masks. Tool-capable providers only.
     tool_mode: Literal["direct", "supervisor"] = "direct"
-    server_vad: bool = True               # server-side turn detection + native barge-in
-    interrupt_response: bool = True        # server auto-cancels the response on user speech (GA)
+    # Who decides what audio goes up the socket. "server": every mic frame streams and the
+    # provider's VAD finds the turns — billed as the provider bills listening (Gemini and the
+    # token-metered vendors charge silence; xAI/GLM charge the connected minute). "vad": the
+    # on-device VAD/endpointer (vad.*) uploads only speech, with the provider in manual-turn
+    # mode. "wake": as "vad", inside an attention window the acoustic wake word (wake.*)
+    # opens; the socket is parked after idleParkS of idle. The gated modes need the neural
+    # VAD ([ondevice] extra) — an energy VAD opening on the TV is a billed upload each time.
+    uplink: Literal["server", "vad", "wake"] = "server"
+    # Gated modes: idle seconds (IDLE, no attention) before the socket is closed and the
+    # session config kept; the next utterance reconnects first. 0 = never park.
+    idle_park_s: float = Field(default=60.0, ge=0.0)
+    # Server-VAD uplink only: the server auto-cancels the response on user speech (GA). The
+    # gated modes always cancel client-side (no server VAD runs).
+    interrupt_response: bool = True
     # None => input transcription off => the cloud backend emits no InputTranscript.
+    # (Gemini transcribes both sides whenever set to anything: it has one switch, no model.)
     input_transcription_model: str | None = None
+
+    # Gemini only. thinkingLevel is accepted by gemini-3.8-live-extended-thinking alone
+    # (the base model rejects it); proactiveAudio lets the model decide whether speech was
+    # for it (bystanders go unanswered) - permanently on for extended thinking.
+    thinking_level: Literal["low", "medium", "high"] | None = None
+    proactive_audio: bool = False
+    # xAI only (think models). The vendor default "high" reasons before every answer, at
+    # latency a voice assistant feels; "none" answers directly, and the supervisor mode
+    # reasons in nanobot anyway.
+    reasoning_effort: Literal["none", "high"] = "none"
 
     # An open mic without echo cancellation feeds our TTS up the uplink and self-cancels every
     # turn, so "aec" requires ``aec_available``, top-level ``aec="hardware"`` or ``aec="webrtc"``,
@@ -807,7 +831,9 @@ class WakeAckConfig(_VoiceBase):
 
 
 class WakeConfig(_VoiceBase):
-    """Wake-word gate (LOCAL backend only; the cloud paths are ungated by design).
+    """Wake-word gate. Local backend: two tiers, as below. Cloud backends: the ACOUSTIC tier
+    only, as the ``realtime.uplink="wake"`` gate (no STT there, so no transcript tier, no
+    stripping, no alias learning; the turn-receipt earcon stands in for the spoken ack).
 
     ``mode="gate"``: a cold start needs the wake phrase; once engaged, follow-ups and barge-in
     stay natural for ``windowS`` after each turn. ``mode="strict"`` additionally requires the
@@ -908,11 +934,12 @@ class VoiceConfig(_VoiceBase):
     enabled: bool = False
 
     # Reasoning brain / supplier. "local" = on-box VAD/STT/TTS + nanobot over the text bus (full
-    # brain, no cloud). The rest are e2e speech-to-speech over a provider's
-    # OpenAI-Realtime-dialect WebSocket ([realtime] extra; "qwen" is Alibaba, "glm" Zhipu)
-    # sharing the ``realtime.*`` block; their model/endpoint/rates come from backend/profiles.py.
+    # brain, no cloud). The rest are e2e speech-to-speech over a provider's WebSocket
+    # ([realtime] extra): the OpenAI-Realtime dialect family ("qwen" is Alibaba, "glm" Zhipu;
+    # model/endpoint/rates from backend/profiles.py) and "gemini" (Gemini Live, its own
+    # protocol), all sharing the ``realtime.*`` block.
     backend: Literal[
-        "local", "openai", "xai", "azure", "qwen", "glm", "stepfun"
+        "local", "openai", "xai", "azure", "qwen", "glm", "stepfun", "gemini"
     ] = "local"
     allow_from: list[str] = Field(default_factory=lambda: ["*"])  # BaseChannel allow-list
     streaming: bool = True  # core `supports_streaming`: send_delta() speaks the reply as it streams
@@ -956,10 +983,12 @@ class VoiceConfig(_VoiceBase):
     # is dead air the core clock cannot see. None = notices on core silence only. agentTimeoutS =
     # no bus traffic at all for this chat (deltas, segment ends, any send(); progress/tool events
     # need core's channels.sendProgress, its default): one silent budget warns, a SECOND /stops
-    # the run and speaks timeoutPhrase. 300 matches core's own ceilings (LLM timeout, subagent
-    # wait); tighter kills turns core would still finish. None disables both. Both phrases are
-    # spoken by the session TTS — localize them together, and never put a stop phrase inside one
-    # (validated): a just-spoken word is self-echo, so the invited command would be swallowed.
+    # the run and speaks timeoutPhrase. 300 sits well above core's only model-call bound, the
+    # 90s stream-idle timeout (NANOBOT_STREAM_IDLE_TIMEOUT_S; there is no wall clock since
+    # 0.3.5), so a stalled call is core's error first; tighter kills turns core would still
+    # finish. None disables both. Both phrases are spoken by the session TTS — localize them
+    # together, and never put a stop phrase inside one (validated): a just-spoken word is
+    # self-echo, so the invited command would be swallowed.
     agent_timeout_s: float | None = Field(default=300.0, gt=0)
     stall_notice_s: float | None = Field(default=60.0, gt=0)
     stall_phrase: str = "Still working on it. This is taking longer than usual."
@@ -1064,6 +1093,29 @@ class VoiceConfig(_VoiceBase):
                     f"{key}='{engine}' cannot run at audio.sampleRate={rate} "
                     f"(supported: {', '.join(map(str, supported))}); "
                     "change the rate or the engine"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _gated_uplink_has_its_engines(self) -> VoiceConfig:
+        """A gated cloud uplink is a billing decision made per frame by the on-device
+        detectors: the runtime fallbacks (energy VAD, no wake detector) would silently turn
+        it into "upload on any noise" / "never upload", so both are refused up front."""
+        if self.backend == "local" or self.realtime.uplink == "server":
+            return self
+        if self.vad.engine not in ("silero", "firered"):
+            raise ValueError(
+                f'realtime.uplink="{self.realtime.uplink}" needs a neural VAD '
+                f"(vad.engine silero or firered, got '{self.vad.engine}'): every false "
+                "onset is a billed upload"
+            )
+        if self.realtime.uplink == "wake":
+            if self.wake.mode == "off":
+                raise ValueError('realtime.uplink="wake" requires wake.mode "gate" or "strict"')
+            if self.wake.engine != "openwakeword":
+                raise ValueError(
+                    'realtime.uplink="wake" requires wake.engine="openwakeword": a cloud '
+                    "session has no STT for the transcript tier"
                 )
         return self
 

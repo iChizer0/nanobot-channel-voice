@@ -85,7 +85,7 @@ def test_setup_validator_reports_plugin_schema_errors():
     ctx = ChannelValidationContext()
     good = manifest._validate({"enabled": True, "backend": "local"}, ctx)
     assert all(c.get("status") != "fail" for c in good.get("checks", []))
-    bad = manifest._validate({"enabled": True, "backend": "gemini"}, ctx)
+    bad = manifest._validate({"enabled": True, "backend": "nova"}, ctx)
     fails = [c for c in bad.get("checks", []) if c.get("status") == "fail"]
     assert fails and "backend" in fails[0].get("message", "")
 

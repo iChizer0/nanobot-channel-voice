@@ -15,6 +15,7 @@ from nanobot_channel_voice.aio import cancel_and_wait
 from nanobot_channel_voice.audio.base import PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend import openai_realtime as rt
+from nanobot_channel_voice.backend import transport
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
     Error,
@@ -343,7 +344,7 @@ def test_a_congested_uplink_cannot_stall_a_control_frame(monkeypatch):
     """websockets' drain() waits forever past its write high-water mark, and barge_in
     sends from the rx loop: unbounded, one stuck audio append froze barge-in and every
     later server event behind the send lock."""
-    monkeypatch.setattr(rt, "_SEND_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(transport, "_SEND_TIMEOUT_S", 0.1)
 
     class _CongestedWs:
         def __init__(self):
@@ -394,7 +395,7 @@ def test_a_slow_send_is_committed_not_lost_so_tool_bookkeeping_runs(monkeypatch)
     """websockets writes the frame before its first await, so a send that outlives the
     budget still reaches the server: treating it as lost skipped the call's bookkeeping
     and _maybe_respond, and the turn died with the result delivered."""
-    monkeypatch.setattr(rt, "_SEND_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(transport, "_SEND_TIMEOUT_S", 0.05)
 
     class _StuckWs:
         def __init__(self):
@@ -636,7 +637,7 @@ def test_submit_tool_result_for_unknown_call_is_dropped():
     asyncio.run(_run())
 
 
-@pytest.mark.parametrize("key", ["openai", "qwen", "glm", "stepfun"])
+@pytest.mark.parametrize("key", ["openai", "xai", "qwen", "glm", "stepfun"])
 def test_session_update_payload_shapes(key):
     async def _run():
         backend = rt.RealtimeBackend(
@@ -657,6 +658,71 @@ def test_session_update_payload_shapes(key):
         assert session["output_audio_format"] == PROFILES[key].output_format
     if key == "glm":
         assert session["beta_fields"] == {"chat_mode": "audio"}  # session_extras merged
+
+
+def _session_of(key: str, **realtime) -> dict:
+    async def _run():
+        backend = rt.RealtimeBackend(
+            VoiceConfig.model_validate({"realtime": realtime}),
+            sink=AudioSink(NullPlayback(), mode="stream"),
+            profile=PROFILES[key],
+        )
+        payload = backend._session_update_payload()
+        await backend.close()
+        return payload["session"]
+
+    return asyncio.run(_run())
+
+
+def test_interrupt_response_rides_the_wire_only_when_off():
+    """``true`` is the server default and xAI documents no such field: the default
+    config sends nothing undocumented to any GA vendor."""
+    assert _session_of("openai")["audio"]["input"]["turn_detection"] == {"type": "server_vad"}
+    td = _session_of("xai", interruptResponse=False)["audio"]["input"]["turn_detection"]
+    assert td == {"type": "server_vad", "interrupt_response": False}
+
+
+def test_xai_session_extensions_are_profile_gated():
+    xai = _session_of("xai")
+    assert xai["reasoning"] == {"effort": "none"}  # the plugin default: answer, don't deliberate
+    assert xai["resumption"] == {"enabled": True}
+    assert xai["audio"]["input"]["format"]["rate"] == 16000
+    assert _session_of("xai", reasoningEffort="high")["reasoning"] == {"effort": "high"}
+    openai = _session_of("openai")
+    assert "reasoning" not in openai and "resumption" not in openai
+
+
+def test_xai_conversation_id_rides_every_reconnect():
+    """The id from ``conversation.created`` goes into the connect URL of every later
+    socket (reconnect, un-park) and survives the per-session state reset; a profile
+    without resumption ignores the event."""
+
+    async def _run():
+        def make(key):
+            return rt.RealtimeBackend(
+                VoiceConfig.model_validate({"realtime": {"apiKey": "k"}}),
+                sink=AudioSink(NullPlayback(), mode="stream"), profile=PROFILES[key],
+            )
+
+        created = {"type": "conversation.created", "conversation": {"id": "conv/1"}}
+        xai = make("xai")
+        fresh, _ = xai._connect_args()
+        assert "conversation_id" not in fresh
+        await xai._handle_event(created)
+        xai._reset_turn_state(reason="session_lost")  # what a reconnect or park does
+        resumed, _ = xai._connect_args()
+        assert resumed == fresh + "&conversation_id=conv%2F1"
+        # Older than the vendor's cache (minus the margin): forgotten, never sent stale.
+        xai._conversation_t -= PROFILES["xai"].resumption_ttl_s
+        assert xai._connect_args()[0] == fresh and xai._conversation_id is None
+        await xai.close()
+
+        plain = make("openai")
+        await plain._handle_event(created)
+        assert "conversation_id" not in plain._connect_args()[0]
+        await plain.close()
+
+    asyncio.run(_run())
 
 
 # ---- stop-command consume (transcript-gated) --------------------------------

@@ -22,8 +22,11 @@ from nanobot.runtime_context import RuntimeContextBlock
 from nanobot_channel_voice.aio import cancel_and_wait
 from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
+from nanobot_channel_voice.backend import gemini_live
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import ToolDef, VoiceState
+from nanobot_channel_voice.backend.gated import GatedUplink
+from nanobot_channel_voice.backend.gemini_live import GeminiLiveBackend, resolve_gemini_key
 from nanobot_channel_voice.backend.local import LocalBackend
 from nanobot_channel_voice.backend.openai_realtime import RealtimeBackend, _load_connect
 from nanobot_channel_voice.backend.profiles import backend_kind, resolve_profile
@@ -46,7 +49,7 @@ from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, 
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
 from nanobot_channel_voice.tts.base import CALIBRATION_TEXT, startup_text
-from nanobot_channel_voice.vad import make_turn_analyzer, make_vad
+from nanobot_channel_voice.vad import EnergyVad, make_turn_analyzer, make_vad
 from nanobot_channel_voice.wake import make_wake_detector
 
 _DEFAULT_PERSONA = (
@@ -346,7 +349,7 @@ class VoiceChannel(BaseChannel):
         self.config: VoiceConfig = config
         self._tool_gateway = tool_gateway  # an AgentLoop, or None (persona-only)
         self._shell: VoiceShell | None = None
-        self._backend: LocalBackend | RealtimeBackend | None = None
+        self._backend: LocalBackend | RealtimeBackend | GeminiLiveBackend | GatedUplink | None = None
         self._stop_event: asyncio.Event | None = None
         self._stt: SttAdapter | None = None
         self._stt_server = None             # stt.serve: local /v1/audio/transcriptions
@@ -396,9 +399,9 @@ class VoiceChannel(BaseChannel):
         shell: VoiceShell | None = None
         try:
             kind = backend_kind(self.config.backend)
-            if kind == "openai_dialect":
+            if kind in ("openai_dialect", "gemini"):
                 self._stt = None  # the provider does ASR; never load on-device models
-                shell, instructions, tools = await self._build_cloud()
+                shell, instructions, tools = await self._build_cloud(kind)
             elif kind == "local":
                 # Off the loop: a dozen ORT/RKNN session loads inline would freeze the
                 # gateway (every other channel, cron, the WebUI) for the whole build.
@@ -588,19 +591,39 @@ class VoiceChannel(BaseChannel):
         )
         return shell, "", []
 
-    async def _build_cloud(self) -> tuple[VoiceShell, str, list]:
+    async def _build_cloud(self, kind: str) -> tuple[VoiceShell, str, list]:
         rt = self.config.realtime
-        profile = resolve_profile(self.config.backend)  # openai/xai/azure/qwen/glm/stepfun
         # Fail fast on STATIC config errors before any device is claimed: left to the
         # backend they raise in the rx task, where the reconnect ladder reads them as
         # transport blips.
-        profile.base_url(rt.base_url)  # raises for a provider with no default (Azure)
         _load_connect()  # missing [realtime] extra: a transport-shaped error otherwise
-        if not resolve_openai_key(rt.api_key):
-            raise RuntimeError(
-                f"no API key for realtime provider '{profile.key}' "
-                "(set channels.voice.realtime.apiKey or OPENAI_API_KEY)"
-            )
+        if kind == "gemini":
+            profile = None
+            input_rate = gemini_live.INPUT_RATE
+            if not resolve_gemini_key(rt.api_key):
+                raise RuntimeError(
+                    "no API key for realtime provider 'gemini' "
+                    "(set channels.voice.realtime.apiKey or GEMINI_API_KEY)"
+                )
+            supported = True
+        else:
+            profile = resolve_profile(self.config.backend)  # openai/xai/azure/qwen/glm/stepfun
+            profile.base_url(rt.base_url)  # raises for a provider with no default (Azure)
+            input_rate = profile.input_rate
+            if not resolve_openai_key(rt.api_key):
+                raise RuntimeError(
+                    f"no API key for realtime provider '{profile.key}' "
+                    "(set channels.voice.realtime.apiKey or OPENAI_API_KEY)"
+                )
+            # Capability is PER MODEL: a newer generation can enable tools.
+            model = rt.model or profile.default_model
+            supported = bool(profile.capabilities_for(model)["supports_tools"])
+        gated = rt.uplink != "server"
+        # Capture at the PROVIDER's input rate (24 kHz OpenAI/xAI/Azure, 16 kHz Qwen/GLM/
+        # Gemini); ALSA `plug` resamples the device. Gated: the on-device detectors are
+        # all 16 kHz models, so capture runs there and the gate upsamples the frames it
+        # admits. Playback opens at the OUTPUT rate: asymmetric rates are fine.
+        capture_rate = 16000 if gated else input_rate
         # The mic stays open for server-VAD barge-in only with echo cancellation: asserted
         # hardware/OS AEC (aecAvailable=true or aec="hardware", one physical fact) or AEC3
         # (aec="webrtc"). Else the shell's SPEAKING gate: barge-in resumes after playback.
@@ -612,7 +635,7 @@ class VoiceChannel(BaseChannel):
 
                 # Cloud playback is always stream-mode, so the playout-timed tap works.
                 aec_stage = make_echo_canceller(
-                    profile.input_rate,
+                    capture_rate,
                     device_delay_ms=self.config.audio.playout_delay_ms,
                 )
             if not hw_aec and aec_stage is None:
@@ -622,29 +645,36 @@ class VoiceChannel(BaseChannel):
                     "aec='webrtc' for the software canceller ([aec] extra), or "
                     "realtime.bargeIn='gated'."
                 )
-        if not rt.server_vad:
-            # No client-side commit / response.create path exists: audio would stream up
-            # forever and the session would never answer.
-            raise RuntimeError(
-                "realtime.serverVad=false is not supported: the channel relies on "
-                "server-side turn detection to commit audio and create responses."
-            )
         open_mic = rt.barge_in == "aec"  # aec => open; gated => shell gates while SPEAKING
-        # Capture at the PROVIDER's input rate (24 kHz OpenAI/xAI/Azure, 16 kHz Qwen/GLM);
-        # ALSA `plug` resamples the device. Playback opens at the OUTPUT rate: asymmetric
-        # rates are fine.
-        audio_cfg = self.config.audio.model_copy(update={"sample_rate": profile.input_rate})
+        # Nothing here claims a device yet: capture/playback open in shell.start().
+        audio_cfg = self.config.audio.model_copy(update={"sample_rate": capture_rate})
         capture, sink_dev = make_audio(audio_cfg)
         audio_sink = AudioSink(sink_dev, mode="stream")
         if aec_stage is not None:
             audio_sink.set_reference_tap(aec_stage)
-        self._backend = RealtimeBackend(
-            self.config, sink=audio_sink, profile=profile, metrics=self._metrics,
-            aec=aec_stage,
-        )
-        # Capability is PER MODEL: a newer generation can enable tools.
-        model = self.config.realtime.model or profile.default_model
-        supported = bool(profile.capabilities_for(model)["supports_tools"])
+        # Gated: the gate runs AEC first (its VAD needs the cancelled signal).
+        inner_aec = None if gated else aec_stage
+        if profile is None:
+            inner = GeminiLiveBackend(
+                self.config, sink=audio_sink, metrics=self._metrics, aec=inner_aec,
+            )
+        else:
+            inner = RealtimeBackend(
+                self.config, sink=audio_sink, profile=profile, metrics=self._metrics,
+                aec=inner_aec,
+            )
+        if not gated:
+            self._backend = inner
+        else:
+            # Last, so nothing built after them can leak them: the gate owns them from
+            # here (released in its close). The config validator refused the static
+            # fallbacks, but a model that fails to LOAD degrades the same way at runtime
+            # (energy VAD / no wake detector), and a gate built on those bills on noise
+            # or never uploads.
+            self._backend = await self._build_gate(
+                inner, audio_sink, aec_stage, capture_rate=capture_rate,
+                uplink_rate=input_rate, open_mic=open_mic,
+            )
         tools, exec_tool = await self._cloud_tools(supported, rt.tool_mode)
         shell = VoiceShell(
             self.config,
@@ -666,6 +696,48 @@ class VoiceChannel(BaseChannel):
             rt.persona, supervisor=supervisor, has_tools=bool(tools)
         )
         return shell, instructions, tools
+
+    async def _build_gate(
+        self, inner, audio_sink: AudioSink, aec_stage, *,
+        capture_rate: int, uplink_rate: int, open_mic: bool,
+    ) -> GatedUplink:
+        rt = self.config.realtime
+        frame_ms = self.config.audio.frame_ms
+        engines: list = []
+        try:
+            vad = await asyncio.to_thread(make_vad, self.config.vad, capture_rate, frame_ms)
+            engines.append(vad)
+            if isinstance(vad, EnergyVad):
+                raise RuntimeError(
+                    f"realtime.uplink='{rt.uplink}' needs the {self.config.vad.engine} "
+                    "VAD, which did not load (see the warning above)"
+                )
+            turn_analyzer = await asyncio.to_thread(
+                make_turn_analyzer, self.config.vad, capture_rate, frame_ms
+            )
+            engines.append(turn_analyzer)
+            wake_detector = await asyncio.to_thread(
+                make_wake_detector, self.config.wake, capture_rate, frame_ms
+            )
+            engines.append(wake_detector)
+            if rt.uplink == "wake" and wake_detector is None:
+                raise RuntimeError(
+                    "realtime.uplink='wake' needs the acoustic wake detector, which did "
+                    "not load (see the warning above); fix wake.openwakeword or use "
+                    "uplink='vad'"
+                )
+            return GatedUplink(
+                inner, config=self.config, sink=audio_sink, vad=vad,
+                turn_analyzer=turn_analyzer, wake_detector=wake_detector, aec=aec_stage,
+                capture_rate=capture_rate, uplink_rate=uplink_rate,
+                open_mic=open_mic, metrics=self._metrics,
+            )
+        except BaseException:
+            for engine in engines:
+                if engine is not None:
+                    with suppress(Exception):
+                        engine.release()
+            raise
 
     async def _cloud_tools(self, supported: bool, tool_mode: str):
         """(tool_defs, exec_tool) for the realtime model, or ([], None) persona-only.

@@ -8,7 +8,7 @@ A voice channel plugin for [nanobot](https://github.com/HKUDS/nanobot), talk to 
 - **Two on-device inference backends**: `.onnx` (CPU, or GPU/DLA on Jetson via the TensorRT/CUDA execution providers) and `.rknn` (Rockchip NPU). One `OnDeviceModel` dispatches on file extension, so the same adapter code drives both.
 - **Duck-then-confirm barge-in**: half-duplex mutes the mic while speaking, or the open-mic modes (hardware AEC, software AEC3, or none at all) duck the reply the moment you start talking, then confirm. A real interruption stops playback (with streaming STT, mid-sentence) and the agent is told how much of its reply you actually heard. An echo, a cough, or an "uh-huh" releases the duck and the reply continues.
 - **Wake word**: optional, off by default. Two tiers — a transcript-prefix match in any language the STT covers, plus an acoustic detector (openWakeWord) that hears through the bot's own playback. `gate` asks for the phrase on a cold start and then leaves follow-ups natural for a while; `strict` also makes the phrase the *only* thing that interrupts a reply, so a room full of other people never perturbs it. A summon can answer with a spoken ack or a wordless earcon.
-- **E2E speech-to-speech**: alternative backend, one WebSocket session to an OpenAI-Realtime-dialect provider does turn detection + ASR + reasoning + TTS, while the model's tool calls still route through nanobot's guarded tool registry.
+- **E2E speech-to-speech**: alternative backend, one WebSocket session to an OpenAI-Realtime-dialect provider or Gemini Live does turn detection + ASR + reasoning + TTS, while the model's tool calls still route through nanobot's guarded tool registry. The on-device VAD and wake word can gate what leaves the box (`realtime.uplink`), so a cloud brain is billed for speech, not for listening.
 
 ```mermaid
 flowchart TB
@@ -62,7 +62,7 @@ The default stack (ALSA, energy VAD, OpenAI-compatible TTS) needs no extras. Eac
 
 - `[ondevice]` is every on-device engine over local ONNX models (CPU, via onnxruntime): STT `whisper`/`sensevoice`/`zipformer`, TTS `mms`/`supertonic`/`matcha`, VAD `firered`/`silero` (Silero VAD v6), end-of-turn `smartturn` (Smart Turn v3). Matcha's English front-end needs espeak-ng: the system package, or add `[espeak]` for a pip-bundled library on boards without a package manager.
 - `[rknn]` adds Rockchip's NPU runtime (`rknn-toolkit-lite2`) for `.rknn` artifacts, on top of `[ondevice]`. Requires aarch64 arch and Python <= 3.12, elsewhere it installs nothing, since `.onnx` is the non-board path.
-- `[realtime]` is the WebSocket client for the E2E cloud backends (`backend: "openai"` and its dialects).
+- `[realtime]` is the WebSocket client for the E2E cloud backends (`backend: "openai"` and its dialects, `"gemini"`).
 - `[aec]` is software echo cancellation (`aec: "webrtc"`, WebRTC AEC3), large wheel.
 - `[webrtc]` is the spectral VAD (`vad.engine: "webrtc"`).
 - `[pyalsa]` is the in-process libasound backend (`audio.backend: "pyalsa"`) instead of the `arecord`/`aplay` subprocesses, needs `libasound2-dev` to build.
@@ -71,12 +71,12 @@ The default stack (ALSA, energy VAD, OpenAI-compatible TTS) needs no extras. Eac
 
 ## Get started
 
-Run `nanobot webui`, open **Settings -> Channels -> Voice**, paste your config into the **Import Json** box - the whole form; a partial paste patches just those keys over the current section - and **Check and enable** - see [Example Configs](docs/EXAMPLE_CONFIGS.md) for various copy-pasteable setups and troubleshooting. `nanobot-voice config` prints the current section back, paste-ready (API keys withheld unless `--secrets`). Every key - default, range, per-field note - is documented inline in the schema, see [config.py](nanobot_channel_voice/config.py).
+Run `nanobot webui`, open **Settings -> Channels -> Voice**, paste your config into the **Import Json** box - the whole form; a partial paste patches just those keys over the current section - and enable it (the toggle validates the paste first; 0.3.0 labels this **Check and enable**) - see [Example Configs](docs/EXAMPLE_CONFIGS.md) for various copy-pasteable setups and troubleshooting. `nanobot-voice config` prints the current section back, paste-ready (API keys withheld unless `--secrets`). Every key - default, range, per-field note - is documented inline in the schema, see [config.py](nanobot_channel_voice/config.py).
 
 Setups vary too much for one recipe (hardware, languages, cloud vs local, interactivity), so let an agent drive: run a coding agent (e.g. Claude Code) on the target machine and paste this prompt:
 
 ```
-Set up nanobot-channel-voice on this machine. Ground truth: docs/EXAMPLE_CONFIGS.md and the schema in nanobot_channel_voice/config.py; inspect first (OS/arch, RAM, sound devices via arecord -l / aplay -l, NPU, network, existing nanobot config).
+Set up nanobot-channel-voice (https://github.com/iChizer0/nanobot-channel-voice) on this machine. Ground truth: docs/EXAMPLE_CONFIGS.md and the schema in nanobot_channel_voice/config.py; inspect first (OS/arch, RAM, sound devices via arecord -l / aplay -l, NPU, network, existing nanobot config).
 Ask me one round of questions (reply languages, cloud keys or fully local, barge-in or half-duplex, wake word, latency vs quality), then pick the stack: cloud engines when keys + network allow, else on-device ([ondevice]/[rknn] extras), models via nanobot-voice sync, AEC only with a raw-PCM TTS at a rate divisible by 100.
 Verify audio with a short record + replay (dsnoop/dmix if the card is shared), write channels.voice, validate with `nanobot channels status`, then a live smoke test - a robotic espeak voice means a fallback fired, fix the logged cause. Ask before installing packages or spending credits; finish with the final config and each choice's trade-off.
 ```
