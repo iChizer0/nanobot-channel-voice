@@ -8,9 +8,10 @@ target to live inside ``nanobot.channels.voice``, which ``runtime.py`` satisfies
 re-export.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
-from nanobot.channels._manifest import field, required
+from nanobot.channels._manifest import field
 from nanobot.channels.contracts import (
     ChannelSetupSpec,
     ChannelValidationContext,
@@ -233,7 +234,24 @@ def _pipeline_check(cfg: Any, check: Any) -> dict[str, Any]:
     return check("pipeline", "Local pipeline", "pass", message)
 
 
-SETUP_SPEC = ChannelSetupSpec(
+@dataclass(frozen=True)
+class _PasteBoxSpec(ChannelSetupSpec):
+    """A setup spec whose one box renders as the primary field without being required.
+
+    The WebUI places a field up front only when its payload says ``required``, and core
+    derives that from ``required=`` — which since 0.3.5 the browser also enforces before
+    enabling ("Required to complete setup."). The paste is optional by design (a bare
+    section enables with pure defaults, and start() deletes the blob once expanded, so a
+    re-enable would demand a fresh paste), hence the flag is set on the payload alone."""
+
+    def to_public_dict(self, channel_name: str) -> dict[str, Any]:
+        payload = super().to_public_dict(channel_name)
+        for public_field in payload["fields"]:
+            public_field["required"] = True
+        return payload
+
+
+SETUP_SPEC = _PasteBoxSpec(
     # ONE field: the channels.voice section pasted as JSON (bare or file-wrapped). The
     # schema lints it, it deep-merges (paste wins, partial pastes patch), and start()
     # expands it into real config.json keys, deleting the blob. secret kind: a paste may
@@ -246,11 +264,8 @@ SETUP_SPEC = ChannelSetupSpec(
     fields={
         "importJson": field("secret"),
     },
-    # Shapes the RENDERER only: it drops the "Advanced" section, which would show the same
-    # box twice. It does NOT gate — with a custom validator core adds no required-field
-    # checks and _validate always reports missing=[], so a bare section still enables with
-    # pure defaults (side effect: feature.configured now means "paste pending").
-    required=(required("importJson"),),
+    # No `required=`: nothing gates enabling (the validator never reports missing fields
+    # either), and feature.configured then simply tracks enabled instead of "paste pending".
     validator=_validate,
 )
 

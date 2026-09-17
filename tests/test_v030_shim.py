@@ -52,12 +52,15 @@ def test_setup_spec_is_import_only():
     # importJson is secret-kind although it's not a credential: the paste may CONTAIN
     # credentials, and secret is the one kind core never echoes back to a browser.
     assert spec.secrets == frozenset({"importJson"})
-    # Renderer-shaping only (one box, no Advanced duplicate): core adds no gating
-    # with a custom validator; bare-enable is pinned below via can_enable.
-    assert spec.simple_required_fields == ("importJson",)
+    # The box renders up front (payload `required`) yet nothing is required: no
+    # requirement means neither core's validator nor the >= 0.3.5 browser gate can block
+    # enabling a bare section, and start() deleting a consumed paste never strands a
+    # re-enable. Bare-enable is pinned below via can_enable.
+    assert spec.required == ()
     public = spec.to_public_dict("voice")
     assert [f["key"] for f in public["fields"]] == ["channels.voice.importJson"]
     assert public["fields"][0]["required"] is True
+    assert public.get("requirements", []) == []
 
 
 def test_enable_toggle_materialization_stays_allow_everyone():
@@ -165,7 +168,7 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     # engine trio + the file home, the devices row the PCMs + the export command
     out = manifest._validate({"enabled": True}, ctx)
     assert "backend='local'" in _check_ids(out)["schema"]["message"]
-    assert out["can_enable"] is True  # the required-marked paste box never gates
+    assert out["can_enable"] is True  # the up-front paste box never gates
     pipeline = _check_ids(out)["pipeline"]
     assert pipeline["status"] == "pass"
     for expected in ("vad.engine='energy'", "stt.provider='nanobot'", "config.json"):
