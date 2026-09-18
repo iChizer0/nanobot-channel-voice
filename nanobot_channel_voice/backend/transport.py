@@ -519,29 +519,38 @@ class RealtimeTransport(TurnEventMixin):
 
     def _start_drain(self) -> None:
         self._cancel_drain()
-        self._drain_task = asyncio.create_task(self._drain())
+        self._drain_task = asyncio.create_task(self._drain(VoiceState.IDLE))
+
+    def _start_hold_thinking(self) -> None:
+        """The turn goes on after the audio (a tool runs, background reasoning): the filler
+        drains, then THINKING — not IDLE (the turn is live), not SPEAKING (a half-duplex mic
+        would stay gated for the whole wait, unable to stop or steer a delegation)."""
+        self._cancel_drain()
+        self._drain_task = asyncio.create_task(self._drain(VoiceState.THINKING))
 
     def _cancel_drain(self) -> None:
         if self._drain_task is not None and not self._drain_task.done():
             self._drain_task.cancel()
 
-    async def _drain(self) -> None:
+    async def _drain(self, settle: VoiceState) -> None:
         try:
             await self._sink.drain_stream()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            # A device failure must not skip the IDLE transition: the watchdog died at
-            # turn end and gated-mic SPEAKING mutes the mic — nothing else recovers.
-            self._log.warning("drain failed ({}); forcing IDLE", exc)
+            # A device failure must not skip the transition: the watchdog died at turn
+            # end and gated-mic SPEAKING mutes the mic — nothing else recovers.
+            self._log.warning("drain failed ({}); forcing {}", exc, settle.value)
         self._on_drained()
         if self._turn is VoiceState.CAPTURING:
             # A completion landing after the next onset: the onset owns the state, and
             # the deadman that completion cancelled guards the answer it is still owed.
             self._arm_watchdog()
             return
+        if settle is VoiceState.THINKING and self._turn is not VoiceState.SPEAKING:
+            return  # nothing was spoken: the wait is THINKING already
         with suppress(Exception):  # a raising dispatcher must not strand SPEAKING
-            await self._set_turn(VoiceState.IDLE)
+            await self._set_turn(settle)
 
     def _arm_watchdog(self) -> None:
         self._cancel_watchdog()

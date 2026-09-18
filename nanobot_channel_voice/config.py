@@ -656,9 +656,9 @@ class RealtimeConfig(_VoiceBase):
     barge_in: Literal["aec", "gated"] = "gated"
     aec_available: bool = False           # assert hardware/OS AEC so open-mic is safe
     turn_timeout_s: float = Field(default=30.0, gt=0)  # watchdog for a missing response.done
-    # Budget for ONE ask_nanobot delegation (supervisor mode); None -> turn_timeout_s. A
-    # tool-heavy agent turn routinely runs past 30 s; raise THIS, not the wire watchdog.
-    delegation_timeout_s: float | None = Field(default=None, gt=0)
+    # Budget for ONE ask_nanobot delegation (supervisor mode): a full agent turn, tool
+    # chains included, which routinely runs past the 30 s wire watchdog above.
+    delegation_timeout_s: float = Field(default=120.0, gt=0)
 
 
 class TelemetryConfig(_VoiceBase):

@@ -676,7 +676,7 @@ Set the key explicitly rather than via `OPENAI_API_KEY`, which is the fallback f
 
 ### Supervisor with open-mic barge-in
 
-The robust-tools variant, on a core that passes the tool gateway: the realtime model owns the conversation but delegates every reasoning and tool step to nanobot's full agent loop (`realtime.toolMode: "supervisor"`), with the software AEC (`[aec]` extra) keeping the mic open so you can cut it off mid-reply. `delegationTimeoutS` budgets the agent's tool work; `inputTranscriptionModel` turns on user-side transcripts. On the official core the same file runs as an open-mic persona-only session - the AEC and barge-in parts still apply.
+The robust-tools variant, on a core that passes the tool gateway: the realtime model owns the conversation but delegates every reasoning and tool step to nanobot's full agent loop (`realtime.toolMode: "supervisor"`), with the software AEC (`[aec]` extra) keeping the mic open so you can cut it off mid-reply. `delegationTimeoutS` budgets the agent's tool work; a delegation is one ordinary turn in the voice session, so it is stopped like any turn when you talk over it, and while it runs the session waits with the mic open even without AEC (after the filler, the state is THINKING, not SPEAKING). `inputTranscriptionModel` turns on user-side transcripts. On the official core the same file runs as an open-mic persona-only session - the AEC and barge-in parts still apply.
 
 ```json
 {

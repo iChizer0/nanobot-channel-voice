@@ -45,7 +45,7 @@ from nanobot_channel_voice.context_tool import (
 )
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
-from nanobot_channel_voice.streamid import TURN_META, started_ns, unique_token
+from nanobot_channel_voice.streamid import TURN_META, unique_token
 from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, write_temp_wav
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
@@ -117,8 +117,8 @@ _SUPERVISOR_TOOL = ToolDef(
     },
 )
 
-# The ask_nanobot result on a mid-delegation barge-in: only satisfies the function call,
-# the backend's stale-response guard drops it.
+# The ask_nanobot result on a mid-delegation barge-in: satisfies the function call, and
+# each dialect lets a result for a talked-over call resume nothing.
 _DELEGATION_INTERRUPTED = "(interrupted by the user)"
 
 # Tags our own priority commands: core copies INBOUND metadata onto the command ack
@@ -244,37 +244,27 @@ def _voice_context_blocks(
     return [RuntimeContextBlock(source="voice", content=content)]
 
 
-# Stamped on a delegated ask_nanobot request; the AgentLoop echoes inbound metadata onto
-# the turn's FINAL send (a /stop-ped delegation can finish minutes later with a bare final
-# send). The token must match: an unstamped delivery into this chat is someone else's
-# turn (a cron fire, a message-tool send), never the delegation's answer.
+# Stamped on a delegated ask_nanobot request; core echoes inbound metadata onto every delta,
+# end and final of the turn it opens, so an exact match is the delegation's identity (no
+# stamp: a cron fire or message-tool send; a stale one: a /stop-ped predecessor's straggler).
 _DELEGATION_META = "_voice_delegation"
 
 
 class _DelegationCollector:
-    """Collects one delegated nanobot turn's reply off the bus (supervisor mode); the first
-    terminal resolves the future. Streaming ON: deltas accumulate, ``_stream_end`` resolves,
-    the turn's final never reaches a channel (core drops it). OFF: one final ``send``
-    resolves."""
+    """Collects one delegated nanobot turn's reply off the bus (supervisor mode). Streaming
+    ON: deltas accumulate and an end that closes a segment WITH content resolves (the turn's
+    final never reaches a channel: core drops it). Streaming OFF, or a last segment that
+    streamed nothing: the regular ``send`` resolves, joined behind what streamed."""
 
     def __init__(self, metrics: VoiceMetrics) -> None:
         self._future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._parts: list[str] = []
+        self._segment = False  # content since the last boundary
         self._metrics = metrics
         self._started_at = time.monotonic()
         self._first_token = False
-        # Tombstone: a /stop-ped turn's reply may still be in flight, so a dead collector
-        # stays registered to swallow it, not resolve the NEXT delegation.
-        self.dead = False
-        # Watermark against a PREVIOUS turn's stragglers: stream ids embed the turn's start
-        # time_ns (streamid) and one answering THIS delegation starts after the collector.
-        # An unrecognized id format accepts everything.
-        self._created_ns = time.time_ns()
-        self.token = unique_token()  # non-streaming identity, see _DELEGATION_META
-
-    def accepts_stream(self, stream_id: str | None) -> bool:
-        ns = started_ns(stream_id)
-        return ns is None or ns >= self._created_ns
+        self.token = unique_token()
+        self.foreign = 0  # deliveries into our chat that were not ours, while we waited
 
     def _mark_first_token(self) -> None:
         if self._first_token:
@@ -288,41 +278,36 @@ class _DelegationCollector:
         if delta:
             self._mark_first_token()
             self._parts.append(delta)
+            self._segment = True
 
     def note_boundary(self) -> None:
         """A tool-boundary segment break: separates the reply's parts WITHOUT latching the
         first-token clock — the separator is channel-fabricated, and latching would
         under-report TTFT for exactly the tool-first delegations supervisor mode is for."""
         self._parts.append("\n")
+        self._segment = False
 
     def finish(self, fallback: str = "") -> None:
-        text = "".join(self._parts).strip() or (fallback or "").strip()
-        if not text:
-            # Not a terminal: core fires on_stream_end(resuming=False) mid-turn on its
-            # blank-response retry, so keep collecting (the real end or delegationTimeoutS
-            # decides) and do not mark a first token, which would suppress the real one.
-            return
-        self._mark_first_token()
-        self._resolve(text)
+        """A non-resuming end is terminal only when its segment carried content: core fires
+        one mid-turn on its blank-response retry too (resolving there drops the real answer)."""
+        self.add(fallback)
+        if self._segment:
+            self._resolve(self._text())
 
     def set_final(self, text: str) -> None:
-        """The non-streaming terminal: one whole reply, so it is also first token."""
+        """The regular final: the whole reply, or what a last segment that streamed nothing
+        (blank retries) ended on; either way it is also first token."""
         self._mark_first_token()
-        self._resolve(text)
-
-    def entomb(self) -> None:
-        """Mark dead AND latch first-token: a tombstone's late reply must neither resolve
-        the next delegation nor time a delegation that failed."""
-        self.dead = True
-        self._first_token = True
+        self._resolve("\n".join(part for part in (self._text(), text.strip()) if part))
 
     def abandon(self, text: str) -> None:
-        """Release the delegation, latching first-token: no answer was produced, and the
-        cancelled turn's late ``send``/``send_delta`` (possible until
-        ``_pending_delegation`` clears) must not be timed as one."""
+        """Release with no answer (interrupted): a delta landing in the tick before the
+        slot clears must not be timed as one."""
         self._first_token = True
-        self.dead = True
         self._resolve(text)
+
+    def _text(self) -> str:
+        return "".join(self._parts).strip()
 
     def _resolve(self, text: str) -> None:
         if not self._future.done():
@@ -401,6 +386,7 @@ class VoiceChannel(BaseChannel):
         # serializes them.
         self._pending_delegation: _DelegationCollector | None = None
         self._delegation_lock = asyncio.Lock()
+        self._cloud_onsets = 0  # every user onset lands in _on_cloud_barge_in
         # One per session, shared with backend and shell: segments join on call_id.
         self._metrics = VoiceMetrics()
         self._tracer = VoiceTracer(self.config.telemetry)
@@ -827,8 +813,8 @@ class VoiceChannel(BaseChannel):
         except (ValueError, TypeError):
             params = None
         if isinstance(params, dict):
-            request = (params.get("request") or "").strip()
-            context = (params.get("relevant_context") or "").strip()
+            request = str(params.get("request") or "").strip()
+            context = str(params.get("relevant_context") or "").strip()
         else:
             # args wasn't a JSON object: take it whole rather than drop a real call.
             request = (args or "").strip()
@@ -840,10 +826,13 @@ class VoiceChannel(BaseChannel):
         # Queue wait is its own component: a delegation can wait on the lock as long as it
         # then takes to run, and folding them would blame the AgentLoop.
         queued_at = time.monotonic()
-        # Its own budget: an ask_nanobot turn is a full AgentLoop run (tool-heavy ones
-        # exceed 30 s), whereas turn_timeout_s is the REALTIME WIRE watchdog.
-        timeout_s = self.config.realtime.delegation_timeout_s or self.config.realtime.turn_timeout_s
+        onset = self._cloud_onsets
+        timeout_s = self.config.realtime.delegation_timeout_s
         async with self._delegation_lock:
+            if onset != self._cloud_onsets:
+                # Barged in while queued: the asking response is cancelled, the answer stale.
+                self._metrics.count("delegation_interrupted")
+                return _DELEGATION_INTERRUPTED
             self._metrics.observe(
                 "delegation_wait_ms", (time.monotonic() - queued_at) * 1000.0
             )
@@ -856,25 +845,28 @@ class VoiceChannel(BaseChannel):
                 return await asyncio.wait_for(collector.result(), timeout=timeout_s)
             except TimeoutError:
                 self._metrics.count("delegation_timeout")
+                # foreign > 0 and no answer: a core that stopped echoing inbound metadata.
                 self.logger.warning(
-                    "delegation timed out after {}s; answering with a retry prompt",
-                    timeout_s,
+                    "delegation timed out after {}s ({} deliveries into this chat carried "
+                    "another turn's stamp meanwhile); answering with a retry prompt",
+                    timeout_s, collector.foreign,
                 )
-                # Still RUNNING: stop it, or it burns tokens on an answer nobody hears.
-                collector.entomb()
-                await self._publish_stop()
+                await self._publish_stop()  # still RUNNING: nobody will hear its answer
                 return "I couldn't finish that in time. Please try again."
+            except asyncio.CancelledError:
+                await self._publish_stop()  # the shell swept the task (teardown): as above
+                raise
             finally:
-                # A dead collector stays as a tombstone; the next delegation replaces it.
-                if self._pending_delegation is collector and not collector.dead:
+                if self._pending_delegation is collector:
                     self._pending_delegation = None
 
     async def _on_cloud_barge_in(self) -> None:
-        """Supervisor mode: the user talked over an in-flight ask_nanobot delegation — stop
-        the moot nanobot turn (``/stop``) and release the delegation. No-op otherwise."""
+        """Every user onset lands here. Supervisor mode: a talked-over ask_nanobot delegation
+        is /stop-ped and released, and one queued behind it gives up."""
+        self._cloud_onsets += 1
         collector = self._pending_delegation
-        if collector is None or collector.dead:
-            return  # nothing delegating (a tombstone is not a live delegation)
+        if collector is None:
+            return
         self._metrics.count("delegation_interrupted")
         await self._publish_stop()
         collector.abandon(_DELEGATION_INTERRUPTED)
@@ -1146,9 +1138,7 @@ class VoiceChannel(BaseChannel):
             return
         if self._pending_delegation is not None:
             if meta.get(_DELEGATION_META) != self._pending_delegation.token:
-                # Another turn's reply (a straggler, a cron fire), not our answer. Logged:
-                # a core that stopped echoing the stamp would show up as a silent hang.
-                self.logger.debug("voice: unstamped delivery ignored while delegating")
+                self._pending_delegation.foreign += 1
                 return
             if _speakable(msg):
                 text = (msg.content or "").strip()
@@ -1193,8 +1183,9 @@ class VoiceChannel(BaseChannel):
         if chat_id != self.config.chat_id:
             return  # addressed elsewhere; see send()
         if self._pending_delegation is not None:
-            if not self._pending_delegation.accepts_stream(stream_id):
-                return  # a stopped PREVIOUS turn's queued straggler, not our answer
+            if (metadata or {}).get(_DELEGATION_META) != self._pending_delegation.token:
+                self._pending_delegation.foreign += 1
+                return
             if stream_end:
                 if resuming:
                     self._pending_delegation.note_boundary()  # segment break, keep collecting

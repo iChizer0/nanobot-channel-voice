@@ -1,11 +1,12 @@
-"""_DelegationCollector: terminal-signal races, tombstones, straggler watermark."""
+"""Supervisor delegation: the collector's terminals, token identity on the bus glue, and
+the handler's barge-in / sweep / queueing paths."""
 
 from __future__ import annotations
 
 import asyncio
-import time
+import json
 
-from nanobot_channel_voice.channel import _DelegationCollector
+from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel, _DelegationCollector
 from nanobot_channel_voice.metrics import VoiceMetrics
 
 
@@ -44,82 +45,178 @@ def test_first_terminal_wins():
     run(_case())
 
 
-def test_abandon_resolves_and_marks_dead():
+def test_abandon_resolves_without_a_first_token_sample():
     async def _case():
         m = VoiceMetrics()
         c = _DelegationCollector(m)
         c.abandon("(interrupted)")
-        assert c.dead is True
         assert await c.result() == "(interrupted)"
-        # A dead collector must not record first-token timing for a turn that
-        # never produced an answer.
+        # A delta landing in the tick before the slot clears is not an answer's timing.
         c.add("late delta")
         assert "delegation_first_token_ms" not in m.snapshot()["latency_ms"]
 
     run(_case())
 
 
-def test_entomb_latches_without_resolving():
-    async def _case():
-        m = VoiceMetrics()
-        c = _DelegationCollector(m)
-        c.entomb()
-        assert c.dead is True
-        c.add("straggler")  # swallowed by the tombstone, no timing sample
-        assert "delegation_first_token_ms" not in m.snapshot()["latency_ms"]
-        c.finish()  # a late terminal resolves it (nobody is waiting)
-        assert await c.result() == "straggler"
-
-    run(_case())
-
-
-def test_accepts_stream_watermark_rejects_prior_turns():
+def test_blank_retry_end_keeps_collecting_past_the_status_line():
+    """Core's callback order for status line + tool call, blank continuation (it fires
+    on_stream_end(resuming=False) and RETRIES), then the answer: the blank end must not
+    resolve, or the status line is read aloud as the answer and the real one is lost."""
     async def _case():
         c = _DelegationCollector(VoiceMetrics())
-        now_ns = time.time_ns()
-        # Stream base embeds the turn's start time_ns; only turns that started
-        # AFTER the collector existed can be answering this delegation.
-        assert c.accepts_stream(f"voice:local:{now_ns - 10**9}:0") is False
-        assert c.accepts_stream(f"voice:local:{now_ns + 10**9}:0") is True
-        assert c.accepts_stream(f"voice:local:{now_ns + 10**9}") is True  # no segment part
-        # Unrecognized formats keep the old accept-everything behavior.
-        assert c.accepts_stream(None) is True
-        assert c.accepts_stream("no-timestamps-here") is True
-        assert c.accepts_stream("sess:123:0") is True  # digits too short for time_ns
+        c.add("Let me check.")
+        c.note_boundary()       # end(resuming=True): the tool runs
+        c.finish()              # end(resuming=False) with nothing streamed: the blank retry
+        assert not c._future.done()
+        c.add("The answer is 42.")
+        c.finish()
+        assert await c.result() == "Let me check.\nThe answer is 42."
 
     run(_case())
 
 
-def test_cloud_barge_in_ignores_tombstone():
-    """A dead tombstone left registered after a timeout must NOT make later
-    barge-ins publish /stop or count delegation_interrupted (regression: the
-    guard only checked `is None`, so one timeout turned every subsequent
-    barge-in into a spurious bus /stop until the next delegation)."""
-    from nanobot_channel_voice.channel import VoiceChannel
+def test_regular_final_joins_behind_what_streamed():
+    """A last segment that streamed nothing (blank retries exhausted) ends in core's
+    regular final send; what the earlier segments streamed still belongs to the reply."""
+    async def _case():
+        c = _DelegationCollector(VoiceMetrics())
+        c.add("Checking.")
+        c.note_boundary()
+        c.finish()
+        c.set_final("I could not produce a response.")
+        assert await c.result() == "Checking.\nI could not produce a response."
+        alone = _DelegationCollector(VoiceMetrics())
+        alone.set_final("whole reply")  # streaming off: nothing streamed
+        assert await alone.result() == "whole reply"
 
+    run(_case())
+
+
+def test_stream_identity_is_the_token_on_every_delta():
+    """Core echoes the inbound metadata onto every delta and end, so the delegation token
+    is the identity: a /stop-ped predecessor's straggler carries the old token, a cron
+    turn none, whatever their stream ids look like."""
     async def _case():
         m = VoiceMetrics()
-        c = _DelegationCollector(m)
-        c.entomb()  # timed-out delegation left as tombstone
+        current = _DelegationCollector(m)
+        stale = _DelegationCollector(m)
 
-        stops: list[bool] = []
+        class _Cfg:
+            chat_id = "voice"
 
         class _Stub:
-            _pending_delegation = c
-            _metrics = m
+            config = _Cfg()
+            _pending_delegation = current
 
-            async def _publish_stop(self):
-                stops.append(True)
+        async def delta(text, meta, *, end=False, resuming=False):
+            await VoiceChannel.send_delta(
+                _Stub(), "voice", text, meta, stream_id="whatever:format",
+                stream_end=end, resuming=resuming,
+            )
 
-        await VoiceChannel._on_cloud_barge_in(_Stub())
-        assert stops == []
-        assert m.snapshot()["counters"].get("delegation_interrupted", 0) == 0
-        # A live collector still triggers the full path.
-        live = _DelegationCollector(m)
-        _Stub._pending_delegation = live
-        await VoiceChannel._on_cloud_barge_in(_Stub())
+        await delta("old answer", {_DELEGATION_META: stale.token})
+        await delta("", {_DELEGATION_META: stale.token}, end=True)
+        await delta("reminder text", None)
+        assert not current._future.done()
+        await delta("real ", {_DELEGATION_META: current.token})
+        await delta("answer", {_DELEGATION_META: current.token})
+        await delta("", {_DELEGATION_META: current.token}, end=True)
+        assert await current.result() == "real answer"
+
+    run(_case())
+
+
+def _supervisor_channel():
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    cfg = VoiceConfig.model_validate(
+        {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k",
+                                           "delegationTimeoutS": 5}}
+    )
+    channel = VoiceChannel(cfg, MessageBus(), tool_gateway=object())
+    published: list[tuple[str, dict | None]] = []
+    stops: list[bool] = []
+
+    async def publish(text, metadata=None):
+        published.append((text, metadata))
+
+    async def stop():
+        stops.append(True)
+
+    channel._publish_user_text = publish  # type: ignore[method-assign]
+    channel._publish_stop = stop  # type: ignore[method-assign]
+    return channel, published, stops
+
+
+def _args(request) -> str:
+    return json.dumps({"request": request})
+
+
+async def _answer(channel: VoiceChannel, text: str) -> None:
+    token = channel._pending_delegation.token
+    await channel.send_delta(channel.config.chat_id, text, {_DELEGATION_META: token},
+                             stream_id="s:1:0")
+    await channel.send_delta(channel.config.chat_id, "", {_DELEGATION_META: token},
+                             stream_id="s:1:0", stream_end=True)
+
+
+def test_barge_in_stops_the_live_delegation_and_moots_the_queued_one():
+    """Two ask_nanobot calls in one response: the second queues on the lock. A barge-in
+    cancels the response that asked, so the queued call must not spend a whole nanobot
+    turn on an answer the backend would drop as stale."""
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        first = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("one")))
+        await asyncio.sleep(0)
+        second = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("two")))
+        await asyncio.sleep(0.01)
+        assert [t for t, _ in published] == ["one"]
+        await channel._on_cloud_barge_in()
+        assert await first == "(interrupted by the user)"
+        assert await second == "(interrupted by the user)"
+        assert [t for t, _ in published] == ["one"]  # "two" never ran
         assert stops == [True]
-        assert live.dead is True
+        assert channel._metrics.snapshot()["counters"]["delegation_interrupted"] == 2
+        # A call made AFTER the barge-in runs normally.
+        third = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("three")))
+        await asyncio.sleep(0.01)
+        await _answer(channel, "3")
+        assert await third == "3"
+        assert channel._pending_delegation is None
+
+    run(_case())
+
+
+def test_a_swept_delegation_stops_its_turn():
+    """The shell cancels tool tasks at teardown: nobody will hear the answer, so the
+    nanobot turn is stopped like a timed-out one instead of burning tokens."""
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        task = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("q")))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert stops == [True]
+        assert channel._pending_delegation is None
+
+    run(_case())
+
+
+def test_non_string_arguments_are_taken_as_text():
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        task = asyncio.create_task(channel._delegate_to_nanobot(
+            "ask_nanobot", json.dumps({"request": {"city": "Oslo"}, "relevant_context": 7}),
+        ))
+        await asyncio.sleep(0.01)
+        assert published[0][0] == "{'city': 'Oslo'}\n\n[context from the conversation: 7]"
+        await _answer(channel, "ok")
+        assert await task == "ok"
 
     run(_case())
 
@@ -132,12 +229,9 @@ def test_late_reply_from_stopped_delegation_cannot_resolve_next():
     unstamped delivery into this chat is another turn's, never our answer."""
     from nanobot.bus.events import OutboundMessage
 
-    from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel
-
     async def _case():
         m = VoiceMetrics()
-        stale = _DelegationCollector(m)
-        stale.entomb()  # delegation A timed out; its turn is still running
+        stale = _DelegationCollector(m)  # delegation A timed out; its turn is still running
         current = _DelegationCollector(m)  # delegation B, awaiting its answer
 
         class _Cfg:
@@ -153,7 +247,7 @@ def test_late_reply_from_stopped_delegation_cannot_resolve_next():
                 channel="voice", chat_id="voice", content=text, metadata=meta
             )
 
-        # A's late final lands after B replaced the tombstone: must be swallowed.
+        # A's late final lands while B waits: must be swallowed.
         await VoiceChannel.send(_Stub(), reply("old answer", **{_DELEGATION_META: stale.token}))
         assert not current._future.done()
         await VoiceChannel.send(_Stub(), reply("real answer", **{_DELEGATION_META: current.token}))
@@ -176,7 +270,6 @@ def test_foreign_chat_delivery_is_neither_spoken_nor_collected():
     from nanobot.bus.events import OutboundMessage
     from nanobot.bus.queue import MessageBus
 
-    from nanobot_channel_voice.channel import VoiceChannel
     from nanobot_channel_voice.config import VoiceConfig
 
     async def _case():
@@ -212,8 +305,6 @@ def test_foreign_chat_delivery_is_neither_spoken_nor_collected():
         assert not collector._future.done()
 
         # The session's own chat, stamped with the live token, still resolves.
-        from nanobot_channel_voice.channel import _DELEGATION_META
-
         await channel.send(OutboundMessage(
             channel="voice", chat_id=channel.config.chat_id, content="ours",
             metadata={_DELEGATION_META: collector.token},
@@ -265,7 +356,6 @@ def test_missing_tool_gateway_says_the_tool_mode_is_inert():
     not one log line saying why."""
     from nanobot.bus.queue import MessageBus
 
-    from nanobot_channel_voice.channel import VoiceChannel
     from nanobot_channel_voice.config import VoiceConfig
 
     async def _case():

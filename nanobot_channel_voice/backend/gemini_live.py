@@ -23,7 +23,6 @@ this module is the Gemini wire (verified against the Live API reference, 2026-09
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import os
@@ -163,6 +162,7 @@ class GeminiLiveBackend(RealtimeTransport):
             self._log.warning("dropping {} unanswered tool obligation(s) on {}", dropped, reason)
         # Announced, unanswered (this session): id -> name (FunctionResponse.name is required).
         self._pending_calls: dict[str, str] = {}
+        self._cut_calls: set[str] = set()  # pending at a user onset: answered SILENT
         self._generating = False   # audio/text seen since the last turn boundary
         self._in_progress = False  # extended thinking: background work continues
         # The server cut the model off (its VAD, or our activityStart): that turn's
@@ -193,6 +193,9 @@ class GeminiLiveBackend(RealtimeTransport):
         # No truncate on this protocol: the server keeps what it already sent; the shell
         # already flushed the sink. `_generating` stays: _activity_begin_wire reads it
         # after this to arm the dead-audio guard.
+        # A call the user talked over resumes nothing: its result must neither interrupt
+        # the new utterance nor speak a stale answer after it.
+        self._cut_calls.update(self._pending_calls)
         self._record_barge_in("interrupt")
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
@@ -201,6 +204,8 @@ class GeminiLiveBackend(RealtimeTransport):
             self._log.debug("dropping tool result for call {} (not pending)", call_id)
             return
         name = self._pending_calls.pop(call_id)
+        cut = call_id in self._cut_calls
+        self._cut_calls.discard(call_id)
         try:
             result = json.loads(output)  # a JSON tool result rides as structure
         except (ValueError, TypeError):
@@ -212,12 +217,15 @@ class GeminiLiveBackend(RealtimeTransport):
                 "functionResponses": [{
                     "id": call_id,
                     "name": name,
-                    "response": {"result": result, "scheduling": self._scheduling},
+                    "response": {
+                        "result": result,
+                        "scheduling": "SILENT" if cut else self._scheduling,
+                    },
                 }],
             },
         })
-        if self._pending_calls:
-            return  # siblings still running: their budget, not the deadman's
+        if self._pending_calls or cut:
+            return  # siblings still running (their budget), or nothing is owed
         # The continuation is the model's; what follows is continuation latency.
         self._metrics.turn_continuation()
         self._arm_watchdog()
@@ -390,10 +398,9 @@ class GeminiLiveBackend(RealtimeTransport):
             return
         if status == "IN_PROGRESS" or self._pending_calls:
             # The filler is spoken, the work goes on (extended thinking's background
-            # reasoning, or a NON_BLOCKING tool the shell is still running). Hold
-            # THINKING - the gate's attention and the park timer key on IDLE - and let
-            # playback drain. An unlabeled completion with nothing pending is DONE: a
-            # missed label then costs a benign extra turn, never a stuck THINKING.
+            # reasoning, or a NON_BLOCKING tool the shell is still running). An unlabeled
+            # completion with nothing pending is DONE: a missed label then costs a benign
+            # extra turn, never a stuck THINKING.
             if self._pending_calls:
                 self._cancel_watchdog()  # the shell's tool task has its own budget
             else:
@@ -412,21 +419,6 @@ class GeminiLiveBackend(RealtimeTransport):
             await self._set_turn(VoiceState.IDLE)
             return
         self._start_drain()
-
-    def _start_hold_thinking(self) -> None:
-        """Drain the spoken filler, then settle to THINKING instead of IDLE."""
-        self._cancel_drain()
-        self._drain_task = asyncio.create_task(self._drain_to_thinking())
-
-    async def _drain_to_thinking(self) -> None:
-        try:
-            await self._sink.drain_stream()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - never strand SPEAKING
-            self._log.warning("drain failed ({}); holding THINKING", exc)
-        if self._turn is VoiceState.SPEAKING:  # not a CAPTURING the next onset owns
-            await self._set_turn(VoiceState.THINKING)
 
     async def _on_interrupted(self) -> None:
         # Server-side VAD (or our activityStart) cut the model off. WS ordering: what
@@ -470,6 +462,7 @@ class GeminiLiveBackend(RealtimeTransport):
         self._metrics.calls_abandoned(self._pending_calls.keys() & ids)
         for cid in ids:
             self._pending_calls.pop(cid, None)
+        self._cut_calls -= ids
 
     # ---- transport hooks ----------------------------------------------------
 

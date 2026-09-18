@@ -633,3 +633,28 @@ def test_schema_infers_object_for_an_implicit_object_property():
     })
     assert wire["properties"]["where"]["type"] == "object"
     assert wire["properties"]["where"]["properties"]["city"] == {"type": "string"}
+
+
+def test_a_call_the_user_talked_over_answers_silently():
+    """A barge-in lands while a call is pending: its late result joins the context SILENT
+    (INTERRUPT would talk over the new utterance, WHEN_IDLE speak a stale answer after it)
+    and arms no deadman. A call announced after the onset keeps its schedule."""
+    cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
+
+    async def after(backend):
+        await backend.barge_in(0)
+        await backend.submit_tool_result("c1", "(interrupted by the user)")
+        assert backend._watchdog_task is None or backend._watchdog_task.done()
+        await backend._handle_event(
+            {"toolCall": {"functionCalls": [{"id": "c2", "name": "ask_nanobot", "args": {}}]}}
+        )
+        await backend.submit_tool_result("c2", "fresh answer")
+
+    _, sent, _ = drive([
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}}]}},
+    ], config=cfg, after=after)
+    schedules = [
+        m["toolResponse"]["functionResponses"][0]["response"]["scheduling"]
+        for m in sent if "toolResponse" in m
+    ]
+    assert schedules == ["SILENT", "INTERRUPT"]

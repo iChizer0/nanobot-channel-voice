@@ -1113,3 +1113,80 @@ def test_hello_rejection_is_attributed_by_event_id():
         await backend.close()
 
     asyncio.run(_run())
+
+
+def test_a_tool_run_after_the_filler_holds_thinking_not_speaking():
+    """A tool-bearing response completes with its call outstanding: the filler drains and
+    the state settles to THINKING, as on Gemini. Left SPEAKING, a half-duplex mic stayed
+    gated for the whole wait, so a delegation could be neither stopped nor steered."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent = make_sending_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.audio.delta", "response_id": "r1",
+                  "delta": b64(b"\x00" * 3200)})
+        assert backend._turn is VoiceState.SPEAKING
+        await ev({"type": "response.output_item.added", "response_id": "r1",
+                  "item": {"type": "function_call", "call_id": "c1", "name": "ask_nanobot"}})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed",
+                  "output": [{"type": "function_call", "call_id": "c1"}]}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        assert backend._active_response_id == "r1"  # a barge-in can still cancel it
+        await backend.submit_tool_result("c1", "answer")
+        assert [p["type"] for p in sent[-2:]] == ["conversation.item.create", "response.create"]
+        assert backend._turn is VoiceState.THINKING
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        await ev({"type": "response.audio.delta", "response_id": "r2",
+                  "delta": b64(b"\x00" * 3200)})
+        assert backend._turn is VoiceState.SPEAKING
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.IDLE
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_barge_in_during_the_tool_wait_cancels_the_continuation_without_a_truncate():
+    """The user speaks into the THINKING wait (the filler fully played): the trigger
+    response is cancelled so the late tool result resumes nothing, and no truncate is sent
+    for the drained filler item (the server would refuse an end past its length)."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent = make_sending_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.output_item.added", "response_id": "r1",
+                  "item": {"type": "message", "id": "item-filler"}})
+        await ev({"type": "response.audio.delta", "response_id": "r1", "item_id": "item-filler",
+                  "delta": b64(b"\x00" * 3200)})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed",
+                  "output": [{"type": "function_call", "call_id": "c1"}]}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        sent.clear()
+        await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+        assert backend._turn is VoiceState.CAPTURING
+        await backend.barge_in(100)
+        assert not any(p["type"] == "conversation.item.truncate" for p in sent)
+        await backend.submit_tool_result("c1", "(interrupted by the user)")
+        assert [p["type"] for p in sent if p["type"] != "response.cancel"] == [
+            "conversation.item.create"
+        ]  # the call is answered, nothing is re-triggered over the user
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())

@@ -759,6 +759,8 @@ class RealtimeBackend(RealtimeTransport):
             # run must be able to cancel it, or the abandoned results re-trigger
             # response.create over the user's new speech.
             await self._maybe_respond(rid)
+            if self._tools_pending.get(rid):
+                self._start_hold_thinking()  # the filler played; the tool run is a wait
         else:
             if rid == self._active_response_id:
                 self._active_response_id = None  # finished turn: nothing left to cancel
