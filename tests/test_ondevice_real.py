@@ -571,6 +571,37 @@ def test_zipformer_onnx_real_streaming_matches_batch():
     assert streamed == batch  # the streaming path is transcript-identical to batch
 
 
+def test_zipformer_onnx_real_start_context_matches_sherpa():
+    """The decoder context opens as sherpa-onnx opens it ([-1, blank], wrapped by this
+    clamp-free export's Gather to the last vocab row), not [blank, blank]: on the fp32
+    export's own clips 2.wav read 这个是频繁的 instead of sherpa's 是不是平凡的."""
+    d = _ZIPFORMER_ONNX
+    enc, dec, join = (d / f"{n}-epoch-99-avg-1.onnx" for n in ("encoder", "decoder", "joiner"))
+    wavs = {name: d / "test_wavs" / f"{name}.wav" for name in ("0", "1", "2", "3")}
+    _need(enc, dec, join, d / "tokens.txt", *wavs.values())
+    from nanobot_channel_voice.config import ZipformerSttConfig
+    from nanobot_channel_voice.stt.zipformer import ZipformerOnDeviceStt
+
+    stt = ZipformerOnDeviceStt.from_config(ZipformerSttConfig(
+        encoder_path=str(enc), decoder_path=str(dec), joiner_path=str(join),
+        tokens_path=str(d / "tokens.txt"),
+    ))
+    try:
+        heard = {}
+        for name, path in wavs.items():
+            with wave.open(str(path), "rb") as w:
+                assert w.getframerate() == 16000
+                heard[name] = asyncio.run(stt.transcribe(w.readframes(w.getnframes()), 16000))
+    finally:
+        stt.release()
+    assert heard == {
+        "0": "昨天是 MONDAY TODAY IS LIBR THE DAY AFTER TOMORROW是星期三",
+        "1": "这是第一种第二种叫呃与 ALWAYS ALWAYS什么意思啊",
+        "2": "是不是平凡的啊不认识记下来 FREQUENTLY频繁的",
+        "3": "第一句是个什么时态加了 ES是一般现在时对后面它时态写上",
+    }
+
+
 def test_zipformer_rknn_real_transcription():
     pytest.importorskip("rknnlite.api", reason="RKNN Lite runtime only exists on the board")
     d = _ZIPFORMER_RKNN

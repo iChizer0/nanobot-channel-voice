@@ -32,8 +32,7 @@ def test_wav_blob_tts_degrades_to_soft_without_building_a_canceller(monkeypatch)
         lambda *a, **k: pytest.fail("built a canceller a blob sink can never feed"),
     )
     ch = _channel("wav")
-    ch._build_local()
-    backend = ch._backend
+    _shell, backend, _tts, _blocks = ch._build_local()  # pure: it returns, start() publishes
     assert backend._aec is None            # no reference-starved canceller
     assert backend._open_mic               # degrade is to SOFT: the mic stays open
     assert not backend._full_duplex        # soft wiring, not asserted-AEC full duplex
@@ -55,8 +54,7 @@ def test_unframeable_pcm_rate_degrades_to_soft(monkeypatch):
                 "pcmSampleRate": 22050},
     })
     ch = VoiceChannel(cfg, MessageBus())
-    ch._build_local()
-    backend = ch._backend
+    _shell, backend, _tts, _blocks = ch._build_local()  # pure: it returns, start() publishes
     assert backend._aec is None
     assert backend._open_mic
     assert not backend._full_duplex
@@ -67,8 +65,7 @@ def test_pcm_tts_builds_and_taps_the_canceller(monkeypatch):
     stub = object()
     monkeypatch.setattr(aec_mod, "make_echo_canceller", lambda *a, **k: stub)
     ch = _channel("pcm")
-    ch._build_local()
-    backend = ch._backend
+    _shell, backend, _tts, _blocks = ch._build_local()  # pure: it returns, start() publishes
     assert backend._aec is stub
     assert backend._sink._ref_tap is stub  # the sink will feed it every block
     assert backend._sink.stream_mode

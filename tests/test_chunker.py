@@ -49,6 +49,56 @@ def test_sanitize_unspeakable_becomes_space_never_glue():
     assert sanitize("Hi \U0001f44b there") == "Hi there"
 
 
+def test_sanitize_keeps_the_single_codepoint_degree_units():
+    from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en, verbalize_numbers_zh
+
+    # ℃/℉ were not whitelisted like °, so the unit vanished before any frontend ran.
+    assert sanitize("今天25℃，很热") == "今天25℃，很热"
+    assert verbalize_numbers_zh(sanitize("今天25℃，很热")) == "今天二十五摄氏度，很热"
+    assert sanitize("It is 77℉ outside") == "It is 77℉ outside"
+    assert verbalize_numbers_en(sanitize("It is 77℉ outside")) == (
+        "It is seventy seven degrees Fahrenheit outside"
+    )
+
+
+def test_sanitize_folds_the_math_minus_to_a_hyphen():
+    from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en, verbalize_numbers_zh
+
+    # U+2212 was dropped as unspeakable: "−5°C" became " 5°C", a sign flip. Folded to
+    # "-" so every downstream pass (sign, range) sees the one minus it knows.
+    assert sanitize("−5°C") == "-5°C"
+    assert verbalize_numbers_en(sanitize("−5°C")) == "minus five degrees Celsius"
+    assert verbalize_numbers_zh(sanitize("−5°C")) == "零下五摄氏度"
+    assert verbalize_numbers_zh(sanitize("5−10分钟")) == "五到十分钟"
+
+
+def test_sanitize_folds_fullwidth_percent_yen_and_hyphen():
+    from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_zh
+
+    # ％/￥/－ were not whitelisted: "增长5％。" lost its percent, "（￥450）" its currency,
+    # and "5－10分钟" fused into 五十分钟. Folded to the twins the frontends read.
+    assert sanitize("增长5％。") == "增长5%。"
+    assert verbalize_numbers_zh(sanitize("增长5％。")) == "增长百分之五。"
+    assert sanitize("（￥450）") == "（¥450）"
+    assert verbalize_numbers_zh(sanitize("（￥450）")) == "（四百五十元）"
+    assert sanitize("5－10%") == "5-10%"
+    assert verbalize_numbers_zh(sanitize("5－10分钟")) == "五到十分钟"
+
+
+def test_sanitize_strips_emphasis_only_at_word_edges():
+    # An intraword marker is not emphasis: "_case_" inside snake_case_name was stripped
+    # as a pair, gluing the words. Left over, a marker becomes a space, never nothing.
+    assert sanitize("snake_case_name") == "snake case name"
+    assert sanitize("file_name_here.txt") == "file name here.txt"
+    assert sanitize("2*3*4") == "2 3 4"
+    assert sanitize("a*b*c") == "a b c"
+    # Pairs at word edges still strip, CJK glue included ("**重要**的" is how zh emphasis
+    # is written), and a dunder is a pair at both edges.
+    assert sanitize("**bold** text, *em*, ~~gone~~.") == "bold text, em, gone."
+    assert sanitize("**重要**的事情") == "重要的事情"
+    assert sanitize("__init__") == "init"
+
+
 # ---- cut rules --------------------------------------------------------------
 
 def test_sentence_cut_needs_following_separator():
@@ -159,6 +209,66 @@ def test_abbreviations_and_initialisms_do_not_end_a_sentence():
     assert c.feed("The U.S. team won. Next.") == ["The U.S. team won."]
     c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
     assert c.feed("Ms. Smith arrived. Next.") == ["Ms. Smith arrived."]
+
+
+def test_initials_bind_when_a_capitalised_word_follows():
+    # A lone capital + "." read as a sentence end: "George W." got sentence-final
+    # prosody and a seam pause mid-name. An initial sits between a capitalised word (or
+    # a dotted initial, or the sentence start) and a capitalised word.
+    for text, chunks in (
+        ("George W. Bush was president. Then he left.",
+         ["George W. Bush was president.", "Then he left."]),
+        ("Dr. J. K. Rowling wrote it. Then more.", ["Dr. J. K. Rowling wrote it.", "Then more."]),
+        ("J. K. Rowling wrote it. Then more.", ["J. K. Rowling wrote it.", "Then more."]),
+        ("John F. Kennedy spoke. Then he left.", ["John F. Kennedy spoke.", "Then he left."]),
+        ("Flight No. 5 leaves at 3:45pm. OK.", ["Flight No. 5 leaves at 3:45pm.", "OK."]),
+        # The accepted side of the asymmetry: after a capitalised word, a sentence that
+        # ENDS in a lone capital loses its pause when the next one is capitalised too.
+        ("Meet K. Then go.", ["Meet K. Then go."]),
+        ("Vitamin C. Then D.", ["Vitamin C. Then D."]),
+        # A lowercase or non-capitalised follow-up keeps the cut; "no." binds only as
+        # the capitalised "No." before a digit.
+        ("It was plan B. and then some.", ["It was plan B.", "and then some."]),
+        ("The answer is no. Next question.", ["The answer is no.", "Next question."]),
+    ):
+        c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+        assert collect(c, text) == chunks, text
+    # Streamed: the follow-up context arrives in a later delta, so the dot waits.
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert c.feed("George W.") == []
+    assert c.feed(" Bush won. Then") == ["George W. Bush won."]
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert c.feed("Plan A. ") == []
+    assert c.feed("Then B") == []
+    assert c.flush() == "Plan A. Then B"
+
+
+def test_a_lone_capital_after_a_lowercase_word_or_digit_ends_its_sentence():
+    # "25°C." bound to the capitalised "Tomorrow": a weather reply's first chunk was
+    # held until the NEXT sentence ended (TTFA), and the seam between them was lost.
+    for text, chunks in (
+        ("It is 25°C. Tomorrow will be warmer.", ["It is 25°C.", "Tomorrow will be warmer."]),
+        ("It is 77°F. Tomorrow is cooler.", ["It is 77°F.", "Tomorrow is cooler."]),
+        ("It is 25 °C. Then rain.", ["It is 25 °C.", "Then rain."]),
+        ("Highs of 68-72°F. The wind is calm.", ["Highs of 68-72°F.", "The wind is calm."]),
+        ("Take exit 42B. Room 5 is on the left.", ["Take exit 42B.", "Room 5 is on the left."]),
+        ("Your seat is 14C. Gate 7 opens at noon.", ["Your seat is 14C.", "Gate 7 opens at noon."]),
+        ("Apartment 5A. Then ring twice.", ["Apartment 5A.", "Then ring twice."]),
+        ("Use 5 V. Then check.", ["Use 5 V.", "Then check."]),
+        ("He got an A. She got a B. They left.", ["He got an A.", "She got a B.", "They left."]),
+        ("It was plan B. Then C.", ["It was plan B.", "Then C."]),
+        ("I chose option C. What about you?", ["I chose option C.", "What about you?"]),
+        ("So did I. Then we went.", ["So did I.", "Then we went."]),
+        ("The answer is B. Correct!", ["The answer is B.", "Correct!"]),
+        ("My grade was an A. Then I left.", ["My grade was an A.", "Then I left."]),
+        ("Step 1: press A. Step 2: press B.", ["Step 1: press A.", "Step 2:", "press B."]),
+    ):
+        c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+        assert collect(c, text) == chunks, text
+    # Streamed: the first chunk goes out at the next delta, not at the next sentence end.
+    c = SentenceChunker(min_chars=6, max_chars=240, min_chars_first=6)
+    assert c.feed("It is 25°C.") == []
+    assert c.feed(" Tomorrow will") == ["It is 25°C."]
 
 
 def test_lowercase_lookalikes_still_end_a_sentence():

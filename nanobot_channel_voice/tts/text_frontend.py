@@ -90,16 +90,18 @@ _ONES = (
     "thirteen fourteen fifteen sixteen seventeen eighteen nineteen"
 ).split()
 _TENS = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
-_SCALES = ((10**9, "billion"), (10**6, "million"), (10**3, "thousand"), (100, "hundred"))
+_SCALES = (
+    (10**18, "quintillion"), (10**15, "quadrillion"), (10**12, "trillion"),
+    (10**9, "billion"), (10**6, "million"), (10**3, "thousand"), (100, "hundred"),
+)
 _ORDINAL_IRREGULAR = {
     "one": "first", "two": "second", "three": "third", "five": "fifth",
     "eight": "eighth", "nine": "ninth", "twelve": "twelfth",
 }
+_RUN_ID_FLOOR = 10**12  # an ungrouped run this long is phone-number/id territory
 
 
 def _int_words(n: int) -> str:
-    if n >= 10**12:  # phone-number/id territory: read the digits out
-        return en_digit_words(str(n))
     if n < 20:
         return _ONES[n]
     if n < 100:
@@ -117,8 +119,11 @@ def en_digit_words(digits: str) -> str:
 
 
 def _en_run_words(run: str) -> str:
-    """A cardinal never carries a leading zero: reading "007" as one deletes it."""
-    return en_digit_words(run) if len(run) > 1 and run[0] == "0" else _int_words(int(run))
+    """A cardinal never carries a leading zero: reading "007" as one deletes it. Only a
+    grouped amount is named past the id floor; a bare run that long is read out."""
+    if (len(run) > 1 and run[0] == "0") or int(run) >= _RUN_ID_FLOOR:
+        return en_digit_words(run)
+    return _int_words(int(run))
 
 
 def _ordinal_words(n: int) -> str:
@@ -133,11 +138,10 @@ def _ordinal_words(n: int) -> str:
     return f"{head} {last}".strip()
 
 
-def _time_words(m: re.Match) -> str:
-    hour, minute = int(m.group(1)), int(m.group(2))
-    second = m.group(3)
-    if second is not None:  # h:mm:ss is a duration/timestamp: read all three fields
-        return f"{_int_words(hour)} {_int_words(minute)} {_int_words(int(second))}"
+def _time_words(clock: str) -> str:
+    hour, minute, *second = (int(part) for part in clock.split(":"))
+    if second:  # h:mm:ss is a duration/timestamp: read all three fields
+        return f"{_int_words(hour)} {_int_words(minute)} {_int_words(second[0])}"
     if minute == 0:
         return f"{_int_words(hour)} o'clock"
     if minute < 10:
@@ -149,14 +153,23 @@ def _time_words(m: re.Match) -> str:
 # dot, so without this "192.168.1.1" keeps a literal "." the engine cannot voice.
 _RE_DOTTED = re.compile(r"(?<!\d)\d+(?:\.\d+){2,}(?!\d)")
 # Optional seconds, like the zh twin: a half-read "one thirty:45" voices the colon.
-_RE_TIME = re.compile(r"\b(\d{1,2}):([0-5]\d)(?::([0-5]\d))?(?!\d)")
+_RE_TIME = re.compile(r"\b\d{1,2}:[0-5]\d(?::[0-5]\d)?(?!\d)")
+# A meridiem already says the hour is on the hour: "nine am", never "nine o'clock am".
+_RE_TIME_ON_HOUR = re.compile(r"(?<!:)\b\d{1,2}:00(?=\s?[ap]\.?m(?![a-z]))", re.IGNORECASE)
 _GROUPED = r"\d{1,3}(?:,\d{3})+"  # the thousands-separator grammar, shared by every amount pattern
-_RE_GROUPED = re.compile(rf"\b{_GROUPED}\b")
-# Lookaround anchors, not \b: a glued unit ("3.5kg") is still a decimal, and \b
-# between digit and letter never fires.
+# A grouped power of ten with a glued "s" is a plural scale word ("1,000s of users"),
+# not "one thousand s"; the head says which: thousands, tens of thousands, hundreds of.
+_RE_GROUPED_PLURAL = re.compile(r"\b(1|10|100)((?:,000)+)s\b")
+_PLURAL_HEADS = {"1": "", "10": "tens of ", "100": "hundreds of "}
+_SCALE_NAMES = dict(_SCALES)
+# Lookaround anchors, not \b: a glued unit ("3.5kg", "1,000km") is still an amount, and
+# \b between digit and letter never fires.
+_RE_GROUPED = re.compile(rf"(?<!\d){_GROUPED}(?!\d)")
 _RE_DECIMAL = re.compile(rf"(?<!\d)({_GROUPED}|\d+)\.(\d+)(?!\d)")
 _RE_GROUPED_DECIMAL = re.compile(rf"(?<!\d)({_GROUPED})\.(\d+)(?!\d)")
-_RE_ORDINAL = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+# The dot lookbehind leaves "99.9th" to the decimal pass: a fraction is never ordinal.
+_RE_ORDINAL = re.compile(rf"(?<!\.)\b({_GROUPED}|\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+_RE_GROUPED_ORDINAL = re.compile(rf"(?<!\.)\b({_GROUPED})(st|nd|rd|th)\b", re.IGNORECASE)
 # Amount-aware like the zh twin, and run BEFORE decimal/grouped: those passes eat
 # the digits and strand a "%" no char vocab can voice.
 _RE_PERCENT = re.compile(rf"(?<!\d)(?:{_GROUPED}|\d+)(?:\.\d+)?\s*%")
@@ -171,6 +184,20 @@ def _en_amount_words(amount: str) -> str:
 
 def _en_percent(text: str) -> str:
     return _en_amount_words(text.rstrip("%").strip()) + " percent"
+
+
+def _en_ordinal(m: re.Match[str]) -> str:
+    return _ordinal_words(int(m.group(1).replace(",", "")))
+
+
+def _en_grouped_plural(m: re.Match[str]) -> str:
+    scale = _SCALE_NAMES.get(1000 ** (len(m.group(2)) // 4))
+    return f"{_PLURAL_HEADS[m.group(1)]}{scale}s" if scale else m.group()
+
+
+def _sub_times(text: str) -> str:
+    text = _sub_padded(_RE_TIME_ON_HOUR, text, lambda clock: _int_words(int(clock[:-3])))
+    return _sub_padded(_RE_TIME, text, _time_words)
 
 
 def _dotted_words(
@@ -198,12 +225,15 @@ def verbalize_numbers_en(text: str) -> str:
         _RE_DOTTED, text,
         lambda run: _dotted_words(run, " point ", en_digit_words, _en_run_words),
     )
-    text = _RE_TIME.sub(_time_words, text)
+    text = _sub_times(text)
+    # Ordinals and plurals before the amount passes: "1,000th" is one ordinal, not an
+    # amount + "th".
+    text = _RE_ORDINAL.sub(_en_ordinal, text)
+    text = _RE_GROUPED_PLURAL.sub(_en_grouped_plural, text)
     text = _sub_padded(_RE_PERCENT, text, _en_percent)
     # Decimal before grouped, or "1,234.56" loses its integer part and strands a ".".
     text = _sub_padded(_RE_DECIMAL, text, _en_amount_words)
-    text = _RE_GROUPED.sub(lambda m: _int_words(int(m.group().replace(",", ""))), text)
-    text = _RE_ORDINAL.sub(lambda m: _ordinal_words(int(m.group(1))), text)
+    text = _sub_padded(_RE_GROUPED, text, _en_amount_words)
     text = _read_sequences(text, "en", en_digit_words, _en_year_words)
     return _sub_padded(_RE_INT, text, _en_run_words)
 
@@ -215,6 +245,17 @@ def verbalize_numbers_en(text: str) -> str:
 _ZH_DIGITS = "零一二三四五六七八九"
 _ZH_SMALL_UNITS = ("", "十", "百", "千")
 _ZH_GROUP_UNITS = ("", "万", "亿", "万亿")
+_ZH_RUN_ID_FLOOR = 10**13  # as _RUN_ID_FLOOR: a bare run this long is an id
+# 两 before a measure word, for a whole-run 2 only (PaddleSpeech TN): 12个 and 200元 keep
+# 二; 2月/2号/2楼/第2 are not listed. 点 is the clock hour (2点半), the twin of the 2:30
+# rule in _zh_time_words. Ordinal shapes of a listed word are excluded in place (2年级,
+# 2层 as a floor number; 2层楼 counts storeys).
+_ZH_TWO_MEASURES = (
+    "个 位 只 条 张 本 次 天 周 年(?![级代]) 小时 分钟 秒 岁 块 元 斤 公斤 克 米 公里 厘米 倍 种 "
+    "件 家 口 台 辆 份 杯 瓶 间 套 双 对 层(?=楼) 场 首 部 篇 页 句 遍 顿 趟 批 组 队 名 人 "
+    "百 千 万 亿 点"
+).split()
+_RE_ZH_TWO = re.compile(r"(?<![\d.第])2(?=(?:" + "|".join(_ZH_TWO_MEASURES) + "))")
 
 
 def _zh_four(n: int) -> str:
@@ -236,7 +277,7 @@ def _zh_four(n: int) -> str:
 def _zh_int(n: int) -> str:
     if n == 0:
         return "零"
-    if n >= 10**13:  # id/phone territory: read the digits out
+    if n >= 10**16:  # past the last group unit: read the digits out
         return zh_digit_words(str(n))
     groups = []
     while n:
@@ -260,8 +301,10 @@ def zh_digit_words(digits: str) -> str:
 
 
 def _zh_run_words(run: str) -> str:
-    """Leading-zero identifier, as ``_en_run_words``."""
-    return zh_digit_words(run) if len(run) > 1 and run[0] == "0" else _zh_int(int(run))
+    """Leading-zero identifier and the bare-run id floor, as ``_en_run_words``."""
+    if (len(run) > 1 and run[0] == "0") or int(run) >= _ZH_RUN_ID_FLOOR:
+        return zh_digit_words(run)
+    return _zh_int(int(run))
 
 
 def _zh_number(number: str) -> str:
@@ -272,14 +315,15 @@ def _zh_number(number: str) -> str:
 
 def _zh_time_words(m: re.Match) -> str:
     hour, minute, sec = int(m.group(1)), int(m.group(2)), m.group(3)
+    hour_words = "两" if hour == 2 else _zh_int(hour)  # 两点, never 二点
     pad = "零" if minute < 10 else ""
     if sec is not None:
         # Clock wording for a duration too: it stays intelligible, and the alternative
         # left the ":" to reach the model as a mid-number pause.
-        return f"{_zh_int(hour)}点{pad}{_zh_int(minute)}分{_zh_int(int(sec))}秒"
+        return f"{hour_words}点{pad}{_zh_int(minute)}分{_zh_int(int(sec))}秒"
     if minute == 0:
-        return f"{_zh_int(hour)}点"
-    return f"{_zh_int(hour)}点{pad}{_zh_int(minute)}分"
+        return f"{hour_words}点"
+    return f"{hour_words}点{pad}{_zh_int(minute)}分"
 
 
 # \b never fires beside CJK (both \w): anchor on digit lookarounds instead. Percent
@@ -357,6 +401,7 @@ def verbalize_numbers_zh(text: str) -> str:
     text = _read_sequences(text, "zh", zh_digit_words)
     text = _RE_YEAR_ZH.sub(lambda m: zh_digit_words(m.group()), text)
     text = _RE_ZH_GEN.sub(lambda m: zh_digit_words(m.group()), text)
+    text = _RE_ZH_TWO.sub("两", text)
     return _sub_padded(_RE_INT_ZH, text, _zh_run_words)
 
 
@@ -364,7 +409,7 @@ def verbalize_numbers_zh(text: str) -> str:
 # Dates are ISO order only: DD-MM and MM-DD are ambiguous with each other and with
 # id fragments.
 
-_HYPHENS = r"\-‑–"  # escaped: it is interpolated into character classes
+_HYPHENS = r"\-‑–−－"  # escaped: it is interpolated into character classes; ends U+2212, U+FF0D
 _MONTHS_EN = ("January", "February", "March", "April", "May", "June", "July",
               "August", "September", "October", "November", "December")
 _MONTH_DAYS = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)  # Feb 29 allowed blind
@@ -387,11 +432,11 @@ _CURRENCIES = {
 # A scale word belongs in front of the relocated unit ($5 million -> 5 million dollars).
 # Shapes the pass cannot own — glued suffix ($100k), range or time tail ($20-30, $12:30),
 # 多/几万, explicit unit (¥199元) — fall through. The digit in the guard stops
-# backtracking onto a prefix ($1,234k vs $1).
+# backtracking onto a prefix ($1,234k vs $1, $1.5k vs $1).
 _RE_CURRENCY = re.compile(
     rf"[{''.join(_CURRENCIES)}]\s?(?:{_GROUPED}|\d+)(?:\.\d+)?"
     rf"(?:\s?(?:thousand|million|billion|trillion)\b|[万亿]+)?"
-    rf"(?!\d|[A-Za-z]|[{_HYPHENS}:：,，]\d|[多几][万亿]"
+    rf"(?!\d|\.\d|[A-Za-z]|[{_HYPHENS}:：,，]\d|[多几][万亿]"
     rf"|\s?(?:元|(?:dollars?|euros?|pounds?|yuan|yen|thousand|million|billion|trillion)\b))",
     re.IGNORECASE,
 )
@@ -525,10 +570,11 @@ def fold_degree_marks(text: str) -> str:
 # A digit run reads as a SEQUENCE, not a quantity, when the surface form carries evidence
 # a cardinal cannot produce or a trigger word names it. A miss is the cardinal reading.
 
-_SEQ_MIN_BARE = 7  # conversational text does not state a 7-digit quantity ungrouped
-_SEQ_MIN_GLUE = 3  # shorter and letter-glued is a model name: COVID-19, gate B12
-_CTX_LEFT = 40     # trigger window, wide enough for four English words
-_CTX_RIGHT = 16    # unit window, wide enough for "kilometres"
+_SEQ_MIN_BARE = 7     # conversational text does not state a 7-digit quantity ungrouped
+_SEQ_MIN_GLUE = 3     # shorter and letter-glued is a model name: COVID-19, gate B12
+_SEQ_MIN_TRIGGER = 3  # shorter reads the same either way: "room twelve" IS room 12
+_CTX_LEFT = 40        # trigger window, wide enough for four English words
+_CTX_RIGHT = 16       # unit window, wide enough for "kilometres"
 
 _RE_RUN = re.compile(r"\d+")
 # Group spans cover their separators, so "555-1234" loses the hyphen instead of voicing it.
@@ -538,7 +584,8 @@ _RE_YEAR_RANGE = re.compile(rf"^[12]\d{{3}}[{_HYPHENS}][12]\d{{3}}$")
 # Only cues that mean a year far more often than not: "a value of 1234" is not one.
 _RE_EN_YEAR_CUE = re.compile(r"\b(?:in|since|the year)\s+$", re.I)
 _RE_GLUE_L = re.compile(r"[A-Za-z]$")
-_RE_GLUE_R = re.compile(r"^[A-Za-z]")
+# A lone k/m/b/x behind the run is a magnitude or multiplier (100k, 10x), not id glue.
+_RE_GLUE_R = re.compile(r"^(?![kmbx](?![a-z0-9]))[a-z]", re.I)
 _RE_WORD = re.compile(r"[A-Za-z]+")
 
 _EN_TRIGGERS = frozenset("""
@@ -549,42 +596,52 @@ order invoice receipt tracking reference ref ticket case claim policy
 flight room apartment apt door
 serial sku isbn vin imei mac badge id identifier number num
 licence license plate port status error iso
-member membership employee student patient record file batch lot
+member membership employee student patient record file batch
 """.split())
-_EN_TRIGGER_PHRASES = ("area code", "postal code", "zip code", "verification code",
-                       "order number", "phone number", "account number", "case number")
+# After the trigger, a modifier ("my account balance is 250"), a possessive verb directly
+# before the run ("the file has 20 lines") or an "of" NOT directly before it ("the number
+# of users is 45") disarms it; position-bound, so "a PIN of 1234" keeps its label.
+_EN_TRIGGER_MODIFIERS = frozenset("total balance count amount size limit cost price".split())
+_EN_POSSESSIVE_VERBS = ("has", "have", "had")
 # A unit or counter after the run pins it to a quantity; checked before every positive
-# rule, so "1000000 residents" survives the length rule.
-_RE_EN_UNIT = re.compile(r"""^\s*(?:percent|dollars?|euros?|pounds?|cents?|yen|yuan|
+# rule, so "1000000 residents" survives the length rule. Degree marks are units too
+# (the range pass needs them: "20-30°C" is a range), spelled as _RE_DEGREES accepts.
+_DEGREE_MARK = r"°(?:\s?[CF])?(?![A-Za-z])|[℃℉]"
+# The Latin abbreviations both languages write glued ("512MB", "20ms"); without them the
+# glue rule reads those digit-wise. Two letters minimum, so 1080p/4K/5G stay identifiers;
+# a letter lookahead, not \b, which never fires before a CJK char.
+_LATIN_UNITS = (
+    r"(?:[kmg]?hz|[kmgt]b|[kmg]?bps|fps|dpi|bpm|mph|px|km|cm|mm|kg|mg|ml|ms|kw)(?![a-z])"
+)
+_RE_EN_UNIT = re.compile(rf"""^\s*(?:(?:percent|dollars?|euros?|pounds?|cents?|yen|yuan|
     items?|records?|files?|people|persons?|users?|times?|copies|pages?|
     seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?|years?|degrees?|
-    kilomet(?:er|re)s?|km|met(?:er|re)s?|m|miles?|feet|ft|inches|
-    kilograms?|kg|grams?|g|lbs?|lit(?:er|re)s?|l|ml|pixels?|bytes?|[kmgt]b|
-    residents?|employees?|options?|calories)\b""", re.I | re.X)
+    kilomet(?:er|re)s?|met(?:er|re)s?|m|miles?|feet|ft|inches|
+    kilograms?|grams?|g|lbs?|lit(?:er|re)s?|l|pixels?|bytes?|
+    residents?|employees?|options?|calories)\b|{_LATIN_UNITS}|{_DEGREE_MARK})""", re.I | re.X)
 
 _ZH_TRIGGERS = ("打 拨 拨打 电话 手机 座机 号码 传真 热线 分机 区号 邮编 邮政编码 验证码 "
                 "确认码 密码 口令 动态码 账号 账户 卡号 银行卡 尾号 后四位 订单号 订单 单号 "
                 "快递 运单 工号 学号 编号 序号 序列号 编码 身份证 护照 房间 房号 门牌 座位 "
                 "车位 航班 车次 车牌 牌照 端口 状态码 错误码 型号 批号 档案 病历 会员").split()
 _ZH_UNITS = ("元 块 角 美元 欧元 个 只 条 张 台 部 件 份 位 人 名 家 次 遍 页 章 岁 年 月 日 "
-             "天 小时 分钟 秒 周 度 米 公里 千米 厘米 毫米 里 克 千克 公斤 吨 升 毫升 斤 两 "
-             "倍 成 折 分 平方米 亿 万 种 款 层 楼 步").split()
+             "天 小时 分钟 秒 周 度 摄氏度 华氏度 米 公里 千米 厘米 毫米 里 克 千克 公斤 吨 升 "
+             "毫升 斤 两 倍 成 折 分 平方米 亿 万 种 款 层 楼 步").split()
 _RE_ZH_TRIGGER = re.compile("(?:" + "|".join(_ZH_TRIGGERS) + r")[^0-9]{0,6}$")
-# Longest-first, or 公里 loses its first character to 里. The Latin branch mirrors
-# _RE_EN_UNIT's: zh writes "512MB" too, and without it _is_sequence's glue rule reads those
-# digit-wise. Two letters minimum, so 1080p/4K/5G stay identifiers.
+# Longest-first, or 公里 loses its first character to 里.
 _RE_ZH_UNIT = re.compile(
     r"^\s*(?:(?:" + "|".join(sorted(_ZH_UNITS, key=len, reverse=True)) + r")"
-    r"|(?:[kmg]?hz|[kmgt]b|fps|dpi|bpm|km|cm|mm|kg|mg|ml|ms|kw)(?![a-z]))",
+    rf"|{_LATIN_UNITS}|{_DEGREE_MARK})",
     re.I,
 )
 
 # Neither separator is silent: espeak names them ("five dash ten", "one slash two") and the
 # zh lexicon drops them, fusing "5-10分钟" into 五十分钟. "\s*%" is ONE optional unit — a bare
-# trailing "\s*" would eat the space before the unit ("5 to 10minutes").
+# trailing "\s*" would eat the space before the unit ("5 to 10minutes"). The guard bars a
+# decimal continuation only, so a sentence-final "10%." keeps its "%".
 _RE_RANGE = re.compile(
     rf"(?<![\d{_HYPHENS}.])(\d+(?:\.\d+)?(?:\s*%)?)\s*[{_HYPHENS}~～]\s*"
-    rf"(\d+(?:\.\d+)?(?:\s*%)?)(?![\d.])"
+    rf"(\d+(?:\.\d+)?(?:\s*%)?)(?!\d|\.\d)"
 )
 # Denominators a reader says as a fraction; 24/7, 16/9 and a bare M/D date keep their
 # literal reading rather than inventing "twenty fifths".
@@ -594,16 +651,20 @@ _RE_FRACTION = re.compile(r"(?<![\d./])(\d{1,2})/(\d{1,2})(?![\d/])")
 
 def _ranges(text: str, lang: str) -> str:
     """Give a quantity range its connective, unit-anchored exactly as the sequence pass
-    is: with nothing behind it a hyphen run is as often an id."""
+    is: with nothing behind it a hyphen run is as often an id. A "%" on either end
+    counts; zh repeats it on the low end (百分之五到百分之十), en says it once."""
     unit = _RE_ZH_UNIT if lang == "zh" else _RE_EN_UNIT
     to = "到" if lang == "zh" else " to "
 
     def connect(m: re.Match[str]) -> str:
         lo, hi = m.group(1), m.group(2)
-        if not (lo.endswith("%") or unit.match(text[m.end():m.end() + _CTX_RIGHT])):
+        percent = lo.endswith("%") or hi.endswith("%")
+        if not (percent or unit.match(text[m.end():m.end() + _CTX_RIGHT])):
             return m.group()
         if lo.isdigit() and len(lo) == 4 and hi.isdigit() and len(hi) <= 2:
             return m.group()  # "2026-8月": a date shape the date pass did not claim
+        if percent and lang == "zh" and not lo.endswith("%"):
+            lo += "%"
         return f"{lo}{to}{hi}"
 
     return _RE_RANGE.sub(connect, text)
@@ -625,22 +686,29 @@ def _fractions(text: str, lang: str) -> str:
 
 def _en_triggered(left: str) -> bool:
     """Whole-token match over the last four words: as a substring, "phone" would make
-    every iPhone a phone number."""
+    every iPhone a phone number. The words after the LAST trigger can disarm it."""
     tail = [t.lower() for t in _RE_WORD.findall(left)[-4:]]
-    return bool(_EN_TRIGGERS.intersection(tail)) or any(
-        phrase in " ".join(tail) for phrase in _EN_TRIGGER_PHRASES
-    )
+    last = max((i for i, t in enumerate(tail) if t in _EN_TRIGGERS), default=-1)
+    if last < 0:
+        return False
+    after = tail[last + 1:]
+    if not _EN_TRIGGER_MODIFIERS.isdisjoint(after) or "of" in after[:-1]:
+        return False
+    return not after or after[-1] not in _EN_POSSESSIVE_VERBS
 
 
 def _is_sequence(run: str, left: str, right: str, lang: str) -> bool:
     """Positive evidence only; the caller owns the unit guard."""
     if len(run) > 1 and run[0] == "0":  # also the espeak path's only leading-zero rule
         return True
-    if len(run) >= _SEQ_MIN_GLUE and (_RE_GLUE_L.search(left) or _RE_GLUE_R.match(right)):
+    glued = bool(_RE_GLUE_L.search(left) or _RE_GLUE_R.match(right))
+    if glued and len(run) >= _SEQ_MIN_GLUE:
         return True
     if lang == "zh" and _RE_ZH_TRIGGER.search(left):
         return True
-    if _en_triggered(left):  # triggers are additive: a zh sentence still says ISO or PIN
+    # Triggers are additive: a zh sentence still says ISO or PIN. The floor spares a
+    # bare short run only: glued, it is a fragment of a label ("tracking 1Z999").
+    if (glued or len(run) >= _SEQ_MIN_TRIGGER) and _en_triggered(left):
         return True
     return len(run) >= _SEQ_MIN_BARE
 
@@ -740,9 +808,11 @@ def space_digit_sequences(text: str, language: str | None = "en") -> str:
         # leading-zero rule shreds "12:00" and each "000" group of "1,000,000". A grouped
         # decimal goes whole ("1,234.56"), or the grouped pass strands ".56"; a plain
         # decimal ("3.14") stays engine-native.
-        text = _RE_TIME.sub(_time_words, text)
+        text = _sub_times(text)
+        text = _RE_GROUPED_ORDINAL.sub(_en_ordinal, text)
+        text = _RE_GROUPED_PLURAL.sub(_en_grouped_plural, text)
         text = _sub_padded(_RE_GROUPED_DECIMAL, text, _en_amount_words)
-        text = _RE_GROUPED.sub(lambda m: _int_words(int(m.group().replace(",", ""))), text)
+        text = _sub_padded(_RE_GROUPED, text, _en_amount_words)
     return _read_sequences(
         text, "en" if en else "", lambda run: " ".join(run), _en_year_split if en else None
     )

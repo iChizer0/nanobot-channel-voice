@@ -803,6 +803,34 @@ def test_resummon_during_the_playing_ack_lets_it_finish():
     _run(_case())
 
 
+def test_a_delivery_landing_inside_the_ack_owns_the_state():
+    """A proactive delivery whose first delta lands while the wake ack plays: the ack's
+    audio finishes ahead of it, but the STATE is the reply's (a _canned_base left IDLE
+    made a barge-in a flush-only kill, and the delivery's later deltas spoke on)."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["y" * 120]}),
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot")
+            await conv.wait_state(VoiceState.SPEAKING)  # the ack, ~0.7 s
+            assert b._canned_base is VoiceState.IDLE
+            sid = "voice:voice:local:1000000000000000000:0"
+            await b.on_delta("Reminder: time to stretch. Also drink some water now.", stream_id=sid)
+            assert b._canned_base is None  # the delivery took the state
+            await conv.wait_played_ms(800)  # the ack is over, the reminder sounds
+            await conv.user_says("actually use the other timer")
+            assert conv.interrupts == 1
+            assert b._is_rejected("voice:voice:local:1000000000000000000")
+            assert conv.texts() == ["actually use the other timer"]
+            await b.on_delta(" more of the reminder.", stream_id=sid)  # a straggler
+            assert b._tts_queue.empty()
+
+    _run(_case())
+
+
 def test_fast_ack_plays_unducked_through_the_summons_hangover():
     """The fast ack plays inside the summon utterance's trailing hangover: that
     stale in-speech must not duck (or, in pause mode, self-pause) it — while
@@ -840,6 +868,46 @@ def test_ack_skips_while_the_user_is_already_speaking():
             assert conv.counter("wake_ack") == 0
             assert conv.backend._turn is VoiceState.IDLE
             conv.backend._endpointer._in_speech = False
+
+    _run(_case())
+
+
+def test_a_clip_failing_before_its_flip_leaves_a_live_reply_alone():
+    """The owner's error handler restored ``base`` whenever the turn read SPEAKING at
+    the same epoch, without asking whether the CLIP made it so: an ack whose
+    synthesis raised while a real reply played mis-stated that reply as IDLE."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate", ack={"enabled": True})) as conv:
+            await _speaking_reply(conv)
+            b = conv.backend
+
+            async def boom(text, *, voice=None):
+                raise RuntimeError("tts down")
+
+            b._tts.synthesize_pcm = boom
+            await b._wake_ack(conv.sink.epoch)  # the arm sites task-wrap this call
+            assert b._turn is VoiceState.SPEAKING  # the reply still owns the state
+            assert conv.sink.epoch == b._sink.epoch
+
+    _run(_case())
+
+
+def test_a_clip_failing_after_its_flip_restores_its_base():
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, **_wake("gate", ack={"enabled": True}),
+        ) as conv:
+            b = conv.backend
+
+            async def boom():
+                raise RuntimeError("device gone")
+
+            conv.sink.drain_stream = boom  # fails once the clip took SPEAKING
+            b._arm_wake_ack()
+            await _until(lambda: b._ack_task is not None and b._ack_task.done())
+            assert b._turn is VoiceState.IDLE
+            assert b._canned_base is None
 
     _run(_case())
 
@@ -1081,7 +1149,8 @@ def test_resummon_during_thinking_without_canned_audio_is_silent_but_safe():
             await conv.user_says("hey nanobot what's the weather")
             await conv.user_says("hey nanobot")
             assert conv.interrupts == 0
-            assert conv.counter("wake_reassure") == 1
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_reassure") == 0  # nothing spoke: nothing counted
             assert VoiceState.SPEAKING not in conv.states  # nothing to say
             await conv.agent_replies("here is the weather")  # query survived
             await conv.wait_state(VoiceState.IDLE)
@@ -1128,6 +1197,151 @@ def test_resummon_during_playing_filler_lets_it_finish():
     _run(_case())
 
 
+def test_acoustic_hit_over_the_playing_filler_keeps_the_wait_alive():
+    """Hop-side hit with no utterance open while a THINKING-base clip plays: the clip IS
+    the reassure. Re-arming the prologue cancelled the playing clip's task: SPEAKING stood
+    unowned, and the next utterance /stop-ped the query it was meant to keep."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 0, "phrases": ["y" * 100]},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler, ~0.6 s
+            assert b._canned_base is VoiceState.THINKING
+            det.fire = True
+            await b.push_audio(_FRAME)  # the bare phrase; VAD saw nothing
+            assert b._canned_base is VoiceState.THINKING  # the clip plays on
+            assert conv.counter("wake_reassure") == 0
+            await conv.wait_state(VoiceState.THINKING)  # settled beneath it
+            assert conv.interrupts == 0
+            await conv.agent_replies("here is the weather")  # the query survived
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("thanks")
+            assert conv.interrupts == 0
+            assert conv.notes()[-1] == ()
+
+    _run(_case())
+
+
+def test_second_hit_over_the_playing_fast_ack_lets_it_finish():
+    """The acoustic twin of test_resummon_during_the_playing_ack_lets_it_finish: cancelling
+    the PLAYING ack's task left the audio unowned, SPEAKING never settled, and the summon's
+    verdict /stop-ped a turn that never existed."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i" * 200]}),
+        ) as conv:
+            b = conv.backend
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)
+            conv.vad.flag = False
+            await _push_frames(conv, 13)
+            await _until(lambda: conv.counter("wake_ack_fast") == 1, timeout=2.0)
+            await conv.wait_state(VoiceState.SPEAKING)
+            det.fire = True
+            await b.push_audio(_FRAME)  # the user repeats the phrase over the ack
+            assert b._canned_base is VoiceState.IDLE  # the ack plays on
+            await _close_utterance(conv)
+            assert conv.interrupts == 0
+            assert conv.counter("wake_ack") == 1
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("what time is it")
+            assert conv.texts() == ["what time is it"]
+            assert conv.notes() == [()]
+
+    _run(_case())
+
+
+def test_second_summon_closing_over_the_playing_ack_lets_it_finish():
+    """The at-close sibling: summon B closes while A's ack still plays and A's verdict has
+    wiped the stamp. Cancelling the playing ack there left SPEAKING unowned; B's verdict
+    then /stop-ped a turn that never existed and planted a false wake note."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1, vad={"hangoverMs": 200},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i" * 300]}),
+        ) as conv:
+            b = conv.backend
+            gate = asyncio.Event()
+            orig = b._transcribe
+
+            async def slow(pcm):
+                await gate.wait()
+                return await orig(pcm)
+
+            b._transcribe = slow
+            conv._stt.append("")  # A: the bare phrase
+            conv._stt.append("")  # B: the same
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)
+            conv.vad.flag = False
+            await _push_frames(conv, 12)  # A closes: its close ack starts
+            await _until(lambda: conv.counter("wake_ack_fast") == 1, timeout=3.0)
+            await conv.wait_state(VoiceState.SPEAKING)
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)  # B, over the ack
+            gate.set()  # A's verdict runs now and wipes the stamp
+            await _until(lambda: conv.counter("wake_only") == 1, timeout=3.0)
+            conv.vad.flag = False
+            await _push_frames(conv, 12)  # B closes -> _arm_close_ack(B)
+            await asyncio.sleep(0.05)
+            assert b._canned_base is VoiceState.IDLE  # A's ack plays on, still owned
+            await b._utt_queue.join()  # B's verdict
+            assert conv.interrupts == 0
+            assert b._pending_note is None
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("what time is it")
+            assert conv.texts() == ["what time is it"]
+            assert conv.notes() == [()]
+
+    _run(_case())
+
+
+def test_summon_during_the_attention_cue_flushes_it_and_acks():
+    """The close cue plays with the ack's IDLE base but is no answer to a summon: a hit
+    over it must flush the cue and ack (the cue's own docstring), not be read as "an
+    ack already plays" and leave the user with the close cue and silence."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1, earcons={"attention": True},
+            **_wake("gate", windowS=0.3, ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot what time is it")
+            await conv.agent_replies("It is noon.")
+            await conv.wait_state(VoiceState.IDLE)
+            await _until(lambda: conv.counter("earcon_attention") == 1)
+            await _until(
+                lambda: b._turn is VoiceState.SPEAKING and b._canned_base is VoiceState.IDLE
+            )
+            assert not b._ack_playing()  # the cue, not an ack
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)
+            conv.vad.flag = False
+            await _push_frames(conv, 13)
+            await _close_utterance(conv)
+            await _until(lambda: conv.counter("wake_ack") == 1, timeout=3.0)
+            await conv.wait_state(VoiceState.IDLE)
+            assert conv.counter("wake_only") == 1
+            assert conv.interrupts == 0
+
+    _run(_case())
+
+
 def test_half_duplex_tap_over_filler_keeps_the_query():
     async def _case():
         det = _ScriptDetector()
@@ -1144,6 +1358,33 @@ def test_half_duplex_tap_over_filler_keeps_the_query():
             assert conv.interrupts == 0
             assert conv.counter("wake_kill") == 0
             await conv.agent_replies("here is the weather")
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_half_duplex_tap_over_the_ack_counts_no_kill():
+    """A hit through the gated mic while the wake ACK plays flushes the ack (canned:
+    never a /stop), so wake_kill and wake_kill_ms count nothing."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, aec="auto", playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i" * 200]}),
+        ) as conv:
+            b = conv.backend
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)
+            await _close_utterance(conv)  # the at-close ack speaks
+            await conv.wait_state(VoiceState.SPEAKING)
+            assert b._canned_base is VoiceState.IDLE
+            det.fire = True
+            await b.push_gated_audio(_FRAME)  # the user repeats the phrase over it
+            assert conv.interrupts == 0
+            assert conv.counter("wake_kill") == 0
+            assert "wake_kill_ms" not in b._metrics.snapshot()["latency_ms"]
             await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())
@@ -1215,6 +1456,43 @@ def test_close_ack_catches_the_short_hangover_summon():
             await _until(lambda: conv.counter("wake_ack_fast") == 1)
             assert conv.counter("wake_only") == 1
             assert conv.counter("wake_ack") == 1
+
+    _run(_case())
+
+
+def test_an_earlier_queued_verdict_does_not_wipe_the_summons_ack_stamp():
+    """Slow STT, two utterances queued: a noise utterance ahead of a close-acked bare
+    summon. Only a claimed verdict resets _fast_acked_at, else the noise verdict wipes
+    the summon's stamp and the summon's own verdict acks AGAIN."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            vad={"hangoverMs": 100},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            b = conv.backend
+            gate = asyncio.Event()
+            orig = b._transcribe
+
+            async def slow(pcm):
+                await gate.wait()
+                return await orig(pcm)
+
+            b._transcribe = slow
+            await conv.user_noise(speech_frames=20, silence_frames=7)  # queued, decoding
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=8, det=det)  # the bare summon
+            conv.vad.flag = False
+            await _push_frames(conv, 7)  # closes: the at-close ack speaks now
+            await _until(lambda: conv.counter("wake_ack_fast") == 1)
+            await _until(lambda: b._canned_base is None)  # and finished
+            gate.set()
+            await b._utt_queue.join()
+            await asyncio.sleep(0.05)
+            assert conv.counter("wake_only") == 1
+            assert conv.counter("wake_ack") == 1  # no second ack for the same summon
 
     _run(_case())
 

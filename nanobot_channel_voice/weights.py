@@ -288,18 +288,49 @@ def disk_usage(d: Path) -> int:
     return total
 
 
+def relocation_target(key: str, root: Path | None = None) -> Path | None:
+    """Where a relocated (symlinked) leaf points, else None."""
+    d = store_dir(key, root or store_root())
+    return Path(os.readlink(d)) if d.is_symlink() else None
+
+
+def dangling(key: str, root: Path | None = None) -> bool:
+    """A relocated leaf whose target is gone: absent from ``installed()``, prunable.
+    False for anything but a full key (a prefix resolves against ``installed()``)."""
+    try:
+        d = store_dir(key, root or store_root())
+    except WeightsError:
+        return False
+    return d.is_symlink() and not d.exists()
+
+
 def prune(key: str, root: Path | None = None) -> int:
-    """Remove one fetched key from the store; returns the bytes freed."""
+    """Remove one fetched key from the store; returns the bytes freed (a relocated leaf
+    frees only its link)."""
     base = root or store_root()
     d = store_dir(key, base)
+    if d.is_symlink() and not d.exists():
+        d.unlink()  # a relocation whose target is gone (store unplugged, deleted)
+        return 0
     # manifest required: a bare ancestor dir would prune other keys' children
     if not (d / MANIFEST).is_file():
         raise WeightsError(f"'{key}' is not in the store ({base})")
-    freed = disk_usage(d)
-    shutil.rmtree(d)
-    # Remove every now-empty ancestor, never the store root, stopping at a sibling.
+    if d.is_symlink():
+        # A relocated leaf (installed() follows links): drop the link, never its target.
+        freed = d.lstat().st_size
+        d.unlink()
+    else:
+        freed = disk_usage(d)
+        shutil.rmtree(d)
+    # Remove every now-empty ancestor, never the store root, stopping at a sibling or at
+    # a symlink: that is the user's relocation of a subtree, not store scaffolding.
     parent = d.parent
-    while parent != base and parent.is_dir() and not any(parent.iterdir()):
+    while (
+        parent != base
+        and not parent.is_symlink()
+        and parent.is_dir()
+        and not any(parent.iterdir())
+    ):
         parent.rmdir()
         parent = parent.parent
     return freed

@@ -183,6 +183,79 @@ def test_prune_frees_and_drops_empty_parents(store, tmp_path):
         w.prune("stt/m/onnx")
 
 
+def test_prune_never_follows_a_relocation_symlink(store, tmp_path):
+    """installed() follows symlinks because users relocate subtrees that way; prune must
+    drop a symlinked LEAF as a link (never rmtree into the target) and stop at a
+    symlinked ANCESTOR (the user's relocation, not store scaffolding)."""
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("vad/silero/onnx", _entry_for(src))
+    leaf = store / "vad" / "silero" / "onnx"
+    target = tmp_path / "elsewhere"
+    leaf.rename(target)
+    leaf.symlink_to(target)
+    assert set(w.installed()) == {"vad/silero/onnx"}
+    link_size = leaf.lstat().st_size
+    assert w.relocation_target("vad/silero/onnx") == target
+    assert w.prune("vad/silero/onnx") == link_size  # the link's bytes, not the target's
+    assert not leaf.is_symlink() and not leaf.exists()
+    assert (target / w.MANIFEST).is_file()  # untouched
+    assert not (store / "vad").exists()     # the store's own scaffolding still goes
+    assert w.relocation_target("vad/silero/onnx") is None
+
+    w.fetch("tts/mms/eng/onnx", _entry_for(src))
+    ancestor = store / "tts"
+    big = tmp_path / "big-disk-tts"
+    ancestor.rename(big)
+    ancestor.symlink_to(big)
+    assert set(w.installed()) == {"tts/mms/eng/onnx"}
+    assert w.prune("tts/mms/eng/onnx") > 0
+    assert w.installed() == {}
+    assert ancestor.is_symlink() and big.is_dir() and not any(big.iterdir())
+
+
+def test_prune_drops_a_dangling_relocation_link(store, tmp_path, capsys):
+    """The relocated target is gone (USB store unplugged, deleted): the link itself is
+    the only thing left to prune, and "not in the store" would strand it."""
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("vad/silero/onnx", _entry_for(src))
+    leaf = store / "vad" / "silero" / "onnx"
+    target = tmp_path / "gone"
+    leaf.rename(target)
+    leaf.symlink_to(target)
+    import shutil
+
+    shutil.rmtree(target)
+    assert leaf.is_symlink() and not leaf.exists()
+    assert cli_main(["prune", "vad/silero/onnx", "--yes"]) == 0
+    assert "dangling link" in capsys.readouterr().out
+    assert not leaf.is_symlink()
+
+
+def test_cli_prune_names_where_a_relocated_key_still_lives(store, tmp_path, capsys):
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("vad/silero/onnx", _entry_for(src))
+    leaf = store / "vad" / "silero" / "onnx"
+    target = tmp_path / "elsewhere"
+    leaf.rename(target)
+    leaf.symlink_to(target)
+    assert cli_main(["prune", "vad/silero/onnx", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "unlinked vad/silero/onnx" in out and str(target) in out
+    assert (target / w.MANIFEST).is_file()
+
+
+def test_cli_reports_a_filesystem_failure_as_a_clean_error(store, tmp_path, monkeypatch, capsys):
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("vad/silero/onnx", _entry_for(src))
+
+    def locked(path, *a, **k):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(w.shutil, "rmtree", locked)
+    assert cli_main(["prune", "vad/silero/onnx", "--yes"]) == 2
+    assert "error: [Errno 13] Permission denied" in capsys.readouterr().err
+
+
 def test_disk_usage_counts_links_not_targets(store, tmp_path):
     src = _src(tmp_path, "encoder.onnx", b"x" * (1 << 20))
     d = w.fetch("stt/m/onnx", _entry_for(src))

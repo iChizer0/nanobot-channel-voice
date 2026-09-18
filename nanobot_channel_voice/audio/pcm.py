@@ -53,11 +53,11 @@ def pcm_rms(pcm: bytes) -> float:
 def quietest_split(pcm: bytes, rate: int, *, back_ms: float = 240.0, win_ms: float = 10.0) -> int:
     """Byte offset (even) of the END of the quietest ``win_ms`` window inside
     the trailing ``back_ms`` of ``pcm``; ties go to the LATEST window;
-    ``len(pcm)`` when no full window fits."""
+    the (even) length when no full window fits."""
     n = len(pcm) & ~1
     win_b = max(2, int(rate * win_ms / 1000.0) * 2)
     if n < win_b or rate <= 0:
-        return len(pcm)
+        return n
     lo = max(0, n - (int(rate * back_ms / 1000.0) * 2)) // win_b * win_b
     lo = min(lo, (n - win_b) // win_b * win_b)  # >=1 full window on the grid
     if _np is not None:

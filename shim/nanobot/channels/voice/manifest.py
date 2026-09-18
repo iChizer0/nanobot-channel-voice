@@ -82,9 +82,21 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
                 )
             )
     else:
-        # One slot, three states: env-fallback on non-OpenAI warns (start() WILL send that
-        # key and the provider rejects it), no key nudges, a real key is silent.
-        if not rt.api_key and cfg.backend != "openai" and resolve_openai_key(None):
+        # Mirrors start(): the OpenAI dialects share the OPENAI_API_KEY fallback, gemini
+        # reads the Google SDK variables and never OPENAI_API_KEY.
+        if cfg.backend == "gemini":
+            from nanobot_channel_voice.backend.gemini_live import resolve_gemini_key
+
+            resolve_key, env_var = resolve_gemini_key, "GEMINI_API_KEY or GOOGLE_API_KEY"
+        else:
+            resolve_key, env_var = resolve_openai_key, "OPENAI_API_KEY"
+        # One slot, three states: env-fallback on a non-OpenAI dialect warns (start() WILL
+        # send that key and the provider rejects it), no key nudges, a real key is silent.
+        if (
+            not rt.api_key
+            and cfg.backend not in ("openai", "gemini")
+            and resolve_openai_key(None)
+        ):
             checks.append(
                 check(
                     "realtime_key", "Realtime API key", "skipped",
@@ -93,12 +105,12 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
                     "realtime.apiKey.",
                 )
             )
-        elif not resolve_openai_key(rt.api_key):
+        elif not resolve_key(rt.api_key):
             # The env-export alternative is offered ONLY where that key would work.
             hint = (
-                "set realtime.apiKey (or export OPENAI_API_KEY in the gateway "
+                f"set realtime.apiKey (or export {env_var} in the gateway "
                 "environment) before starting."
-                if cfg.backend == "openai"
+                if cfg.backend in ("openai", "gemini")
                 else "set realtime.apiKey before starting."
             )
             checks.append(
@@ -130,8 +142,18 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
             WakeConfig,
         )
 
-        # Local-only blocks, default-compared, and the row NAMES them: with no form fields
-        # this is the only place a dead knob is visible.
+        # Blocks the cloud path DOES read (channel._build_gate / _start_stt_server): the
+        # gated uplink runs vad.* and, under uplink="wake", wake.*; stt.serve loads stt.*.
+        gated = rt.uplink != "server"
+        cloud_blocks = set()
+        if gated:
+            cloud_blocks.add("vad")
+            if rt.uplink == "wake":
+                cloud_blocks.add("wake")
+        if cfg.stt.serve.enabled:
+            cloud_blocks.add("stt")
+        # The rest is local-only, default-compared, and the row NAMES them: with no form
+        # fields this is the only place a dead knob is visible.
         unused = [
             name
             for name, value, default in (
@@ -145,10 +167,13 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
                 ("goal", cfg.goal, GoalConfig),
                 ("earcons", cfg.earcons, EarconsConfig),
             )
-            if value != default()
+            if name not in cloud_blocks and value != default()
         ] + (["context"] if cfg.context else [])
-        # bargeIn is only PARTLY local: the realtime backend reads its stop/ack phrases.
+        # bargeIn is only PARTLY local: the realtime backend reads its stop/ack phrases,
+        # the gate its suspicion-duck onset.
         _cloud_read = {"stop_phrases", "ack_phrases"}
+        if gated:
+            _cloud_read.add("duck_start_frames")
         if cfg.barge_in.model_dump(exclude=_cloud_read) != BargeInConfig().model_dump(
             exclude=_cloud_read
         ):

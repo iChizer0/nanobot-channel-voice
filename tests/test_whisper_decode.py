@@ -128,6 +128,45 @@ def test_decode_steps_scale_with_the_encoder_window():
     assert short._max_steps == w._MIN_DECODE_STEPS  # floor: a sentence still fits
 
 
+class _FixedEncoder:
+    def run(self, inputs):
+        return [np.zeros((1, 1000, 512), dtype=np.float32)]
+
+
+class _RowsDecoder:
+    """A decoder export emitting ``rows`` token rows: 12 is the reference contract,
+    1 a last-row-only export."""
+
+    def __init__(self, rows: int):
+        self._rows = rows
+
+    def run(self, inputs):
+        return [np.zeros((1, self._rows, _VOCAB_SIZE), dtype=np.float32)]
+
+
+def _validated(rows: int) -> w.WhisperOnDeviceStt:
+    adapter = w.WhisperOnDeviceStt(
+        encoder=_FixedEncoder(),
+        decoder=_RowsDecoder(rows),
+        vocab={50257: "<|endoftext|>"},
+        mel_filters=np.zeros((1, 1), dtype=np.float32),
+        lang_token=50259,
+        chunk_length=20,
+    )
+    adapter._validate()
+    return adapter
+
+
+def test_validate_pins_the_decoder_token_axis():
+    """Language ID reads ``out[0, 0]`` (the SOT row) and the next token ``out[0, -1]``:
+    a last-row-only export would silently argmax text logits as a language."""
+    import pytest
+
+    _validated(w.MAX_TOKENS)
+    with pytest.raises(RuntimeError, match=r"\[1, 12, vocab\]"):
+        _validated(1)
+
+
 def test_read_vocab_refuses_an_empty_table(tmp_path):
     """A flat file in the wrong shape (token-first, tabs) parsed to {} and every utterance
     decoded to "": a mute STT that looked healthy."""

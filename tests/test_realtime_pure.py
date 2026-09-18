@@ -169,6 +169,7 @@ def test_plain_turn_full_lifecycle():
 
     backend, events = drive([
         {"type": "session.created"},
+        {"type": "session.updated"},
         {"type": "input_audio_buffer.speech_started"},
         {"type": "input_audio_buffer.speech_stopped"},
         {"type": "response.created", "response": {"id": "r1"}},
@@ -989,6 +990,126 @@ def test_watchdog_recovers_a_capturing_wedge():
         timeouts = [e for e in events if isinstance(e, Error)]
         assert timeouts and not timeouts[0].fatal and "timed out" in timeouts[0].message
         assert hints(events)[-1] is VoiceState.IDLE
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_barge_in_on_an_unborn_continuation_kills_it_at_birth():
+    """Between the post-tool response.create and its response.created the active id still
+    names the finished trigger: an onset in that window must kill the continuation once
+    its id is known, or it plays over the user."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        backend, sent = make_sending_backend(sink)
+        events: list = []
+
+        async def on_event(e):  # what VoiceShell._cloud_barge_in does
+            events.append(e)
+            if isinstance(e, UserSpeechStarted):
+                await backend.barge_in(await sink.flush())
+
+        backend._on_event = on_event
+        await backend._handle_event({"type": "session.created"})
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.function_call_arguments.done",
+                                     "response_id": "r1", "call_id": "c1", "name": "t",
+                                     "arguments": "{}"})
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r1", "status": "completed"}})
+        await backend.submit_tool_result("c1", "ok")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert not any(p["type"] == "response.cancel" for p in sent)  # r1 is done
+        await backend._handle_event({"type": "response.created", "response": {"id": "r2"}})
+        assert sent[-1] == {"type": "response.cancel", "response_id": "r2"}
+        await backend._handle_event({"type": "response.output_audio.delta",
+                                     "response_id": "r2", "delta": b64(b"\x01")})
+        assert not any(isinstance(e, OutputAudio) for e in events)
+        assert hints(events)[-1] is VoiceState.CAPTURING
+        # The veto during the tool run itself is unchanged: the trigger is marked
+        # (server VAD auto-cancels; nothing to send) and its result resumes nothing.
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r2", "status": "cancelled"}})
+        await backend._handle_event({"type": "response.created", "response": {"id": "r3"}})
+        await backend._handle_event({"type": "response.function_call_arguments.done",
+                                     "response_id": "r3", "call_id": "c2", "name": "t",
+                                     "arguments": "{}"})
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r3", "status": "completed"}})
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert "r3" in backend._cancelled_responses and backend._kill_at_birth is False
+        await backend.submit_tool_result("c2", "late")
+        assert [p["type"] for p in sent[-2:]] == ["response.cancel", "conversation.item.create"]
+        assert backend._continuation_unborn is False  # no continuation asked for
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_rejected_hello_is_fatal_until_session_updated():
+    """A rejected session.update yields only an error event, and the session would run
+    on the server's defaults (no tools, its own audio format). The hello is the one
+    frame on the wire before session.updated, so an error there is its rejection."""
+
+    async def _run():
+        backend, events = make_backend()
+        backend._hello_payload()  # as _connect_and_run does right after connect
+        await backend._handle_event({"type": "session.created"})
+        await backend._handle_event({"type": "error", "error": {
+            "type": "invalid_request_error", "code": "invalid_value",
+            "message": "Invalid value: 'audio/pcm'"}})
+        errors = [e for e in events if isinstance(e, Error)]
+        assert len(errors) == 1 and errors[0].fatal
+        assert "session.update rejected" in errors[0].message
+        assert "Invalid value" in errors[0].message
+        await backend._handle_event({"type": "session.updated"})
+        await backend._handle_event({"type": "error", "error": {
+            "code": "server_error", "message": "later"}})
+        assert [e.fatal for e in events if isinstance(e, Error)] == [True, False]
+        # After a working session, a pre-ready error on a reconnect is a blip: the
+        # ladder owns it, never a fatal stop.
+        backend._ready.clear()
+        backend._hello_payload()
+        await backend._handle_event({"type": "error", "error": {
+            "code": "server_error", "message": "overloaded"}})
+        assert [e.fatal for e in events if isinstance(e, Error)] == [True, False, False]
+        assert "session.update rejected" in events[-1].message
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_ready_opens_on_session_updated_not_session_created():
+    """session.created precedes the hello's acceptance (it describes the server's
+    defaults); frames must wait for our session.update to be applied."""
+
+    async def _run():
+        backend, _ = make_backend()
+        await backend._handle_event({"type": "session.created"})
+        assert not backend._ready.is_set()
+        await backend._handle_event({"type": "session.updated"})
+        assert backend._ready.is_set()
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_hello_rejection_is_attributed_by_event_id():
+    """The hello carries an event_id; an error naming ANOTHER client event before
+    session.updated is not the hello's rejection (non-fatal), while an unattributed
+    one, or one naming the hello, is."""
+
+    async def _run():
+        backend, events = make_backend()
+        hello = backend._hello_payload()
+        assert hello["event_id"].startswith("hello-")
+        await backend._handle_event({"type": "error", "error": {
+            "code": "invalid_value", "message": "other", "event_id": "evt-other"}})
+        await backend._handle_event({"type": "error", "error": {
+            "code": "invalid_value", "message": "ours", "event_id": hello["event_id"]}})
+        assert [e.fatal for e in events if isinstance(e, Error)] == [False, True]
         await backend.close()
 
     asyncio.run(_run())

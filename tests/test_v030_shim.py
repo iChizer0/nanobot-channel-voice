@@ -233,6 +233,68 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     )
 
 
+def test_setup_validator_unused_row_follows_what_the_cloud_path_reads(monkeypatch):
+    """The gated uplink runs vad.* and, under uplink="wake", wake.*; stt.serve loads stt.*;
+    the gate reads bargeIn.duckStartFrames. This row is the paste box's only readout, so
+    it must not call a required block "not used"."""
+    from nanobot.channels.contracts import ChannelValidationContext
+
+    manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
+    ctx = ChannelValidationContext()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    cloud = {"backend": "openai"}
+    vad = {"engine": "silero", "silero": {"modelPath": "/x.onnx"}}
+    wake = {"mode": "gate", "phrases": ["hey"], "engine": "openwakeword"}
+
+    def unused(section):
+        row = _check_ids(manifest._validate(section, ctx)).get("local_unused")
+        return row["message"].split("(")[1].split(")")[0] if row else ""
+
+    assert unused({**cloud, "vad": vad}) == "vad"  # server uplink: local-only indeed
+    assert unused({**cloud, "realtime": {"uplink": "vad"}, "vad": vad}) == ""
+    # uplink="vad" drops the wake detector, so a configured wake.* IS dead there
+    assert unused({**cloud, "realtime": {"uplink": "vad"}, "vad": vad, "wake": wake}) == "wake"
+    assert unused({**cloud, "realtime": {"uplink": "wake"}, "vad": vad, "wake": wake}) == ""
+    # the rest of the local pipeline stays flagged under a gate
+    gated = {**cloud, "realtime": {"uplink": "vad"}, "vad": vad}
+    assert unused({**gated, "prologue": {"enabled": True}}) == "prologue"
+    assert unused({**gated, "bargeIn": {"duckStartFrames": 3}}) == ""
+    assert unused({**cloud, "bargeIn": {"duckStartFrames": 3}}) == "bargeIn"
+    assert unused({**cloud, "bargeIn": {"stopPhrases": ["halt"]}}) == ""  # cloud-read
+    # stt.serve borrows the on-device STT under a cloud backend
+    serve = {"provider": "whisper", "serve": {"enabled": True}}
+    assert unused({**cloud, "stt": serve}) == ""
+    assert unused({**cloud, "stt": {"provider": "whisper"}}) == "stt"
+
+
+def test_setup_validator_resolves_the_realtime_key_per_backend(monkeypatch):
+    """backend='gemini' reads GEMINI_API_KEY/GOOGLE_API_KEY and never OPENAI_API_KEY
+    (channel.py's start-time check), so its row must neither claim an OpenAI fallback
+    nor nudge when a Google key is exported."""
+    from nanobot.channels.contracts import ChannelValidationContext
+
+    manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
+    ctx = ChannelValidationContext()
+    for var in ("OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    row = _check_ids(manifest._validate({"backend": "gemini"}, ctx))["realtime_key"]
+    assert "GEMINI_API_KEY" in row["message"] and "GOOGLE_API_KEY" in row["message"]
+    assert "OPENAI_API_KEY" not in row["message"]
+    # an OpenAI key is no fallback for gemini: still the plain nudge, no "reject" warning
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    row = _check_ids(manifest._validate({"backend": "gemini"}, ctx))["realtime_key"]
+    assert "OPENAI_API_KEY" not in row["message"] and "reject" not in row["message"]
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.setenv(var, "g-key")
+        assert "realtime_key" not in _check_ids(manifest._validate({"backend": "gemini"}, ctx))
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    assert "realtime_key" not in _check_ids(
+        manifest._validate({"backend": "gemini", "realtime": {"apiKey": "k"}}, ctx)
+    )
+
+
 def test_setup_validator_lints_the_import_paste(monkeypatch):
     """The importJson box is write-only (secret-kind), so the Check button is the
     only pre-restart feedback: a good paste gets its own row saying what will

@@ -24,6 +24,7 @@ from loguru import logger
 from nanobot_channel_voice.aio import (
     Throttle,
     cancel_and_wait,
+    cancel_task,
     put_drop_oldest,
     wait_for_stall,
 )
@@ -60,21 +61,28 @@ def _load_connect():
     return connect
 
 
-def _auth_rejection(exc: BaseException) -> str | None:
-    """Why this transport failure is a credentials problem, or None. Two shapes: an HTTP
-    401/403 on the HANDSHAKE (OpenAI-dialect vendors; ``.response.status_code`` = modern
-    websockets InvalidStatus, ``.status_code`` = legacy), or a close AFTER it with a
-    policy/data code and an API-key reason (Gemini closes 1007 "API key not valid")."""
+class _SetupError(RuntimeError):
+    """Our own connect could not be prepared (a key, a URL, a tool schema): config, not
+    network — never walked up the reconnect ladder."""
+
+
+def _rejection(exc: BaseException) -> tuple[str, bool] | None:
+    """``(why, is_auth)`` when the provider REFUSED us rather than dropped us, else None:
+    an HTTP 4xx on the handshake (``.response.status_code`` = modern websockets,
+    ``.status_code`` = legacy; 429 is load, not refusal) or a 1007/1008 close after it
+    (Gemini: "API key not valid", a rejected setup). Retried, a refusal only burns the ladder."""
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if status is None:
         status = getattr(exc, "status_code", None)
     if status in (401, 403):
-        return f"HTTP {status}"
+        return f"HTTP {status}", True
+    if isinstance(status, int) and 400 <= status < 500 and status != 429:
+        return f"HTTP {status}", False
     close = getattr(exc, "rcvd", None)
     code = getattr(close, "code", None)
-    reason = str(getattr(close, "reason", "") or exc)
-    if code in (1007, 1008) and "api key" in reason.lower():
-        return f"close {code}: {reason.strip()}"
+    if code in (1007, 1008):
+        reason = str(getattr(close, "reason", "") or exc).strip()
+        return f"close {code}: {reason}", "api key" in reason.lower()
     return None
 
 
@@ -102,9 +110,6 @@ class RealtimeTransport(TurnEventMixin):
         # runs, and every barge-in is a client-side cancel.
         self._manual = config.realtime.uplink != "server"
         self._parked = False
-        # park() awaits across its teardown; an onset landing inside would resume into a
-        # half-torn socket and park's continuation would clobber the new rx task.
-        self._park_lock = asyncio.Lock()
         self._on_event: OnEvent | None = None
         self._instructions: str | None = None
         self._tools: list[ToolDef] = []
@@ -113,11 +118,14 @@ class RealtimeTransport(TurnEventMixin):
         self._ready = asyncio.Event()
         self._closing = False
         self._rx_task: asyncio.Task | None = None
+        # Parked rx tasks still closing their socket: swept at close().
+        self._orphan_rx: set[asyncio.Task] = set()
         self._sender_task: asyncio.Task | None = None
         self._drain_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._send_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_SEND_Q_MAX)
         self._warn_throttle = Throttle()
+        self._connected_at: float | None = None  # this socket's open, until its hello lands
         self._ever_ready = False
         self._auth_fails = 0
         self._progress_t = 0.0  # feeds the turn deadman
@@ -186,8 +194,18 @@ class RealtimeTransport(TurnEventMixin):
         # this drains due reference blocks). Loop-side: ~0.05 ms per 10 ms frame pair.
         if self._aec is not None:
             pcm = self._aec.process(pcm)
-        # Session-ready barrier: drop until the format/VAD config is applied.
+        # Session-ready barrier: drop until the format/VAD config is applied. Under the
+        # server uplink nothing else notices a hello that is never acknowledged.
         if self._closing or not self._ready.is_set():
+            if (
+                self._connected_at is not None
+                and time.monotonic() - self._connected_at > _RESUME_TIMEOUT_S
+                and self._warn_throttle.ready()
+            ):
+                self._log.warning(
+                    "realtime session not ready {:.0f}s after connect (no session.updated/"
+                    "setupComplete); mic frames are being dropped", _RESUME_TIMEOUT_S,
+                )
             return
         if put_drop_oldest(self._send_q, pcm) is not None:
             self._warn_backpressure()  # dropped a frame to stay near real time
@@ -201,7 +219,10 @@ class RealtimeTransport(TurnEventMixin):
         self._ready.clear()
         # cancel_and_wait re-raises the CALLER's cancellation; the sweep stays complete
         # because VoiceShell.stop shields _teardown, so nothing cancels close() from above.
-        for task in (self._drain_task, self._watchdog_task, self._sender_task, self._rx_task):
+        for task in (
+            self._drain_task, self._watchdog_task, self._sender_task, self._rx_task,
+            *self._orphan_rx,
+        ):
             await cancel_and_wait(task)
         self._drain_task = self._watchdog_task = self._sender_task = self._rx_task = None
         ws, self._ws = self._ws, None
@@ -243,37 +264,53 @@ class RealtimeTransport(TurnEventMixin):
             await self._set_turn(VoiceState.IDLE)
 
     async def park(self) -> None:
-        async with self._park_lock:
-            if self._parked or self._closing:
-                return
-            self._parked = True
-            await cancel_and_wait(self._rx_task)  # its finally already dropped _ws
-            self._rx_task = None
-            await self._on_session_lost()
+        if self._parked or self._closing:
+            return
+        self._parked = True
+        task, self._rx_task = self._rx_task, None
+        if task is not None:
+            cancel_task(task)  # before the bookkeeping: no event may land after the reset
+            self._orphan_rx.add(task)
+            task.add_done_callback(self._orphan_rx.discard)
+        await self._on_session_lost()
         self._metrics.count("park")
         self._log.info("realtime session parked (idle); reconnects on the next utterance")
+        # The close handshake (websockets' close_timeout) holds nothing up: an onset
+        # cancels this wait and resumes on a fresh socket while the old one finishes.
+        if task is not None:
+            await asyncio.wait({task})
 
     async def _resume(self) -> None:
-        async with self._park_lock:
-            if not self._parked:
-                return  # raced with another resume
-            t0 = time.monotonic()
-            self._parked = False
-            self._rx_task = asyncio.create_task(self._rx_loop())
-            await self._await_ready("resume")
-            self._metrics.observe("resume_latency_ms", (time.monotonic() - t0) * 1000.0)
+        if not self._parked:
+            return  # begin_activity's guard; a resume of a live loop would double it
+        t0 = time.monotonic()
+        self._parked = False
+        self._rx_task = asyncio.create_task(self._rx_loop())
+        await self._await_ready("resume")
+        self._metrics.observe("resume_latency_ms", (time.monotonic() - t0) * 1000.0)
 
     async def _await_ready(self, what: str) -> None:
-        """Bounded wait for the session hello; past the budget the gate drops the
-        utterance rather than blocking capture behind a dead network."""
+        """Bounded wait for the session hello; past the budget, or once the rx loop gave
+        up (ladder exhausted), the gate drops the utterance rather than blocking capture
+        behind a dead network."""
         if self._ready.is_set():
             return
+        ready = asyncio.ensure_future(self._ready.wait())
+        rx = self._rx_task
         try:
-            await asyncio.wait_for(self._ready.wait(), _RESUME_TIMEOUT_S)
-        except TimeoutError:
-            raise RuntimeError(
-                f"realtime session did not {what} within {_RESUME_TIMEOUT_S:.0f}s"
-            ) from None
+            await asyncio.wait(
+                {ready, rx} if rx is not None else {ready}, timeout=_RESUME_TIMEOUT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready.cancel()
+        if self._ready.is_set():
+            return
+        why = (
+            "reconnect gave up" if rx is not None and rx.done()
+            else f"no session within {_RESUME_TIMEOUT_S:.0f}s"
+        )
+        raise RuntimeError(f"realtime session did not {what}: {why}")
 
     async def _flush_uplink(self) -> None:
         """Wait for every queued mic frame to reach the socket, bounded: a dead sender
@@ -315,6 +352,7 @@ class RealtimeTransport(TurnEventMixin):
 
     async def _rx_loop(self) -> None:
         attempt = 0
+        me = asyncio.current_task()
         while not self._closing and not self._parked:
             started = time.monotonic()
             try:
@@ -323,23 +361,31 @@ class RealtimeTransport(TurnEventMixin):
                 # cap, Gemini's goAway); still a disconnect: same teardown + backoff.
             except asyncio.CancelledError:
                 raise
+            except _SetupError as exc:
+                await self._emit(Error(message=str(exc), fatal=True))
+                break
             except Exception as exc:  # noqa: BLE001 - reconnect on any transport failure
-                if self._closing:
-                    break
-                # A credentials rejection is not a blip: fatal at once if the key NEVER
-                # worked, else one ladder retry (proxy blip, key rotation).
-                rejected = _auth_rejection(exc)
+                if self._closing or self._rx_task is not me:
+                    break  # closing, or a resumed session overtook this loop (orphan)
+                # A refusal is not a blip: fatal at once if the session NEVER worked (a
+                # config error), else one ladder retry (proxy blip, key rotation).
+                rejected = _rejection(exc)
                 if rejected is not None:
+                    why, is_auth = rejected
                     self._auth_fails += 1
                     if not self._ever_ready or self._auth_fails >= 2:
+                        hint = (
+                            "check the realtime.apiKey for this provider" if is_auth
+                            else "check realtime.model/baseUrl and the tool schemas"
+                        )
                         await self._emit(Error(
-                            message=f"realtime auth rejected ({rejected}): check the "
-                                    "realtime.apiKey for this provider",
+                            message=f"realtime {'auth ' if is_auth else ''}rejected "
+                                    f"({why}): {hint}",
                             fatal=True,
                         ))
                         break
                 await self._emit(Error(message=f"realtime disconnected: {exc}", fatal=False))
-            if self._closing or self._parked:
+            if self._closing or self._parked or self._rx_task is not me:
                 break
             await self._on_session_lost()
             # Only back-to-back FAST failures walk the ladder to the fatal rung.
@@ -366,6 +412,7 @@ class RealtimeTransport(TurnEventMixin):
     async def _on_session_lost(self) -> None:
         """Teardown shared by every way a session can end, clean or not."""
         self._ready.clear()
+        self._connected_at = None  # the ladder's own log covers the gap to the next hello
         # A surviving watchdog would fire, with real side effects, into the next session.
         self._cancel_watchdog()
         self._cancel_drain()
@@ -383,11 +430,16 @@ class RealtimeTransport(TurnEventMixin):
 
     async def _connect_and_run(self) -> None:
         connect = _load_connect()
-        url, headers = self._connect_args()
+        try:
+            url, headers = self._connect_args()
+            hello = self._hello_payload()
+        except Exception as exc:
+            raise _SetupError(f"realtime connect could not be prepared: {exc}") from exc
         async with connect(url, additional_headers=headers) as ws:
             try:
                 self._ws = ws
-                await self._send(self._hello_payload())
+                self._connected_at = time.monotonic()
+                await self._send(hello)
                 async for raw in ws:
                     if self._closing:
                         break
@@ -407,8 +459,10 @@ class RealtimeTransport(TurnEventMixin):
                         self._log.exception("event handler failed for {}", self._event_name(evt))
             finally:
                 # _ws must not outlive the socket: submit_tool_result must see None and
-                # drop the frame, not raise and skip its bookkeeping.
-                self._ws = None
+                # drop the frame, not raise and skip its bookkeeping. Own socket only: a
+                # park cancelled mid-handshake lets a resumed session overtake this one.
+                if self._ws is ws:
+                    self._ws = None
 
     @staticmethod
     def _event_name(evt: dict) -> str:

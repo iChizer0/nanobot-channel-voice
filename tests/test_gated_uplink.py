@@ -7,6 +7,7 @@ backend records the call sequence and plays the adapter's state hints back.
 from __future__ import annotations
 
 import asyncio
+import math
 
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
@@ -371,6 +372,10 @@ def test_sentence_attention_is_spent_unless_the_reply_asks():
 
 
 def test_own_reply_saying_the_phrase_vetoes_the_hit():
+    """OpenAI-family transcript deltas are token sized: the phrase never sits inside
+    one, so the veto must read across delta boundaries — and stamp once per mention,
+    not again on every delta that follows it."""
+
     async def _run():
         gate, inner, _, on_event = build(
             "wake", vad=ScriptVad([False] * 3), detector=ScriptWake({2}),
@@ -378,10 +383,20 @@ def test_own_reply_saying_the_phrase_vetoes_the_hit():
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
         await inner.emit(StateHint(VoiceState.SPEAKING))
-        await inner.emit(OutputTranscript("Just say hey nanobot and I'm here."))
+        for delta in ("Just say hey", " nano", "bot and"):
+            await inner.emit(OutputTranscript(delta))
+        stamp = gate._phrase_echo_until
+        assert stamp > 0.0
+        await inner.emit(OutputTranscript(" I'm here."))
+        assert gate._phrase_echo_until == stamp
         await feed(gate, 3)
         assert inner.kinds() == []
         assert gate._metrics.snapshot()["counters"]["wake_echo_suppressed"] == 1
+        # A SECOND mention inside the tail window is its own echo: stamped again, or
+        # the phrase spoken ten seconds later summons the bot on its own reply.
+        await asyncio.sleep(0.01)
+        await inner.emit(OutputTranscript(" Any time, say hey nanobot again."))
+        assert gate._phrase_echo_until > stamp
         await gate.close()
 
     asyncio.run(_run())
@@ -536,7 +551,7 @@ def test_session_lost_under_an_open_activity_drops_it():
     asyncio.run(_run())
 
 
-def test_reply_text_resets_when_a_reply_starts_without_thinking():
+def test_reply_tail_resets_when_a_reply_starts_without_thinking():
     async def _run():
         gate, inner, _, on_event = build(vad=ScriptVad([]))
         await gate.start(instructions=None, tools=[], on_event=on_event)
@@ -545,7 +560,56 @@ def test_reply_text_resets_when_a_reply_starts_without_thinking():
         await inner.emit(StateHint(VoiceState.IDLE))
         await inner.emit(StateHint(VoiceState.SPEAKING))  # Gemini server VAD: no THINKING
         await inner.emit(OutputTranscript("two"))
-        assert gate._reply_text == ["two"]
+        assert gate._reply_tail == "two"
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_failed_begin_re_arms_the_park_timer():
+    """The onset cancelled the idle timer; a begin that fails (resume budget expired)
+    must not leave the socket up until the next successful turn."""
+
+    async def _run():
+        config = VoiceConfig(realtime={"uplink": "vad", "idleParkS": 0.05}, vad=VAD_CFG)
+        inner = FakeInner()
+        vad = ScriptVad([True] * 3 + [False] * 6)
+        gate = GatedUplink(
+            inner, config=config, sink=AudioSink(NullPlayback(), mode="stream"), vad=vad,
+            capture_rate=RATE, uplink_rate=RATE, open_mic=False,
+        )
+        await gate.start(instructions=None, tools=[], on_event=_recorder())
+        await asyncio.sleep(0.1)
+        assert inner.calls == [("park",)]
+        inner.calls.clear()
+        inner.fail_begin = True
+        await feed(gate, 9)  # onset (fails) ... close
+        assert gate._metrics.snapshot()["counters"]["gate_activity_failed"] == 1
+        await asyncio.sleep(0.1)
+        assert inner.calls == [("park",)]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_hit_under_an_open_activity_keeps_the_engaged_window():
+    """"hey nanobot ... hey nanobot" mid-upload: the turn owns attention until IDLE, so
+    a reply longer than windowS still takes barge-in onsets."""
+
+    async def _run():
+        vad = ScriptVad([True] * 8 + [False] * 6)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await inner.emit(StateHint(VoiceState.IDLE))  # window open (conversation)
+        await feed(gate, 3)  # onset inside the window: engaged
+        assert gate._active and gate._window_until == math.inf
+        await feed(gate, 3, start=3)  # frame 5 carries a hit while _active
+        assert gate._active and gate._window_until == math.inf
+        assert gate._metrics.snapshot()["counters"]["wake_hit"] == 1
         await gate.close()
 
     asyncio.run(_run())

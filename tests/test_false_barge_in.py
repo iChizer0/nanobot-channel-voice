@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+from eval_harness import EvalConversation
+
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import VoiceState
@@ -84,6 +86,93 @@ def test_endpointer_exposes_silence_and_active_runs():
     assert ep.in_speech
     assert ep.active_ms == 120     # 6 speech frames
     assert ep.silence_run_ms == 60  # 3 trailing silence frames
+
+
+# ---- suspicion -> confirmed ------------------------------------------------
+
+_LONG_REPLY = "Once upon a time there was a very long story that keeps going and going " * 3
+
+
+def test_suspect_candidate_graduates_at_the_confirmed_onset():
+    """duckStartFrames (2) < startFrames (5): the suspicion engage precedes the onset and
+    must graduate there, or the close frame releases it as a dead suspicion before the
+    verdict (the reply resumed for the whole STT window, then died)."""
+
+    async def _case(mode: str):
+        async with EvalConversation(
+            bargeIn={"mode": mode, "minWords": 2, "ackPhrases": ["ok"],
+                     "stopPhrases": ["stop"], "heardMarker": True},
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("tell me a story")
+            await conv.agent_replies(_LONG_REPLY)
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(30)
+            gate = asyncio.Event()
+
+            async def slow(pcm):
+                await gate.wait()
+                return "actually use tokyo instead"
+
+            b._transcribe = slow
+            conv.vad.flag = True
+            for _ in range(25):
+                await b.push_audio(_FRAME)
+            assert b._duck_onset is not None and not b._duck_suspect  # graduated
+            conv.vad.flag = False
+            for _ in range(32):  # through the hangover close; the verdict now waits on STT
+                await b.push_audio(_FRAME)
+            assert b._duck_onset is not None  # held for the verdict
+            if mode == "pause":
+                assert conv.sink.paused
+            else:
+                assert conv.sink._gain_target < 1.0
+            assert conv.counter("barge_in_false_resume.suspect") == 0
+            gate.set()
+            await b._utt_queue.join()
+            assert conv.interrupts == 1
+            assert conv.texts()[-1] == "actually use tokyo instead"
+
+    for mode in ("pause", "duck"):
+        _run(_case(mode))
+
+
+def test_a_failed_verdict_releases_the_candidate():
+    """STT raising on a confirmed candidate: the worker's error path settled the turn
+    state but never released the pause, so playback stayed frozen (the drain watcher
+    waits on the gate) until some later verdict happened to clear it."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            bargeIn={"mode": "pause", "minWords": 2, "ackPhrases": ["ok"],
+                     "stopPhrases": ["stop"], "heardMarker": True},
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("tell me a story")
+            await conv.agent_replies(_LONG_REPLY)
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(30)
+
+            async def boom(pcm):
+                raise RuntimeError("stt backend down")
+
+            b._transcribe = boom
+            conv.vad.flag = True
+            for _ in range(25):
+                await b.push_audio(_FRAME)
+            assert conv.sink.paused
+            conv.vad.flag = False
+            for _ in range(32):
+                await b.push_audio(_FRAME)
+            await b._utt_queue.join()
+            assert b._duck_onset is None
+            assert not conv.sink.paused
+            assert conv.counter("barge_in_false_resume.error") == 1
+            assert conv.interrupts == 0  # an error never kills the reply
+            await conv.wait_state(VoiceState.IDLE)  # which drains on its own
+
+    _run(_case())
 
 
 # ---- the pause-probe --------------------------------------------------------

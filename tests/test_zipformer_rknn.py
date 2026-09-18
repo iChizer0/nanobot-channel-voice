@@ -40,8 +40,10 @@ class FakeModel:
     def __init__(self, path: str):
         self.path = path
         self.calls: list[list[str]] = []
+        self.contexts: list[list[int]] = []  # the decoder's y rows, in call order
         self.released = False
         self.joiner_script: list[int] = []  # tokens for successive calls, then blanks
+        self.fault: Exception | None = None  # raised by every run() once set
 
     def __enter__(self):
         return self
@@ -61,6 +63,8 @@ class FakeModel:
 
     def run(self, inputs):
         self.calls.append([n for n, _ in inputs])
+        if self.fault is not None:
+            raise self.fault
         if self.path.endswith("encoder.rknn"):
             return [
                 np.zeros((1, 2, _DIM), dtype=np.float32),  # 2 output frames per chunk
@@ -68,6 +72,7 @@ class FakeModel:
                 np.ones((1, _DIM, 4, 1), dtype=np.float32),  # new_cached_key_0, NCHW
             ]
         if self.path.endswith("decoder.rknn"):
+            self.contexts.append(np.asarray(inputs[0][1])[0].tolist())
             return [np.zeros((1, _DIM), dtype=np.float32)]
         tok = self.joiner_script.pop(0) if self.joiner_script else 0
         logit = np.full((1, _VOCAB), -10.0, dtype=np.float32)
@@ -100,7 +105,6 @@ def sidecar(tmp_path):
         "T": 39,
         "decode_chunk_len": 32,
         "context_size": 2,
-        "vocab_size": _VOCAB,
     }
     (tmp_path / "meta.json").write_text(json.dumps(meta))
     (tmp_path / "tokens.txt").write_text("<blk> 0\n▁x 7\n▁y 9\n")
@@ -162,6 +166,81 @@ def test_text_decodes_through_the_rknn_path(fakes, sidecar):
     text = s.finish()
     assert text == "x y"  # the joiner script, ▁ -> space
     adapter.release()
+
+
+def test_decoder_context_seeds_like_sherpa_and_slides_per_token(fakes, sidecar):
+    """Regression: the start-of-utterance context was [blank, blank]; sherpa-onnx feeds
+    [-1, blank], which the clamp-free export's Gather wraps to the LAST vocab row (measured
+    on the real export: a different first word). Fed as the explicit id, not -1."""
+    adapter = ZipformerOnDeviceStt.from_config(_cfg(sidecar))
+    dec = fakes[str(sidecar / "decoder.rknn")]
+    fakes[str(sidecar / "joiner.rknn")].joiner_script = [7, 0, 9]
+    n = len(dec.contexts)
+    s = adapter.stream_start()
+    s.accept(_one_second())
+    assert dec.contexts[n:] == [[_VOCAB - 1, 0], [0, 7], [7, 9]]
+    assert s.finish() == "x y"
+    adapter.release()
+
+
+def test_a_decoder_dead_at_the_load_probe_raises_clearly(fakes, sidecar, monkeypatch):
+    """The seed decoder run sits inside the stream latch; at the probe that latch must
+    surface as the load error, not as the joiner choking on a None decoder_out."""
+
+    def factory(path, **kw):
+        model = FakeModel(path)
+        if path.endswith("decoder.rknn"):
+            model.fault = RuntimeError("decoder init failed")
+        fakes[path] = model
+        return model
+
+    monkeypatch.setattr(zf_mod, "OnDeviceModel", factory)
+    with pytest.raises(RuntimeError, match="load probe.*decoder init failed"):
+        ZipformerOnDeviceStt.from_config(_cfg(sidecar))
+    assert all(m.released for m in fakes.values())  # the ExitStack freed the trio
+
+
+def test_stream_fault_latches_once_and_finish_raises(fakes, sidecar):
+    """accept() was the one per-frame hop component not swallowing a runtime fault: a dead
+    NPU context logged 50 warnings/s while the endpointer built an utterance the stream
+    never saw, then finish() decoded the truncated stream as whole. Now one throttled
+    warning, silent frames, and finish() raises so the backend decodes fresh."""
+    from loguru import logger as loguru_logger
+
+    adapter = ZipformerOnDeviceStt.from_config(_cfg(sidecar))
+    enc = fakes[str(sidecar / "encoder.rknn")]
+    warnings: list[str] = []
+    sink = loguru_logger.add(lambda m: warnings.append(str(m)), level="WARNING")
+    try:
+        s = adapter.stream_start()
+        enc.fault = RuntimeError("npu context lost")
+        calls = len(enc.calls)
+        for _ in range(3):
+            s.accept(_one_second())  # never raises into the frame hop
+        assert len(enc.calls) == calls + 1  # one failing chunk; later frames are no-ops
+        assert s.partial() == ""
+        with pytest.raises(RuntimeError, match="npu context lost"):
+            s.finish()
+        assert [m for m in warnings if "npu context lost" in m] and len(warnings) == 1
+        # The seed decoder run at stream_start sits inside the same latch: a dead
+        # decoder must not raise into the onset frame's hop either.
+        dec = fakes[str(sidecar / "decoder.rknn")]
+        dec.fault = RuntimeError("decoder gone")
+        dead = adapter.stream_start()
+        dead.accept(_one_second())
+        assert dead.partial() == ""
+        with pytest.raises(RuntimeError, match="decoder gone"):
+            dead.finish()
+        dec.fault = None
+        # The latch is per stream: a fresh handle on a recovered engine decodes again.
+        enc.fault = None
+        fakes[str(sidecar / "joiner.rknn")].joiner_script = [7]
+        fresh = adapter.stream_start()
+        fresh.accept(_one_second())
+        assert fresh.finish() == "x"
+    finally:
+        loguru_logger.remove(sink)
+        adapter.release()
 
 
 def test_missing_meta_path_degrades_to_none(fakes, sidecar):

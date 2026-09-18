@@ -204,16 +204,24 @@ class WhisperOnDeviceStt(SttAdapter):
         x_mel = np.zeros((1, N_MELS, self._max_frames), dtype=np.float32)
         try:
             out_encoder = self._encoder.run([("x", x_mel)])[0]
-            self._decoder.run([
+            out = self._decoder.run([
                 ("tokens", np.asarray([self._window(self._lang_token)], dtype=np.int64)),
                 ("audio", out_encoder),
-            ])
+            ])[0]
         except Exception as exc:  # noqa: BLE001 - re-raise as a clear construction error
             raise RuntimeError(
                 f"whisper export rejected the expected inputs (encoder 'x'"
                 f"[1,{N_MELS},{self._max_frames}], decoder 'tokens'[1,{MAX_TOKENS}] "
                 f"+ 'audio'): {exc}"
             ) from exc
+        # _decode reads row 0 (language ID) and row -1 (next token): a last-row-only
+        # export would argmax text logits as a language.
+        shape = tuple(np.shape(out))
+        if len(shape) != 3 or shape[1] != MAX_TOKENS:
+            raise RuntimeError(
+                f"whisper decoder must emit logits for every window position "
+                f"([1, {MAX_TOKENS}, vocab]); this export emits {list(shape)}"
+            )
 
     def release(self) -> None:
         for model in (self._encoder, self._decoder):

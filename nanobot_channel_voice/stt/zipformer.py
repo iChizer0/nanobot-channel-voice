@@ -9,7 +9,7 @@ only the tail remains at the endpoint. Contract, verified against
   consumes T=39 frames and ADVANCES by decode_chunk_len=32 (7 frames of right context
   re-read).
 * stateless decoder ``y [N, context_size=2]`` int64 -> ``[N, 512]``; joiner
-  ``(encoder_out, decoder_out) -> logit``.
+  ``(encoder_out, decoder_out) -> logit``, whose width is the vocabulary.
 * ``tokens.txt`` is ``<token> <id>`` with ``<blk> 0``; BPE ``▁`` marks word starts.
 
 State plumbing is GENERIC (zero states from the encoder's declared inputs, each
@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 from loguru import logger
 
+from nanobot_channel_voice.aio import Throttle
 from nanobot_channel_voice.config import ZipformerSttConfig
 from nanobot_channel_voice.ondevice.runtime import OnDeviceModel, check_deterministic
 from nanobot_channel_voice.stt.base import (
@@ -50,13 +51,16 @@ _BLANK_ID = 0
 # Trailing zeros fed at finish so the last real audio clears the 7-frame lookahead and
 # fills a final full chunk.
 _FINISH_PAD_S = 0.66
+_FAIL_LOG_EVERY_S = 30.0  # throttle the stream-fault warning
 
 
 class _ZipformerStream(SttStream):
     """One utterance's decode state (fbank + encoder caches + hypothesis); every
     consumer builds its OWN handle per the :class:`SttStream` contract."""
 
-    __slots__ = ("_engine", "fbank", "consumed", "states", "hyp", "decoder_out")
+    __slots__ = (
+        "_engine", "fbank", "consumed", "states", "hyp", "context", "decoder_out", "failed",
+    )
 
     def __init__(self, engine: ZipformerOnDeviceStt):
         self._engine = engine
@@ -64,21 +68,52 @@ class _ZipformerStream(SttStream):
         self.consumed = 0  # fbank frames already fed to the encoder (chunk starts)
         self.states = engine._zero_states()
         self.hyp: list[int] = []
-        y = np.array([[_BLANK_ID] * engine._context], dtype=np.int64)
-        self.decoder_out = engine._decoder.run([("y", y)])[0]
+        # The decoder's sliding context, seeded as sherpa-onnx seeds it (the load
+        # probe runs before the seed is known: blanks, then).
+        seed = _BLANK_ID if engine._seed_id is None else engine._seed_id
+        self.context = [seed] * (engine._context - 1) + [_BLANK_ID]
+        self.failed: Exception | None = None
+        self.decoder_out = None
+
+        def seed() -> None:
+            self.decoder_out = engine._run_decoder(self.context)
+
+        self._guarded(seed)
+
+    def _guarded(self, step) -> None:
+        """A runtime fault latches: later steps are silent no-ops and ``finish`` raises
+        (the frame hop must not see 50 raises a second)."""
+        if self.failed is not None:
+            return
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001
+            self.failed = exc
+            if self._engine._fail_throttle.ready():
+                self._engine._log.warning(
+                    "zipformer stream failed: {}; its state is dropped and the utterance "
+                    "is decoded fresh at its close (throttled)", exc,
+                )
 
     def accept(self, pcm: bytes) -> None:
         """Frames must already be 16 kHz: the streaming path never resamples."""
-        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        self.fbank.accept_waveform(SAMPLE_RATE, samples)
-        self._engine._decode_ready(self)
+        def step() -> None:
+            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+            self.fbank.accept_waveform(SAMPLE_RATE, samples)
+            self._engine._decode_ready(self)
+
+        self._guarded(step)
 
     def partial(self) -> str:
         """Live hypothesis for the early-confirm gate: a token join, the decode
-        already ran in accept()."""
-        return self._engine._decode_text(self)
+        already ran in accept(); nothing once the stream has failed."""
+        return "" if self.failed is not None else self._engine._decode_text(self)
 
     def finish(self) -> str:
+        if self.failed is not None:
+            raise RuntimeError(
+                f"zipformer stream failed mid-utterance: {self.failed}"
+            ) from self.failed
         pad = np.zeros(int(_FINISH_PAD_S * SAMPLE_RATE), dtype=np.float32)
         self.fbank.accept_waveform(SAMPLE_RATE, pad)
         self.fbank.input_finished()
@@ -128,6 +163,10 @@ class ZipformerOnDeviceStt(SttAdapter):
         self._chunk_t = chunk_t
         self._chunk_shift = chunk_shift
         self._context = context_size
+        # sherpa-onnx opens the context with -1, which this clamp-free export's Gather
+        # wraps to the last vocab row: fed as that explicit id (RKNN may reject -1),
+        # sized from the joiner's logit at the probe (tokens.txt carries extra rows).
+        self._seed_id: int | None = None
         # Encoder state contract: from the model itself (ONNX) or the sidecar (RKNN).
         self._state_specs = state_specs or [
             (name, shape, typ) for name, shape, typ in encoder.input_specs() if name != "x"
@@ -149,9 +188,20 @@ class ZipformerOnDeviceStt(SttAdapter):
                 f"sidecar increment): {missing} -- meta.json/encoder mismatch"
             )
         self._log = logger.bind(component="stt-zipformer")
+        self._fail_throttle = Throttle(_FAIL_LOG_EVERY_S)
         # Contract probe + warmup: a stale export or meta.json mismatch raises HERE,
-        # not inside _transcribe_sync's blanket except.
-        self.stream_start().accept(bytes(2 * (25 + 10 * self._chunk_t) * (SAMPLE_RATE // 1000)))
+        # not inside accept()'s latch or _transcribe_sync's blanket except.
+        probe = self.stream_start()
+        if probe.failed is not None:
+            raise RuntimeError(
+                f"zipformer decoder failed at the load probe: {probe.failed}"
+            ) from probe.failed
+        probe.fbank.accept_waveform(
+            SAMPLE_RATE, np.zeros((25 + 10 * self._chunk_t) * (SAMPLE_RATE // 1000), np.float32)
+        )
+        self._decode_ready(probe)
+        if self._seed_id is None:
+            raise RuntimeError("zipformer probe decoded no frame: chunk geometry (T) is off")
         # A broken runtime corrupts the encoder silently: blank wins every frame and
         # every utterance transcribes to "".
         check_deterministic(
@@ -295,17 +345,20 @@ class ZipformerOnDeviceStt(SttAdapter):
         """Stateless-transducer greedy search: at most one symbol per frame, decoder
         re-run only when a symbol is emitted."""
         for t in range(encoder_out.shape[0]):
-            logit = self._joiner.run(
+            logit = np.asarray(self._joiner.run(
                 [("encoder_out", encoder_out[t : t + 1]), ("decoder_out", s.decoder_out)]
-            )[0]
-            tok = int(np.asarray(logit)[0].argmax())
+            )[0])
+            if self._seed_id is None:
+                self._seed_id = logit.shape[-1] - 1
+            tok = int(logit[0].argmax())
             if tok == _BLANK_ID:
                 continue
             s.hyp.append(tok)
-            y = np.array([s.hyp[-self._context :]], dtype=np.int64)
-            if y.shape[1] < self._context:  # pad early context with blanks
-                y = np.pad(y, ((0, 0), (self._context - y.shape[1], 0)))
-            s.decoder_out = self._decoder.run([("y", y)])[0]
+            s.context = s.context[1:] + [tok]
+            s.decoder_out = self._run_decoder(s.context)
+
+    def _run_decoder(self, context: list[int]) -> np.ndarray:
+        return self._decoder.run([("y", np.array([context], dtype=np.int64))])[0]
 
     def _decode_text(self, s: _ZipformerStream) -> str:
         pieces = [self._tokens.get(i, "") for i in s.hyp]

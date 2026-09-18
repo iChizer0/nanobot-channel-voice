@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from contextlib import suppress
 from typing import Any
@@ -331,6 +332,40 @@ class _DelegationCollector:
         return await self._future
 
 
+# One model load at a time, process-wide: a restart waits for the load it cancelled
+# (two model stacks resident at once exhaust the NPU / RAM).
+_LOAD_LOCK = threading.Lock()
+
+
+class _Load:
+    __slots__ = ("cancelled",)
+
+    def __init__(self) -> None:
+        self.cancelled = False
+
+
+def _run_load(load: _Load, fn, args: tuple):
+    with _LOAD_LOCK:
+        result = fn(*args)
+        if load.cancelled:  # start() gave up: nothing will own this
+            _release(result)
+            return None
+        return result
+
+
+def _release(result) -> None:
+    for item in result if isinstance(result, tuple) else (result,):
+        release = getattr(item, "release", None)
+        if callable(release):
+            with suppress(Exception):
+                release()
+
+
+def _release_late(fut: asyncio.Future) -> None:
+    if not fut.cancelled() and fut.exception() is None:
+        _release(fut.result())
+
+
 class VoiceChannel(BaseChannel):
     name = "voice"
     display_name = "Voice"
@@ -397,6 +432,8 @@ class VoiceChannel(BaseChannel):
                         "and removed importJson from config.json", imported,
                     )
         shell: VoiceShell | None = None
+        server = None
+        started = False
         try:
             kind = backend_kind(self.config.backend)
             if kind in ("openai_dialect", "gemini"):
@@ -406,64 +443,51 @@ class VoiceChannel(BaseChannel):
                 # Off the loop: a dozen ORT/RKNN session loads inline would freeze the
                 # gateway (every other channel, cron, the WebUI) for the whole build.
                 # Nothing here binds to a loop — Queue/Event bind lazily on first use.
-                self._stt = await asyncio.to_thread(make_stt, self.config.stt)
+                self._stt = await self._load(make_stt, self.config.stt)
                 self._warn_if_transcription_unconfigured()
-                shell, instructions, tools = await asyncio.to_thread(self._build_local)
+                shell, backend, tts, blocks = await self._load(self._build_local)
+                instructions, tools = "", []
+                if self._running:  # a cancelled start() must not register a dead bridge
+                    self._backend, self._tts_adapter, self._voice_context = backend, tts, blocks
+                    self._context_bridge = register_bridge(self.name, self.config.chat_id, blocks)
+                    self._announce_context()
             else:
                 # Refuse loudly: falling through to local would run the wrong brain.
                 raise RuntimeError(f"voice backend kind '{kind}' is not implemented")
             if not self._running:
-                self._backend = None
-                self._drop_bridge()
-                return  # stop() raced the build; nothing was started yet
+                return  # stop() raced the build
             self.logger.info(
                 "voice channel starting (backend={}, capture={}, playback={})",
                 self.config.backend,
                 self.config.audio.capture_device, self.config.audio.playback_device,
             )
             await shell.start(instructions=instructions, tools=tools)
-        except BaseException:
-            # Must not report healthy, leave a never-started backend registered (speak_final
-            # queues into a worker that never runs), or leave a half-started shell holding
-            # devices (shell.start's first await already spawned arecord).
-            self._running = False
-            self._backend = None
-            self._drop_bridge()
-            if shell is not None:
-                with suppress(Exception):
-                    await shell.stop()
-            raise
-        if not self._running:
-            # stop() landed mid-start, before _shell was published: tear it down here.
-            await shell.stop()
-            self._backend = None
-            self._drop_bridge()
-            return
-        self._shell = shell
-        try:
-            server = await self._start_stt_server()
-        except BaseException:
+            if not self._running:
+                return  # stop() landed mid-start, before _shell was published
+            self._shell = shell
             # A serve endpoint that cannot bind refuses loudly (WebUI dictation would be
             # silently broken) and takes the shell down.
-            self._running = False
-            self._shell = None
-            self._backend = None
-            self._drop_bridge()
-            with suppress(Exception):
-                await shell.stop()
-            raise
-        if not self._running:
-            # stop() raced the endpoint coming up: the handle is published only after the
-            # bind, so stop() saw None. THIS frame owns the listener.
-            if server is not None:
-                with suppress(Exception):
-                    await server.stop()
-            self._stt_server = None
-            self._shell = None
-            self._backend = None
-            self._drop_bridge()
-            await shell.stop()  # idempotent
-            return
+            server = await self._start_stt_server()
+            if not self._running:
+                return  # stop() raced the bind: the handle was not published yet
+            started = True
+        finally:
+            if not started:
+                # Raised or raced: a never-started backend must not stay registered (speak_final
+                # would queue into a worker that never runs), and a half-started shell holds
+                # devices (shell.start's first await already spawned arecord).
+                self._running = False
+                self._shell = None
+                self._stt_server = None
+                self._backend = None
+                self._drop_bridge()
+                if server is not None:
+                    with suppress(Exception):
+                        await server.stop()
+                if shell is not None:
+                    with suppress(Exception):
+                        await shell.stop()
+                self._release_stt()
         # Off the critical path: the first turn then pays no cold start (ORT/RKNN/TRT).
         self._warmup_task = asyncio.create_task(self._warmup())
         if self.config.debug.metrics_interval_s:
@@ -473,7 +497,9 @@ class VoiceChannel(BaseChannel):
         await self._stop_event.wait()
         self.logger.info("voice channel stopped")
 
-    def _build_local(self) -> tuple[VoiceShell, str, list]:
+    def _build_local(self) -> tuple[VoiceShell, LocalBackend, TtsAdapter | None, list]:
+        """Pure: the thread may outlive a cancelled start(), so it touches neither this
+        instance nor the global context bridge; start() publishes on the loop."""
         # The adapter's window, not config: a whisper export may override chunkLength.
         window = None if self._stt is None else self._stt.max_decode_ms
         if window is not None and self.config.vad.max_utterance_ms > window:
@@ -493,7 +519,6 @@ class VoiceChannel(BaseChannel):
             self.config.wake, self.config.audio.sample_rate, self.config.audio.frame_ms
         )
         tts = make_tts(self.config.tts)
-        self._tts_adapter = tts
         if tts is not None:
             # The engine that actually LOADED: a failed build degrades to the system voice
             # behind one warning, and sounds like mispronunciation rather than a swap.
@@ -506,22 +531,7 @@ class VoiceChannel(BaseChannel):
                 getattr(tts, "output_rate", None) or "wav",
                 "+".join(lang for lang in langs if lang) or "language unknown",
             )
-        self._voice_context = _voice_context_blocks(self._stt, tts, self.config.context)
-        self._context_bridge = register_bridge(
-            self.name, self.config.chat_id, self._voice_context
-        )
-        if tool_created():
-            # `context` is unbounded and the per-turn cost invisible: say it once.
-            self.logger.info(
-                "voice context: {} words ride every published utterance (voice_context tool)",
-                sum(len(block.content.split()) for block in self._voice_context),
-            )
-        else:
-            self.logger.warning(
-                "voice_context bridge tool is not registered with the agent loop "
-                "(nanobot.tools entry point not visible?): NO voice context reaches "
-                "the model; reinstall the plugin so the gateway sees its entry points"
-            )
+        blocks = _voice_context_blocks(self._stt, tts, self.config.context)
         # Raw-PCM TTS streams gaplessly through one persistent player (no per-chunk aplay
         # spawn); WAV-only adapters keep blob mode.
         pcm_capable = tts is not None and getattr(tts, "output_rate", None) is not None
@@ -563,7 +573,7 @@ class VoiceChannel(BaseChannel):
         # batch on-device adapters get it. Never the nanobot delegate: it may be a billed
         # cloud API, where a resumed speaker wastes one call per pause.
         streaming = self._stt is not None and getattr(self._stt, "streaming", False)
-        self._backend = LocalBackend(
+        backend = LocalBackend(
             self.config,
             vad=vad,
             tts=tts,
@@ -582,14 +592,28 @@ class VoiceChannel(BaseChannel):
             self.config,
             capture=capture,
             sink=audio_sink,
-            backend=self._backend,
+            backend=backend,
             open_mic=self.config.open_mic,
             on_fatal=self.stop,  # a dead shell must release the channel too
             # Shared, else the shell builds its own and re-logs the telemetry banner.
             metrics=self._metrics,
             tracer=self._tracer,
         )
-        return shell, "", []
+        return shell, backend, tts, blocks
+
+    def _announce_context(self) -> None:
+        if tool_created():
+            # `context` is unbounded and the per-turn cost invisible: say it once.
+            self.logger.info(
+                "voice context: {} words ride every published utterance (voice_context tool)",
+                sum(len(block.content.split()) for block in self._voice_context),
+            )
+        else:
+            self.logger.warning(
+                "voice_context bridge tool is not registered with the agent loop "
+                "(nanobot.tools entry point not visible?): NO voice context reaches "
+                "the model; reinstall the plugin so the gateway sees its entry points"
+            )
 
     async def _build_cloud(self, kind: str) -> tuple[VoiceShell, str, list]:
         rt = self.config.realtime
@@ -705,27 +729,30 @@ class VoiceChannel(BaseChannel):
         frame_ms = self.config.audio.frame_ms
         engines: list = []
         try:
-            vad = await asyncio.to_thread(make_vad, self.config.vad, capture_rate, frame_ms)
+            vad = await self._load(make_vad, self.config.vad, capture_rate, frame_ms)
             engines.append(vad)
             if isinstance(vad, EnergyVad):
                 raise RuntimeError(
                     f"realtime.uplink='{rt.uplink}' needs the {self.config.vad.engine} "
                     "VAD, which did not load (see the warning above)"
                 )
-            turn_analyzer = await asyncio.to_thread(
+            turn_analyzer = await self._load(
                 make_turn_analyzer, self.config.vad, capture_rate, frame_ms
             )
             engines.append(turn_analyzer)
-            wake_detector = await asyncio.to_thread(
-                make_wake_detector, self.config.wake, capture_rate, frame_ms
-            )
-            engines.append(wake_detector)
-            if rt.uplink == "wake" and wake_detector is None:
-                raise RuntimeError(
-                    "realtime.uplink='wake' needs the acoustic wake detector, which did "
-                    "not load (see the warning above); fix wake.openwakeword or use "
-                    "uplink='vad'"
+            # uplink="vad" never consults the detector (the gate drops it unreleased).
+            wake_detector = None
+            if rt.uplink == "wake":
+                wake_detector = await self._load(
+                    make_wake_detector, self.config.wake, capture_rate, frame_ms
                 )
+                engines.append(wake_detector)
+                if wake_detector is None:
+                    raise RuntimeError(
+                        "realtime.uplink='wake' needs the acoustic wake detector, which "
+                        "did not load (see the warning above); fix wake.openwakeword or "
+                        "use uplink='vad'"
+                    )
             return GatedUplink(
                 inner, config=self.config, sink=audio_sink, vad=vad,
                 turn_analyzer=turn_analyzer, wake_detector=wake_detector, aec=aec_stage,
@@ -864,7 +891,8 @@ class VoiceChannel(BaseChannel):
         if not cfg.enabled:
             return None
         if self._stt is None:
-            self._stt = make_stt(self.config.stt)  # cloud backend + serve: build ONCE here
+            # cloud backend + serve: build ONCE here, off the loop like the local load.
+            self._stt = await self._load(make_stt, self.config.stt)
         if self._stt is None:
             # Config validation rejects provider='nanobot', so None means the engine
             # degraded (make_stt logged why); a silently absent endpoint breaks dictation.
@@ -1022,13 +1050,30 @@ class VoiceChannel(BaseChannel):
             await self._shell.stop()
             self._shell = None
             self._backend = None
+        # Last, so no decode can be running against it. The backend freed TTS/VAD.
+        self._release_stt()
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    @staticmethod
+    async def _load(fn, *args):
+        """A model load off the loop. Core cancels the start task and a thread cannot be
+        interrupted: a cancelled load frees its result (in the thread, or via the callback
+        when it landed before the flag) instead of leaking a session past the restart."""
+        load = _Load()
+        fut = asyncio.get_running_loop().run_in_executor(None, _run_load, load, fn, args)
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            load.cancelled = True
+            fut.add_done_callback(_release_late)
+            raise
+
+    def _release_stt(self) -> None:
         if self._stt is not None:
-            # Last, so no decode can be running against it. The backend freed TTS/VAD.
             with suppress(Exception):
                 self._stt.release()
             self._stt = None
-        if self._stop_event is not None:
-            self._stop_event.set()
 
     # ---- input helpers ------------------------------------------------------
 

@@ -196,6 +196,77 @@ def test_unknown_keys_are_rejected_loudly():
     assert VadConfig.model_validate({"hangoverMs": 700}).hangover_ms == 700
 
 
+def test_core_progress_overrides_are_accepted_in_either_spelling():
+    """Core's ChannelManager reads sendProgress/sendToolHints/showReasoning off the raw
+    section (either spelling) as per-channel overrides; forbid must not reject them, and
+    an unset one stays None so the export never pins core's global default."""
+    for key in ("sendProgress", "send_progress", "sendToolHints", "showReasoning"):
+        VoiceConfig.model_validate({key: False})
+    assert VoiceConfig.model_validate({"sendProgress": True}).send_progress is True
+    unset = VoiceConfig()
+    assert (unset.send_progress, unset.send_tool_hints, unset.show_reasoning) == (None,) * 3
+    assert "sendProgress" not in unset.model_dump(by_alias=True, exclude_unset=True)
+
+
+def test_every_path_field_expands_the_user_directory():
+    """The loaders open ``*Path``/``*Dir`` values verbatim, so ``~`` is expanded at parse
+    time — on the shared base, so every path-holding field (walked here, not hand-listed)
+    is covered, including engine blocks and the bilingual matcha secondary."""
+    import os
+
+    from nanobot_channel_voice.config import (
+        DebugConfig,
+        EarconsConfig,
+        MatchaTtsConfig,
+        OpenWakeWordConfig,
+        _VoiceBase,
+    )
+
+    def walk(model, seen=frozenset()):
+        if model in seen:
+            return
+        seen = seen | {model}
+        yield model
+        for info in model.model_fields.values():
+            for nested in (info.annotation, *getattr(info.annotation, "__args__", ())):
+                if isinstance(nested, type) and hasattr(nested, "model_fields"):
+                    yield from walk(nested, seen)
+
+    path_fields = {
+        model: [n for n in model.model_fields if n.rsplit("_", 1)[-1] in ("path", "dir")]
+        for model in walk(VoiceConfig)
+    }
+    path_fields = {m: names for m, names in path_fields.items() if names}
+    assert sum(map(len, path_fields.values())) >= 40  # the walker sees the whole tree
+    for model, expected in (
+        (SileroVadConfig, ["model_path"]),
+        (OpenWakeWordConfig, ["mel_path", "mel_filters_path", "embedding_path", "model_path"]),
+        (EarconsConfig, ["path", "attention_path"]),
+        (DebugConfig, ["dump_dir"]),
+        (MatchaTtsConfig, ["acoustic_model_path", "lexicon_overrides_path", "espeak_data_dir"]),
+    ):
+        assert set(expected) <= set(path_fields[model]), model
+    extras = {EarconsConfig: {"captured": True, "attention": True}}
+    for model, names in path_fields.items():
+        assert issubclass(model, _VoiceBase), model  # the seam every one inherits
+        values = {n: f"~/{n}" for n in names} | extras.get(model, {})
+        if model is MatchaTtsConfig:  # acoustic XOR encoder/decoder: check it alone
+            assert model(acoustic_model_path="~/a").acoustic_model_path == os.path.expanduser("~/a")
+            values.pop("acoustic_model_path")
+        inst = model.model_validate(values)
+        for n in values:
+            if n in names:
+                assert getattr(inst, n) == os.path.expanduser(f"~/{n}"), (model, n)
+    # end to end, through the top-level section, and only leading ~ (a bare name stays)
+    cfg = VoiceConfig.model_validate({
+        "vad": {"silero": {"modelPath": "~/m/silero.onnx"}},
+        "tts": {"matcha": {"espeakPath": "espeak-ng", "secondary": {"tokensPath": "~/t.txt"}}},
+    })
+    assert cfg.vad.silero.model_path == os.path.expanduser("~/m/silero.onnx")
+    assert cfg.tts.matcha.secondary.tokens_path == os.path.expanduser("~/t.txt")
+    assert cfg.tts.matcha.espeak_path == "espeak-ng"
+
+
 def test_gemini_fields_parse():
     cfg = VoiceConfig.model_validate({
         "backend": "gemini",
@@ -372,6 +443,29 @@ def test_consume_import_json_expands_and_deletes(tmp_path):
     assert voice["enabled"] is True
     assert saved["providers"] == {"openai": {"apiKey": "k"}}  # rest of the file untouched
     assert consume_import_json(path) == 0  # idempotent: nothing pending anymore
+
+
+def test_import_paste_never_carries_enabled(tmp_path):
+    """`enabled` belongs to the WebUI toggle: a paste from a disabled section must neither
+    flip the channel off nor be written back by start(). allowFrom stays importable."""
+    import json
+
+    from nanobot_channel_voice.config import consume_import_json, parse_import_blob
+
+    paste = json.dumps({"enabled": False, "allowFrom": ["u1"], "vad": {"hangoverMs": 800}})
+    assert "enabled" not in parse_import_blob(paste)
+    cfg = VoiceConfig.model_validate({"enabled": True, "importJson": paste})
+    assert cfg.enabled is True
+    assert cfg.allow_from == ["u1"]
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"channels": {"voice": {"enabled": True, "importJson": paste}}}),
+        encoding="utf-8",
+    )
+    consume_import_json(path)
+    voice = json.loads(path.read_text(encoding="utf-8"))["channels"]["voice"]
+    assert voice["enabled"] is True
+    assert voice["allowFrom"] == ["u1"] and voice["vad"] == {"hangoverMs": 800}
 
 
 def test_consume_import_json_leaves_files_without_a_pending_paste(tmp_path):

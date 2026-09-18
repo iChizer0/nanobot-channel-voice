@@ -99,7 +99,12 @@ def floats_to_pcm(samples) -> bytes:
     """Clip a float32 waveform to [-1, 1] and quantise to raw S16_LE mono PCM."""
     import numpy as np  # lazy: this module must import without numpy
 
-    arr = np.clip(np.asarray(samples, dtype=np.float32).reshape(-1), -1.0, 1.0)
+    arr = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if np.isnan(arr).any():
+        # NaN survives np.clip into an undefined float->int16 cast (a full-scale click);
+        # +-inf clips on its own. Copied only when a NaN is present.
+        arr = np.nan_to_num(arr, nan=0.0)
+    arr = np.clip(arr, -1.0, 1.0)
     return (arr * 32767.0).astype("<i2").tobytes()
 
 

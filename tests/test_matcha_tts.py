@@ -193,14 +193,39 @@ def test_espeak_sentences_split_on_final_punctuation():
 def test_sentences_keep_a_closer_with_its_terminator():
     from nanobot_channel_voice.tts.matcha import _sentences
 
-    # A split before 」/" would strand the closer at the next piece's head;
-    # the split lands after the closer, keeping pieces semantically whole.
-    assert _sentences("他说「你好。」然后走了。") == [("他说「你好。」", ""), ("然后走了", "。")]
-    assert _sentences('他说"好。"继续。') == [('他说"好。"', ""), ("继续", "。")]
-    assert _sentences("他问「走吗？！」好。") == [("他问「走吗？！」", ""), ("好", "。")]
+    # A split before 」/" would strand the closer at the next piece's head; the split
+    # lands after the closer, and the closer itself goes (no frontend voices it) so
+    # the terminator is reported as the sentence's punctuation.
+    assert _sentences("他说「你好。」然后走了。") == [("他说「你好", "。"), ("然后走了", "。")]
+    assert _sentences('他说"好。"继续。') == [('他说"好', "。"), ("继续", "。")]
+    assert _sentences("他问「走吗？！」好。") == [("他问「走吗", "？！"), ("好", "。")]
     # A longer closer run fuses (never blips); plain sentences still split.
     assert _sentences("问「走。」）x。") == [("问「走。」）x", "。")]
     assert _sentences("你好。再见。") == [("你好", "。"), ("再见", "。")]
+    # An ASCII terminator behind a closing quote is a boundary too: unsplit, the "!"
+    # rode inside the clause text (espeak drops it) and the sentences merged.
+    assert _sentences("Hello!” Bye.") == [("Hello", "!"), ("Bye", ".")]
+    assert _sentences('He said "Hi!" Then left.') == [('He said "Hi', "!"), ("Then left", ".")]
+    assert _sentences('(sure.) Next.') == [("(sure", "."), ("Next", ".")]
+
+
+def test_espeak_sentences_keep_the_terminator_token_behind_a_closer():
+    fe, t = _en_frontend({"hello": "h", "world": "w"})
+    assert fe.sentences('hello!" world.') == [[t["h"], t["!"]], [t["w"], t["."]]]
+
+
+def test_floats_to_pcm_sanitises_non_finite_samples():
+    import warnings
+
+    from nanobot_channel_voice.tts.base import floats_to_pcm
+
+    # NaN passed np.clip into an undefined float->int16 cast: a full-scale click per
+    # sample on x86 (arm64 saturates to 0, but numpy still warns about the cast).
+    # NaN is silence, an infinity is full scale.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pcm = floats_to_pcm(np.array([np.nan, np.inf, -np.inf, 0.5], np.float32))
+    assert np.frombuffer(pcm, "<i2").tolist() == [0, 32767, -32767, 16383]
 
 
 def test_sentence_and_clause_splits_leave_numbers_intact():
@@ -575,7 +600,13 @@ def test_verbalize_numbers_zh_inside_cjk_text():
     # The sign survives only on temperatures — elsewhere a hyphen is a range or id —
     # and would otherwise drop as lexicon OOV, reading the temperature as positive.
     assert verbalize_numbers_zh("今天-3.5°C") == "今天零下三点五摄氏度"
-    assert verbalize_numbers_zh("20-30°C之间") == "二十-三十摄氏度之间"
+    # A degree mark is a unit, so the range keeps its 到: the lexicon dropped the "-"
+    # and 二十三十 was heard.
+    assert verbalize_numbers_zh("20-30°C之间") == "二十到三十摄氏度之间"
+    assert verbalize_numbers_zh("今天20-30℃") == "今天二十到三十摄氏度"
+    assert verbalize_numbers_zh("70-80℉") == "七十到八十华氏度"
+    assert verbalize_numbers_zh("20-30摄氏度") == "二十到三十摄氏度"  # written out is a unit too
+    assert verbalize_numbers_zh("70-80华氏度") == "七十到八十华氏度"
 
 
 def test_verbalize_numbers_zh():
@@ -644,12 +675,21 @@ def test_verbalize_numbers_zh_ranges_keep_a_connective():
     # numbers fuse and "5~10分钟" speaks as 五十分钟 -- fifty.
     assert verbalize_numbers_zh("大概需要10-15分钟") == "大概需要十到十五分钟"
     assert verbalize_numbers_zh("5~10分钟") == "五到十分钟"
+    # The math minus and the full-width hyphen too: a canned phrase skips sanitize(), and
+    # the lexicon dropped the unknown "−" (五−十分钟 -> 五十分钟, fifty).
+    assert verbalize_numbers_zh("5−10分钟") == "五到十分钟"
+    assert verbalize_numbers_zh("5－10分钟") == "五到十分钟"
     # …though in the real pipeline sanitize() has already folded that tilde to a hyphen.
     assert sanitize("5~10分钟") == "5-10分钟"
     assert sanitize("about ~5 degrees") == "about 5 degrees"  # not a range: still dropped
     assert verbalize_numbers_zh("3-5天") == "三到五天"
     assert verbalize_numbers_zh("第3-5章") == "第三到五章"
     assert verbalize_numbers_zh("电量50%-60%") == "电量百分之五十到百分之六十"
+    # A "%" on the high end alone: both ends are percentages (五-百分之十 was heard as
+    # 五百分之十, one in five hundred).
+    assert verbalize_numbers_zh("增长5-10%") == "增长百分之五到百分之十"
+    assert verbalize_numbers_zh("增长5-10%.") == "增长百分之五到百分之十."  # ASCII period behind the %
+    assert verbalize_numbers_zh("10-20 %") == "百分之十到百分之二十"
     assert verbalize_numbers_zh("重2.5-3.5公斤") == "重二点五到三点五公斤"
     assert verbalize_numbers_zh("从2020-2024年") == "从二零二零到二零二四年"
     # Unit-anchored, exactly as the sequence pass is: with nothing behind it a hyphen run
@@ -711,6 +751,34 @@ def test_verbalize_numbers_zh_sequences():
     # Ungrouped and long is an identifier: a quantity that size carries a counter.
     assert verbalize_numbers_zh("100000001") == "一零零零零零零零一"
     assert verbalize_numbers_zh("总额 10000000 元") == "总额 一千万 元"  # counter behind a space
+    # A grouped amount is explicit quantity notation: named as far as the units go,
+    # while a bare 13-digit run behind a counter keeps the id-territory reading.
+    assert verbalize_numbers_zh("10,000,000,000,000颗星") == "十万亿颗星"
+    assert verbalize_numbers_zh("10000000000000颗星") == "一零零零零零零零零零零零零零颗星"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # 两 before a measure word (PaddleSpeech TN convention), for a whole-run 2 only.
+        ("2个人", "两个人"), ("2天", "两天"), ("2小时", "两小时"), ("2岁", "两岁"),
+        ("2万", "两万"), ("2亿", "两亿"), ("2百", "两百"), ("2人", "两人"), ("2次", "两次"),
+        ("有2件事", "有两件事"), ("1-2个", "一到两个"),
+        # …and the clock hour, in either form.
+        ("2:30", "两点三十分"), ("2:00", "两点"), ("2:05", "两点零五分"), ("12:00", "十二点"),
+        ("2点半", "两点半"), ("12点", "十二点"), ("第2点", "第二点"),
+        # Not 两: dates, floors, minutes, ordinals, weekdays, and any longer run. A floor
+        # number (2层, like 2楼) and a grade (2年级) are ordinal; 2层楼 counts storeys.
+        ("2月", "二月"), ("2号", "二号"), ("2日", "二日"), ("2楼", "二楼"), ("3:02", "三点零二分"),
+        ("房间在2层", "房间在二层"), ("2层楼", "两层楼"), ("上2年级的孩子", "上二年级的孩子"),
+        ("2年", "两年"), ("2年后", "两年后"),
+        ("第2个", "第二个"), ("第2名", "第二名"), ("周2", "周二"), ("星期2", "星期二"),
+        ("12个", "十二个"), ("22个", "二十二个"), ("200元", "二百元"), ("2000", "二千"),
+        ("20000", "二万"), ("2.5倍", "二点五倍"), ("1.2个", "一点二个"), ("2", "二"),
+    ],
+)
+def test_verbalize_numbers_zh_liang_before_measure_words(text, expected):
+    assert verbalize_numbers_zh(text) == expected
 
 
 # ---- the espeak resolution ladder -------------------------------------------

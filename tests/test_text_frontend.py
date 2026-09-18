@@ -50,6 +50,7 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
         # ("five dash ten") and the char-vocab engines drop it, fusing the two numbers.
         ("it takes 10-15 minutes", "it takes ten to fifteen minutes"),
         ("3-5 days", "three to five days"),
+        ("5−10 minutes", "five to ten minutes"),  # U+2212: canned phrases skip sanitize()
         ("order 3-5", "order three-five"),               # no unit behind it: left alone
         ("about 1/2 cup", "about one half cup"),
         ("2/3 of users", "two thirds of users"),
@@ -112,14 +113,83 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
         # unambiguous; the digit lookbehind keeps "20-30°C" a range.
         ("it is -3.5°C now", "it is minus three point five degrees Celsius now"),
         ("−5℃ tonight", "minus five degrees Celsius tonight"),
-        ("between 20-30°C", "between twenty-thirty degrees Celsius"),
+        # A degree mark is a unit: the range gets its connective (espeak said "dash",
+        # the zh lexicon fused the ends), and the ℃/℉ spellings too.
+        ("between 20-30°C", "between twenty to thirty degrees Celsius"),
+        ("highs of 70-80°F", "highs of seventy to eighty degrees Fahrenheit"),
+        ("20-30℃ today", "twenty to thirty degrees Celsius today"),
+        ("20-30 °C", "twenty to thirty degrees Celsius"),
+        # A "%" on the HIGH end alone also marks a range; the low end need not repeat it.
+        ("5-10%", "five to ten percent"),
+        ("a 10-20% discount", "a ten to twenty percent discount"),
+        ("5-10 %", "five to ten percent"),
+        ("5%-10%", "five percent to ten percent"),
+        # Sentence-final: the high end's decimal guard sat AFTER its optional "%", so
+        # the match backtracked to a bare "10" and the range lost its connective.
+        ("Growth of 5-10%.", "Growth of five to ten percent."),
+        ("40-50%.", "forty to fifty percent."),
+        ("5-10 %.", "five to ten percent."),
+        ("5-10%...", "five to ten percent..."),
+        ("5-10.5%", "five to ten point five percent"),
+        # …while a sentence-final pair with no unit keeps its id/year reading.
+        ("call 555-1234.", "call five five five, one two three four."),
+        ("from 2020-2024.", "from twenty twenty to twenty twenty four."),
+        ("order 5-10.", "order five, one zero."),
+        # The clock reading is padded like every other renderer: a glued am/pm fused
+        # ("three forty fivepm", espeak: fˈaɪvəpəm).
+        ("3:45pm", "three forty five pm"),
+        ("12:05am", "twelve oh five am"),
+        # A meridiem already says the hour is on the hour: "nine am", not "nine o'clock am".
+        ("at 9:00am", "at nine am"),
+        ("at 9:00 a.m.", "at nine a.m."),
+        ("12:00 PM", "twelve PM"),
+        ("9:00 amazing", "nine o'clock amazing"),
+        ("at 9:00:00 am", "at nine zero zero am"),  # h:mm:ss keeps its three fields
+        # A grouped amount with a glued suffix: \b never fired between "0" and "k", and
+        # the fallthrough read "000" as a leading-zero sequence.
+        ("1,000km", "one thousand km"),
+        ("1,000x faster", "one thousand x faster"),
+        # A grouped power of ten with a glued "s" is a plural scale word, not "thousand s".
+        ("1,000s of users", "thousands of users"),
+        ("10,000s of users", "tens of thousands of users"),
+        ("100,000s of users", "hundreds of thousands of users"),
+        ("1,000,000s of dollars", "millions of dollars"),
+        ("$1,000k", "$one thousand k"),
+        ("the 1,000th user", "the one thousandth user"),
+        # A decimal is never an ordinal: "99.9th" reached the ordinal pass as "9th"
+        # ("ninety nine.ninth"). It reads as the decimal pass leaves it, suffix and all.
+        ("the 99.9th percentile", "the ninety nine point nine th percentile"),
+        ("the 1,000.5th", "the one thousand point five th"),
+        ("the 1.2nd", "the one point two nd"),
+        # A lone k/m/b/x after a number is a magnitude or multiplier, not id glue.
+        ("100k", "one hundred k"),
+        ("100k users", "one hundred k users"),
+        ("10x faster", "ten x faster"),
+        ("part 100X4", "part one zero zero X four"),   # letter+digit is still glue
+        # The Latin unit abbreviations zh already knew (ms, mg, hz, kw…) are units here
+        # too: glued, they read digit-wise as id glue ("one zero zero ms").
+        ("Latency is 100ms", "Latency is one hundred ms"),
+        ("500mg", "five hundred mg"),
+        ("100Hz", "one hundred Hz"),
+        ("100mph", "one hundred mph"),
+        ("100px", "one hundred px"),
+        ("100kW", "one hundred kW"),
+        ("100Mbps", "one hundred Mbps"),
+        ("100-200ms", "one hundred to two hundred ms"),
+        # A glued suffix after a decimal made the currency pass backtrack to the integer
+        # part ("one dollar.five k"); it falls through to the k path, like "$100k".
+        ("$1.5k", "$one point five k"),
+        ("$2.5b", "$two point five b"),
+        # A grouped amount is explicit quantity notation: named at any size.
+        ("1,000,000,000,000 stars", "one trillion stars"),
+        ("2,500,000,000,000,000", "two quadrillion five hundred trillion"),
+        ("$1,000,000,000,000", "one trillion dollars"),
         # A scale word rides in front of the relocated unit.
         ("about $5 million", "about five million dollars"),
         ("a $1.5 billion round", "a one point five billion dollars round"),
         ("$1,234.56 total", "one thousand two hundred thirty four point five six dollars total"),
-        # Shapes the currency pass cannot own fall back to the plain readings
-        # (here the pre-existing letter-glue sequence rule).
-        ("a $100k budget", "a $one zero zero k budget"),
+        # Shapes the currency pass cannot own fall back to the plain readings.
+        ("a $100k budget", "a $one hundred k budget"),
         ("tickets are $20-30", "tickets are $twenty-thirty"),
         ("it costs $5 million dollars", "it costs $five million dollars"),
         # An invalid month or impossible day is not a date; the id keeps its
@@ -130,6 +200,73 @@ from nanobot_channel_voice.tts.text_frontend import verbalize_numbers_en
 )
 def test_verbalize_numbers_en(text, expected):
     assert verbalize_numbers_en(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Trigger nouns (number, file, account, order, status...) must not read everyday
+        # quantities digit-wise: a run under three digits reads the same either way, and a
+        # modifier (total/balance) or possessor ("has" before the run, "of" not directly
+        # before it) after the trigger vetoes it. Measured at no recall cost.
+        ("the number of users is 45", "the number of users is forty five"),
+        ("the number of users is 4821", "the number of users is four thousand eight hundred twenty one"),
+        ("the file has 20 lines", "the file has twenty lines"),
+        ("my account balance is 250", "my account balance is two hundred fifty"),
+        ("The account total is 4821.", "The account total is four thousand eight hundred twenty one."),
+        ("The invoice amount is 1500.", "The invoice amount is one thousand five hundred."),
+        ("the order total is 45", "the order total is forty five"),
+        ("the status is 42", "the status is forty two"),
+        ("my phone has 12 apps", "my phone has twelve apps"),
+        ("I'll call you back in 10", "I'll call you back in ten"),
+        ("my flight is at 10", "my flight is at ten"),
+        ("the card has 500 points", "the card has five hundred points"),
+        ("room 12", "room twelve"),
+        # "lot" left the lexicon: "a lot of" is everyday, lot 707 is a rare label.
+        ("a lot of 500", "a lot of five hundred"),
+        ("the lot has 40 cars", "the lot has forty cars"),
+        # …while the label readings the lexicon exists for still fire.
+        ("room 101", "room one zero one"),
+        ("the account ending in 4821", "the account ending in four eight two one"),
+        ("Your PIN is 4829", "Your PIN is four eight two nine"),
+        ("Jenny's number ends in 5309", "Jenny's number ends in five three zero nine"),
+        ("the code has 6 digits: 482913", "the code has six digits: four eight two nine one three"),
+        ("my phone with the number 5551234",
+         "my phone with the number five five five one two three four"),
+        # …including the standard id phrasings, "X of NNNN" and "X has been …", which a
+        # position-free veto disarmed.
+        ("Use a PIN of 1234.", "Use a PIN of one two three four."),
+        ("Your verification code has been sent: 482913.",
+         "Your verification code has been sent: four eight two nine one three."),
+        ("Enter the zip code of 90210.", "Enter the zip code of nine zero two one zero."),
+        ("with a confirmation number of 778899.",
+         "with a confirmation number of seven seven eight eight nine nine."),
+        ("an extension of 4021.", "an extension of four zero two one."),
+        ("with an ID of 4242.", "with an ID of four two four two."),
+        ("a case number of 12345.", "a case number of one two three four five."),
+        ("the port of 8080.", "the port of eight zero eight zero."),
+        ("a status of 404.", "a status of four zero four."),
+        ("an OTP of 482913.", "an OTP of four eight two nine one three."),
+        ("Your PIN has changed to 4829.", "Your PIN has changed to four eight two nine."),
+        ("The code I had was 482913.", "The code I had was four eight two nine one three."),
+        ("The code you have is 482913.", "The code you have is four eight two nine one three."),
+        ("The extension has changed to 4021.", "The extension has changed to four zero two one."),
+        ("The ticket has been assigned 12345.",
+         "The ticket has been assigned one two three four five."),
+        ("The area code of 415 is San Francisco.",
+         "The area code of four one five is San Francisco."),
+    ],
+)
+def test_trigger_nouns_do_not_shred_everyday_quantities(text, expected):
+    assert verbalize_numbers_en(text) == expected
+
+
+def test_bare_huge_runs_keep_the_digit_fallback():
+    # Only a GROUPED amount is explicit quantity notation; an ungrouped 13-digit run
+    # behind a unit is still read out (the id-territory rule of the bare cardinal pass).
+    assert verbalize_numbers_en("1000000000000 residents") == (
+        "one zero zero zero zero zero zero zero zero zero zero zero zero residents"
+    )
 
 
 @pytest.mark.parametrize(
@@ -175,6 +312,17 @@ def test_space_digit_sequences_is_engine_native():
     assert space_digit_sequences("it is 25°C") == "it is 25 degrees Celsius"
     assert space_digit_sequences("$5.00 total") == "5 dollars total"
     assert space_digit_sequences("it is -3.5°C") == "it is minus 3.5 degrees Celsius"
+    # Range connectives too: espeak names a bare hyphen ("twenty dash thirty"), and a
+    # hyphen pair with a stray "%" behind it was digit-shredded ("5, 1 0%").
+    assert space_digit_sequences("20-30°C") == "20 to 30 degrees Celsius"
+    assert space_digit_sequences("5-10%") == "5 to 10%"
+    assert space_digit_sequences("Growth of 5-10%.") == "Growth of 5 to 10%."
+    assert space_digit_sequences("at 9:00am") == "at nine am"
+    assert space_digit_sequences("1,000km") == "one thousand km"
+    assert space_digit_sequences("1,000s of users") == "thousands of users"
+    assert space_digit_sequences("the 1,000th user") == "the one thousandth user"
+    assert space_digit_sequences("the 21st user") == "the 21st user"  # plain: engine-native
+    assert space_digit_sequences("$100k") == "$100k"  # no glue rule fires: espeak's own cardinal
     # Any other language keeps the language-neutral digit spacing — month names
     # are English words a German or Japanese voice cannot say.
     assert space_digit_sequences("Termin am 2026-08-19", "de") == "Termin am 2 0 2 6, 0 8, 1 9"
@@ -188,7 +336,7 @@ def test_espeak_path_renders_clocks_and_grouped_amounts_to_words():
     # espeak then read "12:0 0" as "twelve COLON zero zero" and "1,0 0 0,0 0 0" as
     # seven separate digits instead of "one million".
     assert space_digit_sequences("at 12:00") == "at twelve o'clock"
-    assert space_digit_sequences("meeting at 9:00 am") == "meeting at nine o'clock am"
+    assert space_digit_sequences("meeting at 9:00 am") == "meeting at nine am"
     assert space_digit_sequences("the time is 08:30") == "the time is eight thirty"
     assert space_digit_sequences("it was 1,000,000") == "it was one million"
     assert space_digit_sequences("3,000 and 40,000") == "three thousand and forty thousand"

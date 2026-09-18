@@ -167,6 +167,21 @@ class SelfEchoFilter:
         cutoff = -float("inf") if max_age_s is None else time.monotonic() - max_age_s
         return " ".join(t for deadline, _, _, t in self._spoken if deadline >= cutoff)
 
+    def cut(self, unheard: Iterable[str]) -> None:
+        """Playback stopped NOW: ``unheard`` (the texts that never sounded, in spoken order,
+        so the newest notes) go — a user repeating them is fresh; what remains ends its
+        hold now, so eviction runs from the cut, not from a playout that never came."""
+        for text in reversed(list(unheard)):
+            if self._spoken and self._spoken[-1][3] == text:
+                self._spoken.pop()
+            elif units_of(text):
+                break  # noted, yet not the tail: the ledger moved on (unit-less = never noted)
+        now = time.monotonic()
+        self._spoken = deque(
+            (min(deadline, now), units, stream, text)
+            for deadline, units, stream, text in self._spoken
+        )
+
     def reset(self) -> None:
         self._spoken.clear()
 

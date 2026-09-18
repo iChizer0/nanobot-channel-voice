@@ -1,7 +1,9 @@
 """VoiceShell: the edge contracts the backends rely on.
 
 Barge-in ORDERING (flush first, its return value is the played-ms handed to the
-backend), the mic gate, tool-outcome classification, and the late-event gate.
+backend), the mic gate, tool-outcome classification, and the late-event gate. The
+channel's start()/stop() ownership of the shell and the engines lives in
+test_channel_lifecycle.py.
 """
 
 from __future__ import annotations

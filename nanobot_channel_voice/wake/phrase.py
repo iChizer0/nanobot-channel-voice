@@ -45,10 +45,18 @@ def _fold(text: str) -> tuple[str, list[int]]:
     the shortest run whose NFKC is not the concatenation of its parts (halfwidth kana +
     voiced mark, NFD combining marks): callers slice the ORIGINAL text, and the map has one
     entry per folded char plus a terminator."""
+    n = len(text)
+    if text.isascii() or (
+        unicodedata.is_normalized("NFKC", text) and "\u03a3" not in text
+    ):
+        # NFKC and lower() are then char-wise identities: no capital sigma (its lower is
+        # context-bound), and no expanding char (İ) or the map would shift.
+        folded = text.lower()
+        if len(folded) == n:
+            return folded, list(range(n + 1))
     out: list[str] = []
     source: list[int] = []
     start = 0
-    n = len(text)
     while start < n:
         end = start + 1
         while end < n and _nfkc(text[start:end + 1]) != _nfkc(text[start:end]) + _nfkc(text[end]):
@@ -104,6 +112,13 @@ def _clean_end(text: str, end: int) -> bool:
 # out-of-vocabulary names), doubles collapse, the first char survives.
 _SOFT = frozenset("aeiouyhw")
 
+# Vocatives a phrase may open with ("hey nanobot"): in-vocabulary words the STT renders
+# whole, clipped ("he") or as a homophone ("hay"), so the name group starts at word two.
+_VOCATIVES = frozenset({"hey", "hi", "ok", "okay", "hello", "yo"})
+# A voiced coda for its unvoiced pair is the commonest STT confusion on a name's last
+# consonant ("nanobad", "nanobody" for "nanobot"): equal at the skeleton's end.
+_CODA_FOLD = str.maketrans("dbgzv", "tpksf")
+
 
 def _skeleton(text: str) -> str:
     # Collapse ADJACENT duplicates BEFORE dropping soft chars: the other order fuses
@@ -132,7 +147,8 @@ def _edit_distance(a: str, b: str) -> int:
 
 class FuzzyWake:
     """Head-of-utterance phonetic matcher for latin wake phrases the STT mangles ("hey
-    nanobot" -> "he nine obt": consonant skeletons match within 1 edit). STRIP-ONLY
+    nanobot" -> "he nine obt": consonant skeletons match within 1 INTERIOR edit — the
+    measured renders keep the onset and coda consonants and never add one). STRIP-ONLY
     trust tier: a fuzzy match must NEVER open the gate, only trim a turn that already
     passed on other evidence. CJK phrases opt out (homophone drift is the alias layer's
     job), as do skeletons under 4 chars (too collision-prone)."""
@@ -145,12 +161,28 @@ class FuzzyWake:
             toks = tokens_of(p)
             if not toks or any(ord(c) >= _CJK_FLOOR for t in toks for c in t):
                 continue
-            key = _skeleton("".join(toks))
+            lead = toks[0] if len(toks) > 1 and toks[0] in _VOCATIVES else None
+            # The name group keeps its own onset letter, so a vowel-initial render
+            # ("enough bit" for "nanobot") is an edit, not a dropped soft char.
+            key = (_skeleton(lead) if lead else "") + _skeleton("".join(toks[bool(lead):]))
             if len(key) >= 4:
-                self._keys.append((p, key, len(toks)))
+                key = key[:-1] + key[-1:].translate(_CODA_FOLD)  # once; _distance folds skel
+                self._keys.append((p, lead, key, len(toks)))
 
     def __bool__(self) -> bool:
         return bool(self._keys)
+
+    @staticmethod
+    def _distance(skel: str, key: str) -> int | None:
+        """0/1 when *skel* renders *key* (one interior consonant swapped or dropped,
+        never an extra one; the coda equal up to voicing), else None."""
+        skel = skel[:-1] + skel[-1:].translate(_CODA_FOLD)
+        d = _edit_distance(skel, key)
+        if d == 0 or (
+            d == 1 and 5 <= len(skel) <= len(key) and skel[0] == key[0] and skel[-1] == key[-1]
+        ):
+            return d
+        return None
 
     def strip_head(self, text: str) -> tuple[str | None, str]:
         """``(phrase, remainder)`` when leading words of *text* skeleton-match a phrase
@@ -168,16 +200,24 @@ class FuzzyWake:
                 break
         best: tuple[int, int, str, int] | None = None  # (dist, k, phrase, end)
         for lead in range(lead_max + 1):
-            for phrase, key, ptoks in self._keys:
+            for phrase, vocative, key, ptoks in self._keys:
+                head = words[lead: lead + ptoks + 2]
+                prefix = ""
+                if vocative is not None:
+                    # The same skeleton ("he", "hay", "hi" for hey), never another word:
+                    # "the nanobot" and "his computer" are content.
+                    first = head[0].group() if head else None
+                    if first is None or _skeleton(first) != _skeleton(vocative):
+                        continue
+                    prefix, head = _skeleton(vocative), head[1:]
                 collected = ""
-                for k, m in enumerate(words[lead: lead + ptoks + 2], 1):
+                for k, m in enumerate(head, 1 if vocative is None else 2):
                     tok = m.group()
                     if any(ord(c) >= _CJK_FLOOR for c in tok):
                         break  # a CJK head is not a mangled latin name
                     collected += tok
-                    skel = _skeleton(collected)
-                    d = _edit_distance(skel, key)
-                    if d == 0 or (d == 1 and min(len(skel), len(key)) >= 5):
+                    d = self._distance(prefix + _skeleton(collected), key)
+                    if d is not None:
                         cand = (d, k, phrase, m.end())
                         if best is None or cand < best:
                             best = cand
@@ -223,11 +263,17 @@ class WakePhrase:
     def present(self, text: str) -> bool:
         """A wake phrase occurs ANYWHERE in *text* (``strip``'s word-boundary rules, no
         leading demand): the mention test the wake echo veto runs against spoken TTS."""
+        return self.count(text) > 0
+
+    def count(self, text: str) -> int:
+        """Mentions in *text* under ``present``'s rules (a reply can name the phrase
+        twice; each is its own echo)."""
         folded, _ = _fold(text)
-        return any(
-            _clean_start(folded, m.start()) and _clean_end(folded, m.end())
+        return sum(
+            1
             for _, pat in self._patterns
             for m in pat.finditer(folded)
+            if _clean_start(folded, m.start()) and _clean_end(folded, m.end())
         )
 
     def strip(

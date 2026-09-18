@@ -151,3 +151,35 @@ def test_the_paced_producer_never_trips_the_ceiling():
         assert sink.dropped_ms == 0.0 and sink._queue.qsize() == 4
 
     asyncio.run(scenario())
+
+
+# ---- stream position ---------------------------------------------------------
+
+def test_accepted_ms_is_where_audio_enqueued_now_starts():
+    """The span ledger anchors on this: written bytes plus the queued remainder, so an
+    item behind a still-buffered one starts at that one's END. ``backlog_ms`` cannot
+    serve (it over-counts the in-flight item) and ``played_ms`` is what has sounded."""
+    async def scenario():
+        ps = _RecordingSink()
+        sink = AudioSink(ps, mode="stream")
+        await sink.start()
+        try:
+            assert sink.accepted_ms() == 0
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(1000), rate=RATE))
+            assert sink.accepted_ms() == 1000  # queued, unwritten
+            deadline = asyncio.get_event_loop().time() + 2.0
+            while ps.stream is None or len(ps.stream.sizes) < 3:  # mid-write
+                assert asyncio.get_event_loop().time() < deadline
+                await asyncio.sleep(0.005)
+            assert sink.accepted_ms() == 1000  # written head + unwritten remainder
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(500), rate=RATE))
+            assert sink.accepted_ms() == 1500
+            await asyncio.wait_for(sink.wait_idle(), 5.0)
+            assert sink.accepted_ms() == 1500  # all written: a stream position, not a backlog
+            assert sink.played_ms() <= 1500
+            await sink.flush()
+            assert sink.accepted_ms() == 0
+        finally:
+            await sink.stop()
+
+    asyncio.run(scenario())

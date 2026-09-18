@@ -90,6 +90,44 @@ def test_tool_wire_is_non_blocking():
     assert wire["behavior"] == "NON_BLOCKING" and wire["name"] == "t"
 
 
+def test_parameterless_tool_declares_no_parameters():
+    """nanobot's list_exec_sessions ships ``properties: {}``; Gemini rejects an empty
+    OBJECT ("should be non-empty for OBJECT type") and a rejected setup closes the
+    socket, so a parameterless declaration leaves ``parameters`` unset."""
+    bare = gl._tool_to_wire(ToolDef(name="t", description="d", parameters={
+        "type": "object", "properties": {}, "additionalProperties": False,
+    }))
+    assert "parameters" not in bare
+    typed = gl._tool_to_wire(ToolDef(name="t", description="d", parameters={
+        "type": "object", "properties": {"a": {"type": "string"}},
+    }))
+    assert typed["parameters"] == {"type": "object", "properties": {"a": {"type": "string"}}}
+
+
+def test_schema_types_every_property():
+    """A typeless property (nanobot's ``my.value``), a ``$ref`` one (MCP) and an OBJECT
+    with no properties are all setup rejections; each is declared as a string."""
+    out = gl._gemini_schema({
+        "type": "object",
+        "properties": {
+            "value": {"description": "any"},
+            "ref": {"$ref": "#/$defs/A"},
+            "opts": {"type": "object", "properties": {}, "required": [],
+                     "description": "free-form"},
+            "tags": {"type": "array", "items": {"$ref": "#/$defs/B"}},
+            "nested": {"type": "object", "properties": {"n": {"description": "x"}}},
+        },
+        "required": ["value"],
+        "$defs": {"A": {"type": "object"}, "B": {"type": "string"}},
+    })
+    assert out["properties"]["value"] == {"type": "string", "description": "any"}
+    assert out["properties"]["ref"] == {"type": "string"}
+    assert out["properties"]["opts"] == {"type": "string", "description": "free-form"}
+    assert out["properties"]["tags"] == {"type": "array", "items": {"type": "string"}}
+    assert out["properties"]["nested"]["properties"]["n"] == {"type": "string", "description": "x"}
+    assert out["required"] == ["value"] and "$defs" not in out
+
+
 def test_pcm_rate_parses_mime_or_defaults():
     assert gl._pcm_rate("audio/pcm;rate=24000", 16000) == 24000
     assert gl._pcm_rate("audio/pcm", 16000) == 16000
@@ -233,7 +271,8 @@ def test_tool_call_round_trip_is_non_blocking_and_auto_continues():
     assert calls[0].arguments == '{"city": "Oslo"}'
     assert any(isinstance(e, ToolStarted) for e in events)
     assert sent == [{"toolResponse": {"functionResponses": [{
-        "id": "c1", "response": {"result": {"temp": 21}, "scheduling": "WHEN_IDLE"},
+        "id": "c1", "name": "weather",  # FunctionResponse.name is REQUIRED on the wire
+        "response": {"result": {"temp": 21}, "scheduling": "WHEN_IDLE"},
     }]}}]
     assert sum(isinstance(e, TurnDone) for e in events) == 1  # the final turn only
     assert hints(events)[-1] is VoiceState.IDLE
@@ -347,6 +386,128 @@ def test_manual_barge_in_drops_in_flight_audio_until_the_echo():
     assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING, VoiceState.SPEAKING]
 
 
+def make_shell_backend(config: VoiceConfig):
+    """``on_event`` does what VoiceShell._cloud_barge_in does: flush, then ``barge_in``."""
+    backend, sent, events = make_backend(config)
+
+    async def on_event(e):
+        events.append(e)
+        if isinstance(e, UserSpeechStarted):
+            await backend.barge_in(await backend._sink.flush())
+
+    backend._on_event = on_event
+    return backend, sent, events
+
+
+def test_manual_barge_in_via_the_shell_drops_the_dead_turn():
+    """begin_activity emits the onset BEFORE activityStart goes out; the shell's
+    barge_in in between must not clear what arms the dead-audio guards."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def _run():
+        backend, _, events = make_shell_backend(cfg)
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event(audio_msg(b"\x01"))
+        await backend.begin_activity()  # over a live reply: activityStart interrupts
+        assert backend._dead_audio is True
+        await backend._handle_event(audio_msg(b"\x08"))  # already on the wire: stale
+        await backend._handle_event({"serverContent": {"interrupted": True,
+                                                       "turnComplete": True}})
+        await backend.end_activity()
+        await backend._handle_event(audio_msg(b"\x02"))
+        await backend.close()
+        return events
+
+    events = asyncio.run(_run())
+    assert [e.pcm for e in events if isinstance(e, OutputAudio)] == [b"\x01", b"\x02"]
+    assert not any(isinstance(e, TurnDone) for e in events)
+    assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING, VoiceState.SPEAKING]
+
+
+def test_manual_barge_in_echo_after_the_commit_is_not_a_turn_end():
+    """A short utterance commits before the server's ``interrupted`` echo lands: the
+    dead turn's completion must not count as a turn (TurnDone, anchor wiped, deadman
+    disarmed) for the answer the commit is still owed."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def _run():
+        backend, _, events = make_shell_backend(cfg)
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event(audio_msg(b"\x01"))
+        await backend.begin_activity()
+        await backend.end_activity()
+        assert backend.metrics._anchor is not None
+        await backend._handle_event({"serverContent": {"interrupted": True}})
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await asyncio.sleep(0)
+        assert backend.metrics._anchor is not None
+        assert backend._turn is VoiceState.CAPTURING
+        assert backend._watchdog_task is not None and not backend._watchdog_task.done()
+        await backend.close()
+        return events
+
+    events = asyncio.run(_run())
+    assert not any(isinstance(e, TurnDone) for e in events)
+    assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING]
+
+
+def test_manual_unspoken_completion_settles_idle():
+    """Manual turns get no THINKING at commit: a completion with nothing spoken
+    (proactive audio declined) must settle now, not sit in CAPTURING for the deadman."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def _run():
+        backend, _, events = make_shell_backend(cfg)
+        await backend._handle_event({"setupComplete": {}})
+        await backend.begin_activity()
+        await backend.end_activity()
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await asyncio.sleep(0)
+        assert backend._turn is VoiceState.IDLE
+        task = backend._watchdog_task
+        assert task is None or task.done() or task.cancelling()
+        # A completion landing under the NEXT open activity is that onset's to settle.
+        await backend.begin_activity()
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await asyncio.sleep(0)
+        assert backend._turn is VoiceState.CAPTURING
+        await backend.close()
+        return events
+
+    events = asyncio.run(_run())
+    assert hints(events) == [VoiceState.CAPTURING, VoiceState.IDLE, VoiceState.CAPTURING]
+    assert sum(isinstance(e, TurnDone) for e in events) == 2
+
+
+def test_blip_answer_completion_under_the_next_activity_keeps_the_onset():
+    """The unheard answer to a blip completes while the user's real utterance is open:
+    the onset owns the state and the deadman (the gate reads IDLE under an open
+    activity as a lost session)."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def _run():
+        backend, _, events = make_shell_backend(cfg)
+        await backend._handle_event({"setupComplete": {}})
+        await backend.begin_activity()
+        await backend.end_activity(commit=False)
+        await backend.begin_activity()  # the real question
+        await backend._handle_event(audio_msg(b"\x01"))  # the blip's answer, unheard
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await asyncio.sleep(0)
+        assert backend._turn is VoiceState.CAPTURING
+        assert backend._watchdog_task is not None and not backend._watchdog_task.done()
+        await backend.end_activity()
+        await backend._handle_event(audio_msg(b"\x02"))
+        await backend.close()
+        return events
+
+    events = asyncio.run(_run())
+    assert [e.pcm for e in events if isinstance(e, OutputAudio)] == [b"\x02"]
+    assert hints(events) == [
+        VoiceState.CAPTURING, VoiceState.IDLE, VoiceState.CAPTURING, VoiceState.SPEAKING,
+    ]
+
+
 def test_server_vad_interrupted_turn_completion_does_not_end_the_turn():
     _, _, events = drive([
         {"setupComplete": {}},
@@ -427,18 +588,25 @@ def test_resumption_handle_lapses_after_the_vendor_validity():
     assert b._resume_handle is None
 
 
-def test_auth_rejection_recognizes_both_shapes():
+def test_rejection_recognizes_auth_and_refusal_shapes():
+    """A refusal is deterministic (retrying only burns the ladder): auth on 401/403 or an
+    API-key close reason, any other 4xx/1007/1008 a config refusal; 429 and 1006 are
+    load and blips."""
     from types import SimpleNamespace
 
-    from nanobot_channel_voice.backend.transport import _auth_rejection
+    from nanobot_channel_voice.backend.transport import _rejection
 
     handshake = SimpleNamespace(response=SimpleNamespace(status_code=401))
-    assert _auth_rejection(handshake) == "HTTP 401"
+    assert _rejection(handshake) == ("HTTP 401", True)
+    assert _rejection(SimpleNamespace(status_code=404)) == ("HTTP 404", False)
+    assert _rejection(SimpleNamespace(status_code=429)) is None
     closed = SimpleNamespace(rcvd=SimpleNamespace(code=1007, reason="API key not valid."))
-    assert _auth_rejection(closed) == "close 1007: API key not valid."
+    assert _rejection(closed) == ("close 1007: API key not valid.", True)
+    setup = SimpleNamespace(rcvd=SimpleNamespace(code=1008, reason="invalid setup"))
+    assert _rejection(setup) == ("close 1008: invalid setup", False)
     blip = SimpleNamespace(rcvd=SimpleNamespace(code=1006, reason=""))
-    assert _auth_rejection(blip) is None
-    assert _auth_rejection(RuntimeError("boom")) is None
+    assert _rejection(blip) is None
+    assert _rejection(RuntimeError("boom")) is None
 
 
 def test_server_vad_unanswered_interruption_settles_silently():
@@ -455,3 +623,13 @@ def test_server_vad_unanswered_interruption_settles_silently():
     assert not any(isinstance(e, Error) for e in events)
     assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING, VoiceState.IDLE]
     assert backend.metrics.snapshot()["counters"]["turn_unanswered"] == 1
+
+
+def test_schema_infers_object_for_an_implicit_object_property():
+    """A property that declares properties but no type is an object, not a string."""
+    wire = gl._gemini_schema({
+        "type": "object",
+        "properties": {"where": {"properties": {"city": {"type": "string"}}}},
+    })
+    assert wire["properties"]["where"]["type"] == "object"
+    assert wire["properties"]["where"]["properties"]["city"] == {"type": "string"}

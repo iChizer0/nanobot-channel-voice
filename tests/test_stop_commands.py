@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+from eval_harness import EvalConversation
+
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import VoiceState
@@ -288,3 +290,27 @@ def test_cjk_stop_repetition_consumes_and_ack_repetition_keeps_the_reply():
     assert h.published == []
     assert h.interrupts == 1
     assert b._metrics.counters.get("barge_in_stop") == 1
+
+
+def test_a_stopped_replys_unheard_text_is_not_echo():
+    """Reply pieces are noted to the echo filter at emit (hold = backlog + duration): after
+    an early stop the unheard sentences must leave it, or a near-verbatim follow-up
+    ("what gate did you say?") drops as self-echo for hold + 12 s."""
+
+    async def _case():
+        async with EvalConversation(playbackHangoverMs=1) as conv:
+            b = conv.backend
+            await conv.user_says("when is my flight")
+            await conv.agent_replies(
+                "Your flight leaves at nine tonight. It departs from gate forty two at "
+                "the north terminal. Please arrive two hours early."
+            )
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(100)  # into the first sentence only
+            await conv.user_says("stop")
+            assert conv.interrupts == 1
+            assert not b._echo.is_self_echo("gate forty two at the north terminal")
+            await conv.user_says("gate forty two at the north terminal")
+            assert conv.texts()[-1] == "gate forty two at the north terminal"
+
+    _run(_case())

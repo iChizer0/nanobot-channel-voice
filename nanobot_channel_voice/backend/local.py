@@ -899,6 +899,7 @@ class LocalBackend(TurnEventMixin):
         # cleanup cannot wipe the successor's.
         self._canned_base: VoiceState | None = None
         self._canned_nonce: object | None = None
+        self._canned_ack = False  # the clip is a wake ack (the attention cue shares IDLE)
         # Stop-command targeting: turn state latched at VAD onset (see _PendingUtterance),
         # and the wall time of the last stop-consume kill for the double-tap grace.
         self._onset_interrupting = False
@@ -936,8 +937,8 @@ class LocalBackend(TurnEventMixin):
         # in playback order. A barge-in maps the sink's played_ms through these into a bracketed
         # note — the stand-in for history truncation, which a channel cannot do.
         self._spoken_spans: list[tuple[str, float]] = []
-        # played_ms offset of the segment's first chunk: the stream may predate the segment (a
-        # cancelled filler's stream is reused), so spans map from played-base, not stream open.
+        # Stream position (sink.accepted_ms) of the segment's first chunk: a reused filler
+        # stream predates the segment, so spans map from that base, not stream open.
         # _spans_gen pins the stream measured on — a fresh stream restarts played_ms() at 0.
         self._spans_base_ms = 0.0
         self._spans_gen = -1
@@ -1153,9 +1154,7 @@ class LocalBackend(TurnEventMixin):
             # below veto before anything irreversible happens.
             self._wake_seen_at = self._wake_hit_at
             live = self._turn in (VoiceState.SPEAKING, VoiceState.THINKING)
-            base = self._turn
-            if base is VoiceState.SPEAKING and self._canned_base is not None:
-                base = self._canned_base  # canned audio is not a reply
+            base = self._base_turn()
             if self._wake_hit_echoed():
                 # Our own TTS said the phrase and weak/absent AEC heard it back: no window,
                 # no kill, no claim blessing the trailing echo.
@@ -1215,10 +1214,7 @@ class LocalBackend(TurnEventMixin):
                 self._wake_claimed = False
             # Stop targeting is decided by the state NOW, at onset (see _PendingUtterance).
             self._onset_at = time.monotonic()
-            base_turn = self._turn
-            if base_turn is VoiceState.SPEAKING and self._canned_base is not None:
-                # Canned audio is not a reply: the onset joins the state beneath it.
-                base_turn = self._canned_base
+            base_turn = self._base_turn()  # the onset joins the state beneath a clip
             self._onset_interrupting = base_turn in (
                 VoiceState.THINKING, VoiceState.SPEAKING,
             )
@@ -1243,8 +1239,8 @@ class LocalBackend(TurnEventMixin):
                 and self._duck_onset is not None
                 and self._endpointer.speech_run == 0
             ):
-                # The suspicion run died before onset: no candidate remains. (A CONFIRMED duck
-                # reaches here too, but with suspect cleared.)
+                # The suspicion run died before onset: no candidate remains. (A confirmed
+                # candidate was graduated below and holds for the verdict.)
                 self._duck_suspect = False
                 self._release_duck("suspect")
             elif (
@@ -1258,7 +1254,7 @@ class LocalBackend(TurnEventMixin):
         if not self._endpointer.in_speech:
             self._acquitted_open = False  # the acquittal latch dies with its utterance
         elif (
-            self._duck_onset is None
+            (self._duck_onset is None or self._duck_suspect)
             and not self._acquitted_open
             # A confirm already claimed this utterance: a duck now only pollutes metrics.
             and not self._early_confirm
@@ -1267,7 +1263,9 @@ class LocalBackend(TurnEventMixin):
         ):
             # Stage 1 of the two-stage barge-in: yield NOW, reversibly; _on_utterance's verdict
             # confirms (kill + /stop) or releases. State-driven, not edge-driven: an onset whose
-            # edge fell inside the post-acquittal holdoff still engages once it expires.
+            # edge fell inside the post-acquittal holdoff still engages once it expires. A
+            # suspicion candidate graduates here (same clock, no re-count), or the close
+            # frame would release it as a dead suspicion before the verdict.
             self._engage_duck(suspect=False)
         if self._early_confirm:
             # The min-words gate hit mid-utterance: stop audio + /stop now; _on_utterance still
@@ -1286,6 +1284,15 @@ class LocalBackend(TurnEventMixin):
                     # Mid-tool: cut the status line, leave the verdict to the inject rung.
                     # A wake hit still kills — being named IS a demand for the floor.
                     await self._hush_midturn()
+                elif self._cur_turn.dead:
+                    # Already killed (a prior utterance's confirm, still in STT): never
+                    # /stop twice, no heard-up-to against cleared spans; audio that started
+                    # since still stops (as _kill_live_reply's preempted-dead branch).
+                    self._preempted = True
+                    self._early_heard = None
+                    if self._sink.backlog_ms() > 0:
+                        cancel_task(self._drain_task)
+                        await self._sink.flush()
                 else:
                     self._preempted = True
                     self._metrics.count("barge_in_early_confirm")
@@ -1502,9 +1509,9 @@ class LocalBackend(TurnEventMixin):
         if killed:
             self._last_kill = time.monotonic()
             self._pending_note = _wake_note(heard)
+            self._metrics.count("wake_kill")
+            self._observe_wake_kill()
         self._clear_duck()
-        self._metrics.count("wake_kill")
-        self._observe_wake_kill()
         if self._turn is not VoiceState.IDLE:
             await self._set_turn(VoiceState.IDLE)
         self._arm_wake_ack()
@@ -1575,6 +1582,10 @@ class LocalBackend(TurnEventMixin):
             or not self._wake_ack_list
         ):
             return
+        if self._ack_playing():
+            # It answers this summon too; cancelling it would leave SPEAKING unowned.
+            self._fast_acked_at = time.monotonic()
+            return
         cancel_task(self._fast_ack_task)
         self._fast_ack_task = asyncio.create_task(
             self._fast_ack_probe(self._sink.epoch, self._wake_hit_at)
@@ -1601,6 +1612,8 @@ class LocalBackend(TurnEventMixin):
         ):
             return
         self._fast_acked_at = time.monotonic()
+        if self._ack_playing():
+            return  # an ack already plays: it answers this summon too
         cancel_task(self._fast_ack_task)
         self._fast_ack_task = asyncio.create_task(
             self._wake_ack(self._sink.epoch, None, fast=True)
@@ -1665,17 +1678,20 @@ class LocalBackend(TurnEventMixin):
         """Answer a re-summon or a steer during THINKING without touching the query. Prologue
         script first (an IDLE-style ack would invite a fresh command), else the wake ack; rides
         the prologue task slot. False = neither is configured, so the caller owes a receipt."""
-        self._metrics.count(metric)
-        if self._cfg.prologue.enabled and self._prologue_phrases:
-            self._arm_prologue(initial_ms=0)
-            return True
-        if (
+        if self._canned_base is VoiceState.THINKING:
+            return True  # a clip already speaks for the wait; cancelling it strands SPEAKING
+        prologue = bool(self._cfg.prologue.enabled and self._prologue_phrases)
+        if not prologue and (
             self._closing
             or self._tts is None
             or not self._cfg.wake.ack.enabled
             or not self._wake_ack_list
         ):
             return False
+        self._metrics.count(metric)  # counted only when something is armed
+        if prologue:
+            self._arm_prologue(initial_ms=0)
+            return True
         self._cancel_prologue()
         self._cur_turn.prologue_task = asyncio.create_task(
             self._wake_ack(self._sink.epoch, matched, base=VoiceState.THINKING)
@@ -1693,7 +1709,6 @@ class LocalBackend(TurnEventMixin):
         """One ack playback: base -> SPEAKING -> settle -> base. Canned audio: any turn outcome
         flushes it via _kill_live_reply's canned branch, never a /stop or a heard-up-to note.
         ``fast`` tolerates the still-open summon; ``base=THINKING`` is the reassure clip."""
-        nonce = object()
         try:
             phrases = self._ack_pool(matched)
             text = phrases[self._ack_step % len(phrases)]
@@ -1739,18 +1754,11 @@ class LocalBackend(TurnEventMixin):
                 "ack" if base is VoiceState.IDLE else "reassure", text,
             )
             self._note_spoken(text, self._sink.backlog_ms() + self._audio_ms(audio))
-            self._canned_base, self._canned_nonce = base, nonce
-            await self._canned_playback(epoch, audio, base)
+            await self._canned_playback(epoch, audio, base, ack=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - an ack must never wedge the session
             self._log.warning("wake ack failed ({})", exc)
-            if self._turn is VoiceState.SPEAKING and epoch == self._sink.epoch:
-                with suppress(Exception):
-                    await self._set_turn(base)
-        finally:
-            if self._canned_nonce is nonce:
-                self._canned_base = None
 
     async def push_gated_audio(self, pcm: bytes) -> None:
         """Half-duplex wake tap: the shell routes the frames it drops while the bot speaks here,
@@ -2005,6 +2013,8 @@ class LocalBackend(TurnEventMixin):
                 if self._adaptive is not None:
                     self._adaptive.drop_anchor()
                 with suppress(Exception):
+                    # No verdict, no kill: keep the reply, and never leave it paused.
+                    self._release_duck("error")
                     if pending.preempted:
                         await self._orphaned_confirm("error")
                     elif self._turn is VoiceState.CAPTURING:
@@ -2124,14 +2134,18 @@ class LocalBackend(TurnEventMixin):
         if aclose is not None:
             with suppress(Exception):
                 await aclose()
-        # An RKNN context is NOT freed by refcount-GC, so an in-process channel restart would
-        # load a second copy and exhaust the NPU cores.
+        await asyncio.to_thread(self.release)
+
+    def release(self) -> None:
+        """Sync, any thread: close() ends here, a load cancelled mid-start has only this to
+        tear down. An RKNN context is not freed by GC: a restart would load a second copy
+        and exhaust the NPU cores."""
         for engine in (self._tts, self._vad, self._turn_analyzer, self._wake_detector):
             if engine is not None:
                 with suppress(Exception):
                     engine.release()
         if self._dumper is not None:
-            await asyncio.to_thread(self._dumper.close)
+            self._dumper.close()
 
     # ---- input: capture -> STT -> publish (bus) -----------------------------
 
@@ -2192,9 +2206,11 @@ class LocalBackend(TurnEventMixin):
                 )
             if self._cfg.log_transcripts:  # same privacy gate as the log line
                 pending.meta["text"] = text
-            # One-shot per utterance, not per rung: a PUBLISHING claimed utterance never
-            # reaches _take_fast_ack, and the stale latch would mute the next summon's ack.
-            self._fast_acked_at = float("-inf")
+            # One-shot per CLAIMED utterance, not per rung: a PUBLISHING claimed utterance
+            # never reaches _take_fast_ack, and the stale latch would mute the next summon's
+            # ack. An unclaimed utterance queued ahead of the summon must not wipe its stamp.
+            if pending.wake_hit:
+                self._fast_acked_at = float("-inf")
             return verdict
 
         if not text:
@@ -2206,7 +2222,7 @@ class LocalBackend(TurnEventMixin):
                 self._touch_wake()
                 acked_fast = self._take_fast_ack()
                 if not preempted and (
-                    self._canned_base is VoiceState.IDLE
+                    self._ack_playing()
                     or (
                         acked_fast
                         and self._turn in (VoiceState.IDLE, VoiceState.CAPTURING)
@@ -2345,7 +2361,7 @@ class LocalBackend(TurnEventMixin):
                     self._adaptive.drop_anchor()
                 acked_fast = self._take_fast_ack()
                 if not preempted and (
-                    self._canned_base is VoiceState.IDLE
+                    self._ack_playing()
                     or (
                         acked_fast
                         and self._turn in (VoiceState.IDLE, VoiceState.CAPTURING)
@@ -2415,9 +2431,7 @@ class LocalBackend(TurnEventMixin):
         # Steering, not barge-in: a run still WORKING takes the utterance as a mid-turn
         # injection instead of a kill. Decided before the metrics anchor (an injection extends
         # the RUNNING turn), and the verdict joins the state beneath a canned clip.
-        verdict_state = self._turn
-        if verdict_state is VoiceState.SPEAKING and self._canned_base is not None:
-            verdict_state = self._canned_base
+        verdict_state = self._base_turn()
         # A goal command can never be injected: core dispatches commands inline, so an injected
         # "/goal ..." would answer out of band while the old run kept going. Kill first.
         goal = self._is_goal(text)
@@ -2519,9 +2533,15 @@ class LocalBackend(TurnEventMixin):
             self._touch_wake()  # an accepted turn keeps the conversation's attention
         if goal:
             self._metrics.count("goal_command")
-        await self._publish_text(
-            f"/goal {text}" if goal else text, self._cur_turn.tokens[0], tuple(notes)
-        )
+        try:
+            await self._publish_text(
+                f"/goal {text}" if goal else text, self._cur_turn.tokens[0], tuple(notes)
+            )
+        except Exception:
+            # The bus lost the turn: nothing will answer it, so nothing may wait for one.
+            self._metrics.turn_end()
+            await self._set_turn(VoiceState.IDLE)
+            raise
         self._arm_prologue()
         self._arm_earcon()  # after _arm_prologue: its cancel sweep covers earcons
         self._arm_timeout()
@@ -2560,19 +2580,24 @@ class LocalBackend(TurnEventMixin):
 
     def _take_heard(self, played: float) -> str | None:
         """Fold the sink's played-ms into heard TEXT and close the span ledger: every path
-        that cuts audio mid-sentence owes the agent the same account."""
+        that cuts audio mid-sentence owes the agent the same account, and the echo filter
+        the same cut (unheard words must not read back as self-echo)."""
         heard = None
-        if self._pcm_out and self._cfg.barge_in.heard_marker:
+        unheard: list[str] = []
+        if self._pcm_out:
             # played is stream-relative: subtract the segment's base (a reused filler stream's
             # audio must not count as reply) and prepend the turn's completed segments. A base
-            # measured on a REPLACED stream is void: that stream's played_ms restarted at 0.
-            base = (
-                self._spans_base_ms
-                if self._sink.stream_generation == self._spans_gen
-                else 0.0
+            # measured on a REPLACED stream is void: that stream's played_ms restarted at 0
+            # (and its spans all sounded, so none is unheard).
+            live = self._sink.stream_generation == self._spans_gen
+            text, cut = self._heard_text(
+                max(0.0, float(played) - (self._spans_base_ms if live else 0.0))
             )
-            heard = self._heard_text(max(0.0, float(played) - base))
-            heard = f"{self._heard_prefix} {heard}".strip()
+            if live:
+                unheard = cut
+            if self._cfg.barge_in.heard_marker:
+                heard = f"{self._heard_prefix} {text}".strip()
+        self._echo.cut(unheard)  # nothing sounds past the flush
         self._spoken_spans.clear()
         self._heard_prefix = ""
         return heard
@@ -2599,18 +2624,22 @@ class LocalBackend(TurnEventMixin):
         self._metrics.count("midturn_hush")
         self._log.info("midturn steer: audio cut, run kept")
 
-    def _heard_text(self, played_ms: float) -> str:
+    def _heard_text(self, played_ms: float) -> tuple[str, list[str]]:
         """Map the sink's played-ms into the chunk texts the user actually heard: chunk-granular,
-        with a word-proportional cut inside the chunk playback stopped in."""
+        with a word-proportional cut inside the chunk playback stopped in. Also returns the
+        chunk texts that never sounded (a partially heard chunk counts as heard)."""
         out: list[str] = []
         acc = 0.0
-        for chunk_text, dur in self._spoken_spans:
+        unheard_from = len(self._spoken_spans)
+        for i, (chunk_text, dur) in enumerate(self._spoken_spans):
             if acc + dur <= played_ms + 50.0:  # fully heard (scheduling slack)
                 out.append(chunk_text)
                 acc += dur
                 continue
             frac = (played_ms - acc) / dur if dur > 0 else 0.0
+            unheard_from = i
             if frac > 0.15:  # a word or two into the chunk: keep the heard part
+                unheard_from = i + 1
                 cut_words = chunk_text.split()
                 if len(cut_words) > 1:
                     keep = max(1, int(len(cut_words) * frac))
@@ -2620,7 +2649,17 @@ class LocalBackend(TurnEventMixin):
                     # or every partial hearing reports the whole sentence as heard.
                     out.append(chunk_text[: max(1, int(len(chunk_text) * frac))] + "...")
             break
-        return " ".join(out).strip()
+        return " ".join(out).strip(), [t for t, _ in self._spoken_spans[unheard_from:]]
+
+    def _base_turn(self) -> VoiceState:
+        """The state beneath a canned clip: canned audio is not a reply."""
+        if self._turn is VoiceState.SPEAKING and self._canned_base is not None:
+            return self._canned_base
+        return self._turn
+
+    def _ack_playing(self) -> bool:
+        """An ack answers a summon; the attention cue shares its IDLE base and does not."""
+        return self._canned_base is VoiceState.IDLE and self._canned_ack
 
     async def _set_turn(self, state: VoiceState) -> None:
         # A settle re-opens the attention window; a rejected-utterance settle
@@ -2932,8 +2971,9 @@ class LocalBackend(TurnEventMixin):
         half-duplex) until the user happens to speak again."""
         self._metrics.count(f"barge_in_early_orphan.{reason}")
         self._log.warning("early confirm orphaned ({}); reply already stopped", reason)
-        if self._turn is not VoiceState.IDLE:
+        if self._turn is not VoiceState.IDLE and self._cur_turn.dead:
             # THINKING included: nothing produces deltas past the watermark, so it stays dead.
+            # A live current turn is a successor another verdict published: it owns the state.
             await self._set_turn(VoiceState.IDLE)
 
     def _is_ack(self, text: str) -> bool:
@@ -2988,14 +3028,15 @@ class LocalBackend(TurnEventMixin):
         if self._canned_base is VoiceState.IDLE and not preempted:
             # Only a wake ack is live: flush it; killed=False keeps the wake/stop notes honest.
             # A preempted verdict killed a real reply, so its accounting wins and the ack plays.
-            self._canned_base = None
+            self._canned_base, self._canned_ack = None, False
             cancel_task(self._drain_task)
             await self._sink.flush()
             return False, heard
-        if preempted:
+        if preempted and self._cur_turn.dead:
             # The early confirm already /stop-ped and flushed, but audio can have started
             # since (a proactive delivery lands mid-STT): stop that too, or it talks over
-            # whatever this verdict publishes. A live wake ack (_canned_base IDLE) plays on.
+            # whatever this verdict publishes. A live wake ack (_canned_base IDLE) plays on;
+            # a live current turn is a successor another verdict published, judged below.
             if self._canned_base is None and self._sink.backlog_ms() > 0:
                 cancel_task(self._drain_task)
                 await self._sink.flush()
@@ -3105,7 +3146,7 @@ class LocalBackend(TurnEventMixin):
             return
         if base is not None:
             self._cur_turn.base = base
-        if self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
+        if self._base_turn() in (VoiceState.IDLE, VoiceState.CAPTURING):
             # No published turn is live, so this stream IS an unsolicited delivery (cron fire
             # with streaming on) riding the recycled turn object: restart its audibility ledger,
             # as speak_final does, or a stale emitted_audio latch swallows the silence fallback.
@@ -3113,7 +3154,7 @@ class LocalBackend(TurnEventMixin):
             turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
             turn.answered = False
             self._heard_prefix = ""  # as speak_final does: not this delivery's words
-        self._cancel_prologue()  # the reply is arriving; no more filler
+        self._cancel_canned()    # the reply is arriving; it owns the state from here
         self._cancel_midturn()   # a new segment began; the old boundary watch is stale
         self._cur_turn.last_activity = time.monotonic()
         if self._cur_turn.await_first_token and self._cur_turn.published_at:
@@ -3167,7 +3208,7 @@ class LocalBackend(TurnEventMixin):
         self._cur_turn.continuation_pending = False
         if spoke:
             self._cur_turn.answered = True
-        elif self._turn is VoiceState.THINKING:
+        elif self._base_turn() is VoiceState.THINKING:
             # Core fires a non-resuming end on its blank-response RETRY path too, so an empty
             # terminal does not prove the turn is over (and nothing plays, so nothing drains).
             # Hold: let the final or the deadman decide, never disarm under a live run.
@@ -3191,7 +3232,8 @@ class LocalBackend(TurnEventMixin):
         an unsolicited delivery — cron reply, message-tool send)."""
         if self._closing:
             return  # a bus delivery racing teardown: the workers that would speak it are gone
-        self._cancel_prologue()
+        fresh = self._base_turn() in (VoiceState.IDLE, VoiceState.CAPTURING)
+        self._cancel_canned()  # this delivery owns the state from here
         self._cancel_midturn()
         # A final while a segment is open: the stream died without its end marker (core's
         # delivery.fail never closes it), or this send is out-of-band mid-turn. Discard the
@@ -3204,7 +3246,7 @@ class LocalBackend(TurnEventMixin):
         turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
         turn.continuation_pending = False
         turn.answered = True  # a whole message stands as the turn's spoken reply
-        if self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
+        if fresh:
             # A fresh delivery, not a continuation: the previous turn's heard-up-to is not ours.
             self._heard_prefix = ""
         self._note_reply_markdown(text)
@@ -3466,13 +3508,9 @@ class LocalBackend(TurnEventMixin):
                 self._heard_prefix = f"{self._heard_prefix} {spoken}".strip()
                 self._spoken_spans.clear()
             if not self._spoken_spans:
-                # Segment start: anchor at the CURRENT played position (the stream may already
-                # have played a filler); a stream this audio will not play on reports someone
-                # else's position.
-                self._spans_base_ms = (
-                    float(self._sink.played_ms())
-                    if gen == self._sink.stream_generation else 0.0
-                )
+                # Segment start: anchor where THIS audio starts on its stream — past a
+                # filler still buffered ahead of it, which played_ms() has not reached.
+                self._spans_base_ms = float(self._sink.accepted_ms())
                 self._spans_gen = gen
             self._spoken_spans.append((text, dur_ms))
         # Fed HERE, not at chunker feed: the eviction window runs from when the words
@@ -3530,6 +3568,16 @@ class LocalBackend(TurnEventMixin):
         self._cur_turn.cancel_prologue()
         cancel_task(self._earcon_task)
         self._earcon_task = None
+
+    def _cancel_canned(self) -> None:
+        """A delivery takes the pipeline: the base drops NOW (a cancelled task's finally runs
+        a tick late); a clip's queued audio still plays, and the reply's drain settles it."""
+        self._cancel_prologue()
+        cancel_task(self._ack_task)
+        cancel_task(self._fast_ack_task)
+        cancel_task(self._attention_task)
+        self._canned_base = self._canned_nonce = None
+        self._canned_ack = False
 
     def _build_earcon(self, path: str | None, synth) -> bytes | None:
         """One cue, shaped once at init. A custom WAV wins; an unusable file degrades loudly to
@@ -3593,20 +3641,11 @@ class LocalBackend(TurnEventMixin):
             ):
                 return
             self._metrics.count("earcon_captured")
-            nonce = object()
-            self._canned_base, self._canned_nonce = VoiceState.THINKING, nonce
-            try:
-                await self._canned_playback(epoch, self._earcon_audio, VoiceState.THINKING)
-            finally:
-                if self._canned_nonce is nonce:
-                    self._canned_base = None
+            await self._canned_playback(epoch, self._earcon_audio, VoiceState.THINKING)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a cue must never wedge the turn
             self._log.warning("earcon failed ({})", exc)
-            if self._turn is VoiceState.SPEAKING and epoch == self._sink.epoch:
-                with suppress(Exception):
-                    await self._set_turn(VoiceState.THINKING)
 
     def _arm_attention_cue(self) -> None:
         """Ensure the close-cue watcher runs for the current attention episode. A live watcher
@@ -3656,20 +3695,12 @@ class LocalBackend(TurnEventMixin):
         epoch = self._sink.epoch
         self._metrics.count("earcon_attention")
         self._log.info("attention window closed")
-        nonce = object()
-        self._canned_base, self._canned_nonce = VoiceState.IDLE, nonce
         try:
             await self._canned_playback(epoch, self._attention_audio, VoiceState.IDLE)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a cue must never wedge the session
             self._log.warning("attention cue failed ({})", exc)
-            if self._turn is VoiceState.SPEAKING and epoch == self._sink.epoch:
-                with suppress(Exception):
-                    await self._set_turn(VoiceState.IDLE)
-        finally:
-            if self._canned_nonce is nonce:
-                self._canned_base = None
 
     def _note_first_reply(self, ms: float) -> None:
         """Feed the filler-delay EMA. Sample clamped: one pathological turn must
@@ -3787,7 +3818,6 @@ class LocalBackend(TurnEventMixin):
         """Speak stallPhrase over the silent wait (canned THINKING clip, wake-ack
         bracket). Best-effort: any guard failing skips the speech — the escalation
         clock keeps running either way, so the kill still lands one budget later."""
-        nonce = object()
         try:
             if self._closing or self._tts is None:
                 return
@@ -3802,33 +3832,43 @@ class LocalBackend(TurnEventMixin):
             self._note_spoken(
                 self._cfg.stall_phrase, self._sink.backlog_ms() + self._audio_ms(audio)
             )
-            self._canned_base, self._canned_nonce = VoiceState.THINKING, nonce
             await self._canned_playback(epoch, audio, VoiceState.THINKING)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a notice must never wedge the session
             self._log.warning("stall notice failed ({})", exc)
-            if self._turn is VoiceState.SPEAKING and epoch == self._sink.epoch:
-                with suppress(Exception):
-                    await self._set_turn(VoiceState.THINKING)
-        finally:
-            if self._canned_nonce is nonce:
-                self._canned_base = None
 
-    async def _canned_playback(self, epoch: int, audio: bytes, base: VoiceState) -> None:
+    async def _canned_playback(
+        self, epoch: int, audio: bytes, base: VoiceState, *, ack: bool = False
+    ) -> None:
         """The canned-audio dance every ack/filler/cue shares: SPEAKING -> emit -> settle ->
         half-duplex tail guard (device latency/reverb must not re-trigger the VAD) -> ``base``.
-        Callers own the _canned_base/_canned_nonce bracket; a flush mid-dance takes the state."""
-        await self._set_turn(VoiceState.SPEAKING)
-        await self._emit(self._audio_event(epoch, audio))
-        if not await self._settle(epoch):
-            return
-        if self._turn is VoiceState.SPEAKING:
-            if not self._full_duplex:
-                await asyncio.sleep(self._cfg.playback_hangover_ms / 1000)
-                if self._closing or epoch != self._sink.epoch:
-                    return
-            await self._set_turn(base)
+        Owns the base/nonce bracket (the nonce keeps a successor clip's base past this exit).
+        A flush mid-dance takes the state; a failure past the flip restores ``base`` here,
+        or a half-duplex mic gated on a dead SPEAKING never reopens."""
+        nonce = object()
+        self._canned_base, self._canned_nonce, self._canned_ack = base, nonce, ack
+        try:
+            await self._set_turn(VoiceState.SPEAKING)
+            await self._emit(self._audio_event(epoch, audio))
+            if not await self._settle(epoch):
+                return
+            if self._turn is VoiceState.SPEAKING:
+                if not self._full_duplex:
+                    await asyncio.sleep(self._cfg.playback_hangover_ms / 1000)
+                    if self._closing or epoch != self._sink.epoch:
+                        return
+                await self._set_turn(base)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._turn is VoiceState.SPEAKING and epoch == self._sink.epoch:
+                with suppress(Exception):
+                    await self._set_turn(base)
+            raise
+        finally:
+            if self._canned_nonce is nonce:
+                self._canned_base, self._canned_ack = None, False
 
     async def _settle(self, epoch: int) -> bool:
         """Wait until the segment enqueued at *epoch* is fully synthesized and audibly played out,
@@ -3894,11 +3934,7 @@ class LocalBackend(TurnEventMixin):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - filler is best-effort, never fatal
-            # A raise after the flip to SPEAKING gates a half-duplex mic forever.
-            self._log.warning("prologue filler failed ({}); reopening the wait", exc)
-            if epoch == self._sink.epoch and self._turn is VoiceState.SPEAKING:
-                with suppress(Exception):
-                    await self._set_turn(VoiceState.THINKING)
+            self._log.warning("prologue filler failed ({})", exc)
 
     def _prep_canned(self, audio: bytes) -> bytes:
         """One-time cache-fill shaping for a canned clip: cap the edge silence (model padding
@@ -4122,14 +4158,8 @@ class LocalBackend(TurnEventMixin):
             return False
         self._metrics.count("prologue_filler")
         self._note_spoken(text, self._sink.backlog_ms() + self._audio_ms(audio))
-        nonce = object()
-        self._canned_base, self._canned_nonce = VoiceState.THINKING, nonce
-        try:
-            await self._canned_playback(epoch, audio, VoiceState.THINKING)
-            return True
-        finally:
-            if self._canned_nonce is nonce:
-                self._canned_base = None
+        await self._canned_playback(epoch, audio, VoiceState.THINKING)
+        return True
 
     async def _drain_watch(self, epoch: int) -> None:
         """Return to IDLE once the reply finishes playing (plus a hangover). Gates on

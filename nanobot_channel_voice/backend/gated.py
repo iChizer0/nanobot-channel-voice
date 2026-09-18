@@ -44,6 +44,9 @@ from .base import (
 # Own reply said the phrase: veto acoustic hits for this long past the transcript delta,
 # plus whatever the sink still had queued then (the words play that much later).
 _WAKE_ECHO_S = 3.0
+# Transcript deltas are token sized on the OpenAI dialects, so the phrase is looked for
+# in the delta plus this much of the reply before it (longer than any spoken phrase).
+_WAKE_ECHO_TAIL = 64
 
 
 def _reply_is_question(text: str) -> bool:
@@ -127,11 +130,11 @@ class GatedUplink:
         self._spent = False
         self._phrase = WakePhrase(list(wake.phrases) + list(wake.aliases))
         self._phrase_echo_until = 0.0
-        self._reply_text: list[str] = []
+        self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
         if self._mode == "wake" and wake.ack.enabled:
             self._log.info(
-                "voice: wake.ack is spoken by the local TTS; under a cloud session the "
-                "turn-receipt earcon (earcons.captured) is the summon receipt"
+                "voice: wake.ack is spoken by the local TTS, which a cloud session has "
+                "none of: a summon gets no audible receipt"
             )
 
         self._state = VoiceState.IDLE
@@ -286,10 +289,10 @@ class GatedUplink:
         self._metrics.count("wake_hit")
         score = getattr(self._wake, "last_score", None)
         self._log.info("wake hit{}", f" (score={score:.2f})" if score is not None else "")
+        if self._active:
+            return False  # the name mid-upload changes nothing (the window stays inf)
         self._window_until = now + self._window_s
         self._spent = False
-        if self._active:
-            return False  # the name mid-upload changes nothing
         if self._ep.in_speech:
             # Same breath ("hey nanobot, what's the weather"): adopt the open utterance
             # from the phrase end; the endpointer keeps its clock, we keep uploading.
@@ -327,6 +330,7 @@ class GatedUplink:
         except Exception as exc:  # noqa: BLE001 - parked and could not resume
             self._metrics.count("gate_activity_failed")
             self._log.warning("uplink could not open an activity ({}); utterance dropped", exc)
+            self._schedule_park()  # no turn will settle IDLE to re-arm it
             return
         self._active = True
         self._window_until = math.inf  # engaged: the turn owns attention until IDLE
@@ -428,7 +432,7 @@ class GatedUplink:
                 event.state in (VoiceState.THINKING, VoiceState.SPEAKING)
                 and prev in (VoiceState.IDLE, VoiceState.CAPTURING)
             ):
-                self._reply_text.clear()  # a reply begins (some protocols skip THINKING)
+                self._reply_tail = ""  # a reply begins (some protocols skip THINKING)
             elif event.state is VoiceState.IDLE and prev is not VoiceState.IDLE:
                 if self._active:
                     # Only a lost session settles IDLE under an open activity (our own
@@ -437,8 +441,14 @@ class GatedUplink:
                     self._metrics.count("gate_activity_lost")
                 self._on_idle(time.monotonic())
         elif isinstance(event, OutputTranscript):
-            self._reply_text.append(event.text)
-            if self._wake is not None and self._phrase.present(event.text):
+            before = self._reply_tail[-_WAKE_ECHO_TAIL:]
+            self._reply_tail = before + event.text
+            # Stamped by a delta that COMPLETES a mention (one more than the tail already
+            # held), not by every delta after it — and again by a second mention.
+            if (
+                self._wake is not None
+                and self._phrase.count(self._reply_tail) > self._phrase.count(before)
+            ):
                 self._phrase_echo_until = (
                     time.monotonic() + _WAKE_ECHO_S + self._sink.backlog_ms() / 1000.0
                 )
@@ -450,7 +460,7 @@ class GatedUplink:
         if self._mode == "wake":
             spent = self._spent and self._attention == "sentence"
             self._spent = False
-            if spent and not _reply_is_question("".join(self._reply_text)):
+            if spent and not _reply_is_question(self._reply_tail):
                 self._window_until = now  # the summoned sentence was answered
             else:
                 self._window_until = now + self._window_s

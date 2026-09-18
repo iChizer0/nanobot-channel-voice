@@ -312,7 +312,8 @@ def test_steer_over_a_status_line_keeps_the_run_working():
             )
             await b.on_stream_end(resuming=True)          # more tools follow
             await c.wait_state(VoiceState.SPEAKING)
-            await c.wait_played_ms(100)                   # a few words audibly out
+            # The 230 ms captured ding sounds first; only then are reply words heard.
+            await c.wait_played_ms(350)
             quiet_since = b._cur_turn.last_activity = time.monotonic() - 100.0
             dings = c.counter("earcon_captured")  # the opening turn dinged too
             await c.user_says("use the italian place on maple street")
@@ -324,8 +325,9 @@ def test_steer_over_a_status_line_keeps_the_run_working():
             [note] = c.notes()[1]
             assert note.startswith("[voice event: the user spoke while you were working")
             assert "The booking site" in note              # heard-up-to names real words
-            # Nothing configured to say anything, so the ding is the steer's receipt.
-            assert c.counter("midturn_reassure") == 1
+            # Nothing configured to say anything, so the ding is the steer's receipt
+            # and no reassure is counted.
+            assert c.counter("midturn_reassure") == 0
             await _until(lambda: c.counter("earcon_captured") == dings + 1)
             await c.wait_state(VoiceState.THINKING)       # mic reopened, tools running
             # User speech is not core liveness: a steer must not hold the deadman off

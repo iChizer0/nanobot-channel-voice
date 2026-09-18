@@ -662,6 +662,39 @@ def test_skeleton_and_fuzzy_wake():
     assert not FuzzyWake(["nova"])
 
 
+def test_fuzzy_wake_rejects_ordinary_content_with_a_name_like_head():
+    """A 1-edit consonant skeleton let ordinary content summon and lose its head ("the
+    nanobot is cool" published "is cool"): the measured renders keep onset and coda
+    consonants and never add one, and the lead word is never substituted."""
+    from nanobot_channel_voice.wake.phrase import FuzzyWake
+
+    fz = FuzzyWake(["hey nanobot"])
+    for content in (
+        "the nanobot is cool",      # lead word substituted
+        "hey enough bit",           # the name's onset is a vowel
+        "hey nan bought a car",     # an extra consonant (g)
+        "heyday nanobot play",      # a word extending the vocative is another word
+        "his computer is on",       # (for "hi computer") likewise
+    ):
+        fz2 = FuzzyWake(["hi computer"]) if content.startswith("his") else fz
+        assert fz2.strip_head(content) == (None, content), content
+    # the measured renders (zipformer bilingual / whisper, in-command / punctuated) strip
+    assert fz.strip_head("he nine obt play music") == ("hey nanobot", "play music")
+    assert fz.strip_head("he nine ought") == ("hey nanobot", "")
+    assert fz.strip_head("hey nano bot you there") == ("hey nanobot", "you there")
+    assert fz.strip_head("hey nine about what time") == ("hey nanobot", "what time")
+    assert fz.strip_head("hay nanobot play") == ("hey nanobot", "play")  # homophone lead
+    assert fz.strip_head("hi nanobot go") == ("hey nanobot", "go")  # hey/hi: one skeleton
+    assert fz.strip_head("hey nanobad what time") == ("hey nanobot", "what time")  # coda
+    assert fz.strip_head("hey nanobody play") == ("hey nanobot", "play")  # voiced coda
+    # a phrase without a vocative anchors the name's onset and coda the same way
+    bare = FuzzyWake(["computer"])
+    assert bare.strip_head("come pewter lights on") == ("computer", "lights on")
+    assert bare.strip_head("hey come pewter lights on") == ("computer", "lights on")
+    assert bare.strip_head("the computer is on")[0] is None
+    assert bare.strip_head("computers are on")[0] is None
+
+
 def test_wake_phrase_pair_entries_report_the_display():
     """An alias entry matches its spelling but reports the CANONICAL phrase,
     so an alias summon routes the ack by the name the user called."""

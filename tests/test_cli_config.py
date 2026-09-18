@@ -50,6 +50,31 @@ def test_config_shows_the_effective_state_of_a_pending_import(tmp_path, capsys):
     assert "importJson" not in out
 
 
+def test_config_export_never_carries_enabled(tmp_path, capsys):
+    """The paste box strips `enabled` (the WebUI toggle owns it), so the paste-ready
+    export leaves it out too: an export taken from a disabled section must not read as
+    "disable on import"."""
+    path = _write(tmp_path, {"enabled": False, "duckDb": -6})
+    assert main(["config", "--config", path]) == 0
+    assert json.loads(capsys.readouterr().out) == {"duckDb": -6}
+    assert main(["config", "--config", path, "--full"]) == 0
+    assert "enabled" not in json.loads(capsys.readouterr().out)
+
+
+def test_config_export_folds_the_home_directory_back_to_tilde(tmp_path, capsys, monkeypatch):
+    """The schema expands `~` for the loaders; the export must not bake the home
+    directory (and the user name) into a paste meant for another machine."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    path = _write(tmp_path, {
+        "vad": {"silero": {"modelPath": "~/models/silero.onnx"}},
+        "debug": {"dumpDir": "/var/tmp/dumps"},
+    })
+    assert main(["config", "--config", path]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["vad"]["silero"]["modelPath"] == "~/models/silero.onnx"
+    assert out["debug"]["dumpDir"] == "/var/tmp/dumps"
+
+
 def test_config_full_includes_defaults(tmp_path, capsys):
     path = _write(tmp_path, {})
     assert main(["config", "--config", path]) == 0

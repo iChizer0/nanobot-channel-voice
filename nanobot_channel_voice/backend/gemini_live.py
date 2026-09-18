@@ -70,26 +70,45 @@ def resolve_gemini_key(explicit: str | None) -> str | None:
     return explicit or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
+def _typed(prop: dict) -> dict:
+    """A property/items schema the API rejects outright - no type (nanobot's ``my.value``,
+    a stripped ``$ref``) or an OBJECT with no properties - declared as a string instead;
+    a rejected setup closes the socket."""
+    if prop.get("type") == "object" and not prop.get("properties"):
+        prop = {k: v for k, v in prop.items() if k not in ("type", "properties", "required")}
+    if "type" in prop:
+        return prop
+    return {"type": "object" if prop.get("properties") else "string", **prop}
+
+
 def _gemini_schema(schema: dict) -> dict:
-    """Function-declaration parameters: unions/combinators flattened (as for Qwen), then
-    the keywords the OpenAPI subset rejects dropped at every level."""
-    def strip(node):
-        if isinstance(node, dict):
-            return {k: strip(v) for k, v in node.items() if k not in _UNSUPPORTED_SCHEMA_KEYS}
+    """Function-declaration parameters: unions/combinators flattened (as for Qwen), the
+    keywords the OpenAPI subset rejects dropped at every level, every property typed."""
+    def strip(node, *, slot: bool = False):
         if isinstance(node, list):
             return [strip(v) for v in node]
-        return node
+        if not isinstance(node, dict):
+            return node
+        node = {k: v for k, v in node.items() if k not in _UNSUPPORTED_SCHEMA_KEYS}
+        if slot:
+            node = _typed(node)
+        out = {}
+        for k, v in node.items():
+            if k == "properties" and isinstance(v, dict):
+                out[k] = {name: strip(p, slot=True) for name, p in v.items()}
+            else:
+                out[k] = strip(v, slot=k == "items")
+        return out
 
     return strip(_normalize_schema(schema))
 
 
 def _tool_to_wire(tool: ToolDef) -> dict:
-    return {
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": _gemini_schema(tool.parameters),
-        "behavior": "NON_BLOCKING",
-    }
+    wire = {"name": tool.name, "description": tool.description, "behavior": "NON_BLOCKING"}
+    params = _gemini_schema(tool.parameters)
+    if params.get("properties"):
+        wire["parameters"] = params  # unset for a parameterless tool: an empty OBJECT is rejected
+    return wire
 
 
 def _pcm_rate(mime: str | None, default: int) -> int:
@@ -142,7 +161,8 @@ class GeminiLiveBackend(RealtimeTransport):
         dropped = self._metrics.calls_dropped(pending, reason)
         if dropped:
             self._log.warning("dropping {} unanswered tool obligation(s) on {}", dropped, reason)
-        self._pending_calls: set[str] = set()   # announced, unanswered (this session)
+        # Announced, unanswered (this session): id -> name (FunctionResponse.name is required).
+        self._pending_calls: dict[str, str] = {}
         self._generating = False   # audio/text seen since the last turn boundary
         self._in_progress = False  # extended thinking: background work continues
         # The server cut the model off (its VAD, or our activityStart): that turn's
@@ -171,8 +191,8 @@ class GeminiLiveBackend(RealtimeTransport):
 
     async def barge_in(self, played_ms: int) -> None:
         # No truncate on this protocol: the server keeps what it already sent; the shell
-        # already flushed the sink. Measure, and make sure the dead turn's tail drops.
-        self._generating = False
+        # already flushed the sink. `_generating` stays: _activity_begin_wire reads it
+        # after this to arm the dead-audio guard.
         self._record_barge_in("interrupt")
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
@@ -180,7 +200,7 @@ class GeminiLiveBackend(RealtimeTransport):
             # Cancelled by the server, or issued by a session that is gone.
             self._log.debug("dropping tool result for call {} (not pending)", call_id)
             return
-        self._pending_calls.discard(call_id)
+        name = self._pending_calls.pop(call_id)
         try:
             result = json.loads(output)  # a JSON tool result rides as structure
         except (ValueError, TypeError):
@@ -191,6 +211,7 @@ class GeminiLiveBackend(RealtimeTransport):
             "toolResponse": {
                 "functionResponses": [{
                     "id": call_id,
+                    "name": name,
                     "response": {"result": result, "scheduling": self._scheduling},
                 }],
             },
@@ -362,9 +383,10 @@ class GeminiLiveBackend(RealtimeTransport):
         if self._suppress_turn:
             # The unheard answer to an uncommitted activity ended; the flag lives on
             # until the next committed activity (nothing else is owed an answer).
-            self._cancel_watchdog()
-            if self._turn is not VoiceState.IDLE:
-                await self._set_turn(VoiceState.IDLE)
+            if not self._user_speaking:  # else the open activity owns state + deadman
+                self._cancel_watchdog()
+                if self._turn is not VoiceState.IDLE:
+                    await self._set_turn(VoiceState.IDLE)
             return
         if status == "IN_PROGRESS" or self._pending_calls:
             # The filler is spoken, the work goes on (extended thinking's background
@@ -383,6 +405,12 @@ class GeminiLiveBackend(RealtimeTransport):
         self._metrics.turn_end()
         if not self._pending_calls:
             await self._emit(TurnDone())
+        if self._manual and self._turn is VoiceState.CAPTURING and not self._user_speaking:
+            # Manual turns leave CAPTURING only at the first audio: nothing spoken
+            # (proactive audio declined) and no activity open, the drain's CAPTURING
+            # guard would hold the state until the deadman.
+            await self._set_turn(VoiceState.IDLE)
+            return
         self._start_drain()
 
     def _start_hold_thinking(self) -> None:
@@ -425,7 +453,7 @@ class GeminiLiveBackend(RealtimeTransport):
             if not cid:
                 continue
             self._progress_t = time.monotonic()
-            self._pending_calls.add(cid)
+            self._pending_calls[cid] = name
             self._metrics.call_seen(cid, name)
             await self._emit(ToolStarted(name or None, call_id=cid))
             args = fc.get("args")
@@ -439,8 +467,9 @@ class GeminiLiveBackend(RealtimeTransport):
     def _on_tool_cancel(self, cancel: dict) -> None:
         # The shell's tool task runs on; its result then finds no pending call and drops.
         ids = {i for i in cancel.get("ids") or [] if isinstance(i, str)}
-        self._metrics.calls_abandoned(ids & self._pending_calls)
-        self._pending_calls -= ids
+        self._metrics.calls_abandoned(self._pending_calls.keys() & ids)
+        for cid in ids:
+            self._pending_calls.pop(cid, None)
 
     # ---- transport hooks ----------------------------------------------------
 

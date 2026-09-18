@@ -38,11 +38,13 @@ _LANG_NAMES = {"english": "en", "chinese": "zh", "german": "de", "japanese": "ja
 # CJK terminators split anywhere; ASCII only before whitespace/end ("3.14" survives).
 # A closer after the terminator (。」) belongs to its sentence, or a pause token
 # strands at the next utterance's head; one trailing closer is covered.
-_CLOSE_AFTER_TERM = re.escape("」』”’）】〉》\"')]}»")
+_CLOSERS = "」』”’）】〉》\"')]}»"
+_CLOSE_AFTER_TERM = re.escape(_CLOSERS)
 _SENTENCE_SPLIT_RE = re.compile(
     rf"(?:(?<=[。！？…])(?![。！？…{_CLOSE_AFTER_TERM}])"
     rf"|(?<=[。！？…][{_CLOSE_AFTER_TERM}])(?![{_CLOSE_AFTER_TERM}])"
-    rf"|(?<=[.!?])(?=\s|$))"
+    rf"|(?<=[.!?])(?=\s|$)"
+    rf"|(?<=[.!?][{_CLOSE_AFTER_TERM}])(?=\s|$))"
 )
 _CLAUSE_SPLIT_RE = re.compile(r"([、，；：]|[,;:](?=\s|$))")
 _SENTENCE_PUNCT = ".!?…。！？"
@@ -273,10 +275,11 @@ def _is_latin(ch: str) -> bool:
 
 
 def _sentences(text: str) -> list[tuple[str, str]]:
-    """(body, trailing sentence punctuation) chunks; the model voices the pause."""
+    """(body, trailing sentence punctuation) chunks; the model voices the pause. A
+    trailing closer goes: no frontend voices it, and it hid the terminator."""
     ans = []
     for piece in _SENTENCE_SPLIT_RE.split(text):
-        piece = piece.strip()
+        piece = piece.strip().rstrip(_CLOSERS)
         if not piece:
             continue
         body = piece.rstrip(_SENTENCE_PUNCT)

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
+
+from eval_harness import EvalConversation
 
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
@@ -260,5 +263,60 @@ def test_a_mute_filler_leaves_the_script_instead_of_retrying_forever():
         assert tts.calls == ["two"]                 # nothing left: no synthesis at all
         assert b._turn is VoiceState.THINKING       # and no flip to SPEAKING
         await b.close()
+
+    asyncio.run(_t())
+
+
+def test_blank_stream_end_holds_the_wait_under_a_playing_filler():
+    """Core fires a non-resuming end on its blank-response RETRY too: under a playing filler
+    the turn reads SPEAKING, and the marker must still hold the wait (a drain to IDLE
+    disarmed the deadman and made the retried reply an unsolicited delivery)."""
+
+    async def _t():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 0, "phrases": ["y" * 100]},
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("what's the weather")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler, ~0.6 s
+            assert b._canned_base is VoiceState.THINKING
+            await b.on_stream_end(resuming=False)  # blank retry marker: nothing spoken
+            deadline = time.monotonic() + 3.0
+            while b._turn is VoiceState.SPEAKING and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert b._turn is VoiceState.THINKING  # the wait outlived the clip
+            timeout = b._cur_turn.timeout_task
+            assert timeout is not None and not timeout.done()  # deadman still armed
+            await conv.agent_replies("here is the weather")  # the retry lands as the reply
+            await conv.wait_state(VoiceState.IDLE)
+
+    asyncio.run(_t())
+
+
+def test_reply_spans_anchor_past_the_buffered_filler():
+    """A reply chunk emitted while the filler's audio is still buffered starts at the
+    filler's END, not at played_ms(): else a barge-in in the filler's remainder reports
+    reply words as heard and the JIT runway under-counts by that remainder."""
+
+    async def _t():
+        async with EvalConversation(
+            playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 0, "phrases": ["y" * 300]},
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("what's the weather")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler, 1.8 s
+            await conv.wait_played_ms(100)
+            await b.on_delta("Here is the reply sentence one. ")
+            deadline = time.monotonic() + 2.0
+            while not b._spoken_spans and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
+            assert b._spans_base_ms >= 1700  # the filler's full length, not its played part
+            assert b._runway_ms() > 1400     # filler remainder + the reply chunk
+            await conv.user_says("stop")     # the filler is still sounding
+            assert conv.interrupts == 1
+            await conv.user_says("next question")
+            assert any("before hearing it" in n for n in conv.notes()[-1])
 
     asyncio.run(_t())

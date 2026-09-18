@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from loguru import logger
 from nanobot.config.schema import Base
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 from pydantic.alias_generators import to_camel, to_snake
 from pydantic_core import PydanticUndefined
 
@@ -80,6 +80,9 @@ def parse_import_blob(raw: Any) -> dict[str, Any]:
         raise ValueError("importJson must be a JSON object: the channels.voice section")
     parsed.pop("importJson", None)  # a not-yet-consumed section must not recurse
     parsed.pop("import_json", None)
+    # The WebUI toggle owns `enabled`: a paste exported from a disabled section would
+    # otherwise be written back by start() and disable the channel on the next restart.
+    parsed.pop("enabled", None)
     return parsed
 
 
@@ -146,6 +149,15 @@ class _VoiceBase(Base):
                 alias, name, f"'{name}'" if keep_snake else f"'{alias}'",
             )
         return data
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def _expand_user_in_paths(cls, value: Any, info: ValidationInfo) -> Any:
+        """``~`` in any ``*Path``/``*Dir`` field: the loaders open the value verbatim."""
+        leaf = (info.field_name or "").rsplit("_", 1)[-1]
+        if isinstance(value, str) and leaf in ("path", "dir"):
+            return os.path.expanduser(value)
+        return value
 
     @classmethod
     def _comparable_default(cls, name: str) -> Any:
@@ -833,7 +845,7 @@ class WakeAckConfig(_VoiceBase):
 class WakeConfig(_VoiceBase):
     """Wake-word gate. Local backend: two tiers, as below. Cloud backends: the ACOUSTIC tier
     only, as the ``realtime.uplink="wake"`` gate (no STT there, so no transcript tier, no
-    stripping, no alias learning; the turn-receipt earcon stands in for the spoken ack).
+    stripping, no alias learning, and no spoken ack: a cloud summon has no audible receipt).
 
     ``mode="gate"``: a cold start needs the wake phrase; once engaged, follow-ups and barge-in
     stay natural for ``windowS`` after each turn. ``mode="strict"`` additionally requires the
@@ -927,8 +939,8 @@ class WakeConfig(_VoiceBase):
 class VoiceConfig(_VoiceBase):
     """Top-level ``channels.voice`` config.
 
-    ``enabled``, ``allowFrom`` and ``streaming`` have no in-repo reader: nanobot core
-    consumes them. Do not remove them as dead.
+    ``enabled``, ``allowFrom``, ``streaming`` and the three progress overrides have no
+    in-repo reader: nanobot core consumes them. Do not remove them as dead.
     """
 
     enabled: bool = False
@@ -943,6 +955,12 @@ class VoiceConfig(_VoiceBase):
     ] = "local"
     allow_from: list[str] = Field(default_factory=lambda: ["*"])  # BaseChannel allow-list
     streaming: bool = True  # core `supports_streaming`: send_delta() speaks the reply as it streams
+    # Core's per-channel overrides of channels.sendProgress/sendToolHints/showReasoning,
+    # read off the raw section; None = the global setting. Progress traffic feeds the
+    # deadman, so voice can keep it while a global off quiets the chat channels.
+    send_progress: bool | None = None
+    send_tool_hints: bool | None = None
+    show_reasoning: bool | None = None
     sender_id: str = "local"
     chat_id: str = "voice:local"
 
@@ -982,13 +1000,13 @@ class VoiceConfig(_VoiceBase):
     # agentTimeoutS) for the rest of the turn, never killing — a tool chain that stops narrating
     # is dead air the core clock cannot see. None = notices on core silence only. agentTimeoutS =
     # no bus traffic at all for this chat (deltas, segment ends, any send(); progress/tool events
-    # need core's channels.sendProgress, its default): one silent budget warns, a SECOND /stops
-    # the run and speaks timeoutPhrase. 300 sits well above core's only model-call bound, the
-    # 90s stream-idle timeout (NANOBOT_STREAM_IDLE_TIMEOUT_S; there is no wall clock since
-    # 0.3.5), so a stalled call is core's error first; tighter kills turns core would still
-    # finish. None disables both. Both phrases are spoken by the session TTS — localize them
-    # together, and never put a stop phrase inside one (validated): a just-spoken word is
-    # self-echo, so the invited command would be swallowed.
+    # need core's channels.sendProgress or this section's sendProgress): one silent budget
+    # warns, a SECOND /stops the run and speaks timeoutPhrase. 300 sits well above core's
+    # only model-call bound, the 90s stream-idle timeout (NANOBOT_STREAM_IDLE_TIMEOUT_S;
+    # there is no wall clock since 0.3.5), so a stalled call is core's error first; tighter
+    # kills turns core would still finish. None disables both. Both phrases are spoken by
+    # the session TTS — localize them together, and never put a stop phrase inside one
+    # (validated): a just-spoken word is self-echo, so the invited command would be swallowed.
     agent_timeout_s: float | None = Field(default=300.0, gt=0)
     stall_notice_s: float | None = Field(default=60.0, gt=0)
     stall_phrase: str = "Still working on it. This is taking longer than usual."

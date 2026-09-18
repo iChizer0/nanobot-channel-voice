@@ -196,6 +196,7 @@ def test_preempted_but_empty_transcript_orphans_to_idle():
     trigger was not speech, so the session must not sit in a dead SPEAKING."""
     h = _build()
     h.backend._turn = VoiceState.SPEAKING
+    h.backend._cur_turn.abandon()  # what the early confirm's _do_interrupt did
     h.transcript = ""
     _run(h.backend._on_utterance(_utt(preempted=True)))
     assert h.backend._turn is VoiceState.IDLE
@@ -254,19 +255,18 @@ def test_publish_carries_the_new_turn_token():
 
 
 def test_interrupt_kills_the_old_token_but_not_a_superseded_one():
-    """Only a KILLED turn's final is muted: core may coalesce a queued follow-up
-    into its still-running turn, and that combined reply (echoing the older
-    token) must speak."""
+    """Only a KILLED turn's final is muted: a turn that drained and was followed by a
+    new publish may still echo its token on a late final, and that must speak."""
     async def _case():
         h = _build()
         h.backend._turn = VoiceState.IDLE
         h.transcript = "first"
         await h.backend._on_utterance(_utt())
         _, first = h.published[0]
-        # Superseded WITHOUT a kill (preempted skips the /stop): stays speakable.
-        h.backend._turn = VoiceState.THINKING
+        # Superseded WITHOUT a kill (the reply drained; nothing to /stop): stays speakable.
+        h.backend._turn = VoiceState.IDLE
         h.transcript = "and also"
-        await h.backend._on_utterance(_utt(preempted=True))
+        await h.backend._on_utterance(_utt())
         assert not h.backend.is_dead_turn(first)
         # A genuine interrupt (talking over AUDIBLE speech) kills the CURRENT token,
         # before any await can race it. (Content words: a bare stop command would
@@ -402,6 +402,7 @@ def test_preempted_turn_releases_a_duck_raised_during_stt():
     explicit clear the sink stays ducked and the NEXT reply plays attenuated."""
     h = _build()
     h.backend._turn = VoiceState.SPEAKING
+    h.backend._cur_turn.abandon()  # what the early confirm's _do_interrupt did
     h.backend._engage_duck(suspect=True)  # candidate raised while STT ran
     assert h.sink._gain_target == pytest.approx(h.backend._duck_gain)
     h.transcript = "open the door"
@@ -428,11 +429,12 @@ def test_false_barge_in_releases_the_duck_and_counts_it():
 def test_heard_text_cuts_inside_the_chunk_playback_stopped_in():
     h = _build()
     h.backend._spoken_spans = [("first sentence here", 1000.0), ("second one follows", 1000.0)]
-    assert h.backend._heard_text(1000.0) == "first sentence here"
-    partial = h.backend._heard_text(1500.0)
+    assert h.backend._heard_text(1000.0) == ("first sentence here", ["second one follows"])
+    partial, unheard = h.backend._heard_text(1500.0)
     assert partial.startswith("first sentence here second")
     assert partial.endswith("...")
-    assert h.backend._heard_text(0.0) == ""
+    assert unheard == []  # a partially heard chunk stays echo material
+    assert h.backend._heard_text(0.0) == ("", ["first sentence here", "second one follows"])
 
 
 # ---- sink invariants the backend depends on ---------------------------------
@@ -915,6 +917,97 @@ def test_preempted_verdict_flushes_audio_that_started_after_the_kill():
         assert h.interrupts == 0     # but no second /stop
         assert h.published
         return h
+
+    _run(_case())
+
+
+def test_preempted_verdict_kills_a_live_successor_turn_properly():
+    """Two utterances in flight: U2's early confirm killed T0, then U1's verdict published
+    T1, SPEAKING when U2's verdict runs. ``preempted`` must not read as "the current turn
+    is dead": T1 needs the /stop, dead token and rejected base, not a bare flush."""
+    async def _case():
+        h = _build()
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._cur_turn = _Turn("t1-live")
+        b._cur_turn.base = "voice:voice:local:1000000000000000000"
+        epoch = h.sink.epoch
+        h.sink.enqueue(OutputAudio(epoch=epoch, pcm=bytes(3200), rate=16000))
+        h.transcript = "use tokyo instead"
+        await b._on_utterance(
+            _utt(preempted=True, onset_interrupting=True, onset_speaking=True)
+        )
+        assert h.sink.epoch > epoch
+        assert h.interrupts == 1
+        assert b.is_dead_turn("t1-live")
+        assert b._is_rejected("voice:voice:local:1000000000000000000")
+        assert [t for t, _ in h.published] == ["use tokyo instead"]
+        await b.on_delta("late words", stream_id="voice:voice:local:1000000000000000000:0")
+        assert b._tts_queue.empty()  # dropped, not spoken into the new turn
+
+    _run(_case())
+
+
+def test_a_failed_publish_settles_to_idle():
+    """The bus lost the turn, so no reply will come: the state must not sit in THINKING
+    (installed before the publish) with no deadman, prologue or earcon."""
+    async def _case():
+        h = _build(agentTimeoutS=0.05)
+        b = h.backend
+
+        async def bad_publish(text, token, notes=()):
+            raise RuntimeError("bus closed")
+
+        b._publish_text = bad_publish
+        h.transcript = "hello there"
+        await b.start(instructions=None, tools=[], on_event=_collect)
+        try:
+            b._queue_utterance(_utt())
+            await b._utt_queue.join()
+            assert b._turn is VoiceState.IDLE
+            assert b._cur_turn.timeout_task is None
+            await asyncio.sleep(0.1)
+            assert "agent_turn_timeout" not in b._metrics.counters
+            assert h.interrupts == 0
+        finally:
+            await b.close()
+
+    _run(_case())
+
+
+def test_orphaned_confirm_spares_a_live_successor_turn():
+    """Same two-in-flight shape, U2 judged empty: the orphan settle is for the DEAD
+    turn's stranded SPEAKING, never for a successor that owns the state."""
+    h = _build()
+    b = h.backend
+    b._turn = VoiceState.THINKING
+    b._cur_turn = _Turn("t1-live")
+    h.transcript = ""
+    _run(b._on_utterance(_utt(preempted=True)))
+    assert b._turn is VoiceState.THINKING
+    assert b._metrics.counters.get("barge_in_early_orphan.empty") == 1
+
+
+def test_hop_early_confirm_on_a_dead_turn_does_not_stop_twice():
+    """U1's early confirm killed and /stop-ped the turn; U2's partials clear min-words while
+    U1 is still in STT. No second /stop, no second early-confirm count, no "interrupted
+    before your reply was heard" from cleared spans; audio started since still stops."""
+    async def _case():
+        h = _build()
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._cur_turn = _Turn("t0")
+        b._cur_turn.abandon()
+        b._dead_tokens.append("t0")
+        epoch = h.sink.epoch
+        h.sink.enqueue(OutputAudio(epoch=epoch, pcm=bytes(3200), rate=16000))
+        b._endpointer._in_speech = True  # U2 open
+        b._early_confirm = True          # its partials cleared min-words
+        await b.push_audio(b"\x01\x00" * 320)
+        assert h.interrupts == 0
+        assert h.sink.epoch > epoch
+        assert b._preempted and b._early_heard is None
+        assert "barge_in_early_confirm" not in b._metrics.counters
 
     _run(_case())
 

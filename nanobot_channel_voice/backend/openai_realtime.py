@@ -162,6 +162,8 @@ class RealtimeBackend(RealtimeTransport):
         # last turn the server cached.
         self._conversation_id: str | None = None
         self._conversation_t = 0.0
+        # event_id of the hello (session.update): a vendor that attributes errors names it.
+        self._hello_id = ""
         # The stop latch + clocks live in _reset_turn_state, per LATEST onset.
         self._reset_turn_state()
 
@@ -206,6 +208,10 @@ class RealtimeBackend(RealtimeTransport):
         # Manual turns: a commit landing between a response.create and its
         # response.created is refused (already active); re-ask once that response ends.
         self._retry_create = False
+        # A tool continuation asked for but not born (no response.created yet): a barge-in
+        # has no id to cancel, so it marks the newborn. Unbounded, unlike the stop window.
+        self._continuation_unborn = False
+        self._kill_at_birth = False
 
     def _api_key(self) -> str:
         key = resolve_openai_key(self._rt.api_key)
@@ -269,11 +275,16 @@ class RealtimeBackend(RealtimeTransport):
             del self._cancelled_responses[next(iter(self._cancelled_responses))]
 
     def _mark_cancelled(self) -> None:
-        if self._active_response_id:
+        if self._continuation_unborn:
+            self._kill_at_birth = True
+        elif self._active_response_id:
             self._note_cancelled(self._active_response_id)
 
     async def _cancel_active(self) -> None:
         """Send ``response.cancel`` for the live response, at most once."""
+        if self._continuation_unborn:
+            self._kill_at_birth = True  # no id to name yet: dies at response.created
+            return
         rid = self._active_response_id
         if not rid or rid in self._cancelled_responses:
             return
@@ -364,11 +375,21 @@ class RealtimeBackend(RealtimeTransport):
 
     async def _activity_end_wire(self, *, commit: bool) -> None:
         if commit:
+            self._retry_create = False  # this create answers the whole buffer
             await self._send({"type": "input_audio_buffer.commit"})
             await self._send({"type": "response.create"})
-        else:
-            self._retry_create = False  # nothing owed for a discarded activity
-            await self._send({"type": "input_audio_buffer.clear"})
+            return
+        await self._send({"type": "input_audio_buffer.clear"})
+        if not self._retry_create:
+            return
+        rid = self._active_response_id
+        if not rid:
+            # The trigger ended while this activity spoke (the re-ask was deferred): no
+            # done will re-ask now, and the committed audio is still owed an answer.
+            self._retry_create = False
+            await self._send({"type": "response.create"})
+        elif self._response_had_tools.get(rid):
+            self._retry_create = False  # the tool continuation's create answers it too
 
     # ---- wire ---------------------------------------------------------------
 
@@ -386,7 +407,8 @@ class RealtimeBackend(RealtimeTransport):
         return url, self._profile.auth_headers(self._api_key())
 
     def _hello_payload(self) -> dict:
-        return self._session_update_payload()
+        self._hello_id = f"hello-{time.monotonic_ns()}"
+        return {"event_id": self._hello_id, **self._session_update_payload()}
 
     def _audio_frame(self, pcm: bytes) -> dict:
         return {
@@ -465,7 +487,8 @@ class RealtimeBackend(RealtimeTransport):
 
     async def _handle_event(self, evt: dict) -> None:
         t = evt.get("type", "")
-        if t in ("session.created", "session.updated"):
+        if t == "session.updated":
+            # OUR config applied; session.created precedes the hello's acceptance.
             self._ready.set()
             self._ever_ready = True
             self._auth_fails = 0
@@ -484,9 +507,12 @@ class RealtimeBackend(RealtimeTransport):
                 self._on_speech_stopped()
         elif t == "response.created":
             rid = (evt.get("response") or {}).get("id")
-            if time.monotonic() < self._stop_suppress_until:
-                # Kill the consumed stop's response at birth; silence is the acknowledgment.
+            self._continuation_unborn = False
+            if time.monotonic() < self._stop_suppress_until or self._kill_at_birth:
+                # Kill the consumed stop's response (or the continuation barged in on
+                # while unborn) at birth; silence is the acknowledgment.
                 self._stop_suppress_until = 0.0
+                self._kill_at_birth = False
                 self._active_response_id = rid
                 await self._cancel_active()
                 return
@@ -662,7 +688,12 @@ class RealtimeBackend(RealtimeTransport):
         # response.create; the refused commit's turn rides behind it.
         continues = bool(rid and self._response_had_tools.get(rid))
         await self._handle_response_done(evt)
-        if self._retry_create and not continues and not self._closing:
+        # Not under an open activity (a cancelled done lands mid-utterance): the user's
+        # own commit carries the refused audio too, and its create clears the flag.
+        if (
+            self._retry_create and not continues and not self._closing
+            and not self._user_speaking
+        ):
             self._retry_create = False
             self._log.debug("re-issuing the response.create refused while rid={} ran", rid)
             await self._send({"type": "response.create"})
@@ -759,6 +790,7 @@ class RealtimeBackend(RealtimeTransport):
         else:
             # Auto-continuing dialects resume on the function_call_output alone.
             self._log.debug("auto-continuing dialect; no response.create for rid={}", rid)
+        self._continuation_unborn = True
         # response.done cancelled the watchdog: the create -> response.created gap is the
         # one window with no deadman, and a continuation never started wedges the session
         # (mic gated while SPEAKING, so nothing can recover it).
@@ -800,6 +832,15 @@ class RealtimeBackend(RealtimeTransport):
         if benign:
             self._log.debug("realtime error (benign): {}", msg)
             return
+        if not self._ready.is_set() and err.get("event_id") in (None, "", self._hello_id):
+            # Unattributed, or ours: the hello is the only frame out before the barrier.
+            # A session that NEVER worked is a config error (fatal); after a working one
+            # this is a reconnect's blip, and the close that follows walks the ladder.
+            msg = (
+                f"session.update rejected by '{self._profile.key}' ({msg}); the session "
+                "would run on the server's defaults - check the realtime.* settings"
+            )
+            fatal = not self._ever_ready
         # Kept so a following response.done(failed) with bare status_details can use it.
         self._last_error = f"{code}: {msg}" if code else msg
         await self._emit(Error(message=f"realtime error: {msg}", fatal=fatal))
@@ -811,6 +852,7 @@ class RealtimeBackend(RealtimeTransport):
 
     async def _watchdog_recover(self) -> str | None:
         rid, self._active_response_id = self._active_response_id, None
+        self._continuation_unborn = self._kill_at_birth = False  # the turn is given up
         if rid:
             # Recover, not just report: stragglers drop via _is_live, a late tool result
             # cannot re-trigger the response, and the server stops generating.

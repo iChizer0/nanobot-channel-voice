@@ -28,6 +28,13 @@ _ABBREV_CAP = frozenset({
     "ave", "sgt", "capt", "dept",
 })
 _ABBREV_ANY = frozenset({"vs", "etc", "approx"})
+# An initial follows a capitalised word, a dotted initial or the sentence start (after
+# "25°C", "42B", "plan" or "is", a lone capital ends its sentence); searched over the
+# last _INITIAL_LOOKBACK chars, a word plus its space, so a letter run stays linear.
+_RE_INITIAL_PREV = re.compile(r"^[ \t]*$|[A-Z][A-Za-z]*\.?[ \t]+$")
+_INITIAL_LOOKBACK = 32
+_RE_INITIAL_NEXT = re.compile(r"[ \t]+[A-Z]")
+_RE_NO_NEXT = re.compile(r"[ \t]*\d")
 # Ordered-list marker, line-anchored by the caller: "1." heads an item, never a sentence.
 _RE_ORDERED = re.compile(r"[ \t]{0,3}\d{1,3}[.)](?=[ \t])")
 
@@ -37,7 +44,10 @@ _RE_FENCE = re.compile(r"(?m)^[ \t]{0,3}```[\s\S]*?```")
 _RE_INLINE_CODE = re.compile(r"`([^`]*)`")
 _RE_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _RE_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_RE_EMPHASIS = re.compile(r"([*_~]{1,3})(\S(?:.*?\S)?)\1")
+# A pair binds only at word edges: intraword markers (snake_case, 2*3) are content,
+# and stripping them glued the words. ASCII edges only, so CJK glue ("**重要**的") strips.
+_RE_EMPHASIS = re.compile(r"(?<![A-Za-z0-9])([*_~]{1,3})(\S(?:.*?\S)?)\1(?![A-Za-z0-9])")
+_RE_UNDERSCORE = re.compile(r"_+")  # left over, it is \w: the whitelist would keep it
 # Bracketed spans are labels/stage directions/leaked placeholders, never speech (the
 # whitelist below would drop the brackets and SPEAK the words). Must run after _RE_LINK
 # so "[text](url)" kept its text. Bounded, single-line; CJK quote pairs (「」『』) stay.
@@ -56,8 +66,12 @@ _RE_ORDERED_MARK = re.compile(r"(?m)^(\s{0,3}\d{1,3})[.)]([ \t]+)")
 _RE_QUOTE = re.compile(r"(?m)^\s{0,3}>\s?")
 _RE_WS = re.compile(r"[ \t]+")
 
-# Curly quotes -> ASCII BEFORE the whitelist below, which would drop them.
-_SMART_PUNCT = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
+# Curly quotes, the math minus and the full-width ％/￥/－ -> the twins the frontends
+# read, BEFORE the whitelist below, which would drop them (a lost "%" or "¥" changes
+# the number; a lost "－" fuses "5－10分钟" into 五十分钟).
+_SMART_PUNCT = str.maketrans({
+    "‘": "'", "’": "'", "“": '"', "”": '"', "−": "-", "％": "%", "￥": "¥", "－": "-",
+})
 # Between digits a tilde is the hyphen's twin ("5~10分钟"); as itself it is unspeakable
 # (espeak names it "tilde") and the whitelist would drop it, fusing 5 and 10 into 五十.
 _RE_TILDE_RANGE = re.compile(r"(?<=\d)\s*[~～]\s*(?=\d)")
@@ -65,11 +79,11 @@ _RE_TILDE_RANGE = re.compile(r"(?<=\d)\s*[~～]\s*(?=\d)")
 # pause on. Everything else -> space (never glue neighbours), collapsed by _RE_WS;
 # espeak and MMS VITS read raw codepoint names aloud.
 _RE_UNSPEAKABLE = re.compile(
-    r"[^\w\s.,;:!?'\"()\-/%&+=@°$€£¥₹₽¢…。，！？、；：「」『』（）《》〈〉・·—–]"
+    r"[^\w\s.,;:!?'\"()\-/%&+=@°℃℉$€£¥₹₽¢…。，！？、；：「」『』（）《》〈〉・·—–]"
 )
 
 
-_SPEAKABLE_SYMBOLS = "%&+=@°$€£¥₹₽¢"  # kept by the whitelist above: TTS voices them as words
+_SPEAKABLE_SYMBOLS = "%&+=@°℃℉$€£¥₹₽¢"  # kept by the whitelist above: TTS voices them as words
 
 
 def has_speech(text: str) -> bool:
@@ -85,6 +99,7 @@ def sanitize(text: str) -> str:
     text = _RE_LINK.sub(r"\1", text)
     text = _RE_STAGE.sub(" ", text)
     text = _RE_EMPHASIS.sub(r"\2", text)
+    text = _RE_UNDERSCORE.sub(" ", text)
     text = _RE_HEADER.sub("", text)
     text = _RE_BULLET.sub("", text)
     text = _RE_ORDERED_MARK.sub(r"\1,\2", text)
@@ -99,15 +114,31 @@ def sanitize(text: str) -> str:
 
 def _dot_binds(buf: str, i: int) -> bool:
     """Is the "." at ``i`` inside a token? True for the closing dot of a dotted initialism
-    ("p.m.", "U.S.") and for a known abbreviation; both read as sentence ends to the bare
-    terminator rule. Bounded lookback: the alphabet's longest entry is 6 letters."""
+    ("p.m.", "U.S."), for a known abbreviation, and for an initial or "No." whose
+    follow-up says so; all read as sentence ends to the bare terminator rule. Bounded
+    lookback: the alphabet's longest entry is 6 letters."""
     if i >= 2 and buf[i - 2] == "." and buf[i - 1].isalpha() and buf[i - 1].isascii():
         return True
     k = i
     while k > max(0, i - 7) and buf[k - 1].isalpha() and ord(buf[k - 1]) < _CJK_FLOOR:
         k -= 1
     tok = buf[k:i]
-    return tok.lower() in _ABBREV_ANY or (tok[:1].isupper() and tok.lower() in _ABBREV_CAP)
+    if tok.lower() in _ABBREV_ANY or (tok[:1].isupper() and tok.lower() in _ABBREV_CAP):
+        return True
+    # Only the follow-up tells "George W. Bush" from "Meet K. Then": a capitalised word
+    # binds the initial, a digit binds "No."; whitespace alone holds for the next delta.
+    if tok.isascii() and len(tok) == 1 and tok.isupper():
+        return _RE_INITIAL_PREV.search(buf[max(0, k - _INITIAL_LOOKBACK):k]) is not None and (
+            _undecided(buf, i) or _RE_INITIAL_NEXT.match(buf, i + 1) is not None
+        )
+    if tok == "No":
+        return _undecided(buf, i) or _RE_NO_NEXT.match(buf, i + 1) is not None
+    return False
+
+
+def _undecided(buf: str, i: int) -> bool:
+    """Nothing but whitespace after the dot at ``i`` yet: the next delta decides."""
+    return not buf[i + 1 :].strip()
 
 
 def _primary_cut(buf: str, line_start: bool) -> int:

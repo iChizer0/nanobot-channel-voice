@@ -126,6 +126,15 @@ def test_quietest_split_ties_latest_and_short_input_passes():
     assert quietest_split(tone(8), RATE) == 16      # under one window: unchanged
 
 
+def test_quietest_split_odd_length_input_returns_an_even_offset():
+    from nanobot_channel_voice.audio.pcm import quietest_split
+
+    # A torn trailing byte: the "(even)" contract holds on the no-window exit too.
+    assert quietest_split(tone(8) + b"\x01", RATE) == 16
+    assert quietest_split(b"\x01", RATE) == 0
+    assert quietest_split(tone(1600) + b"\x01", RATE, back_ms=1, win_ms=0.05) % 2 == 0
+
+
 def test_quietest_split_only_searches_the_back_window():
     from nanobot_channel_voice.audio.pcm import quietest_split
 

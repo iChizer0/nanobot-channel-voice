@@ -64,6 +64,25 @@ def test_reset_forgets_everything():
     assert f.is_self_echo("something spoken") is False
 
 
+def test_cut_drops_the_unheard_tail_and_ends_the_hold(monkeypatch):
+    """Playback stopped: the newest notes named as unheard go (a user repeating those
+    words is fresh), a text with no units was never noted and is skipped, and what
+    remains stops holding from a playout that never came."""
+    now = [0.0]
+    monkeypatch.setattr(er.time, "monotonic", lambda: now[0])
+    f = SelfEchoFilter(threshold=0.5, window_secs=1.0)
+    f.note_spoken("alpha beta gamma", hold_ms=5000.0)
+    f.note_spoken("...", hold_ms=5000.0)
+    f.note_spoken("delta epsilon zeta", hold_ms=5000.0)
+    f.cut(["...", "delta epsilon zeta"])
+    assert f.is_self_echo("delta epsilon zeta") is False
+    assert f.is_self_echo("alpha beta gamma") is True
+    f.cut(["never spoken words"])  # a mismatch stops the walk: nothing else goes
+    assert f.is_self_echo("alpha beta gamma") is True
+    now[0] = 1.5  # the hold ended at the cut (t=0): the window has run out
+    assert f.is_self_echo("alpha beta gamma") is False
+
+
 def test_units_of_uses_cjk_bigrams():
     from nanobot_channel_voice.echo_reject import units_of
 

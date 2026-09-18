@@ -153,6 +153,7 @@ class AudioSink:
         self._generation = 0
         self._rate = 0
         self._queued_ms = 0.0  # duration of queued-but-unwritten items (backlog_ms)
+        self._inflight_b = 0  # bytes of the item being written that are already written
         self._dropped_ms = 0.0  # audio the overflow guard discarded this session
         self._overflow_warned = False
         # Set whenever _queued_ms shrinks (item played, flush): wakes wait_backlog_below.
@@ -271,18 +272,34 @@ class AudioSink:
         """Identity of the stream ``played_ms()`` currently measures."""
         return self._generation
 
-    @property
-    def next_generation(self) -> int:
-        """Identity audio enqueued NOW will play on: the stream opens lazily in the
-        worker, so a producer reading ``stream_generation`` before its first write
-        anchors to a stream that is already gone."""
-        live = (
+    def _stream_live(self) -> bool:
+        """Will the next write land on the current stream (rather than open a fresh one)?"""
+        return (
             self._stream is not None
             and self._stream is not self._draining
             and self._stream not in self._parked
             and not self._stream.dead  # _stream_write reopens under a dead handle
         )
-        return self._generation if live else self._generation + 1
+
+    @property
+    def next_generation(self) -> int:
+        """Identity audio enqueued NOW will play on: the stream opens lazily in the
+        worker, so a producer reading ``stream_generation`` before its first write
+        anchors to a stream that is already gone."""
+        return self._generation if self._stream_live() else self._generation + 1
+
+    def accepted_ms(self) -> int:
+        """Stream mode: where audio enqueued NOW starts on the stream it will play on
+        (``next_generation``): the bytes written there plus the queued audio still to be
+        written, a coordinate like ``played_ms()``. ``backlog_ms`` cannot serve: it counts
+        the in-flight item whole, written part included. Blob: 0."""
+        if self._mode != "stream":
+            return 0
+        inflight = pcm_ms(self._inflight_b, self._rate) if self._rate > 0 else 0.0
+        total = max(0.0, self._queued_ms - inflight)
+        if self._stream_live() and self._rate > 0:
+            total += self._bytes / (2 * self._rate) * 1000.0
+        return int(total)
 
     @property
     def busy(self) -> bool:
@@ -535,6 +552,7 @@ class AudioSink:
             except Exception as exc:  # noqa: BLE001 - never let one item kill the worker
                 self._log.warning("playback error: {}", exc)
             finally:
+                self._inflight_b = 0
                 if item.epoch == self._epoch:
                     # Debit only what enqueue credited, else a dead item thins the
                     # NEXT turn's echo hold.
@@ -644,4 +662,5 @@ class AudioSink:
                 self._ref_tap.push_reference(block, rate, playout)
             await stream.write(block)
             self._bytes += len(block)
+            self._inflight_b += len(block)
             off += len(block)

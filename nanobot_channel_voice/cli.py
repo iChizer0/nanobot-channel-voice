@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from pydantic.alias_generators import to_snake
+
 from nanobot_channel_voice import weights as w
 
 
@@ -143,7 +145,8 @@ def _config(args: argparse.Namespace) -> int:
         mode="json",
         by_alias=True,
         exclude_unset=not args.full,  # default: only what is configured (round-trips small)
-        exclude={"import_json"},      # the transport itself never exports
+        # Not the transport, nor `enabled`: the WebUI toggle owns it and the paste box drops it.
+        exclude={"import_json", "enabled"},
     )
     if not args.secrets:
         omitted = _scrub_secrets(dumped)
@@ -152,8 +155,30 @@ def _config(args: argparse.Namespace) -> int:
                 f"note: {omitted} secret field(s) omitted; --secrets includes them",
                 file=sys.stderr,
             )
+    _fold_home(dumped)
     print(json.dumps(dumped, indent=2, ensure_ascii=False))
     return 0
+
+
+def _is_path_field(name: str) -> bool:
+    """The schema's rule (config._VoiceBase): a ``*Path``/``*Dir`` leaf."""
+    return to_snake(name).rsplit("_", 1)[-1] in ("path", "dir")
+
+
+def _fold_home(node: Any) -> None:
+    """Paths back to ``~`` in place: the schema expands them, and an export that names
+    the home directory neither pastes across machines nor keeps the user name out."""
+    home = os.path.expanduser("~")
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str) and _is_path_field(key):
+                if value == home or value.startswith(home + os.sep):
+                    node[key] = "~" + value[len(home):]
+            else:
+                _fold_home(value)
+    elif isinstance(node, list):
+        for value in node:
+            _fold_home(value)
 
 
 def _scrub_secrets(node: Any) -> int:
@@ -213,11 +238,20 @@ def _prune(args: argparse.Namespace, root: Path) -> int:
         )
         keys = sorted(have)
     else:
-        keys = [_resolve_key(t, have, "nothing fetched under that name") for t in args.keys]
+        keys = [
+            t if w.dangling(t, root) else _resolve_key(t, have, "nothing fetched under that name")
+            for t in args.keys
+        ]
     freed = 0
     for key in keys:
+        target = w.relocation_target(key, root)
         freed += w.prune(key, root)
-        print(f"removed {key}")
+        if target is None:
+            print(f"removed {key}")
+        elif target.exists():  # only the link went: say where the data still is
+            print(f"unlinked {key} (relocated; its files stay at {target})")
+        else:
+            print(f"removed the dangling link {key} (its target {target} is gone)")
     print(f"freed {_fmt_mb(freed)}")
     return 0
 
@@ -305,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "sync":
             return _sync(args, index, root)
         return _list(args, index, root)
-    except w.WeightsError as exc:
+    except (w.WeightsError, OSError) as exc:  # OSError: a store path that won't go
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

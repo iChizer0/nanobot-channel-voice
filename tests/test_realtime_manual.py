@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from types import SimpleNamespace
 
 import pytest
 
@@ -368,6 +369,89 @@ def test_park_and_resume_interleaved_leave_one_live_loop():
     run(_run())
 
 
+def test_a_park_cancelled_in_its_close_handshake_resumes_on_a_fresh_session():
+    """The gate's onset cancels the idle timer's park() inside cancel_and_wait(rx) (the
+    socket's close handshake) and calls begin_activity at once: the resume must not
+    inherit the parked session's ready flag, and nothing goes out before the new hello."""
+
+    async def _run():
+        backend, sent, events = make_backend()
+        connects: list[int] = []
+        release = asyncio.Event()
+        seen: dict = {}
+
+        async def connect_and_run():
+            n = len(connects) + 1
+            connects.append(n)
+            if n == 2:
+                seen.update(ready=backend._ready.is_set(), turn=backend._turn)
+                await release.wait()  # the reconnect is still in flight
+            backend._ws = object()
+            backend._ready.set()
+            backend._ever_ready = True
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                backend._ws = None  # the real finally
+                await asyncio.sleep(0.2)  # websockets' close handshake
+                raise
+
+        marks: list = []
+
+        async def begin_wire():
+            marks.append((len(connects), backend._ready.is_set()))
+
+        backend._connect_and_run = connect_and_run
+        backend._activity_begin_wire = begin_wire
+        await backend.start(instructions="", tools=[], on_event=backend._on_event)
+        await asyncio.sleep(0)
+        old = backend._rx_task
+        parking = asyncio.create_task(backend.park())
+        await asyncio.sleep(0.05)  # inside the handshake wait
+        assert backend._parked and not parking.done()
+        parking.cancel()  # gate._cancel_park, then begin_activity on the same task
+
+        async def release_later():
+            await asyncio.sleep(0.05)
+            release.set()
+
+        releaser = asyncio.create_task(release_later())
+        await backend.begin_activity()
+        await releaser
+        assert seen == {"ready": False, "turn": VoiceState.IDLE}
+        assert marks == [(2, True)]
+        assert backend._turn is VoiceState.CAPTURING and not backend._parked
+        assert connects == [1, 2]
+        assert backend._rx_task is not old and not backend._rx_task.done()
+        await asyncio.sleep(0.25)  # the old socket finished closing on its own
+        assert old.done() and not backend._rx_task.done()
+        assert backend._ws is not None
+        await backend.close()
+
+    run(_run())
+
+
+def test_reconnect_wait_ends_when_the_ladder_gives_up(monkeypatch):
+    """An utterance during a reconnect in flight: once the ladder parks the backend,
+    no session is coming, so the gate gets its answer then, not at the budget."""
+    monkeypatch.setattr(transport, "_BACKOFF", (0.02, 0.02))
+    monkeypatch.setattr(transport, "_RESUME_TIMEOUT_S", 2.0)
+
+    async def _run():
+        backend, _, _ = make_backend()
+        attempts = _failing_connection(backend)
+        await backend.start(instructions="", tools=[], on_event=backend._on_event)
+        t0 = asyncio.get_running_loop().time()
+        with pytest.raises(RuntimeError, match="reconnect"):
+            await backend.begin_activity()
+        assert asyncio.get_running_loop().time() - t0 < 1.0
+        assert backend._parked and len(attempts) == 3
+        assert backend._turn is VoiceState.IDLE
+        await backend.close()
+
+    run(_run())
+
+
 def test_drain_never_flips_capturing_to_idle():
     """A completion landing after the next onset: the onset owns the state."""
 
@@ -403,3 +487,218 @@ def test_discarding_an_activity_under_a_live_reply_keeps_its_deadman():
         await backend.close()
 
     run(_run())
+
+
+def make_shell_backend(profile="openai", config: VoiceConfig | None = None):
+    """``on_event`` does what VoiceShell._cloud_barge_in does: flush, then ``barge_in``."""
+    backend, sent, events = make_backend(profile, config)
+
+    async def on_event(e):
+        events.append(e)
+        if isinstance(e, UserSpeechStarted):
+            await backend.barge_in(await backend._sink.flush())
+
+    backend._on_event = on_event
+    return backend, sent, events
+
+
+def test_manual_onset_on_an_unborn_continuation_kills_it_at_birth():
+    """The gate's onset lands between the post-tool response.create and its
+    response.created: naming the finished trigger cancels nothing (the server answers
+    response_cancel_not_active) and the continuation then plays over the user."""
+
+    async def _run():
+        backend, sent, events = make_shell_backend()
+        backend._ready.set()
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.function_call_arguments.done",
+                                     "response_id": "r1", "call_id": "c1", "name": "t",
+                                     "arguments": "{}"})
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r1", "status": "completed"}})
+        await backend.submit_tool_result("c1", "ok")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.begin_activity()
+        assert not any(p["type"] == "response.cancel" for p in sent)
+        await backend._handle_event({"type": "response.created", "response": {"id": "r2"}})
+        assert sent[-1] == {"type": "response.cancel", "response_id": "r2"}
+        await backend._handle_event({"type": "response.output_audio.delta",
+                                     "response_id": "r2", "delta": b64(b"\x01")})
+        assert backend._turn is VoiceState.CAPTURING
+        assert not any(isinstance(e, StateHint) and e.state is VoiceState.SPEAKING
+                       for e in events)
+        await backend.close()
+
+    run(_run())
+
+
+def test_refused_commit_is_not_re_asked_while_the_user_speaks():
+    """The deferred response.create re-issued on the cancelled done of the response the
+    user just barged in on answers A over B, and B's own commit is refused again: it
+    waits for B's commit, which carries A's audio too."""
+
+    async def _run():
+        backend, sent, _ = make_shell_backend()
+        backend._ready.set()
+        await backend._handle_event({"type": "response.created", "response": {"id": "r0"}})
+        await backend.begin_activity()  # A barges in on r0
+        await backend.end_activity()  # commit + create, refused: r0 is still active
+        await backend._handle_event({"type": "error", "error": {
+            "code": "conversation_already_has_active_response", "message": "busy"}})
+        sent.clear()
+        await backend.begin_activity()  # B starts before r0's done lands
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r0", "status": "cancelled"}})
+        assert sent == [] and backend._retry_create is True
+        await backend.end_activity()
+        assert [p["type"] for p in sent] == ["input_audio_buffer.commit", "response.create"]
+        assert backend._retry_create is False  # B's create answers both
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r1", "status": "completed"}})
+        assert [p["type"] for p in sent] == ["input_audio_buffer.commit", "response.create"]
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_discarded_blip_still_answers_the_deferred_commit():
+    """The twin of the test above where B is a blip: its discard carries no create, and
+    r0's done already passed while B spoke, so nobody else would re-ask — A's committed
+    audio must get its response.create here."""
+
+    async def _run():
+        backend, sent, _ = make_shell_backend()
+        backend._ready.set()
+        await backend._handle_event({"type": "response.created", "response": {"id": "r0"}})
+        await backend.begin_activity()
+        await backend.end_activity()
+        await backend._handle_event({"type": "error", "error": {
+            "code": "conversation_already_has_active_response", "message": "busy"}})
+        sent.clear()
+        await backend.begin_activity()
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r0", "status": "cancelled"}})
+        assert sent == [] and backend._retry_create is True
+        await backend.end_activity(commit=False)  # B: min-length reject
+        assert [p["type"] for p in sent] == ["input_audio_buffer.clear", "response.create"]
+        assert backend._retry_create is False
+        await backend.close()
+
+    run(_run())
+
+
+def test_an_orphaned_rx_task_raising_from_its_close_never_re_enters_the_ladder():
+    """A park cancelled mid-handshake orphans the old rx task; a close raising anything but
+    CancelledError must not run the ladder (it would reset the resumed session and open a
+    third socket beside it)."""
+
+    async def _run():
+        backend, sent, events = make_backend()
+        backend._send = transport.RealtimeTransport._send.__get__(backend)
+        connects: list[int] = []
+
+        async def connect_and_run():
+            n = len(connects) + 1
+            connects.append(n)
+            ws = SimpleNamespace(name=f"ws{n}", send=_async_noop)
+            try:
+                backend._ws = ws
+                await backend._handle_event({"type": "session.updated"})
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if backend._ws is ws:
+                    backend._ws = None
+                await asyncio.sleep(0.05)
+                raise ConnectionError(f"{ws.name}: close handshake failed") from None
+
+        backend._connect_and_run = connect_and_run
+        await backend.start(instructions="", tools=[], on_event=backend._on_event)
+        await asyncio.sleep(0.01)
+        parking = asyncio.create_task(backend.park())
+        await asyncio.sleep(0.01)
+        parking.cancel()
+        await backend.begin_activity()
+        assert connects == [1, 2] and backend._turn is VoiceState.CAPTURING
+        await asyncio.sleep(0.2)  # the orphan's close raised meanwhile
+        assert connects == [1, 2]
+        assert backend._turn is VoiceState.CAPTURING and backend._ready.is_set()
+        assert backend._ws.name == "ws2"
+        assert not backend._orphan_rx
+        assert not [e for e in events if isinstance(e, Error)]
+        await backend.close()
+
+    run(_run())
+
+
+async def _async_noop(*_args, **_kwargs):
+    return None
+
+
+def test_a_provider_refusal_on_a_never_ready_session_is_fatal_at_once(monkeypatch):
+    """A wrong model (HTTP 404 at the handshake) or a rejected setup (close 1008) is
+    deterministic: walking the ladder, and under a gate re-walking it per utterance
+    while parked, only burns connects. Never ready = a config error = fatal."""
+    monkeypatch.setattr(transport, "_BACKOFF", (0.0, 0.0))
+
+    async def _run():
+        backend, _, events = make_backend()
+        attempts: list[int] = []
+
+        async def refused():
+            attempts.append(1)
+            raise OSError(SimpleNamespace(status_code=404))
+
+        backend._connect_and_run = refused
+        refused_exc = SimpleNamespace(response=SimpleNamespace(status_code=404))
+
+        async def connect_and_run():
+            attempts.append(1)
+            raise type("InvalidStatus", (Exception,), {"response": refused_exc.response})()
+
+        backend._connect_and_run = connect_and_run
+        await backend.start(instructions="", tools=[], on_event=backend._on_event)
+        for _ in range(50):
+            if backend._rx_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert len(attempts) == 1
+        [error] = [e for e in events if isinstance(e, Error)]
+        assert error.fatal and "rejected (HTTP 404)" in error.message
+        assert "realtime.model" in error.message
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_connect_that_cannot_be_prepared_is_fatal_not_laddered(monkeypatch):
+    """A key, a URL or a tool schema that raises while the hello is built is our own
+    config, deterministic on every attempt: fatal at once, never a 'disconnected'."""
+    monkeypatch.setattr(transport, "_BACKOFF", (0.0, 0.0))
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+
+    async def _run():
+        backend, _, events = make_backend()
+        attempts: list[int] = []
+
+        def broken_hello():
+            attempts.append(1)
+            raise AttributeError("'NoneType' object has no attribute 'get'")
+
+        backend._hello_payload = broken_hello
+        monkeypatch.setattr(transport, "_load_connect", lambda: _never_connect)
+        await backend.start(instructions="", tools=[], on_event=backend._on_event)
+        for _ in range(50):
+            if backend._rx_task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert len(attempts) == 1
+        [error] = [e for e in events if isinstance(e, Error)]
+        assert error.fatal and "could not be prepared" in error.message
+        await backend.close()
+
+    run(_run())
+
+
+def _never_connect(*_args, **_kwargs):
+    raise AssertionError("the hello must be built before the socket opens")
