@@ -634,9 +634,11 @@ def _gate_sets(choice: str, dumped: dict[str, Any], store: Store | None) -> dict
     that is still waiting for its phrase, which would else refuse the section from a
     section the form has folded away."""
     sets: dict[str, Any] = {}
-    # A mode this pick turned on and nothing has filled goes with it; one the user filled
-    # is theirs to keep. (This row is the cloud path's alone, so no local mode is touched.)
-    if choice != "wake" and _lookup(dumped, "wake.mode") != "off" and not _lookup(dumped, "wake.phrases"):
+    # A mode nothing has filled goes with this pick, one the user filled is theirs to keep;
+    # written even where the mode is already off, since the pick lands on the config the
+    # panel has when clicked, which may be a wake gate picked here since. (This row is the
+    # cloud path's alone, so no local mode is touched.)
+    if choice != "wake" and not _lookup(dumped, "wake.phrases"):
         sets["wake.mode"] = "off"
     if choice == "server":
         return sets or None
@@ -748,8 +750,8 @@ def _wake_field(
     """The wake Model row as the tier switch: a Transcript pill ahead of the heads (read
     by phrase; local backend only, a cloud session has no STT for that tier), every pick
     writing ``wake.engine`` with it (``sets``), a head also filling Phrases with the phrase
-    it hears unless Phrases has it. Custom is a head of your own: it clears the key like
-    Transcript does, so ``customOpen`` (the engine without a key) tells the two apart."""
+    it hears. Custom is a head of your own: it clears the key like Transcript does, so
+    ``customOpen`` (the engine without a key) tells the two apart."""
     phrases = _lookup(dumped, "wake.phrases") or []
     # Only the phrase the selected head hears goes with it: the rest were typed here.
     current = _head_phrase(_lookup(dumped, "wake.openwakeword.weights") or "", store)
@@ -759,11 +761,13 @@ def _wake_field(
         head["sets"] = dict(_ACOUSTIC_TIER)
         if phrase:
             head["label"] = phrase.lower()
-            wanted = (
+            # Always written, even where it is what Phrases already holds: the panel
+            # applies a pick against the config it has when clicked, not the one this
+            # form was built from, so a head that left the list alone would keep the
+            # phrase of a head picked since.
+            head["sets"]["wake.phrases"] = (
                 kept if phrase.casefold() in (p.casefold() for p in kept) else [*kept, phrase.lower()]
             )
-            if wanted != phrases:
-                head["sets"]["wake.phrases"] = wanted
     engine = _lookup(dumped, "wake.engine")
     local = dumped.get("backend") == "local"
     field.update(

@@ -19,7 +19,7 @@ from nanobot_channel_voice import weights as w
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.sync import config_weights_keys, plan_sync, run_sync
 from nanobot_channel_voice.sync import used_weights_keys as _used_weights_keys
-from nanobot_channel_voice.webui_form import build_form
+from nanobot_channel_voice.webui_form import build_form, lenient_config
 from nanobot_channel_voice.webui_sync import MANAGED_BY, VoiceSyncStore
 
 
@@ -664,8 +664,10 @@ def test_the_wake_model_row_is_the_tier_switch_and_a_head_fills_the_phrases(stor
     assert model["sets"] == {"wake.engine": "openwakeword"} and model["customOpen"] is False and model["custom"] == "files"
     assert "value" not in model and model["help"].startswith("Transcript matches the phrase in the transcription. A head")
     assert "wake.openwakeword.threshold" not in fields(gate)
-    # a head whose phrase Phrases already has fills nothing
-    assert fields({"wake": {"mode": "gate", "phrases": ["Alexa"]}})["wake.openwakeword.weights"]["choices"][1]["sets"] == {"wake.engine": "openwakeword"}
+    # a head whose phrase Phrases already has keeps the list as typed, casing and all
+    assert fields({"wake": {"mode": "gate", "phrases": ["Alexa"]}})["wake.openwakeword.weights"]["choices"][1]["sets"] == {
+        "wake.engine": "openwakeword", "wake.phrases": ["Alexa"],
+    }
     # picked: the engine set with it, the key in force, the threshold shown
     oww = {"wake": {**gate["wake"], "engine": "openwakeword", "openwakeword": {"weights": "wake/openwakeword/hey-jarvis/onnx"}}}
     picked = fields(oww)
@@ -699,6 +701,51 @@ def test_the_wake_model_row_is_the_tier_switch_and_a_head_fills_the_phrases(stor
     shutil.rmtree(store / "wake")
     bare = fields(gate)["wake.openwakeword.weights"]
     assert [c["value"] for c in bare["choices"]] == [""] and bare["help"].endswith("The index lists no head, Custom takes one of your own.")
+
+
+def test_two_picks_from_one_form_land_where_the_second_pick_meant(store):
+    """The panel refreshes the form on a debounce and applies ``sets`` against whatever it
+    holds at the click, so picks made in quick succession all come from the one form. Each
+    pick therefore names every key it owns outright, even where that key already holds what
+    it would write, or the second pick keeps the first's: a head would be listened for by
+    the phrase of the head picked between, and leaving the gate would not take back the wake
+    mode After wake word turned on."""
+    def pick(patch, section, path, value):
+        """The panel's pick: the row's own key, then every key the choice's `sets` names."""
+        fields = {f["key"]: f for s in build_form(lenient_config(section))["sections"] for f in s["fields"]}
+        choice = next(c for c in fields[path]["choices"] if c["value"] == value)
+        for key, setting in ((path, value), *(choice.get("sets") or {}).items()):
+            node = patch
+            *parents, leaf = key.split(".")
+            for part in parents:
+                node = node.setdefault(part, {})
+            node[leaf] = setting
+        return patch
+
+    _cache(store, {
+        "wake/openwakeword/alexa/onnx": {"files": {"m.onnx": {"url": "https://x/a", "sha256": "0" * 64}}},
+        "wake/openwakeword/hey-jarvis/onnx": {"files": {"m.onnx": {"url": "https://x/j", "sha256": "0" * 64}}},
+        "vad/silero/v6/onnx": {"files": {"m.onnx": {"url": "https://x/s", "sha256": "0" * 64}}},
+    })
+    # on screen: the jarvis head, heard by the phrase in the list. Away to alexa and back.
+    onscreen = {"wake": {"mode": "gate", "phrases": ["hey jarvis"], "engine": "openwakeword",
+                         "openwakeword": {"weights": "wake/openwakeword/hey-jarvis/onnx"}}}
+    patch: dict = {}
+    for head in ("alexa", "hey-jarvis"):
+        pick(patch, onscreen, "wake.openwakeword.weights", f"wake/openwakeword/{head}/onnx")
+    assert patch["wake"]["phrases"] == ["hey jarvis"]  # not alexa's, which the first pick wrote
+    # ...and what was typed there rides along either way, whichever pick lands last
+    onscreen["wake"]["phrases"] = ["hey nanobot", "hey jarvis"]
+    typed: dict = {}
+    for head in ("alexa", "hey-jarvis", "alexa"):
+        pick(typed, onscreen, "wake.openwakeword.weights", f"wake/openwakeword/{head}/onnx")
+    assert typed["wake"]["phrases"] == ["hey nanobot", "alexa"]
+    # the cloud gate: After wake word and straight back to On speech leaves no mode behind
+    cloud = {"backend": "openai", "vad": {"engine": "silero"}, "realtime": {"uplink": "server"}}
+    gated: dict = {}
+    for uplink in ("wake", "vad"):
+        pick(gated, cloud, "realtime.uplink", uplink)
+    assert gated["wake"]["mode"] == "off"
 
 
 def test_picking_an_engine_also_picks_its_first_model(store):
@@ -744,14 +791,15 @@ def test_picking_a_gate_also_picks_its_detector(store):
         return {c["value"]: c.get("sets") for c in fields[path]["choices"]}
 
     cloud = {"backend": "openai"}
+    off = {"wake.mode": "off"}
     assert choices(cloud) == {  # no index: the engine alone
-        "server": None, "vad": {"vad.engine": "silero"}, "wake": {"vad.engine": "silero", "wake.mode": "gate"},
+        "server": off, "vad": {**off, "vad.engine": "silero"}, "wake": {"vad.engine": "silero", "wake.mode": "gate"},
     }
     _cache(store, {"vad/silero/v6/onnx": {"files": {"m.onnx": {"url": "https://x/s", "sha256": "0" * 64}}}})
     picked = {"vad.engine": "silero", "vad.silero.weights": "vad/silero/v6/onnx"}
-    assert choices(cloud) == {"server": None, "vad": picked, "wake": {**picked, "wake.mode": "gate"}}
-    assert choices({**cloud, "vad": {"silero": {"weights": "vad/silero/mine/onnx"}}})["vad"] == {"vad.engine": "silero"}
-    assert choices({**cloud, "vad": {"engine": "firered"}})["vad"] is None
+    assert choices(cloud) == {"server": off, "vad": {**off, **picked}, "wake": {**picked, "wake.mode": "gate"}}
+    assert choices({**cloud, "vad": {"silero": {"weights": "vad/silero/mine/onnx"}}})["vad"] == {**off, "vad.engine": "silero"}
+    assert choices({**cloud, "vad": {"engine": "firered"}})["vad"] == off
     assert choices({**cloud, "vad": {"engine": "silero"}})["wake"] == {"wake.mode": "gate"}
     strict = {**cloud, "vad": {"engine": "silero"}, "wake": {"mode": "strict", "phrases": ["hey"]}}
     assert choices(strict)["wake"] is None  # a mode on is kept, Strict included

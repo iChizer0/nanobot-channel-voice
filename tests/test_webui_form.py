@@ -371,7 +371,9 @@ def _wake_row(section: dict, store: Store) -> dict:
 
 def test_a_head_pick_fills_phrases_without_dropping_the_typed_ones():
     """A head hears one phrase and Phrases must carry it, so the pick brings it. The rest
-    of the list was typed on the row: only the phrase of the head being replaced goes."""
+    of the list was typed on the row: only the phrase of the head being replaced goes.
+    Every head names the list, the one in force included, since the panel applies a pick
+    to the config it has at the click rather than the one this form was built from."""
     store = _heads("hey-nanobot", "alexa")
     oww = {"mode": "gate", "engine": "openwakeword"}
 
@@ -389,7 +391,7 @@ def test_a_head_pick_fills_phrases_without_dropping_the_typed_ones():
                  "openwakeword": {"weights": "wake/openwakeword/alexa/onnx"}},
     })
     assert picked["wake/openwakeword/hey-nanobot/onnx"] == ["computer", "hey nanobot"]
-    assert picked["wake/openwakeword/alexa/onnx"] is None  # already what it hears
+    assert picked["wake/openwakeword/alexa/onnx"] == ["computer", "alexa"]  # what it already hears
 
 
 def test_the_shared_backbone_is_not_a_head():
