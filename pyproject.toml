@@ -16,10 +16,10 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
-    # >= 0.3.0 discovers channels as nanobot.channels subpackages via a manifest
-    # (the force-include below), not the entry-point group 0.3.0 removed and warns
-    # about — this plugin targets the package contract only.
-    "nanobot-ai>=0.3.0",
+    # Channels are nanobot.channels subpackages with a manifest (the force-include
+    # below), not an entry-point group. 0.3.5 is the floor for what the manifest
+    # declares: the `json` field kind, and a WebUI that shows the validator's rows.
+    "nanobot-ai>=0.3.5",
     "httpx>=0.24",  # openai/openai_compat TTS client (the default provider)
 ]
 
@@ -99,7 +99,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nanobot_channel_voice"]
-# nanobot >= 0.3.0 discovers channels as subpackages of nanobot.channels; shipping
+# nanobot discovers channels as subpackages of nanobot.channels; shipping
 # the dependency-free manifest shim into that namespace is the ONLY registration
 # path. Only the leaf directory is included, so nanobot's own package files are
 # never overwritten. Core resolves through nanobot.channels' OWN directory, so an

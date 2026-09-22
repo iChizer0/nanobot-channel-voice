@@ -17,13 +17,6 @@ from nanobot_channel_voice import weights as w
 from nanobot_channel_voice.cli import main as cli_main
 
 
-@pytest.fixture()
-def store(tmp_path, monkeypatch):
-    root = tmp_path / "store"
-    monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(root))
-    return root
-
-
 def _entry_for(*files, langs=("en",), **extra):
     """Index entry linking file:// sources with pinned sha256s."""
     spec = {}
@@ -69,13 +62,61 @@ def test_no_sources_falls_back_to_the_default_urls_and_nothing_bundled(monkeypat
     assert w.DEFAULT_INDEX_SOURCES
     assert all(s.startswith("https://") for s in w.DEFAULT_INDEX_SOURCES)
     seen = []
-    monkeypatch.setattr(w, "_read_source", lambda s: seen.append(s) or {"models": {}})
+    monkeypatch.setattr(w, "_read_source", lambda s, _timeout: seen.append(s) or {"models": {}})
     assert w.load_index() == {}
     assert seen == list(w.DEFAULT_INDEX_SOURCES)
     # An explicit source REPLACES the default rather than adding to it.
     seen.clear()
     w.load_index(["https://example.invalid/i.json"])
     assert seen == ["https://example.invalid/i.json"]
+
+
+def test_an_index_a_vendor_wrote_loosely_is_refused_or_survived(store, tmp_path, capsys):
+    """Index entries are external input the FORM reads on every validate: a size that is
+    not a number is refused at load (an actionable line), and a wake key with no phrase
+    segment does not break the backbone derivation the whole load runs through."""
+    path = tmp_path / "index.json"
+    path.write_text(json.dumps({"models": {
+        "stt/m/onnx": {"files": {"e.onnx": {"url": "https://x/e", "sha256": "0" * 64, "size": "7MB"}}},
+    }}))
+    with pytest.raises(w.WeightsError, match=r"size must be a whole number"):
+        w.load_index([str(path)])
+    assert cli_main(["--index", str(path), "list"]) == 2
+    assert "error:" in capsys.readouterr().err
+    # wake/openwakeword/<platform>: a valid key with no stem, so no backbone to derive
+    path.write_text(json.dumps({"models": {
+        "wake/openwakeword/onnx": {"files": {"m.onnx": {"url": "https://x/m", "sha256": "0" * 64}}},
+    }}))
+    assert set(w.load_index([str(path)])) == {"wake/openwakeword/onnx"}
+    assert w.entry_size({"files": {"a": {"size": None}, "b": {"size": 5}}}) == 5
+
+
+def test_a_torn_manifest_is_not_an_installed_model(store, tmp_path):
+    """A power cut between the write and the flush can leave an empty manifest. Such a key
+    must read as not fetched — else the plan says "Models are in place" while the engine
+    cannot resolve a single path."""
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("stt/m/onnx", _entry_for(src))
+    manifest = w.store_dir("stt/m/onnx") / w.MANIFEST
+    assert set(w.installed()) == {"stt/m/onnx"}
+    for torn in ("", "null", "[]", '{"key": "stt/m/onnx"}'):
+        manifest.write_text(torn)
+        assert w.installed() == {}
+        from nanobot_channel_voice.config import SttConfig
+
+        with pytest.raises(w.NotFetchedError):
+            w.fill_engine_paths(SttConfig.model_validate({"whisper": {"weights": "stt/m/onnx"}}).whisper)
+
+
+def test_a_store_that_cannot_be_written_says_so(store, tmp_path, monkeypatch):
+    """The gateway reloads the index in the background; a store it cannot write must say
+    which store, not raise an OSError nobody catches."""
+    path = tmp_path / "index.json"
+    path.write_text(json.dumps({"models": {}}))
+    (tmp_path / "blocked").write_text("not a directory")
+    monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(tmp_path / "blocked"))
+    with pytest.raises(w.WeightsError, match="cannot cache the weights index"):
+        w.refresh_index([str(path)])
 
 
 def test_index_with_a_traversal_key_is_rejected(tmp_path):
@@ -231,6 +272,35 @@ def test_prune_drops_a_dangling_relocation_link(store, tmp_path, capsys):
     assert not leaf.is_symlink()
 
 
+def test_fetch_refuses_a_dangling_relocation_link(store, tmp_path):
+    """mkdir raises FileExistsError on a link whose target is gone, so Apply would fail
+    with a bare OSError; the store names the key and prune is the way out."""
+    import shutil
+
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("vad/silero/onnx", _entry_for(src))
+    leaf = store / "vad" / "silero" / "onnx"
+    target = tmp_path / "gone"
+    leaf.rename(target)
+    leaf.symlink_to(target)
+    shutil.rmtree(target)
+    with pytest.raises(w.WeightsError, match="prune it first"):
+        w.fetch("vad/silero/onnx", _entry_for(src))
+
+
+def test_installed_stops_at_a_relocation_that_links_back(store, tmp_path):
+    """The walk follows symlinks, which is how a relocated subtree stays visible; a
+    target that links back into the store would else walk forever in a gateway thread."""
+    src = _src(tmp_path, "encoder.onnx")
+    w.fetch("vad/silero/onnx", _entry_for(src))
+    leaf = store / "vad" / "silero" / "onnx"
+    target = tmp_path / "elsewhere"
+    leaf.rename(target)
+    leaf.symlink_to(target)
+    (target / "loop").symlink_to(store)
+    assert set(w.installed()) == {"vad/silero/onnx"}
+
+
 def test_cli_prune_names_where_a_relocated_key_still_lives(store, tmp_path, capsys):
     src = _src(tmp_path, "encoder.onnx")
     w.fetch("vad/silero/onnx", _entry_for(src))
@@ -321,6 +391,72 @@ def test_unfetched_weights_error_names_the_command(store):
     block = WhisperSttConfig.model_validate({"weights": "stt/whisper-base/onnx"})
     with pytest.raises(w.WeightsError, match="nanobot-voice fetch stt/whisper-base/onnx"):
         w.fill_engine_paths(block)
+
+
+def test_a_head_of_your_own_runs_on_the_stores_backbone(store, tmp_path):
+    """openWakeWord's feature models are one pair per platform, shared by every head: the
+    index gains a derived backbone entry per platform (the head's files minus the head and
+    its meta), a custom head resolves them from that package, the device build first, and
+    the plan wants that package for such a section."""
+    from nanobot_channel_voice.config import VoiceConfig, WakeConfig
+    from nanobot_channel_voice.sync import backbone_wanted, plan_sync
+
+    mel, emb, head, meta = (_src(tmp_path, n, n.encode()) for n in ("mel.onnx", "embedding.onnx", "model.onnx", "meta.json"))
+    filt, emb_rknn = (_src(tmp_path, n, n.encode()) for n in ("mel_filters.npy", "embedding.rknn"))
+    index = w.with_backbones({
+        "wake/openwakeword/alexa/onnx": _entry_for(mel, emb, head, meta),
+        "wake/openwakeword/hey-jarvis/onnx": _entry_for(mel, emb, head, meta),
+        "wake/openwakeword/alexa/rknn.rv1126b": _entry_for(filt, emb_rknn, head, meta),
+        "stt/whisper/base/onnx": _entry_for(head),
+    })
+    assert set(index) - {"stt/whisper/base/onnx"} == {
+        "wake/openwakeword/alexa/onnx", "wake/openwakeword/hey-jarvis/onnx", "wake/openwakeword/alexa/rknn.rv1126b",
+        "wake/openwakeword/backbone/onnx", "wake/openwakeword/backbone/rknn.rv1126b",
+    }
+    assert set(index["wake/openwakeword/backbone/onnx"]["files"]) == {"mel.onnx", "embedding.onnx"}
+    assert set(index["wake/openwakeword/backbone/rknn.rv1126b"]["files"]) == {"mel_filters.npy", "embedding.rknn"}
+    assert w.with_backbones(index) == index  # idempotent, and an index's own entry is kept
+    own = {**index, "wake/openwakeword/backbone/onnx": {"files": {"x": {"url": "u"}}}}
+    assert w.with_backbones(own)["wake/openwakeword/backbone/onnx"] == {"files": {"x": {"url": "u"}}}
+
+    # the section: a head of your own, no key; the plan wants the platform's backbone
+    section = {"wake": {"mode": "gate", "phrases": ["mine"], "engine": "openwakeword", "openwakeword": {"modelPath": "/heads/mine.onnx"}}}
+
+    def wanted(values, models=index):
+        return backbone_wanted(VoiceConfig.model_validate(values), models)
+
+    assert wanted(section) == "wake/openwakeword/backbone/onnx"
+    assert wanted({"device": "rv1126b", **section}) == "wake/openwakeword/backbone/rknn.rv1126b"
+    assert wanted({"wake": {"mode": "off"}}) is None
+    # an index without the chip's build: the CPU pair is what it can fetch, and is named
+    assert wanted({"device": "rv1126b", **section}, {"wake/openwakeword/backbone/onnx": {}}) == "wake/openwakeword/backbone/onnx"
+    # a refused section (a gate without its phrase) plans no backbone
+    assert plan_sync({"wake": {"mode": "gate"}}, index, store, managed_by=None).wanted == []
+    plan = plan_sync({"device": "rv1126b", **section}, index, store, managed_by=None)
+    assert plan.wanted == plan.fetch == ["wake/openwakeword/backbone/rknn.rv1126b"]
+
+    # at start: not fetched names the fetch; fetched fills the pair, the head stays yours
+    cfg = VoiceConfig.model_validate(section)
+    with pytest.raises(w.WeightsError, match="nanobot-voice fetch wake/openwakeword/backbone/onnx"):
+        w.apply_weights(cfg.wake, "openwakeword")
+    w.fetch("wake/openwakeword/backbone/onnx", index["wake/openwakeword/backbone/onnx"])
+    oww = w.apply_weights(cfg.wake, "openwakeword").openwakeword
+    d = w.store_dir("wake/openwakeword/backbone/onnx")
+    assert (oww.model_path, oww.mel_path, oww.embedding_path, oww.meta_path) == ("/heads/mine.onnx", str(d / "mel.onnx"), str(d / "embedding.onnx"), None)
+    assert oww.mel_filters_path is None
+    # a device host prefers its build once fetched, and falls back to the CPU pair until then
+    board = VoiceConfig.model_validate({"device": "rv1126b", **section})
+    assert w.apply_weights(board.wake, "openwakeword").openwakeword.embedding_path == str(d / "embedding.onnx")
+    # the CPU pair in the store does not settle what a board wants: the plan still fetches
+    # its build (the runtime prefers whichever is installed, the plan the host's platform)
+    assert plan_sync({"device": "rv1126b", **section}, index, store, managed_by=None).fetch == [
+        "wake/openwakeword/backbone/rknn.rv1126b"
+    ]
+    w.fetch("wake/openwakeword/backbone/rknn.rv1126b", index["wake/openwakeword/backbone/rknn.rv1126b"])
+    oww = w.apply_weights(board.wake, "openwakeword").openwakeword
+    assert oww.embedding_path.endswith("backbone/rknn.rv1126b/embedding.rknn") and oww.mel_filters_path.endswith("mel_filters.npy")
+    # a head from the store keeps its own files; a block with the pair set by hand is left alone
+    assert w.apply_weights(WakeConfig.model_validate({"openwakeword": {"modelPath": "/m.onnx", "embeddingPath": "/e.onnx"}}), "openwakeword").openwakeword.mel_path is None
 
 
 def test_ambiguous_store_files_are_an_error(store, tmp_path):
@@ -415,8 +551,8 @@ def test_make_vad_falls_back_when_weights_unfetched(store):
 # ---- CLI --------------------------------------------------------------------
 
 
-def _write_index(tmp_path, models):
-    p = tmp_path / "index.json"
+def _write_index(tmp_path, models, name="index.json"):
+    p = tmp_path / name
     p.write_text(json.dumps({"version": 1, "models": models}))
     return str(p)
 
@@ -492,11 +628,51 @@ def test_cli_sync_fetches_configured_keys_and_prunes_the_rest(store, tmp_path, c
     assert "already fetched" in capsys.readouterr().out
 
 
+def test_cli_sync_fetches_the_operator_baseline_beneath_the_section(store, tmp_path, capsys, monkeypatch):
+    """The layer under channels.voice reaches the structural scan too: a fresh section
+    syncs the baseline's models, and a section over it names its own keys as well (sync
+    fetches every named key, the baseline's included; Apply plans what runs)."""
+    src = _src(tmp_path, "encoder.onnx")
+    index = _write_index(tmp_path, {
+        "stt/sensevoice/small/onnx": _entry_for(src),
+        "stt/whisper-base/onnx": _entry_for(src),
+        "vad/silero/v6/onnx": _entry_for(src),
+    })
+    baseline = tmp_path / "voice-defaults.json"
+    baseline.write_text(json.dumps({
+        "stt": {"provider": "sensevoice", "sensevoice": {"weights": "stt/sensevoice/small/onnx"}},
+        "vad": {"engine": "silero", "silero": {"weights": "vad/silero/v6/onnx"}},
+    }))
+    monkeypatch.setenv("NANOBOT_VOICE_DEFAULTS", str(baseline))
+    cfg = _write_config(tmp_path, {"enabled": True, "importJson": ""})  # as onboarding leaves it
+    assert cli_main(["--index", index, "sync", "--config", cfg]) == 0
+    assert set(w.installed()) == {"stt/sensevoice/small/onnx", "vad/silero/v6/onnx"}
+    cfg = _write_config(tmp_path, {"stt": {"provider": "whisper", "whisper": {"weights": "stt/whisper-base/onnx"}}})
+    assert cli_main(["--index", index, "sync", "--config", cfg, "--prune"]) == 0
+    assert set(w.installed()) == {"stt/sensevoice/small/onnx", "stt/whisper-base/onnx", "vad/silero/v6/onnx"}
+    monkeypatch.setenv("NANOBOT_VOICE_DEFAULTS", str(tmp_path / "gone.json"))
+    assert cli_main(["--index", index, "sync", "--config", cfg]) == 2
+    assert "NANOBOT_VOICE_DEFAULTS: cannot read" in capsys.readouterr().err
+
+
 def test_cli_sync_names_configured_keys_missing_from_the_index(store, tmp_path, capsys):
     index = _write_index(tmp_path, {})
     cfg = _write_config(tmp_path, {"vad": {"firered": {"weights": "vad/firered/rknn.rk3588"}}})
     assert cli_main(["--index", index, "sync", "--config", cfg]) == 2
     assert "vad/firered/rknn.rk3588" in capsys.readouterr().err
+
+
+def test_cli_sync_leaves_an_installed_key_this_index_does_not_carry(store, tmp_path, capsys):
+    """A model fetched from another index (or one a vendor has since dropped) is installed
+    and configured: sync says it cannot re-verify it, rather than failing on it."""
+    src = _src(tmp_path, "encoder.onnx")
+    mine = _write_index(tmp_path, {"stt/whisper-base/onnx": _entry_for(src)}, name="mine.json")
+    assert cli_main(["--index", mine, "fetch", "stt/whisper-base/onnx"]) == 0
+    other = _write_index(tmp_path, {"tts/mms-deu/onnx": _entry_for(src)}, name="other.json")
+    cfg = _write_config(tmp_path, {"stt": {"provider": "whisper", "whisper": {"weights": "stt/whisper-base/onnx"}}})
+    assert cli_main(["--index", other, "sync", "--config", cfg]) == 0
+    assert "stt/whisper-base/onnx: installed, not in this index" in capsys.readouterr().out
+    assert set(w.installed()) == {"stt/whisper-base/onnx"}
 
 
 def test_cli_sync_with_an_empty_config_refuses_to_prune(store, tmp_path, capsys):
@@ -520,7 +696,7 @@ def test_cli_sync_missing_config_is_an_actionable_error(store, tmp_path, capsys)
 
 def test_cli_list_survives_an_unreachable_builtin_index(store, tmp_path, monkeypatch, capsys):
     """Offline, `list` must still show the local store: the default index is a URL."""
-    def _boom(source):
+    def _boom(source, _timeout):
         raise OSError("offline")
 
     monkeypatch.setattr(w, "_read_source", _boom)

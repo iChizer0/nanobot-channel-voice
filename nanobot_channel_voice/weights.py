@@ -20,8 +20,10 @@ verified when the index pins one.
 
 File names inside an entry are the resolution contract: an engine block setting
 ``weights: <key>`` gets its unset ``*_path`` fields filled by stem + any extension
-(``encoder_path`` -> ``encoder.<ext>``); explicit paths always win. The network belongs
-to the CLI alone; :func:`apply_weights` touches only the local store.
+(``encoder_path`` -> ``encoder.<ext>``); explicit paths always win. The network is used
+only by the CLI and the WebUI's sync flow (``webui_sync``), never at channel start:
+:func:`apply_weights` touches only the local store. The last loaded index is cached in
+the store (:data:`INDEX_CACHE`) so the WebUI form can offer keys offline.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 MANIFEST = ".manifest.json"
+INDEX_CACHE = ".index.json"
 
 # Consulted when neither --index nor $NANOBOT_VOICE_INDEX names a source. URLs only,
 # never a bundled data file (the wheel ships no entries); an explicit source replaces it.
@@ -53,6 +56,14 @@ _CHUNK = 1 << 20
 
 class WeightsError(RuntimeError):
     """Actionable store/index failure; the message is user-facing."""
+
+
+class NotFetchedError(WeightsError):
+    """A ``weights`` key the store does not hold yet."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"weights '{key}' are not fetched; run: nanobot-voice fetch {key}")
+        self.key = key
 
 
 def store_root() -> Path:
@@ -83,10 +94,10 @@ def store_dir(key: str, root: Path | None = None) -> Path:
 # ---- index ------------------------------------------------------------------
 
 
-def _read_source(source: str) -> dict[str, Any]:
+def _read_source(source: str, timeout: float) -> dict[str, Any]:
     split = urllib.parse.urlsplit(source)
     if split.scheme in ("http", "https"):
-        with urllib.request.urlopen(source, timeout=30) as resp:  # noqa: S310 - user-given index URL
+        with urllib.request.urlopen(source, timeout=timeout) as resp:  # noqa: S310 - user-given index URL
             raw = resp.read()
     elif split.scheme == "file":
         raw = Path(urllib.request.url2pathname(split.path)).read_bytes()
@@ -112,15 +123,18 @@ def _validate_entry(source: str, key: str, entry: Any) -> None:
     for name, spec in files.items():
         if not isinstance(spec or {}, dict):
             raise WeightsError(f"{where}.files['{name}'] must be an object with a url")
+        size = (spec or {}).get("size")
+        if size is not None and not isinstance(size, int):
+            raise WeightsError(f"{where}.files['{name}'].size must be a whole number of bytes")
 
 
-def load_index(sources: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
+def load_index(sources: Sequence[str] = (), *, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
     """Merge the sources (path, ``file://`` or ``http(s)://``) in order, later winning
     per key; empty means :data:`DEFAULT_INDEX_SOURCES`."""
     models: dict[str, dict[str, Any]] = {}
     for source in sources or DEFAULT_INDEX_SOURCES:
         try:
-            data = _read_source(source)
+            data = _read_source(source, timeout)
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise WeightsError(f"cannot read weights index '{source}': {exc}") from None
         entries = data.get("models")
@@ -134,7 +148,105 @@ def load_index(sources: Sequence[str] = ()) -> dict[str, dict[str, Any]]:
             validate_key(key)
             _validate_entry(source, key, entry)
         models.update(entries)
+    return with_backbones(models)
+
+
+def refresh_index(
+    sources: Sequence[str] = (), root: Path | None = None, *, timeout: float = 30.0,
+) -> dict[str, dict[str, Any]]:
+    """:func:`load_index`, then cache the result in the store for offline readers."""
+    models = load_index(sources, timeout=timeout)
+    base = root or store_root()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        _write_json(base / INDEX_CACHE, {
+            "fetched_unix": int(time.time()),
+            "sources": list(sources or DEFAULT_INDEX_SOURCES),
+            "models": models,
+        })
+    except OSError as exc:
+        raise WeightsError(f"cannot cache the weights index under {base}: {exc}") from None
     return models
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    """Replace atomically: a reader (or a crash) never meets a half-written file. The temp
+    name carries the pid, since the CLI and the gateway write one store."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def cached_index(
+    root: Path | None = None,
+) -> tuple[dict[str, dict[str, Any]], int, list[str]] | None:
+    """The last cached index as (models, fetched_unix, sources), or None when nothing
+    is cached."""
+    try:
+        data = json.loads(((root or store_root()) / INDEX_CACHE).read_text("utf-8"))
+        models = data["models"]
+        if not isinstance(models, dict) or not all(isinstance(e, dict) for e in models.values()):
+            return None
+        sources = data.get("sources") or []
+        return with_backbones(models), int(data.get("fetched_unix") or 0), [str(s) for s in sources]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+# openWakeWord: every phrase head ships the same feature models (mel + embedding, one
+# pair per platform). A head of your own needs just that pair, so the index gains one
+# ``backbone`` entry per platform, derived from any head's files minus the head itself —
+# unless the index carries its own.
+WAKE_PREFIX = "wake/openwakeword/"
+BACKBONE_STEM = "backbone"
+_HEAD_FILES = frozenset({"model.onnx", "meta.json"})
+
+
+def with_backbones(models: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """``models`` plus a derived ``wake/openwakeword/backbone/<platform>`` per platform
+    that has a head and no backbone entry of its own."""
+    out = dict(models)
+    for key in sorted(models):
+        rest = key[len(WAKE_PREFIX):] if key.startswith(WAKE_PREFIX) else ""
+        stem, platform = rest.rsplit("/", 1) if "/" in rest else ("", "")
+        backbone = f"{WAKE_PREFIX}{BACKBONE_STEM}/{platform}"
+        if not stem or stem == BACKBONE_STEM or backbone in out:
+            continue
+        files = {n: f for n, f in (models[key].get("files") or {}).items() if n not in _HEAD_FILES}
+        if files:
+            out[backbone] = {"files": files, "derived_from": key}
+    return out
+
+
+def index_sources() -> list[str]:
+    """What an index load reads with no ``--index``: ``$NANOBOT_VOICE_INDEX`` or the defaults."""
+    env = os.environ.get("NANOBOT_VOICE_INDEX")
+    return [env] if env else list(DEFAULT_INDEX_SOURCES)
+
+
+def entry_size(entry: dict[str, Any]) -> int:
+    """Bytes the index declares for an entry (0 when it declares none, or declares one a
+    third-party index wrote as something other than a number)."""
+    sizes = ((f or {}).get("size") for f in (entry.get("files") or {}).values())
+    return sum(s for s in sizes if isinstance(s, int))
+
+
+def key_platform(key: str) -> str:
+    return key.rsplit("/", 1)[-1]
+
+
+def host_platforms(device: str | None) -> tuple[str, ...]:
+    """Platform suffixes a section can run: ``onnx`` always (the CPU path), plus the
+    RKNN build for the SoC its ``device`` names (spelled as keys spell it)."""
+    device = (device or "").strip().lower()
+    return ("onnx", f"rknn.{device}") if device else ("onnx",)
 
 
 # ---- fetch / prune ----------------------------------------------------------
@@ -148,11 +260,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _manifest_files(d: Path) -> dict[str, Any]:
+def _manifest_files(d: Path) -> dict[str, Any] | None:
+    """The manifest's recorded files, None when there is no readable manifest: a truncated
+    one (a power cut between write and flush) must not read as a fetched model."""
     try:
-        return json.loads((d / MANIFEST).read_text("utf-8")).get("files") or {}
+        payload = json.loads((d / MANIFEST).read_text("utf-8"))
     except (OSError, ValueError):
-        return {}
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
+        return None
+    return payload["files"]
 
 
 def fetch(
@@ -162,11 +279,17 @@ def fetch(
     force: bool = False,
     root: Path | None = None,
     log: Callable[[str], None] = lambda _line: None,
+    managed_by: str | None = None,
+    progress: Callable[[str, int], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Path:
     """Verify-and-install one index entry into the store; idempotent. Files already
     present with the index's sha256 (per the manifest) are kept; ``force`` refetches
     everything. Downloads stream to ``.partial-*``, verify, then atomically replace: a
-    partial never lands on the final name."""
+    partial never lands on the final name. ``managed_by`` is recorded in the manifest
+    (what installed the key, so an automatic cleanup removes only its own); ``progress``
+    gets (file name, bytes so far) per chunk and ``should_stop`` is polled between
+    chunks: True abandons the download as a :class:`WeightsError`."""
     d = store_dir(key, root)
     # nested keys would let the stale-file sweep rmtree the inner installation
     for other in installed(root):
@@ -180,8 +303,10 @@ def fetch(
     for name in files:
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise WeightsError(f"index entry '{key}' has an unsafe file name '{name}'")
+    if dangling(key, root):  # mkdir raises FileExistsError on a link whose target is gone
+        raise WeightsError(f"'{key}' is a relocated leaf whose target is gone; prune it first")
     d.mkdir(parents=True, exist_ok=True)
-    have = {} if force else _manifest_files(d)
+    have = ({} if force else _manifest_files(d)) or {}
     recorded: dict[str, Any] = {}
     for name, spec in files.items():
         url = str((spec or {}).get("url") or "")
@@ -211,16 +336,20 @@ def fetch(
                 raise WeightsError(
                     f"'{key}' {name}: remote files must pin a sha256 in the index"
                 )
-            part = d / f".partial-{name}"
+            part = d / f".partial-{os.getpid()}-{name}"
             digester = hashlib.sha256()
             total = 0
             try:
                 try:
                     with urllib.request.urlopen(url, timeout=60) as resp, part.open("wb") as out:  # noqa: S310
                         while chunk := resp.read(_CHUNK):
+                            if should_stop is not None and should_stop():
+                                raise WeightsError(f"'{key}' {name}: download cancelled")
                             digester.update(chunk)
                             out.write(chunk)
                             total += len(chunk)
+                            if progress is not None:
+                                progress(name, total)
                 # A truncated chunked body raises IncompleteRead: HTTPException, NOT OSError.
                 except (OSError, http.client.HTTPException) as exc:
                     raise WeightsError(f"'{key}' {name}: download failed: {exc}") from None
@@ -239,12 +368,15 @@ def fetch(
             raise WeightsError(
                 f"'{key}' {name}: unsupported url '{url or '<missing>'}' (need http(s):// or file://)"
             )
-    payload = {"key": key, "fetched_unix": int(time.time()), "files": recorded}
-    (d / MANIFEST).write_text(json.dumps(payload, indent=2) + "\n", "utf-8")
+    payload: dict[str, Any] = {"key": key, "fetched_unix": int(time.time()), "files": recorded}
+    if managed_by:
+        payload["managed_by"] = managed_by
+    _write_json(d / MANIFEST, payload)
     # A file dropped by a later revision of the entry would poison <stem>.* resolution
     # forever. Sweep AFTER the manifest write: a fetch that raised deletes nothing.
     for p in d.iterdir():
-        if p.name == MANIFEST or p.name in recorded:
+        # Another fetcher's partial (or its manifest temp) is its business, not stale.
+        if p.name == MANIFEST or p.name in recorded or p.name.startswith((".partial-", MANIFEST + ".")):
             continue
         try:
             if p.is_dir() and not p.is_symlink():
@@ -264,8 +396,19 @@ def installed(root: Path | None = None) -> dict[str, Path]:
     if not base.is_dir():
         return {}
     found: dict[str, Path] = {}
-    # os.walk, not rglob: ** skips symlinked dirs, and users relocate subtrees that way
-    for dirpath, _dirnames, filenames in os.walk(base, followlinks=True):
+    seen: set[tuple[int, int]] = set()
+    # os.walk, not rglob: ** skips symlinked dirs, and users relocate subtrees that way.
+    # Following them needs the loop guard a relocation back into the store would else hit.
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=True):
+        try:
+            node = os.stat(dirpath)
+        except OSError:
+            dirnames[:] = []
+            continue
+        if (node.st_dev, node.st_ino) in seen:
+            dirnames[:] = []
+            continue
+        seen.add((node.st_dev, node.st_ino))
         if MANIFEST not in filenames:
             continue
         rel = Path(dirpath).relative_to(base).as_posix()
@@ -273,8 +416,20 @@ def installed(root: Path | None = None) -> dict[str, Path]:
             validate_key(rel)
         except WeightsError:
             continue
+        if _manifest_files(Path(dirpath)) is None:
+            continue  # torn write: the plan refetches it instead of calling it in place
         found[rel] = Path(dirpath)
     return dict(sorted(found.items()))
+
+
+def managed_by(key: str, root: Path | None = None) -> str | None:
+    """What installed a fetched key (its manifest's ``managed_by``), else None."""
+    try:
+        data = json.loads((store_dir(key, root) / MANIFEST).read_text("utf-8"))
+    except (OSError, ValueError, WeightsError):
+        return None
+    value = data.get("managed_by") if isinstance(data, dict) else None
+    return value if isinstance(value, str) and value else None
 
 
 def disk_usage(d: Path) -> int:
@@ -339,6 +494,20 @@ def prune(key: str, root: Path | None = None) -> int:
 # ---- runtime resolution -----------------------------------------------------
 
 
+def backbone_key_for(platform: str) -> str:
+    """The backbone package built for one platform suffix."""
+    return f"{WAKE_PREFIX}{BACKBONE_STEM}/{platform}"
+
+
+def backbone_key(device: str | None, root: Path | None = None) -> str:
+    """The openWakeWord backbone package this host RUNS: the device build when the store
+    has it, else the CPU one (the head itself stays ONNX either way). What the store
+    should hold is the plan's question (:func:`sync.backbone_wanted`)."""
+    keys = [backbone_key_for(p) for p in host_platforms(device)]
+    have = installed(root)
+    return next((k for k in reversed(keys) if k in have), keys[0])
+
+
 def fill_engine_paths(block: Any) -> Any:
     """Copy of an engine block with unset ``*_path`` fields resolved from the store dir
     named by ``block.weights``; explicit paths always win."""
@@ -346,11 +515,9 @@ def fill_engine_paths(block: Any) -> Any:
     if not key:
         return block
     d = store_dir(key)
-    if not (d / MANIFEST).is_file():
-        raise WeightsError(
-            f"weights '{key}' are not fetched (store: {d}); run: nanobot-voice fetch {key}"
-        )
     known = _manifest_files(d)
+    if known is None:
+        raise NotFetchedError(key)
     updates: dict[str, str] = {}
     for name in type(block).model_fields:
         if not name.endswith("_path") or getattr(block, name) is not None:
@@ -380,11 +547,14 @@ def fill_engine_paths(block: Any) -> Any:
 
 def apply_weights(cfg: Any, block_name: str) -> Any:
     """``cfg`` with the named engine block store-resolved (a bilingual ``secondary``
-    sub-block resolves too); a no-op when nothing names a ``weights`` key. Local
-    filesystem only."""
+    sub-block resolves too); a no-op when nothing names a ``weights`` key. An openWakeWord
+    block with a head of its own and no key resolves its feature models from the store's
+    backbone package for its platform. Local filesystem only."""
     block = getattr(cfg, block_name, None)
     if block is None:
         return cfg
+    if block_name == "openwakeword" and not block.weights and block.model_path and not block.embedding_path:
+        block = block.model_copy(update={"weights": backbone_key(block.resolved_target)})
     filled = fill_engine_paths(block) if getattr(block, "weights", None) else block
     second = getattr(filled, "secondary", None)
     if second is not None and getattr(second, "weights", None):

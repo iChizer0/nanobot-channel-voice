@@ -78,7 +78,7 @@ class FireRedVad(Vad):
             smooth_frames=cfg.smooth_frames,
             min_volume=cfg.min_volume,
             core_mask=cfg.core_mask,
-            target=cfg.target,
+            target=cfg.resolved_target,
             device_id=cfg.device_id,
             providers=cfg.execution_providers,
             provider_options=cfg.provider_options,

@@ -144,7 +144,7 @@ class MmsTtsAdapter(OnDeviceTtsAdapter):
         vocab = load_mms_vocab(cfg.vocab_path) if cfg.vocab_path else _ENG_VOCAB
         frontend = make_text_frontend(cfg.text_frontend)
         model_kw = dict(
-            core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
+            core_mask=cfg.core_mask, target=cfg.resolved_target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
             profile="bulk",
         )

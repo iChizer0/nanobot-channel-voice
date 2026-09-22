@@ -71,10 +71,17 @@ def _meta_advisories(cfg: WakeConfig) -> None:
     target = meta.get("target")
     if not isinstance(target, str):
         target = None
-    if target and (oww.embedding_path or "").endswith(".rknn") and target != oww.target:
+    # Only where this section names a target: "runs on 'None'" is no advisory.
+    if (
+        target
+        and oww.resolved_target
+        and (oww.embedding_path or "").endswith(".rknn")
+        and target != oww.resolved_target
+    ):
         logger.warning(
-            "voice: wake package targets '{}' but wake.openwakeword.target is '{}'",
-            target, oww.target,
+            "voice: wake package targets '{}' but this section runs on '{}' "
+            "(device, or wake.openwakeword.target)",
+            target, oww.resolved_target,
         )
 
 

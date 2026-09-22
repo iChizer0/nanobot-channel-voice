@@ -11,12 +11,21 @@ from __future__ import annotations
 import json
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
 from loguru import logger
 from nanobot.config.schema import Base
-from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic.alias_generators import to_camel, to_snake
 from pydantic_core import PydanticUndefined
 
@@ -63,15 +72,19 @@ def transcription_gap() -> str | None:
 def parse_import_blob(raw: Any) -> dict[str, Any]:
     """Parse the WebUI ``importJson`` paste into a plain section dict: the bare
     ``channels.voice`` object, or one still wrapped in ``{"channels": {"voice": ...}}`` /
-    ``{"voice": ...}`` (unambiguous — no VoiceConfig field is named either). ``ValueError``
-    messages are written for a WebUI check row.
+    ``{"voice": ...}`` (unambiguous — no VoiceConfig field is named either). The WebUI's
+    json field persists the paste as an object but validates it as the typed string, so
+    both arrive here. ``ValueError`` messages are written for a WebUI check row.
     """
-    if not isinstance(raw, str):
-        raise ValueError("importJson must be a JSON string (the pasted object, quoted)")
-    try:
-        parsed: Any = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"importJson is not valid JSON: {exc}") from None
+    if isinstance(raw, dict):
+        parsed: Any = deepcopy(raw)
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"importJson is not valid JSON: {exc}") from None
+    else:
+        raise ValueError("importJson must be a JSON object (the channels.voice section)")
     if isinstance(parsed, dict) and isinstance(parsed.get("channels"), dict):
         parsed = parsed["channels"]
     if isinstance(parsed, dict) and isinstance(parsed.get("voice"), dict):
@@ -84,6 +97,90 @@ def parse_import_blob(raw: Any) -> dict[str, Any]:
     # otherwise be written back by start() and disable the channel on the next restart.
     parsed.pop("enabled", None)
     return parsed
+
+
+# The one directive a paste may carry: drop the section's own keys, then lay the rest of
+# the paste on top, so the defaults show through. What the panel's Reset writes, and what
+# makes a pasted section exact.
+RESET_KEY = "$reset"
+# The operator's defaults, a JSON file path or the JSON itself: the layer beneath
+# ``channels.voice``, every key the section leaves unset coming from it and then from the
+# schema. How a board image ships its baseline (chip, ALSA devices, models) so a fresh
+# config runs it, the panel shows it resolved and Reset returns to it. Unset, the schema.
+DEFAULTS_ENV = "NANOBOT_VOICE_DEFAULTS"
+
+
+def default_section() -> dict[str, Any]:
+    """The operator's default section from ``$NANOBOT_VOICE_DEFAULTS`` (wrapped like a
+    paste is fine), empty for the schema's own defaults. ``ValueError`` names the variable."""
+    raw = os.environ.get(DEFAULTS_ENV, "").strip()
+    if not raw:
+        return {}
+    if not raw.startswith("{"):
+        # Named absolutely in the refusal: a relative path resolves against each process's
+        # working directory, so the gateway and a shell can read different files.
+        path = Path(raw).expanduser()
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"{DEFAULTS_ENV}: cannot read {path.resolve()}: {exc.strerror}") from None
+    try:
+        defaults = parse_import_blob(raw)
+    except ValueError as exc:
+        raise ValueError(f"{DEFAULTS_ENV}: {exc}") from None
+    defaults.pop(RESET_KEY, None)
+    return defaults
+
+
+def layer_defaults(section: dict[str, Any]) -> dict[str, Any]:
+    """The section over the operator's defaults: every key it leaves unset, in either
+    spelling, block by block, comes from ``$NANOBOT_VOICE_DEFAULTS``; what it sets, a
+    null included, stays as written. The one place the layer is read, for every consumer
+    of a section (the schema's before-validator, the structural scans)."""
+    return _underlay(section, default_section())
+
+
+def _underlay(section: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    if not defaults:
+        return section
+    out = dict(section)
+    for key, value in defaults.items():
+        camel = to_camel(key) if isinstance(key, str) else key
+        spellings = dict.fromkeys((camel, to_snake(camel), key)) if isinstance(camel, str) else (key,)
+        present = next((twin for twin in spellings if twin in out), None)
+        if present is None:
+            out[camel] = deepcopy(value)
+        elif isinstance(value, dict) and isinstance(out[present], dict):
+            out[present] = _underlay(out[present], value)
+    return out
+
+
+PASTE_KEYS = ("importJson", "import_json")
+
+
+def split_paste(section: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+    """The section without its pending paste, and the paste (None when empty-ish). The one
+    place that decides what counts as a paste, for every consumer of a section."""
+    raw = next((section[k] for k in PASTE_KEYS if not _emptyish(section.get(k))), None)
+    return {k: v for k, v in section.items() if k not in PASTE_KEYS}, raw
+
+
+def resolve_section(section: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+    """What the channel runs from this section — the paste merged in, the operator's
+    defaults beneath — and the paste itself. ``ValueError`` names the fault (the paste or
+    ``$NANOBOT_VOICE_DEFAULTS``)."""
+    base, raw = split_paste(section)
+    return layer_defaults(base if raw is None else merge_import(base, raw)), raw
+
+
+def merge_import(section: dict[str, Any], raw: Any) -> dict[str, Any]:
+    """The section with the paste ``raw`` merged in: over the section itself, or, under
+    ``$reset``, over nothing but the section's ``enabled``, the defaults then showing
+    through the keys the paste does not set."""
+    blob = parse_import_blob(raw)
+    if blob.pop(RESET_KEY, None):
+        return _apply_import({k: section[k] for k in ("enabled",) if k in section}, blob)
+    return _apply_import(section, blob)
 
 
 def _apply_import(section: dict[str, Any], blob: dict[str, Any]) -> dict[str, Any]:
@@ -182,10 +279,16 @@ class OnDeviceRuntime(_VoiceBase):
     # fields resolve by field stem (``encoderPath`` -> ``encoder.<ext>``); explicit paths win.
     weights: str | None = None
     core_mask: Literal["auto", "0", "1", "2", "0_1", "0_1_2", "all"] = "auto"
-    target: str = "rk3588"
+    # The RKNN toolkit's target name; None follows the section's ``device``.
+    target: str | None = None
     device_id: str | None = None
     execution_providers: list[str] | None = None
     provider_options: list[dict] | None = None
+    _device: str | None = PrivateAttr(default=None)
+
+    @property
+    def resolved_target(self) -> str | None:
+        return self.target or self._device
 
 
 class AudioConfig(_VoiceBase):
@@ -891,9 +994,8 @@ class WakeConfig(_VoiceBase):
     def _phrases_required(self) -> WakeConfig:
         if self.mode != "off" and not self.phrases:
             raise ValueError(
-                f'wake.mode="{self.mode}" requires wake.phrases: the transcript tier '
-                "is the always-available fallback (the acoustic engine is "
-                "best-effort and may degrade), and phrases drive wake stripping"
+                f'wake.mode="{self.mode}" requires wake.phrases, the phrase listened for: '
+                "a head fills it with what it hears, the transcript tier matches and strips it"
             )
         if any(not a.strip() for a in self.aliases):
             raise ValueError("wake.aliases entries must be non-empty")
@@ -953,6 +1055,10 @@ class VoiceConfig(_VoiceBase):
     backend: Literal[
         "local", "openai", "xai", "azure", "qwen", "glm", "stepfun", "gemini"
     ] = "local"
+    # The SoC the on-device models are built for ("rv1126b", "rk3588"): the index platform
+    # (``rknn.<device>``) the WebUI offers next to the CPU builds, and every engine block's
+    # RKNN target. None means CPU builds only.
+    device: str | None = None
     allow_from: list[str] = Field(default_factory=lambda: ["*"])  # BaseChannel allow-list
     streaming: bool = True  # core `supports_streaming`: send_delta() speaks the reply as it streams
     # Core's per-channel overrides of channels.sendProgress/sendToolHints/showReasoning,
@@ -1034,10 +1140,12 @@ class VoiceConfig(_VoiceBase):
         return self
 
     # The WebUI's paste box (the manifest's only field): the WHOLE channels.voice section as one
-    # JSON object, deep-merged at parse time (paste wins) and expanded into real config.json keys
-    # at channel start by consume_import_json(), which deletes the blob — a transport, never a
-    # stored copy.
-    import_json: str | None = None
+    # JSON object, deep-merged at parse time (paste wins; under `"$reset": true` over the
+    # section's `enabled` alone, the defaults showing through, see merge_import) and expanded
+    # into real config.json keys at channel start by consume_import_json(), which deletes the
+    # blob — a transport, never a stored copy. An object as the WebUI persists it, a string as
+    # it validates it.
+    import_json: str | dict[str, Any] | None = None
 
     # LOCAL backend: operator text appended to the voice runtime-context block — guidance scoped
     # to spoken turns (a SOUL.md directive applies to every channel). Re-sent on every turn, so
@@ -1059,23 +1167,17 @@ class VoiceConfig(_VoiceBase):
     @model_validator(mode="before")
     @classmethod
     def _merge_import_json(cls, data: Any) -> Any:
-        """Fold a pending ``importJson`` paste into the section it configures. Order-independent
-        vs ``_fold_alias_twins``: it reads both spellings itself and leaves exactly one behind.
-        The raw blob is kept on the field so ``start()`` knows to consume it."""
+        """Fold a pending ``importJson`` paste into the section it configures, then lay the
+        section over the operator's defaults (``layer_defaults``; unreadable ones refuse
+        the section, naming the variable). Order-independent vs ``_fold_alias_twins``: it
+        reads both spellings itself, leaves exactly one behind and adds a key only where
+        neither spelling is. The raw blob is kept on the field so ``start()`` knows to
+        consume it."""
         if not isinstance(data, dict):
             return data
-        raw = next(
-            (data[k] for k in ("importJson", "import_json") if not _emptyish(data.get(k))),
-            None,
-        )
-        if raw is None:
-            if "importJson" in data or "import_json" in data:
-                # the enable-toggle's materialized '' filler (or an emptied box)
-                data = {k: v for k, v in data.items() if k not in ("importJson", "import_json")}
-            return data
-        data = {k: v for k, v in data.items() if k not in ("importJson", "import_json")}
-        merged = _apply_import(data, parse_import_blob(raw))
-        merged["importJson"] = raw
+        merged, raw = resolve_section(data)
+        if raw is not None:
+            merged["importJson"] = raw
         return merged
 
     @model_validator(mode="after")
@@ -1087,6 +1189,25 @@ class VoiceConfig(_VoiceBase):
                 "allowFrom is empty, which denies every speaker and leaves the channel "
                 'deaf with no way to pair; use ["*"] (the default) or list sender ids'
             )
+        return self
+
+    @field_validator("device")
+    @classmethod
+    def _device_is_a_soc_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9]*", value):
+            raise ValueError(f"device must be a SoC name such as rv1126b or rk3588, got {value!r}")
+        return value
+
+    @model_validator(mode="after")
+    def _propagate_device(self) -> VoiceConfig:
+        """Every engine block learns the section's device, so an unset block ``target``
+        follows it; a private attribute, so dumps stay as written."""
+        for block in _model_instances(self):
+            if isinstance(block, OnDeviceRuntime):
+                block._device = self.device
         return self
 
     @model_validator(mode="after")
@@ -1155,6 +1276,17 @@ class VoiceConfig(_VoiceBase):
         return self.full_duplex or self.soft_duplex or self.aec == "webrtc"
 
 
+def _model_instances(model: Any) -> list[Any]:
+    """The pydantic model instances nested under ``model``, depth first."""
+    found: list[Any] = []
+    for name in type(model).model_fields:
+        value = getattr(model, name, None)
+        if isinstance(value, BaseModel):
+            found.append(value)
+            found.extend(_model_instances(value))
+    return found
+
+
 def consume_import_json(config_path: Path | None = None) -> int:
     """Expand a pending ``channels.voice.importJson`` paste in ``config.json`` into real section
     keys and delete the blob; returns how many top-level keys the paste carried (0 = nothing
@@ -1175,17 +1307,14 @@ def consume_import_json(config_path: Path | None = None) -> int:
     section = channels.get("voice") if isinstance(channels, dict) else None
     if not isinstance(section, dict):
         return 0
-    raw = next(
-        (section[k] for k in ("importJson", "import_json") if not _emptyish(section.get(k))),
-        None,
-    )
+    base, raw = split_paste(section)
     if raw is None:
         return 0  # emptyish '' fillers stay put, like every other materialized secret
-    blob = parse_import_blob(raw)
-    base = {k: v for k, v in section.items() if k not in ("importJson", "import_json")}
-    channels["voice"] = _apply_import(base, blob)
+    # No defaults layer here: this writes the FILE, and a baked-in baseline would outlive
+    # the environment that named it.
+    channels["voice"] = merge_import(base, raw)
     _write_json_atomic(config_path, document)
-    return len(blob)
+    return len(parse_import_blob(raw))
 
 
 def _write_json_atomic(path: Path, document: Any) -> None:

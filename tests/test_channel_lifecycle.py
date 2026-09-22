@@ -291,3 +291,22 @@ def test_a_cancelled_load_frees_in_the_thread_and_leaves_no_task_behind(monkeypa
     _run(run())
     assert adapter.released == 1 and ch._stt is None
     assert tasks_at_close == []
+
+
+def test_start_failures_reach_the_webui_in_the_channels_own_words(monkeypatch):
+    """Core's manager shows start_error_message() in the WebUI's "Failed" box and falls
+    back to "Check gateway logs" on None. The refusals start() words for the operator
+    (RuntimeError/OSError) go through, collapsed to one line; a bug does not."""
+    from nanobot_channel_voice.weights import WeightsError
+
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, lambda cfg: _FakeStt())
+    refusal = RuntimeError("no API key for realtime provider 'xai'\n  (set realtime.apiKey)")
+    assert ch.start_error_message(refusal) == (
+        "no API key for realtime provider 'xai' (set realtime.apiKey)"
+    )
+    assert ch.start_error_message(WeightsError("vad/firered/onnx: not fetched")).startswith(
+        "vad/firered/onnx"
+    )
+    assert ch.start_error_message(OSError("address in use")) == "address in use"
+    assert ch.start_error_message(RuntimeError("")) is None
+    assert ch.start_error_message(AttributeError("'NoneType' has no attribute 'x'")) is None

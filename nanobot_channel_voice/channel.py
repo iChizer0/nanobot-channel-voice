@@ -397,6 +397,15 @@ class VoiceChannel(BaseChannel):
 
     # ---- lifecycle ----------------------------------------------------------
 
+    def start_error_message(self, error: Exception) -> str | None:
+        """The WebUI's "Failed" box: core shows this text, else "Check gateway logs".
+        start() words its own refusals for the operator (a missing key or extra, weights,
+        a device, a port) as RuntimeError/OSError; anything else is a bug, and the
+        generic pointer to the logs is the honest message for it."""
+        if isinstance(error, (RuntimeError, OSError)):
+            return " ".join(str(error).split()) or None
+        return None
+
     async def start(self) -> None:
         self._running = True
         self._stop_event = asyncio.Event()

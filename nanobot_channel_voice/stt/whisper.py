@@ -152,7 +152,7 @@ class WhisperOnDeviceStt(SttAdapter):
         suppressed = suppressed_token_ids(vocab, codes)
         mel_filters = load_mel_filters(cfg.mel_filters_path)  # type: ignore[arg-type]
         model_kw = dict(
-            core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
+            core_mask=cfg.core_mask, target=cfg.resolved_target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
         )
         with ExitStack() as models:  # any failure below releases every loaded model

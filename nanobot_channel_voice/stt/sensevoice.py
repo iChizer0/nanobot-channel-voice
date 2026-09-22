@@ -187,7 +187,7 @@ class SenseVoiceOnDeviceStt(SttAdapter):
         with ExitStack() as models:  # any failure below releases the loaded model
             model = models.enter_context(OnDeviceModel(
                 sv.model_path,  # type: ignore[arg-type]
-                core_mask=sv.core_mask, target=sv.target, device_id=sv.device_id,
+                core_mask=sv.core_mask, target=sv.resolved_target, device_id=sv.device_id,
                 providers=sv.execution_providers, provider_options=sv.provider_options,
                 # arena-off kills the O(T^2) SAN-M ratchet; prepack stays (int8-common)
                 profile="bulk", prepack=True,

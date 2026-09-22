@@ -795,7 +795,7 @@ class MatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
         if not cfg.acoustic_model_path:
             raise ValueError("matcha dynamic export needs tts.matcha.acousticModelPath")
         model_kw = dict(
-            core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
+            core_mask=cfg.core_mask, target=cfg.resolved_target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
             profile="bulk",
         )
@@ -1122,7 +1122,7 @@ class SplitMatchaTtsAdapter(_MatchaCommon, OnDeviceTtsAdapter):
             raise ValueError("matcha split tokensPath must contain both '^' and '$', or neither")
         sample_rate = int(side.get("sample_rate", _SAMPLE_RATE_DEFAULT))
         model_kw = dict(
-            core_mask=cfg.core_mask, target=cfg.target, device_id=cfg.device_id,
+            core_mask=cfg.core_mask, target=cfg.resolved_target, device_id=cfg.device_id,
             providers=cfg.execution_providers, provider_options=cfg.provider_options,
             profile="bulk",
         )

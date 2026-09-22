@@ -77,31 +77,45 @@ def describe_build_error(exc: BaseException) -> str:
     return str(exc)
 
 
+@dataclass(frozen=True)
+class Fallback:
+    """The static reason a selected engine would degrade at start: the ``weights`` key
+    the store lacks (``key``, or any other store error verbatim in ``error``), the
+    required fields left unset (full config names), or the module that is not installed,
+    with the pip extra that ships it when one does."""
+
+    key: str | None = None
+    error: str | None = None
+    unset: tuple[str, ...] = ()
+    module: str | None = None
+    extra: str | None = None
+
+
 def preflight(
     cfg: Any, engine: str, table: dict[str, EngineSpec], *, prefix: str = "",
     block: str | None = None,
-) -> str | None:
-    """Validate-time mirror of a registry's fallback triggers: the static reason the
-    selected engine would degrade at start (unresolvable ``weights`` key, unset required
-    fields, missing optional dependency), else None. Engines outside the table are always
-    None. Nothing is imported or loaded; runtime construction can still fail. ``prefix``
-    (``"vad."``) makes field names full config keys; ``block`` names the weights
-    sub-block when it differs from the engine (``vad.turn`` -> ``"smartturn"``)."""
+) -> Fallback | None:
+    """Validate-time mirror of a registry's fallback triggers: why the selected engine
+    would degrade at start (unresolvable ``weights`` key, unset required fields, missing
+    optional dependency), else None. Engines outside the table are always None. Nothing
+    is imported or loaded; runtime construction can still fail. ``prefix`` (``"vad."``)
+    makes field names full config keys; ``block`` names the weights sub-block when it
+    differs from the engine (``vad.turn`` -> ``"smartturn"``)."""
     spec = table.get(engine)
     if spec is None:
         return None
-    from nanobot_channel_voice.weights import WeightsError, apply_weights
+    from nanobot_channel_voice.weights import NotFetchedError, WeightsError, apply_weights
 
     try:
         cfg = apply_weights(cfg, block or engine)
+    except NotFetchedError as exc:
+        return Fallback(key=exc.key)
     except WeightsError as exc:
-        return str(exc)
+        return Fallback(error=str(exc))
     missing = missing_fields(cfg, spec)
     if missing:
-        return "unset: " + ", ".join(prefix + name for name in missing)
+        return Fallback(unset=tuple(prefix + name for name in missing))
     for module in spec.modules:
         if importlib.util.find_spec(module) is None:
-            extra = _EXTRA_BY_MODULE.get(module)
-            hint = f"; pip install 'nanobot-channel-voice[{extra}]'" if extra else ""
-            return f"missing module '{module}'{hint}"
+            return Fallback(module=module, extra=_EXTRA_BY_MODULE.get(module))
     return None

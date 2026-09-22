@@ -62,61 +62,37 @@ def _fetch(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     return 0
 
 
-def _config_weights_keys(node: Any) -> set[str]:
-    """Every ``"weights": "<key>"`` string anywhere under a config node: structural, so
-    new engine blocks need no CLI change."""
-    found: set[str] = set()
-    if isinstance(node, dict):
-        for name, value in node.items():
-            if name == "weights" and isinstance(value, str) and value:
-                found.add(value)
-            else:
-                found |= _config_weights_keys(value)
-    elif isinstance(node, list):
-        for value in node:
-            found |= _config_weights_keys(value)
-    return found
-
-
 def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
-    path = Path(args.config).expanduser() if args.config else Path.home() / ".nanobot" / "config.json"
-    try:
-        data = json.loads(path.read_text("utf-8"))
-    except (OSError, ValueError) as exc:
-        raise w.WeightsError(f"cannot read nanobot config {path}: {exc}") from None
-    section = (data.get("channels") or {}).get("voice") or {}
-    keys = _config_weights_keys(section)
-    paste = section.get("importJson") or section.get("import_json")
-    if isinstance(paste, str) and paste.strip():
-        # A not-yet-consumed WebUI paste holds the whole section as ONE string, which
-        # the structural scan cannot see into.
-        from nanobot_channel_voice.config import parse_import_blob
+    from nanobot_channel_voice.sync import plan_sync, voice_section
 
-        try:
-            keys |= _config_weights_keys(parse_import_blob(paste))
-        except ValueError as exc:
-            raise w.WeightsError(f"{path}: channels.voice importJson is unusable: {exc}") from None
-    wanted = sorted(keys)
-    for key in wanted:
+    path = Path(args.config).expanduser() if args.config else Path.home() / ".nanobot" / "config.json"
+    plan = plan_sync(voice_section(path), index, root, managed_by=None, prune=args.prune)
+    for key in plan.wanted:
         w.validate_key(key)
-    unknown = [k for k in wanted if k not in index]
-    if unknown:
+    if plan.unknown:
         raise w.WeightsError(
-            f"configured weights not in the index: {', '.join(unknown)} "
+            f"configured weights not in the index: {', '.join(plan.unknown)} "
             "(pass the right --index / $NANOBOT_VOICE_INDEX)"
         )
-    for key in wanted:
-        _fetch_one(key, index[key], force=args.force, yes=args.yes, root=root)
-    if not wanted:
+    # The CLI fetches through its own loop: notices prompt here, and every named key is
+    # re-verified against its manifest (fetch is idempotent; --force refetches). A key the
+    # store holds but this index does not name stays as it is: it was fetched from another.
+    for key in plan.wanted:
+        entry = index.get(key)
+        if entry is None:
+            print(f"{key}: installed, not in this index (not re-verified)")
+            continue
+        _fetch_one(key, entry, force=args.force, yes=args.yes, root=root)
+    if not plan.wanted:
         print(f"{path}: channels.voice configures no weights keys")
     if args.prune:
-        if not wanted:  # an empty config must not silently empty the store
+        if not plan.wanted:  # an empty config must not silently empty the store
             raise w.WeightsError(
                 "config names no weights; refusing to prune everything "
                 "(use: nanobot-voice prune --all)"
             )
         freed = 0
-        for key in sorted(set(w.installed(root)) - set(wanted)):
+        for key in plan.prune:
             freed += w.prune(key, root)
             print(f"pruned {key} (not in config)")
         print(f"freed {_fmt_mb(freed)}")
@@ -325,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "prune":
             return _prune(args, root)
         try:
-            index = w.load_index(sources)
+            index = w.refresh_index(sources, root)  # also caches it for the WebUI form
         except w.WeightsError:
             # Offline: `list` degrades to the installed keys. A source the user NAMED
             # stays a hard error, and fetch/sync need an index.

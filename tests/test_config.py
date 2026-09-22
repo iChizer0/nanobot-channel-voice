@@ -405,10 +405,38 @@ def test_import_json_is_linted_by_the_schema():
         VoiceConfig.model_validate({"importJson": json.dumps({"vad": {"engine": "nope"}})})
 
 
+def test_import_json_accepts_the_persisted_object(tmp_path):
+    """The WebUI's json field writes the paste into config.json as an OBJECT (its
+    validate path still sends the typed string): both must merge, wrap-unwrap, and
+    consume the same way, and the caller's object must not be mutated."""
+    import json
+
+    from nanobot_channel_voice.config import consume_import_json, parse_import_blob
+
+    paste = {"channels": {"voice": {"vad": {"hangover_ms": 800}, "enabled": False}}}
+    before = json.dumps(paste)
+    assert parse_import_blob(paste) == {"vad": {"hangover_ms": 800}}
+    assert json.dumps(paste) == before  # unwrapping/popping worked on a copy
+    cfg = VoiceConfig.model_validate({"enabled": True, "importJson": paste})
+    assert cfg.vad.hangover_ms == 800 and cfg.enabled is True
+    assert cfg.import_json == paste  # retained so start() knows to consume
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"channels": {"voice": {"enabled": True, "importJson": paste}}}),
+        encoding="utf-8",
+    )
+    assert consume_import_json(path) == 1
+    voice = json.loads(path.read_text(encoding="utf-8"))["channels"]["voice"]
+    assert voice == {"enabled": True, "vad": {"hangoverMs": 800}}
+    with pytest.raises(ValidationError, match="JSON object"):
+        VoiceConfig.model_validate({"importJson": 7})
+
+
 def test_import_json_empty_filler_is_ignored():
-    """Core's enable toggle materializes secret defaults as ''; that filler (and an
-    emptied box) must neither merge nor mark an import as pending."""
+    """An emptied box (or a hand-written empty value) must neither merge nor mark an
+    import as pending."""
     assert VoiceConfig.model_validate({"importJson": ""}).import_json is None
+    assert VoiceConfig.model_validate({"importJson": {}}).import_json is None
     assert VoiceConfig.model_validate({"import_json": None}).import_json is None
 
 
@@ -466,6 +494,123 @@ def test_import_paste_never_carries_enabled(tmp_path):
     voice = json.loads(path.read_text(encoding="utf-8"))["channels"]["voice"]
     assert voice["enabled"] is True
     assert voice["allowFrom"] == ["u1"] and voice["vad"] == {"hangoverMs": 800}
+
+
+def test_reset_directive_drops_the_sections_own_keys(tmp_path, monkeypatch):
+    """`{"$reset": true}` is the panel's Reset: the section's own keys go, the rest of
+    the paste stacks on `enabled` alone, and the defaults show through whatever the paste
+    does not set, the schema's or the operator's layer (never copied in, so a baseline
+    changed later still reaches every key the section leaves alone)."""
+    import json
+
+    from nanobot_channel_voice.config import DEFAULTS_ENV, consume_import_json, merge_import
+
+    monkeypatch.delenv(DEFAULTS_ENV, raising=False)
+    saved = {"enabled": True, "device": "rv1126b", "stt": {"provider": "whisper"}, "vad": {"hangoverMs": 500}}
+    assert merge_import(saved, {"$reset": True}) == {"enabled": True}
+    assert merge_import(saved, {"$reset": True, "vad": {"hangover_ms": 800}}) == {"enabled": True, "vad": {"hangoverMs": 800}}
+    assert merge_import(saved, {"$reset": False, "duckDb": -6}) == {**saved, "duckDb": -6}  # not a reset
+    cfg = VoiceConfig.model_validate({**saved, "importJson": json.dumps({"$reset": True})})
+    assert cfg.stt.provider == "nanobot" and cfg.device is None and cfg.enabled is True
+
+    defaults = tmp_path / "voice-defaults.json"
+    defaults.write_text(json.dumps({"channels": {"voice": {"enabled": False, "device": "rk3588", "tts": {"provider": "system"}}}}))
+    monkeypatch.setenv(DEFAULTS_ENV, str(defaults))
+    reset = merge_import(saved, {"$reset": True, "stt": {"provider": "sensevoice"}})
+    assert reset == {"enabled": True, "stt": {"provider": "sensevoice"}}  # the layer is read, not written
+    cfg = VoiceConfig.model_validate({**saved, "importJson": {"$reset": True, "stt": {"provider": "sensevoice"}}})
+    assert (cfg.device, cfg.tts.provider, cfg.stt.provider, cfg.enabled) == ("rk3588", "system", "sensevoice", True)
+    monkeypatch.setenv(DEFAULTS_ENV, json.dumps({"device": "rk3588"}))  # the JSON itself
+    assert VoiceConfig.model_validate({**saved, "importJson": {"$reset": True}}).device == "rk3588"
+
+    # start() writes the reset section, not a merge over the old keys and not the layer
+    monkeypatch.setenv(DEFAULTS_ENV, str(defaults))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"channels": {"voice": {**saved, "importJson": {"$reset": True, "aec": "soft"}}}}), encoding="utf-8")
+    assert consume_import_json(path) == 2
+    voice = json.loads(path.read_text(encoding="utf-8"))["channels"]["voice"]
+    assert voice == {"enabled": True, "aec": "soft"}
+
+
+def test_operator_defaults_lie_beneath_the_section(tmp_path, monkeypatch):
+    """$NANOBOT_VOICE_DEFAULTS is a layer under channels.voice, read wherever a section
+    is resolved: a fresh section runs the baseline, a key the section sets wins in either
+    spelling (a null too, being a value of its own), a partial block is filled key by key,
+    what the baseline leaves unset comes from the schema, and the section is left as
+    written. Unreadable defaults refuse every section, naming the variable."""
+    import json
+
+    from nanobot_channel_voice.config import DEFAULTS_ENV, layer_defaults
+
+    baseline = {
+        "device": "rk3588",
+        "audio": {"captureDevice": "plughw:1,0", "playbackDevice": "plughw:1,0"},
+        "stt": {"provider": "sensevoice", "sensevoice": {"weights": "stt/sensevoice/small/rknn.rk3588"}},
+        "vad": {"engine": "silero", "silero": {"weights": "vad/silero/v6/rknn.rk3588"}},
+        "enabled": True,  # core's key, never part of the layer
+        "$reset": True,  # nor the directive
+    }
+    monkeypatch.setenv(DEFAULTS_ENV, json.dumps(baseline))
+    fresh = VoiceConfig.model_validate({"enabled": False, "importJson": ""})  # as onboarding writes it
+    assert (fresh.enabled, fresh.device, fresh.audio.capture_device) == (False, "rk3588", "plughw:1,0")
+    assert (fresh.stt.provider, fresh.stt.sensevoice.weights, fresh.vad.engine) == ("sensevoice", "stt/sensevoice/small/rknn.rk3588", "silero")
+    assert (fresh.tts.provider, fresh.vad.hangover_ms, fresh.audio.backend) == ("openai", 600, "alsa")  # the schema's
+    section = {"device": None, "audio": {"capture_device": "hw:2,0"}, "vad": {"hangoverMs": 800}, "stt": {"provider": "whisper"}}
+    over = VoiceConfig.model_validate(section)
+    assert (over.device, over.audio.capture_device, over.audio.playback_device) == (None, "hw:2,0", "plughw:1,0")
+    assert (over.vad.engine, over.vad.hangover_ms, over.vad.silero.weights) == ("silero", 800, "vad/silero/v6/rknn.rk3588")
+    assert (over.stt.provider, over.stt.sensevoice.weights) == ("whisper", "stt/sensevoice/small/rknn.rk3588")
+    layered = layer_defaults(section)
+    assert layered["audio"] == {"capture_device": "hw:2,0", "playbackDevice": "plughw:1,0"}  # as written, filled
+    assert "enabled" not in layered and "$reset" not in layered and layered["device"] is None
+    assert section == {"device": None, "audio": {"capture_device": "hw:2,0"}, "vad": {"hangoverMs": 800}, "stt": {"provider": "whisper"}}
+    monkeypatch.setenv(DEFAULTS_ENV, str(tmp_path / "gone.json"))
+    with pytest.raises(ValidationError, match="NANOBOT_VOICE_DEFAULTS: cannot read"):
+        VoiceConfig.model_validate({})
+    with pytest.raises(ValueError, match="NANOBOT_VOICE_DEFAULTS: cannot read"):
+        layer_defaults({})
+    # a relative path resolves against each process's cwd, so the refusal names the file
+    # the gateway actually looked for, not the spelling the operator's shell used
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(DEFAULTS_ENV, "gone.json")
+    with pytest.raises(ValueError, match=f"cannot read {tmp_path.resolve()}/gone.json"):
+        layer_defaults({})
+    monkeypatch.setenv(DEFAULTS_ENV, "{nope")
+    with pytest.raises(ValidationError, match="NANOBOT_VOICE_DEFAULTS: importJson is not valid JSON"):
+        VoiceConfig.model_validate({})
+    monkeypatch.delenv(DEFAULTS_ENV)
+    assert layer_defaults(section) is section  # no layer, nothing touched
+
+
+def test_one_rule_decides_what_a_pending_paste_is(tmp_path, monkeypatch):
+    """The schema, the CLI's sync and the form's lenient shaping all resolve a section
+    through one primitive, so they cannot disagree about which blob is pending: the twin
+    spellings, the fillers core materializes, and a blob that is unusable whatever it
+    looks like."""
+    import json
+
+    from nanobot_channel_voice.config import DEFAULTS_ENV, split_paste
+    from nanobot_channel_voice.sync import voice_section
+    from nanobot_channel_voice.webui_form import lenient_config
+
+    monkeypatch.delenv(DEFAULTS_ENV, raising=False)
+    paste = json.dumps({"aec": "soft"})
+    for filler in (None, "", [], {}):
+        assert split_paste({"enabled": True, "importJson": filler}) == ({"enabled": True}, None)
+    assert split_paste({"import_json": paste, "aec": "auto"}) == ({"aec": "auto"}, paste)
+    # both spellings present: the camel one is the paste, and neither key survives
+    assert split_paste({"importJson": paste, "import_json": "{}"})[1] == paste
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"channels": {"voice": {"import_json": paste, "device": "rk3588"}}}))
+    assert voice_section(path) == {"device": "rk3588", "aec": "soft"}
+    # whitespace is not a paste anyone can use: every consumer refuses it, none skips it
+    path.write_text(json.dumps({"channels": {"voice": {"importJson": "   "}}}))
+    with pytest.raises(Exception, match="importJson is not valid JSON"):
+        voice_section(path)
+    with pytest.raises(ValidationError, match="importJson is not valid JSON"):
+        VoiceConfig.model_validate({"importJson": "   "})
+    assert lenient_config({"importJson": "   ", "aec": "soft"}).aec == "soft"  # shapes anyway
 
 
 def test_consume_import_json_leaves_files_without_a_pending_paste(tmp_path):

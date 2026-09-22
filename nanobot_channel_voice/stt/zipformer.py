@@ -216,7 +216,7 @@ class ZipformerOnDeviceStt(SttAdapter):
         # Sidecar first: a bad pairing must fail BEFORE the expensive model loads.
         side = cls._load_sidecar(z.meta_path) if str(z.encoder_path).endswith(".rknn") else {}
         kw = dict(
-            core_mask=z.core_mask, target=z.target, device_id=z.device_id,
+            core_mask=z.core_mask, target=z.resolved_target, device_id=z.device_id,
             providers=z.execution_providers, provider_options=z.provider_options,
             # Shared by the frame hop's chunk decode AND batch transcribe(): the frame
             # budget wins.
