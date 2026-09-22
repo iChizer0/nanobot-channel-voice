@@ -462,9 +462,11 @@ class SttServeConfig(_VoiceBase):
     """Serve the loaded on-device STT adapter as a local OpenAI-compatible
     ``POST /v1/audio/transcriptions``, so core's own transcription consumers (WebUI dictation,
     voice notes) run on THIS box: point core's ``transcription.provider`` at an OpenAI-shaped
-    provider entry whose ``apiBase`` is this endpoint (one you do not chat through, e.g.
-    ``providers.siliconflow``). Shares the
-    pipeline's SINGLE adapter instance: models are never loaded twice.
+    provider entry whose ``apiBase`` is this endpoint — ``providers.custom`` where core's
+    transcription registry offers it, else any entry you do not also chat through (e.g.
+    ``providers.siliconflow``). That entry needs an ``apiKey``, key or none here, since core
+    reads a keyless provider as unconfigured. Shares the pipeline's SINGLE adapter instance:
+    models are never loaded twice.
     """
 
     enabled: bool = False

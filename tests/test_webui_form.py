@@ -248,6 +248,23 @@ def test_field_labels_do_not_echo_their_section():
                 assert field["label"] != section["label"], (section["id"], field["key"])
 
 
+def test_the_served_endpoint_says_what_to_point_at_it():
+    """The API base is the Host and Port rows added up, which nothing else in the panel
+    says; and core reads a provider without a key as unconfigured, whatever this one is."""
+    served = _fields({"stt": {"provider": "whisper", "serve": {"enabled": True}}})
+    assert served["stt.serve.port"]["help"] == "The API base is `http://127.0.0.1:8035/v1`."
+    # beyond loopback the schema demands a key, so this is the shape that reaches the form
+    open_to_lan = _fields({"stt": {"provider": "whisper", "serve": {
+        "enabled": True, "host": "0.0.0.0", "port": 9000, "apiKey": "k",
+    }}})
+    assert open_to_lan["stt.serve.port"]["help"] == (
+        "The API base is `http://<this machine>:9000/v1` for a client on the network."
+    )
+    assert served["stt.serve.apiKey"]["help"].startswith(
+        "Callers send it as a bearer token. nanobot's own transcription needs one either way"
+    )
+
+
 def test_behaviour_rows_follow_their_switches():
     """The rows a listener tunes: a served endpoint's address once served, a filler's
     timing once enabled, a custom cue's clip once the cue is on, the pace of the voice

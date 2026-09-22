@@ -55,12 +55,17 @@ _COPY: dict[str, tuple[str, str | None]] = {
     "stt.sensevoice.language": ("Language", "A language code such as `zh` or `en`, or `auto` to detect it."),
     "stt.serve.enabled": (
         "Serve transcription",
-        "Offer the on-device speech-to-text as an OpenAI-compatible endpoint, to nanobot's own "
-        "transcription provider or any other client.",
+        "Offer the on-device speech-to-text as an OpenAI-compatible endpoint, so nanobot's own "
+        "transcription (Voice input) runs on this machine instead of a cloud provider. Point a "
+        "provider entry's API base at it, one you do not also chat through.",
     ),
     "stt.serve.host": ("Host", "`127.0.0.1` keeps the endpoint on this machine, `0.0.0.0` opens it to the network."),
     "stt.serve.port": ("Port", None),
-    "stt.serve.apiKey": ("API key", "Optional. Callers then send it as a bearer token."),
+    "stt.serve.apiKey": (
+        "API key",
+        "Callers send it as a bearer token. nanobot's own transcription needs one either way: "
+        "a provider without a key reads as not configured.",
+    ),
     "tts.enabled": ("Speak replies", None),
     "tts.matcha.speed": ("Speed", "1 is the voice's own pace. Higher speaks faster."),
     "tts.mms.speakingRate": ("Speed", "1 is the voice's own pace. Higher speaks faster."),
@@ -566,6 +571,8 @@ def _field(dumped: dict[str, Any], path: str, store: Store | None = None) -> dic
     if path == "device":
         assert store is not None
         help_text = _device_help(value, store)
+    if path == "stt.serve.port":
+        help_text = _serve_base_help(dumped)
     if path.endswith(".weights"):
         assert store is not None
         prefix = _key_prefix(dumped, path)
@@ -683,6 +690,16 @@ def _key_prefix(dumped: dict[str, Any], path: str) -> str:
     kind, block = path.split(".")[:2]
     engine = _lookup(dumped, "vad.turn.engine") if (kind, block) == ("vad", "turn") else block
     return f"{kind}/{engine}/"
+
+
+def _serve_base_help(dumped: dict[str, Any]) -> str:
+    """The API base a client needs, spelled out: it is the two rows above this one, and
+    nothing else in the panel says what they add up to."""
+    host = _lookup(dumped, "stt.serve.host") or "127.0.0.1"
+    port = _lookup(dumped, "stt.serve.port")
+    if host in ("0.0.0.0", "::"):
+        return f"The API base is `http://<this machine>:{port}/v1` for a client on the network."
+    return f"The API base is `http://{host}:{port}/v1`."
 
 
 def _device_help(value: Any, store: Store) -> str:
