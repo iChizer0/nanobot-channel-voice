@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import urllib.request
 
 import pytest
@@ -277,6 +278,49 @@ def test_fetch_http_bad_checksum_never_lands(store, monkeypatch):
         w.fetch("vad/firered/onnx", entry)
     d = w.store_dir("vad/firered/onnx")
     assert not (d / "model.onnx").exists() and not list(d.glob(".partial-*"))
+
+
+def test_an_update_that_fails_leaves_the_installed_revision_whole(store, monkeypatch):
+    """Nothing moves in until every file has verified: an update that fails on a later
+    file (one the index pins wrongly, a cancel) leaves the installed revision as it was,
+    never its first file new and the rest old."""
+    served = {}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(served[url]))
+
+    def revision(tag, meta_pin=None):
+        blobs = {"encoder.rknn": b"encoder " + tag, "meta.json": b"meta " + tag}
+        served.update({f"https://x.test/{n}": b for n, b in blobs.items()})
+        pins = {**blobs, "meta.json": meta_pin or blobs["meta.json"]}
+        return {"files": {n: {"url": f"https://x.test/{n}", "sha256": hashlib.sha256(pins[n]).hexdigest()}
+                          for n in blobs}}
+
+    key = "tts/m/rknn.rv1126b"
+    d = w.fetch(key, revision(b"v1"))
+    before = {p.name: p.read_bytes() for p in d.iterdir()}
+    with pytest.raises(w.WeightsError, match="meta.json: sha256 mismatch"):
+        w.fetch(key, revision(b"v2", meta_pin=b"meta v3"))
+    assert {p.name: p.read_bytes() for p in d.iterdir()} == before
+    seen = []
+    with pytest.raises(w.WeightsError, match="meta.json: download cancelled"):
+        w.fetch(key, revision(b"v2"), progress=lambda name, _n: seen.append(name),
+                should_stop=lambda: "encoder.rknn" in seen)
+    assert {p.name: p.read_bytes() for p in d.iterdir()} == before
+    w.fetch(key, revision(b"v2"))
+    assert (d / "encoder.rknn").read_bytes() == b"encoder v2" and (d / "meta.json").read_bytes() == b"meta v2"
+
+
+def test_a_partial_left_under_this_pid_is_never_written_through(store, monkeypatch, tmp_path):
+    """A crashed run's partial, found again under a pid reused after a reboot, may be the
+    link a local file stages as: a download replaces it, never writes into its target."""
+    src = _src(tmp_path, "model.onnx", b"the user's own copy")
+    blob = b"remote-model-bytes"
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(blob))
+    d = w.store_dir("vad/firered/onnx")
+    d.mkdir(parents=True)
+    (d / f".partial-{os.getpid()}-model.onnx").symlink_to(src)
+    entry = {"files": {"model.onnx": {"url": "https://x.test/m", "sha256": hashlib.sha256(blob).hexdigest()}}}
+    w.fetch("vad/firered/onnx", entry)
+    assert src.read_bytes() == b"the user's own copy" and (d / "model.onnx").read_bytes() == blob
 
 
 def test_fetch_http_requires_a_pinned_sha256(store):
@@ -741,6 +785,59 @@ def test_cli_sync_names_configured_keys_missing_from_the_index(store, tmp_path, 
     cfg = _write_config(tmp_path, {"vad": {"firered": {"weights": "vad/firered/rknn.rk3588"}}})
     assert cli_main(["--index", index, "sync", "--config", cfg]) == 2
     assert "vad/firered/rknn.rk3588" in capsys.readouterr().err
+
+
+def _stale(src):
+    """An entry whose pin the file no longer matches, as in an index older than the file."""
+    entry = _entry_for(src)
+    entry["files"][src.name]["sha256"] = "0" * 64
+    return entry
+
+
+def test_cli_sync_goes_past_a_key_that_fails_and_reports_each(store, tmp_path, capsys):
+    """One bad key (a hash the index pins wrongly, a key the index lacks) must not keep the
+    good ones off the device: every key is tried, the run ends on a per-key report and a
+    non-zero exit, and a sync that failed prunes nothing."""
+    src = _src(tmp_path, "encoder.onnx")
+    index = _write_index(tmp_path, {
+        "stt/a/onnx": _entry_for(src),
+        "tts/b/rknn.rv1126b": _stale(src),
+        "vad/c/onnx": _entry_for(src),
+        "wake/e/onnx": _entry_for(src),
+    })
+    assert cli_main(["--index", index, "fetch", "wake/e/onnx"]) == 0  # no longer configured
+    cfg = _write_config(tmp_path, {
+        "stt": {"whisper": {"weights": "stt/a/onnx"}},
+        "tts": {"matcha": {"weights": "tts/b/rknn.rv1126b"}},
+        "vad": {"silero": {"weights": "vad/c/onnx"}},
+        "wake": {"openwakeword": {"weights": "wake/d/onnx"}},
+    })
+    capsys.readouterr()
+    assert cli_main(["--index", index, "sync", "--config", cfg, "--prune"]) == 2
+    out, err = capsys.readouterr()
+    assert set(w.installed()) == {"stt/a/onnx", "vad/c/onnx", "wake/e/onnx"}
+    assert "2 ok, 2 failed" in out
+    assert "  failed   tts/b/rknn.rv1126b: encoder.onnx: sha256 mismatch" in out
+    assert "  failed   wake/d/onnx: not in the index" in out
+    assert "  ok       stt/a/onnx" in out and "  ok       vad/c/onnx" in out
+    assert "error: 2 of 4 weights failed: tts/b/rknn.rv1126b, wake/d/onnx, nothing pruned" in err
+
+
+def test_cli_fetch_of_several_keys_goes_past_one_that_fails(store, tmp_path, capsys):
+    """The same for fetch, where a key that names nothing is a typo in the command and is
+    refused before any download."""
+    src = _src(tmp_path, "encoder.onnx")
+    index = _write_index(tmp_path, {"stt/a/onnx": _entry_for(src), "tts/b/onnx": _stale(src), "vad/c/onnx": _entry_for(src)})
+    assert cli_main(["--index", index, "fetch", "stt/a/onnx", "stt/nope"]) == 2
+    assert "unknown weights key 'stt/nope'" in capsys.readouterr().err and w.installed() == {}
+    assert cli_main(["--index", index, "fetch", "tts/b/onnx", "stt/a/onnx", "vad/c/onnx"]) == 2
+    out, err = capsys.readouterr()
+    assert set(w.installed()) == {"stt/a/onnx", "vad/c/onnx"}
+    assert "2 ok, 1 failed" in out and "  failed   tts/b/onnx: encoder.onnx: sha256 mismatch" in out
+    assert "error: 1 of 3 weights failed: tts/b/onnx" in err
+    assert cli_main(["--index", index, "fetch", "tts/b/onnx", "tts/b"]) == 2  # one key, named twice
+    out, err = capsys.readouterr()
+    assert err.startswith("error: 'tts/b/onnx' encoder.onnx: sha256 mismatch") and "failed" not in out
 
 
 def test_cli_sync_leaves_an_installed_key_this_index_does_not_carry(store, tmp_path, capsys):

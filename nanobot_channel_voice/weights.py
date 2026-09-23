@@ -344,8 +344,9 @@ def fetch(
 ) -> Path:
     """Verify-and-install one index entry into the store; idempotent. Files already
     present with the index's sha256 (per the manifest) are kept; ``force`` refetches
-    everything. Downloads stream to ``.partial-*``, verify, then atomically replace: a
-    partial never lands on the final name. ``managed_by`` is recorded in the manifest
+    everything. Each file stages as a ``.partial-*`` beside its name and none moves in
+    until all have verified: a fetch that fails leaves the key as it was, never a partial
+    on a final name nor two revisions mixed. ``managed_by`` is recorded in the manifest
     (what installed the key, so an automatic cleanup removes only its own); ``progress``
     gets (file name, bytes so far) per chunk and ``should_stop`` is polled between
     chunks: True abandons the download as a :class:`WeightsError`."""
@@ -367,38 +368,42 @@ def fetch(
     d.mkdir(parents=True, exist_ok=True)
     have = ({} if force else _manifest_files(d)) or {}
     recorded: dict[str, Any] = {}
-    for name, spec in files.items():
-        url = str((spec or {}).get("url") or "")
-        want = (spec or {}).get("sha256")
-        dest = d / name
-        prior = have.get(name) or {}
-        if dest.exists() and want and prior.get("sha256") == want:
-            recorded[name] = prior
-            log(f"  {name}: already fetched")
-            continue
-        scheme = urllib.parse.urlsplit(url).scheme
-        if scheme == "file":
-            src = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path)).resolve()
-            if not src.is_file():
-                raise WeightsError(f"'{key}' {name}: source file not found: {src}")
-            digest = _sha256_file(src)
-            if want and digest != want:
-                raise WeightsError(
-                    f"'{key}' {name}: sha256 mismatch (index {want[:12]}..., file {digest[:12]}...)"
-                )
-            dest.unlink(missing_ok=True)
-            dest.symlink_to(src)  # link, not copy: the source stays the one copy on disk
-            recorded[name] = {"sha256": digest, "linked": str(src)}
-            log(f"  {name}: linked -> {src}")
-        elif scheme in ("http", "https"):
-            if not want:
-                raise WeightsError(
-                    f"'{key}' {name}: remote files must pin a sha256 in the index"
-                )
+    staged: dict[Path, Path] = {}  # partial -> the name it moves in as
+    try:
+        for name, spec in files.items():
+            url = str((spec or {}).get("url") or "")
+            want = (spec or {}).get("sha256")
+            dest = d / name
+            prior = have.get(name) or {}
+            if dest.exists() and want and prior.get("sha256") == want:
+                recorded[name] = prior
+                log(f"  {name}: already fetched")
+                continue
             part = d / f".partial-{os.getpid()}-{name}"
-            digester = hashlib.sha256()
-            total = 0
-            try:
+            # One a crashed run left under a reused pid may be a link: never written through.
+            part.unlink(missing_ok=True)
+            scheme = urllib.parse.urlsplit(url).scheme
+            if scheme == "file":
+                src = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path)).resolve()
+                if not src.is_file():
+                    raise WeightsError(f"'{key}' {name}: source file not found: {src}")
+                digest = _sha256_file(src)
+                if want and digest != want:
+                    raise WeightsError(
+                        f"'{key}' {name}: sha256 mismatch (index {want[:12]}..., file {digest[:12]}...)"
+                    )
+                staged[part] = dest
+                part.symlink_to(src)  # link, not copy: the source stays the one copy on disk
+                recorded[name] = {"sha256": digest, "linked": str(src)}
+                log(f"  {name}: linked -> {src}")
+            elif scheme in ("http", "https"):
+                if not want:
+                    raise WeightsError(
+                        f"'{key}' {name}: remote files must pin a sha256 in the index"
+                    )
+                staged[part] = dest
+                digester = hashlib.sha256()
+                total = 0
                 try:
                     with urllib.request.urlopen(url, timeout=60) as resp, part.open("wb") as out:  # noqa: S310
                         while chunk := resp.read(_CHUNK):
@@ -409,6 +414,8 @@ def fetch(
                             total += len(chunk)
                             if progress is not None:
                                 progress(name, total)
+                        out.flush()
+                        os.fsync(out.fileno())  # on disk before a manifest can vouch for it
                 # A truncated chunked body raises IncompleteRead: HTTPException, NOT OSError.
                 except (OSError, http.client.HTTPException) as exc:
                     raise WeightsError(f"'{key}' {name}: download failed: {exc}") from None
@@ -416,17 +423,22 @@ def fetch(
                 if digest != want:
                     raise WeightsError(
                         f"'{key}' {name}: sha256 mismatch after download "
-                        f"(index {want[:12]}..., got {digest[:12]}...); refusing to install"
+                        f"(index {want[:12]}..., got {digest[:12]}...); refusing to install "
+                        "(most likely the file changed after the index was made)"
                     )
+                recorded[name] = {"sha256": digest}
+                log(f"  {name}: fetched {total / 1e6:.1f} MB")
+            else:
+                raise WeightsError(
+                    f"'{key}' {name}: unsupported url '{url or '<missing>'}' (need http(s):// or file://)"
+                )
+        if staged:
+            (d / MANIFEST).unlink(missing_ok=True)  # a crash among the moves reads as not fetched
+            for part, dest in staged.items():
                 os.replace(part, dest)
-            finally:  # covers Ctrl-C too; a no-op once the replace has happened
-                part.unlink(missing_ok=True)
-            recorded[name] = {"sha256": digest}
-            log(f"  {name}: fetched {total / 1e6:.1f} MB")
-        else:
-            raise WeightsError(
-                f"'{key}' {name}: unsupported url '{url or '<missing>'}' (need http(s):// or file://)"
-            )
+    finally:  # covers Ctrl-C too; a no-op for a partial that has moved in
+        for part in staged:
+            part.unlink(missing_ok=True)
     payload: dict[str, Any] = {"key": key, "fetched_unix": int(time.time()), "files": recorded}
     if managed_by:
         payload["managed_by"] = managed_by

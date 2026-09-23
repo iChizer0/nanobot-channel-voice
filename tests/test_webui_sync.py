@@ -572,6 +572,54 @@ def test_connector_reports_a_crashed_run_and_a_cancel_before_the_removals(store,
     assert set(w.installed(store)) == {"tts/mms/en/onnx"}
 
 
+def test_a_model_that_fails_does_not_keep_the_others_off_the_device(store, monkeypatch, server):
+    """A model whose download does not verify (the hash and size an index older than the
+    file still pins) fails alone: the ones after it are fetched, the bar only rises past
+    it though it ran over its declared size, the run names it and how many landed and
+    removes nothing, and the next Apply wants just it. A cancel stays the whole run's,
+    even landing as a model's failed download."""
+    index = _index(server, **{
+        "stt/whisper/base/onnx": ("whisper-encoder.onnx", b"w" * 100),
+        "tts/matcha/zh-en/rknn.rv1126b": ("matcha-decoder.rknn", b"m" * 50),
+        "vad/silero/v6/onnx": ("silero-model.onnx", b"s" * 20),
+        "tts/mms/en/onnx": ("mms-decoder.onnx", b"d" * 10),
+    })
+    w.fetch("tts/mms/en/onnx", index["tts/mms/en/onnx"], root=store, managed_by=MANAGED_BY)
+    index["tts/matcha/zh-en/rknn.rv1126b"]["files"]["decoder.rknn"].update(sha256="0" * 64, size=10)  # republished since
+    section = {
+        "stt": {"whisper": {"weights": "stt/whisper/base/onnx"}},
+        "tts": {"matcha": {"weights": "tts/matcha/zh-en/rknn.rv1126b"}},
+        "vad": {"silero": {"weights": "vad/silero/v6/onnx"}},
+    }
+    plan = plan_sync(section, index, store, managed_by=MANAGED_BY)
+    assert plan.fetch == ["stt/whisper/base/onnx", "tts/matcha/zh-en/rknn.rv1126b", "vad/silero/v6/onnx"]
+    assert plan.prune == ["tts/mms/en/onnx"]
+    seen = []
+    with pytest.raises(w.WeightsError) as failed:
+        run_sync(plan, index, store, managed_by=MANAGED_BY, progress=lambda _key, _name, done: seen.append(done))
+    message = str(failed.value)
+    assert message.startswith("'tts/matcha/zh-en/rknn.rv1126b' decoder.rknn: sha256 mismatch after download")
+    assert "changed after the index was made" in message and message.endswith("(2 of 3 fetched)")
+    assert set(w.installed(store)) == {"stt/whisper/base/onnx", "vad/silero/v6/onnx", "tts/mms/en/onnx"}
+    assert seen == sorted(seen) and seen[-1] == 170
+    again = plan_sync(section, index, store, managed_by=MANAGED_BY)
+    assert again.fetch == ["tts/matcha/zh-en/rknn.rv1126b"] and again.prune == ["tts/mms/en/onnx"]
+
+    for key in ("stt/whisper/base/onnx", "vad/silero/v6/onnx"):
+        w.prune(key, store)
+    tried, stop = [], []
+
+    def cancelled_mid_download(key, *_a, **_k):
+        tried.append(key)
+        stop.append(True)
+        raise w.WeightsError(f"'{key}' encoder.onnx: download cancelled")
+
+    monkeypatch.setattr(w, "fetch", cancelled_mid_download)
+    with pytest.raises(w.WeightsError, match="'stt/whisper/base/onnx' encoder.onnx: download cancelled"):
+        run_sync(plan, index, store, managed_by=MANAGED_BY, should_stop=lambda: bool(stop))
+    assert tried == ["stt/whisper/base/onnx"] and "tts/mms/en/onnx" in w.installed(store)
+
+
 def test_connector_plan_survives_an_unreachable_index(store, tmp_path, monkeypatch):
     _cache(store, {"stt/whisper/base/onnx": {"files": {"e.onnx": {"url": "https://x/e", "sha256": "0" * 64}}}},
            fetched_unix=1)

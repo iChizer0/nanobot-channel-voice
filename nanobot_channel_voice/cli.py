@@ -55,10 +55,45 @@ def _fetch_one(key: str, entry: dict[str, Any], *, force: bool, yes: bool, root:
     print(f"  -> {d}")
 
 
+def _fetch_all(
+    keys: list[str], index: dict[str, Any], *, force: bool, yes: bool, root: Path,
+) -> dict[str, str]:
+    """Fetch each key in turn, why each one that failed did. A failure (a stale index's
+    hash, a dead link, a notice not accepted) never keeps the rest off the device, and
+    leaves its own key as it was."""
+    failed: dict[str, str] = {}
+    for key in keys:
+        try:
+            _fetch_one(key, index[key], force=force, yes=yes, root=root)
+        except (w.WeightsError, OSError) as exc:
+            failed[key] = str(exc)
+    return failed
+
+
+def _report(keys: list[str], failed: dict[str, str], skipped: dict[str, str]) -> None:
+    """Each key's outcome, last, so a long run ends on what did not land."""
+    ok = len(keys) - len(failed) - len(skipped)
+    print(f"{ok} ok, {len(failed)} failed" + (f", {len(skipped)} skipped" if skipped else ""))
+    for key in keys:
+        if key in failed:
+            why = failed[key].removeprefix(f"'{key}' ")  # fetch's messages lead with the key
+            print(f"  failed   {key}: {why}")
+        elif key in skipped:
+            print(f"  skipped  {key}: {skipped[key]}")
+        else:
+            print(f"  ok       {key}")
+
+
 def _fetch(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
-    for token in args.keys:
-        key = _resolve_key(token, index, "try: nanobot-voice list")
-        _fetch_one(key, index[key], force=args.force, yes=args.yes, root=root)
+    # A key that resolves to nothing is a typo in the command: said before any download.
+    keys = list(dict.fromkeys(_resolve_key(t, index, "try: nanobot-voice list") for t in args.keys))
+    failed = _fetch_all(keys, index, force=args.force, yes=args.yes, root=root)
+    if len(keys) == 1 and failed:
+        raise w.WeightsError(failed[keys[0]])
+    if len(keys) > 1:
+        _report(keys, failed, {})
+    if failed:
+        raise w.WeightsError(f"{len(failed)} of {len(keys)} weights failed: {', '.join(failed)}")
     return 0
 
 
@@ -94,28 +129,32 @@ def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     plan = plan_sync(voice_section(path), index, root, managed_by=None, prune=args.prune)
     for key in plan.wanted:
         w.validate_key(key)
-    if plan.unknown:
-        raise w.WeightsError(
-            f"configured weights not in the index: {', '.join(plan.unknown)} "
-            "(set the right channels.voice.index, or pass --index)"
-        )
-    # The CLI fetches through its own loop: notices prompt here, and every named key is
-    # re-verified against its manifest (fetch is idempotent; --force refetches). A key the
-    # store holds but this index does not name stays as it is: it was fetched from another.
-    for key in plan.wanted:
-        entry = index.get(key)
-        if entry is None:
-            print(f"{key}: installed, not in this index (not re-verified)")
-            continue
-        _fetch_one(key, entry, force=args.force, yes=args.yes, root=root)
     if not plan.wanted:
         print(f"{path}: channels.voice configures no weights keys")
-    if args.prune:
-        if not plan.wanted:  # an empty config must not silently empty the store
+        if args.prune:  # an empty config must not silently empty the store
             raise w.WeightsError(
                 "config names no weights; refusing to prune everything "
                 "(use: nanobot-voice prune --all)"
             )
+        return 0
+    # The CLI fetches through its own loop: notices prompt here, and every named key is
+    # re-verified against its manifest (fetch is idempotent; --force refetches). A key the
+    # store holds but this index does not name stays as it is: it was fetched from another.
+    skipped = {
+        k: "installed, not in this index (not re-verified)"
+        for k in plan.wanted if k not in index and k not in plan.unknown
+    }
+    unindexed = "not in the index (set the right channels.voice.index, or pass --index)"
+    failed = dict.fromkeys(plan.unknown, unindexed)
+    listed = [k for k in plan.wanted if k in index]
+    failed |= _fetch_all(listed, index, force=args.force, yes=args.yes, root=root)
+    _report(plan.wanted, failed, skipped)
+    if failed:
+        # A sync that failed removes nothing: the store is as it was, plus whole models.
+        unpruned = ", nothing pruned" if args.prune and plan.prune else ""
+        which = ", ".join(k for k in plan.wanted if k in failed)
+        raise w.WeightsError(f"{len(failed)} of {len(plan.wanted)} weights failed: {which}{unpruned}")
+    if args.prune:
         freed = 0
         for key in plan.prune:
             freed += w.prune(key, root)

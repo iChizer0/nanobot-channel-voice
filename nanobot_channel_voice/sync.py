@@ -166,15 +166,15 @@ def _free_bytes(root: Path) -> int:
 
 
 def _key_progress(
-    progress: Callable[[str, str, int], None], key: str, base: int,
+    progress: Callable[[str, str, int], None], key: str, base: int, files: dict[str, int],
 ) -> Callable[[str, int], None]:
-    """The per-file byte counts :func:`weights.fetch` reports, as one rising number: the
-    files this key has finished plus the one in flight, over the keys before it."""
-    done: dict[str, int] = {}
+    """The per-file byte counts :func:`weights.fetch` reports (kept in ``files``), as one
+    rising number: the files this key has finished plus the one in flight, over the keys
+    before it."""
 
     def report(name: str, so_far: int) -> None:
-        done[name] = so_far
-        progress(key, name, base + sum(done.values()))
+        files[name] = so_far
+        progress(key, name, base + sum(files.values()))
 
     return report
 
@@ -192,25 +192,40 @@ def run_sync(
     """Fetch, then remove; returns (bytes fetched, bytes freed). ``progress`` gets
     (key, file name, bytes fetched so far by the whole run), which only rises;
     ``should_stop`` is honoured between chunks, between keys and before the removals.
-    Fetching precedes removal so a failed or stopped run leaves the store as it was, plus
+    A model that fails does not keep the others off the device, and a run with any
+    failure removes nothing: a failed or stopped run leaves the store as it was, plus
     whole models."""
     def check_stop() -> None:
         if should_stop is not None and should_stop():
             raise w.WeightsError("sync cancelled")
 
-    fetched = 0
+    done = 0
+    failed: list[str] = []
     for key in plan.fetch:
         check_stop()
         log(key)
-        w.fetch(
-            key, index[key], root=root, log=log, managed_by=managed_by,
-            progress=_key_progress(progress, key, fetched) if progress else None,
-            should_stop=should_stop,
+        files: dict[str, int] = {}
+        try:
+            w.fetch(
+                key, index[key], root=root, log=log, managed_by=managed_by,
+                progress=_key_progress(progress, key, done, files) if progress else None,
+                should_stop=should_stop,
+            )
+        except (w.WeightsError, OSError) as exc:
+            if should_stop is not None and should_stop():
+                raise  # a cancel ends the run, naming the download it cut off
+            failed.append(str(exc))
+        # What it downloaded when that ran past the size declared (an index older than the
+        # file, or one declaring none), so the next key's count starts where this one's ended.
+        done += max(plan.sizes[key], sum(files.values()))
+    if failed:
+        landed = len(plan.fetch) - len(failed)
+        raise w.WeightsError(
+            "; ".join(failed) + (f" ({landed} of {len(plan.fetch)} fetched)" if landed else "")
         )
-        fetched += plan.sizes[key]
     check_stop()
     freed = 0
     for key in plan.prune:
         freed += w.prune(key, root)
         log(f"removed {key}")
-    return fetched, freed
+    return done, freed
