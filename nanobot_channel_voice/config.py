@@ -110,8 +110,9 @@ def parse_import_blob(raw: Any) -> dict[str, Any]:
 RESET_KEY = "$reset"
 # The operator's defaults, a JSON file path or the JSON itself: the layer beneath
 # ``channels.voice``, every key the section leaves unset coming from it and then from the
-# schema. How a board image ships its baseline (chip, ALSA devices, models) so a fresh
-# config runs it, the panel shows it resolved and Reset returns to it. Unset, the schema.
+# schema. How a board image ships its baseline (chip, ALSA devices, models): the panel
+# shows it resolved and Reset returns to it. Values only: nanobot activates the channel from
+# config.json's own ``enabled``, and one here is dropped as from a paste. Unset, the schema.
 DEFAULTS_ENV = "NANOBOT_VOICE_DEFAULTS"
 
 
