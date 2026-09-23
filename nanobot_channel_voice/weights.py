@@ -13,10 +13,12 @@ plus sha256::
 
 ``accept`` makes ``fetch`` print the notice and demand confirmation (``--yes`` to
 script it); per-file ``size`` (bytes) only feeds ``list``'s estimate. The wheel ships NO
-entries and NO weights: they come from vendor/user index files (``--index`` /
-``$NANOBOT_VOICE_INDEX``, else :data:`DEFAULT_INDEX_SOURCES`). ``http(s)://`` sources
-stream into the store and MUST pin a sha256; ``file://`` sources are symlinked in place,
-verified when the index pins one.
+entries and NO weights: they come from the index files ``channels.voice.index`` names
+(:data:`DEFAULT_INDEX_SOURCES` unless it names others), or ``--index``. An index is read
+over https or from a file, since it pins the hashes. A file ``url`` may be relative to
+the index, so a copy of one serves its files from wherever it is put (a mirror, a disk).
+``http(s)://`` files stream into the store and MUST pin a sha256; ``file://`` files are
+symlinked in place, verified when the index pins one.
 
 File names inside an entry are the resolution contract: an engine block setting
 ``weights: <key>`` gets its unset ``*_path`` fields filled by stem + any extension
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -44,8 +47,8 @@ from typing import Any
 MANIFEST = ".manifest.json"
 INDEX_CACHE = ".index.json"
 
-# Consulted when neither --index nor $NANOBOT_VOICE_INDEX names a source. URLs only,
-# never a bundled data file (the wheel ships no entries); an explicit source replaces it.
+# ``channels.voice.index`` unless it names others. URLs only, never a bundled data file
+# (the wheel ships no entries); a configured index replaces it.
 DEFAULT_INDEX_SOURCES: tuple[str, ...] = (
     "https://huggingface.co/iChizer0/nanobot-channel-voice-models/resolve/main/weights-index.json",
 )
@@ -94,10 +97,49 @@ def store_dir(key: str, root: Path | None = None) -> Path:
 # ---- index ------------------------------------------------------------------
 
 
+def check_index_source(source: str) -> str:
+    """``source`` when an index may be read from it. ``ValueError`` says why not: the
+    index pins every file's sha256, so it has to arrive authenticated."""
+    split = urllib.parse.urlsplit(source)
+    if split.scheme not in ("", "http", "https", "file"):
+        raise ValueError(f"'{split.scheme}' is not an index scheme (https://, file:// or a path)")
+    if split.scheme == "http" and not _loopback(split.hostname):
+        raise ValueError(
+            "an index must be https or a file: it pins each model's sha256, so over plain "
+            "http anything on the way could swap a model and its hash together"
+        )
+    return source
+
+
+def _loopback(host: str | None) -> bool:
+    """This machine's own address: plain http to it never crosses a network."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
+
+
+def _index_base(source: str) -> str:
+    """What a relative file ``url`` in this index resolves against: the index's location as
+    named, not where a redirect lands (a hub answers with a cache or CDN address, where
+    the index's siblings are not), a bare path taken as the file it names."""
+    if urllib.parse.urlsplit(source).scheme:
+        return source
+    return Path(source).expanduser().absolute().as_uri()
+
+
 def _read_source(source: str, timeout: float) -> dict[str, Any]:
     split = urllib.parse.urlsplit(source)
     if split.scheme in ("http", "https"):
         with urllib.request.urlopen(source, timeout=timeout) as resp:  # noqa: S310 - user-given index URL
+            # urllib follows a redirect from https down to http: the index must still arrive
+            # authenticated.
+            try:
+                check_index_source(resp.url)
+            except ValueError as exc:
+                raise ValueError(f"it redirects to {resp.url}, and {exc}") from None
             raw = resp.read()
     elif split.scheme == "file":
         raw = Path(urllib.request.url2pathname(split.path)).read_bytes()
@@ -126,13 +168,32 @@ def _validate_entry(source: str, key: str, entry: Any) -> None:
         size = (spec or {}).get("size")
         if size is not None and not isinstance(size, int):
             raise WeightsError(f"{where}.files['{name}'].size must be a whole number of bytes")
+        url = (spec or {}).get("url")
+        if url is not None and not _parses(url):
+            raise WeightsError(f"{where}.files['{name}'].url must be a URL, or a path relative to the index")
 
 
-def load_index(sources: Sequence[str] = (), *, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
-    """Merge the sources (path, ``file://`` or ``http(s)://``) in order, later winning
-    per key; empty means :data:`DEFAULT_INDEX_SOURCES`."""
+def _parses(url: Any) -> bool:
+    """Whether a file ``url`` is one the load can resolve against its index."""
+    if not isinstance(url, str):
+        return False
+    try:
+        urllib.parse.urlsplit(url)
+    except ValueError:  # an unclosed IPv6 bracket, a host NFKC would rewrite
+        return False
+    return True
+
+
+def load_index(sources: Sequence[str], *, timeout: float = 30.0) -> dict[str, dict[str, Any]]:
+    """Merge the sources (path, ``file://`` or ``https://``) in order, later winning per
+    key, each entry's relative file urls resolved against the source that listed it. No
+    sources is no index."""
     models: dict[str, dict[str, Any]] = {}
-    for source in sources or DEFAULT_INDEX_SOURCES:
+    for source in sources:
+        try:
+            check_index_source(source)
+        except ValueError as exc:
+            raise WeightsError(f"weights index '{source}': {exc}") from None
         try:
             data = _read_source(source, timeout)
         except (OSError, ValueError, http.client.HTTPException) as exc:
@@ -144,15 +205,19 @@ def load_index(sources: Sequence[str] = (), *, timeout: float = 30.0) -> dict[st
             raise WeightsError(
                 f"weights index '{source}': 'models' must be an object of key -> entry"
             )
+        base = _index_base(source)
         for key, entry in entries.items():
             validate_key(key)
             _validate_entry(source, key, entry)
+            for spec in (entry.get("files") or {}).values():
+                if spec and spec.get("url"):
+                    spec["url"] = urllib.parse.urljoin(base, spec["url"])
         models.update(entries)
     return with_backbones(models)
 
 
 def refresh_index(
-    sources: Sequence[str] = (), root: Path | None = None, *, timeout: float = 30.0,
+    sources: Sequence[str], root: Path | None = None, *, timeout: float = 30.0,
 ) -> dict[str, dict[str, Any]]:
     """:func:`load_index`, then cache the result in the store for offline readers."""
     models = load_index(sources, timeout=timeout)
@@ -161,7 +226,7 @@ def refresh_index(
         base.mkdir(parents=True, exist_ok=True)
         _write_json(base / INDEX_CACHE, {
             "fetched_unix": int(time.time()),
-            "sources": list(sources or DEFAULT_INDEX_SOURCES),
+            "sources": list(sources),
             "models": models,
         })
     except OSError as exc:
@@ -223,12 +288,6 @@ def with_backbones(models: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any
         if files:
             out[backbone] = {"files": files, "derived_from": key}
     return out
-
-
-def index_sources() -> list[str]:
-    """What an index load reads with no ``--index``: ``$NANOBOT_VOICE_INDEX`` or the defaults."""
-    env = os.environ.get("NANOBOT_VOICE_INDEX")
-    return [env] if env else list(DEFAULT_INDEX_SOURCES)
 
 
 def entry_size(entry: dict[str, Any]) -> int:

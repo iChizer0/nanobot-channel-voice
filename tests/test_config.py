@@ -778,3 +778,43 @@ def test_transcription_gap_reports_an_unusable_delegate():
                 sys.modules[name] = mod
             else:
                 del sys.modules[name]
+
+
+def test_the_model_index_is_https_or_a_file_named_absolutely(monkeypatch):
+    """``index`` names where the on-device models come from, the built-in index unless
+    set, empty for none; each entry an https URL or a file on this machine, named
+    absolutely (the gateway and a shell resolve a relative path differently) and never
+    plain http, the index pinning every model's hash. A board's defaults can carry it,
+    and the readers that need the index alone check it as the schema does."""
+    import json
+
+    from nanobot_channel_voice import weights as w
+    from nanobot_channel_voice.config import resolve_section, section_index
+
+    assert VoiceConfig().index == list(w.DEFAULT_INDEX_SOURCES)
+    for fine in (
+        ["https://hf-mirror.com/o/r/resolve/main/weights-index.json"],
+        ["file:///mnt/usb/weights-index.json", "/srv/local.json", "~/idx.json"],
+        ["http://127.0.0.1:8000/i.json"],
+        [],
+    ):
+        assert VoiceConfig.model_validate({"index": fine}).index == fine
+    for refused, why in (
+        (["http://mirror.lan/i.json"], "index entry 'http://mirror.lan/i.json': an index must be https or a file"),
+        (["weights-index.json"], "is a relative path, name the file absolutely"),
+        ([""], "index has an empty entry"),
+        (["ftp://a.example/i.json"], "'ftp' is not an index scheme"),
+    ):
+        with pytest.raises(ValidationError, match=why):
+            VoiceConfig.model_validate({"index": refused})
+    mirror = ["https://hf-mirror.com/o/r/resolve/main/weights-index.json"]
+    monkeypatch.setenv("NANOBOT_VOICE_DEFAULTS", json.dumps({"index": mirror}))
+    assert VoiceConfig().index == mirror
+    assert section_index(resolve_section({})[0]) == mirror
+    assert section_index(resolve_section({"index": []})[0]) == []  # the section's own word stands
+    monkeypatch.delenv("NANOBOT_VOICE_DEFAULTS")
+    assert section_index({}) == list(w.DEFAULT_INDEX_SOURCES)
+    with pytest.raises(ValueError, match="index must be a list"):
+        section_index({"index": "https://a.example/i.json"})
+    with pytest.raises(ValueError, match="must be https or a file"):
+        section_index({"index": ["http://mirror.lan/i.json"]})

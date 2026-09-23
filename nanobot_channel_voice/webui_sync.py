@@ -5,7 +5,8 @@ Core's channel connector seam (``ChannelPlugin.connector``) drives this: a poll 
 run fetches what the resolved setup runs and removes what this same flow installed and it
 no longer runs. ``plan=true`` reports what a run would do from the cached index, or
 re-attaches one already going. ``refresh=true`` reloads the index in a background task,
-since core answers a socket's requests one at a time and the form would wait behind it.
+since core answers a socket's requests one at a time and the form would wait behind it,
+and so does a plan that finds the cache loaded from another index than the section names.
 Nothing else here touches the network.
 """
 
@@ -69,6 +70,9 @@ class VoiceSyncStore:
         self._starting = asyncio.Lock()
         self._reload: asyncio.Task[None] | None = None
         self._reload_error: str | None = None
+        # The index the last reload failed on: a cache from another one reloads by itself,
+        # but not again for these, or every poll would retry a dead link. Retry does.
+        self._failed: list[str] | None = None
 
     async def handle(self, action: str, query: QueryParams) -> dict[str, Any]:
         if action == "start":
@@ -77,9 +81,7 @@ class VoiceSyncStore:
                 # reopens follows it to the end, and core hears its "succeeded" once.
                 if (pending := self._session) is not None and not pending.delivered:
                     return self._deliver(pending)
-                if _flag(query, "refresh"):
-                    self._start_reload()
-                return await asyncio.to_thread(self.plan, refreshing=self._reloading())
+                return await self._planned(refresh=_flag(query, "refresh"))
             accepted = {k for k in (query_first(query, "accept") or "").split(",") if k}
             return await self.start(accepted)
         session_id = (query_first(query, "session_id") or "").strip()
@@ -122,13 +124,26 @@ class VoiceSyncStore:
         """What a run would do, from the cache as it is now. Offline, the cache stands and
         the status carries the last reload's error."""
         root = w.store_root()
-        index, cached_unix = _cached(root)
+        index, cached_unix, _ = _cached(root)
         return {
             "session_id": "",
             "status": "planned",
             "index": {"cached_unix": cached_unix, "refreshing": refreshing, "error": self._reload_error},
             "plan": _plan_payload(self._plan(root, index), index),
         }
+
+    async def _planned(self, *, refresh: bool) -> dict[str, Any]:
+        """The plan, a reload behind it when asked or when the cache is another index's
+        than the section names. An index that just failed reloads again only when asked,
+        and the failure of one the section no longer names stops being the status."""
+        configured, cached = await asyncio.to_thread(_sources, w.store_root())
+        if configured is not None and configured != self._failed:
+            self._failed = self._reload_error = None
+            if cached != configured:
+                self._start_reload()
+        if refresh:
+            self._start_reload()  # one at a time: a no-op while one runs
+        return await asyncio.to_thread(self.plan, refreshing=self._reloading())
 
     def _start_reload(self) -> None:
         """Reload the index in the background, one reload at a time; the cache it writes
@@ -141,11 +156,15 @@ class VoiceSyncStore:
         return self._reload is not None and not self._reload.done()
 
     async def _reload_index(self) -> None:
+        sources = None
         try:
-            await asyncio.to_thread(w.refresh_index, w.index_sources(), w.store_root(), timeout=INDEX_TIMEOUT_S)
+            sources = await asyncio.to_thread(_configured)
+            await asyncio.to_thread(w.refresh_index, sources, w.store_root(), timeout=INDEX_TIMEOUT_S)
+            self._failed = None
         except Exception as exc:  # noqa: BLE001 - nobody awaits this: a silent failure would read as a clean reload
             self._reload_error = str(exc) or type(exc).__name__
-            if not isinstance(exc, w.WeightsError):
+            self._failed = sources
+            if not isinstance(exc, (w.WeightsError, ChannelConnectError)):
                 logger.exception("voice: model index reload failed")
 
     def _plan(self, root: Path, index: dict[str, dict[str, Any]]) -> SyncPlan:
@@ -169,8 +188,18 @@ class VoiceSyncStore:
         if self._running() is not None:
             raise ChannelConnectError("a voice model sync is already running", status=409)
         root = w.store_root()
-        index, _cached_unix = await asyncio.to_thread(_cached, root)
+        index, _cached_unix, sources = await asyncio.to_thread(_cached, root)
         plan = await asyncio.to_thread(self._plan, root, index)
+        # Never a download from an index the section has moved away from: until the one it
+        # names has loaded, the cache lists the other one's files. An Apply that downloads
+        # nothing does not wait on it, offline or behind a blocked hub.
+        if plan.fetch or plan.unknown:
+            configured = await asyncio.to_thread(_configured)
+            if sources != configured:
+                if self._reloading() or self._failed != configured:
+                    self._start_reload()  # one at a time: a no-op while one runs
+                    raise ChannelConnectError("the model index is still loading, apply once it has", status=409)
+                raise ChannelConnectError(f"the model index has not loaded: {self._reload_error}")
         if plan.unknown:
             raise ChannelConnectError(
                 f"not in the model index: {', '.join(plan.unknown)}; fetch by hand or pick "
@@ -239,10 +268,35 @@ class VoiceSyncStore:
         return payload
 
 
-def _cached(root: Path) -> tuple[dict[str, dict[str, Any]], int]:
-    """The cached index and when it was fetched, empty and 0 when nothing is cached."""
+def _cached(root: Path) -> tuple[dict[str, dict[str, Any]], int, list[str] | None]:
+    """The cached index, when it was fetched and what from; empty, 0 and None when
+    nothing is cached."""
     cached = w.cached_index(root)
-    return (cached[0], cached[1]) if cached else ({}, 0)
+    return cached if cached else ({}, 0, None)
+
+
+def _sources(root: Path) -> tuple[list[str] | None, list[str] | None]:
+    """The index the section names, None when that cannot be read (the form or the plan
+    says why), and the one the cache was loaded from, None when nothing is cached."""
+    try:
+        configured = _configured()
+    except ChannelConnectError:
+        configured = None
+    cached = w.cached_index(root)
+    return configured, (cached[2] if cached else None)
+
+
+def _configured() -> list[str]:
+    """The model index the gateway's section names. ``ChannelConnectError`` says why it
+    cannot tell."""
+    from nanobot.config.loader import get_config_path
+
+    from nanobot_channel_voice.config import section_index
+
+    try:
+        return section_index(voice_section(get_config_path()))
+    except (w.WeightsError, ValueError) as exc:
+        raise ChannelConnectError(str(exc)) from None
 
 
 def _plan_payload(plan: SyncPlan, index: dict[str, dict[str, Any]]) -> dict[str, Any]:

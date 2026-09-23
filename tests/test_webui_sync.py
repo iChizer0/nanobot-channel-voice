@@ -14,6 +14,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from nanobot.channels.connect import ChannelConnectError
 
 from nanobot_channel_voice import weights as w
 from nanobot_channel_voice.config import VoiceConfig
@@ -35,6 +36,11 @@ class _Blobs(BaseHTTPRequestHandler):
     poll mid-download sees a partial byte count and a cancel lands between chunks."""
 
     def do_GET(self):  # noqa: N802 - http.server API
+        if (target := self.server.redirects.get(self.path.lstrip("/"))) is not None:
+            self.send_response(307)
+            self.send_header("Location", target)
+            self.end_headers()
+            return
         blob = self.server.blobs.get(self.path.lstrip("/"))
         if blob is None:
             self.send_error(404)
@@ -55,6 +61,7 @@ class _Blobs(BaseHTTPRequestHandler):
 def server():
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Blobs)
     httpd.blobs = {}
+    httpd.redirects = {}
     httpd.delay = 0.0
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -90,7 +97,7 @@ def _write_config(tmp_path, monkeypatch, section):
 # ---- index cache + form choices ---------------------------------------------
 
 
-def test_cli_loads_cache_the_index_and_the_form_reads_only_the_cache(store, tmp_path, capsys):
+def test_cli_loads_cache_the_index_and_the_form_reads_only_the_cache(store, tmp_path, monkeypatch, capsys):
     from nanobot_channel_voice.cli import main as cli_main
 
     index_file = tmp_path / "index.json"
@@ -102,7 +109,8 @@ def test_cli_loads_cache_the_index_and_the_form_reads_only_the_cache(store, tmp_
         "tts/matcha/en-US/ljspeech/onnx": {"files": {"decoder.onnx": {"url": "https://x/d", "sha256": "0" * 64}}},
     }}))
     assert w.cached_index(store) is None
-    assert cli_main(["--index", str(index_file), "list"]) == 0
+    _write_config(tmp_path, monkeypatch, {"index": [str(index_file)]})
+    assert cli_main(["list"]) == 0
     models, fetched_unix, sources = w.cached_index(store)
     assert set(models) == {"stt/whisper/base/onnx", "stt/whisper/base/rknn.rv1126b",
                            "stt/whisper/small/onnx", "tts/matcha/en-US/ljspeech/onnx"}
@@ -478,7 +486,7 @@ def _cache(root, models, *, sources=None, fetched_unix=None):
     root.mkdir(parents=True, exist_ok=True)
     (root / w.INDEX_CACHE).write_text(json.dumps({
         "fetched_unix": int(time.time()) if fetched_unix is None else fetched_unix,
-        "sources": w.index_sources() if sources is None else sources,
+        "sources": list(w.DEFAULT_INDEX_SOURCES) if sources is None else sources,
         "models": models,
     }))
     return models
@@ -581,10 +589,11 @@ def test_connector_plan_survives_an_unreachable_index(store, tmp_path, monkeypat
 
 
 def test_plan_answers_from_the_cache_and_reloads_behind_it(store, tmp_path, monkeypatch):
-    """The plan never waits on the network: a reload runs behind the answer when the
-    panel opens (``refresh``), one at a time, the status saying so; without it the cache
-    stands, whatever its age. Core answers a socket's requests one at a time, so a plan
-    that fetched would hold the form's own request behind it."""
+    """The plan never waits on the network: a reload of the index the section names runs
+    behind the answer when the panel opens (``refresh``), one at a time, the status saying
+    so; without it the cache of that index stands, whatever its age. Core answers a
+    socket's requests one at a time, so a plan that fetched would hold the form's own
+    request behind it."""
     loads = []
     gate = threading.Event()
 
@@ -594,9 +603,9 @@ def test_plan_answers_from_the_cache_and_reloads_behind_it(store, tmp_path, monk
         return _cache(root, {}, sources=list(sources))
 
     monkeypatch.setattr(w, "refresh_index", fake_refresh)
-    monkeypatch.setenv("NANOBOT_VOICE_INDEX", "https://index.test/weights.json")
-    _write_config(tmp_path, monkeypatch, {})
-    _cache(store, {}, fetched_unix=1)  # a cache however old stands until asked
+    remote = "https://index.test/weights.json"
+    _write_config(tmp_path, monkeypatch, {"index": [remote]})
+    _cache(store, {}, fetched_unix=1, sources=[remote])  # a cache however old stands until asked
 
     async def scenario():
         connector = VoiceSyncStore()
@@ -608,7 +617,7 @@ def test_plan_answers_from_the_cache_and_reloads_behind_it(store, tmp_path, monk
         assert opened["index"]["refreshing"] is True and opened["index"]["cached_unix"] == 1  # answered at once
         again = await plan(refresh="true")  # a second open while it runs: the same reload
         assert again["index"]["refreshing"] is True
-        assert loads == [["https://index.test/weights.json"]]
+        assert loads == [[remote]]
         gate.set()
         await connector._reload
         landed = await plan()
@@ -618,7 +627,7 @@ def test_plan_answers_from_the_cache_and_reloads_behind_it(store, tmp_path, monk
         # in the status until the next reload starts
         local = tmp_path / "dev-index.json"
         local.write_text(json.dumps({"version": 1, "models": {}}))
-        monkeypatch.setenv("NANOBOT_VOICE_INDEX", str(local))
+        _write_config(tmp_path, monkeypatch, {"index": [str(local)]})
         await plan(refresh="true")
         await connector._reload
         assert loads[-1] == [str(local)]
@@ -631,6 +640,122 @@ def test_plan_answers_from_the_cache_and_reloads_behind_it(store, tmp_path, monk
         await connector._reload
 
     _run(scenario())
+
+
+def test_the_panel_follows_the_index_the_section_names(store, tmp_path, monkeypatch, server):
+    """The index is the section's: a plan that finds the cache loaded from another one
+    reloads by itself, which is how a changed index reaches the pills, and the files an
+    index names relative to itself download from wherever it was read. One that fails is
+    not retried on every poll, only by Retry or another change; and Apply never
+    downloads from a cache the section has moved away from, saying why instead, while
+    one that downloads nothing does not wait on the index."""
+    blob = b"e" * 4096
+    served = f"{server.base}/weights-index.json"
+    server.blobs["whisper-encoder.onnx"] = blob
+    server.blobs["weights-index.json"] = json.dumps({"models": {"stt/whisper/base/onnx": {
+        "files": {"encoder.onnx": {"url": "whisper-encoder.onnx",
+                                   "sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob)}},
+        "langs": ["en"], "license": "MIT",
+    }}}).encode()
+    reloads = []
+    real_refresh = w.refresh_index
+
+    def counted(sources, root, timeout):
+        reloads.append(list(sources))
+        return real_refresh(sources, root, timeout=timeout)
+
+    monkeypatch.setattr(w, "refresh_index", counted)
+    whisper = {"stt": {"provider": "whisper", "whisper": {"weights": "stt/whisper/base/onnx"}}}
+    _write_config(tmp_path, monkeypatch, {**whisper, "index": [served]})
+    _cache(store, {})  # what the built-in index left behind
+    connector = VoiceSyncStore()
+    plan = lambda **q: connector.handle("start", {"plan": ["true"], **{k: [v] for k, v in q.items()}})  # noqa: E731
+    apply = lambda: connector.handle("start", {})  # noqa: E731
+
+    async def scenario():
+        # no Retry asked: the cache is another index's, so the plan reloads the section's
+        assert (await plan())["index"]["refreshing"] is True
+        await connector._reload
+        planned = await plan()
+        assert reloads == [[served]] and planned["index"]["error"] is None
+        assert [f["key"] for f in planned["plan"]["fetch"]] == ["stt/whisper/base/onnx"]
+        cached = w.cached_index()
+        assert cached[2] == [served]
+        assert cached[0]["stt/whisper/base/onnx"]["files"]["encoder.onnx"]["url"] == f"{server.base}/whisper-encoder.onnx"
+        assert (await _drive(connector, (await apply())["session_id"]))["status"] == "succeeded"
+        assert set(w.installed(store)) == {"stt/whisper/base/onnx"}
+        # an index that does not load: one reload, then the error stands, poll after poll
+        dead = f"{server.base}/gone-index.json"
+        _write_config(tmp_path, monkeypatch, {**whisper, "index": [dead]})
+        assert (await plan())["index"]["refreshing"] is True
+        await connector._reload
+        for _ in range(3):
+            status = (await plan())["index"]
+            assert status["refreshing"] is False and "gone-index.json" in status["error"]
+        assert reloads == [[served], [dead]]
+        # with its model here Apply downloads nothing, so it does not wait on the index;
+        # one that would download says why it cannot
+        assert await apply() == {"session_id": "", "status": "succeeded", "message": "Models are in place."}
+        w.prune("stt/whisper/base/onnx", store)
+        with pytest.raises(ChannelConnectError, match="the model index has not loaded: .*gone-index.json.*404"):
+            await apply()
+        await plan(refresh="true")  # Retry does
+        await connector._reload
+        assert reloads[-1] == [dead]
+        # back to the index the cache holds: nothing to reload
+        _write_config(tmp_path, monkeypatch, {**whisper, "index": [served]})
+        assert (await plan())["index"] == {"cached_unix": cached[1], "refreshing": False, "error": None}
+        assert len(reloads) == 3
+        # Apply straight after a change: it starts the reload, and waits for it to land
+        gate = threading.Event()
+        monkeypatch.setattr(w, "refresh_index", lambda *a, **k: gate.wait(5) and counted(*a, **k))
+        _write_config(tmp_path, monkeypatch, {**whisper, "index": [served, served]})
+        with pytest.raises(ChannelConnectError, match="still loading") as loading:
+            await apply()
+        assert loading.value.status == 409
+        with pytest.raises(ChannelConnectError, match="still loading"):
+            await apply()  # the same reload, still running
+        gate.set()
+        await connector._reload
+        assert (await _drive(connector, (await apply())["session_id"]))["status"] == "succeeded"
+        assert set(w.installed(store)) == {"stt/whisper/base/onnx"}
+
+    _run(scenario())
+
+
+def test_an_apply_that_downloads_nothing_does_not_wait_on_the_index(store, tmp_path, monkeypatch):
+    """The index matters to Apply only for a download: a setup that runs no on-device
+    model applies, and so starts, while the index cannot load, the way a fresh install
+    behind a blocked hub or a board off the network has to."""
+    def offline(sources, root, timeout):
+        raise w.WeightsError("cannot read weights index 'https://x': offline")
+
+    monkeypatch.setattr(w, "refresh_index", offline)
+    _write_config(tmp_path, monkeypatch, {"backend": "openai"})
+    connector = VoiceSyncStore()
+    in_place = {"session_id": "", "status": "succeeded", "message": "Models are in place."}
+
+    async def scenario():
+        assert w.cached_index() is None
+        assert await connector.handle("start", {}) == in_place
+        assert (await _reloaded(connector))["index"]["error"] is not None  # the open's reload failed
+        assert await connector.handle("start", {}) == in_place
+
+    _run(scenario())
+
+
+def test_a_relative_file_resolves_against_the_index_as_named_not_its_redirect(store, server):
+    """A hub answers an index's URL with a redirect to a cache or CDN address, where the
+    index's siblings are not, so a relative file url resolves against the index as named."""
+    blob = b"e" * 64
+    server.blobs["encoder.onnx"] = blob
+    server.blobs["resolve-cache/abc123/weights-index.json"] = json.dumps({"models": {"stt/m/onnx": {"files": {
+        "encoder.onnx": {"url": "encoder.onnx", "sha256": hashlib.sha256(blob).hexdigest()},
+    }}}}).encode()
+    server.redirects["weights-index.json"] = "/resolve-cache/abc123/weights-index.json"
+    entry = w.load_index([f"{server.base}/weights-index.json"])["stt/m/onnx"]
+    assert entry["files"]["encoder.onnx"]["url"] == f"{server.base}/encoder.onnx"
+    assert (w.fetch("stt/m/onnx", entry) / "encoder.onnx").read_bytes() == blob
 
 
 def test_the_wake_model_row_is_the_tier_switch_and_a_head_fills_the_phrases(store):

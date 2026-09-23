@@ -35,8 +35,7 @@ def config_weights_keys(node: Any) -> set[str]:
 
 
 def _resolved(section: dict[str, Any]) -> Any | None:
-    """The section as the schema sees it, None when it refuses. Lazy imports keep pydantic
-    out of the CLI's ``list``/``fetch`` paths."""
+    """The section as the schema sees it, None when it refuses."""
     from pydantic import ValidationError
 
     from nanobot_channel_voice.config import VoiceConfig

@@ -62,17 +62,42 @@ def _fetch(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     return 0
 
 
+def _config_path(args: argparse.Namespace) -> Path:
+    """``--config``, else the file the gateway reads by default."""
+    from nanobot.config.loader import get_config_path
+
+    return Path(args.config).expanduser() if args.config else get_config_path()
+
+
+def _configured_index(path: Path, *, required: bool) -> list[str]:
+    """``channels.voice.index`` as the gateway resolves it from the config at ``path``. With
+    no config file at all (a machine nanobot is not set up on) the operator's defaults
+    decide alone, unless the command needs the config anyway: then its absence is the
+    error, before any download."""
+    from nanobot_channel_voice.config import layer_defaults, section_index
+    from nanobot_channel_voice.sync import voice_section
+
+    try:
+        section = voice_section(path) if required or path.exists() else layer_defaults({})
+    except ValueError as exc:  # the defaults, unreadable (voice_section names its own)
+        raise w.WeightsError(str(exc)) from None
+    try:
+        return section_index(section)
+    except ValueError as exc:
+        raise w.WeightsError(f"{path}: channels.voice.{exc}") from None
+
+
 def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     from nanobot_channel_voice.sync import plan_sync, voice_section
 
-    path = Path(args.config).expanduser() if args.config else Path.home() / ".nanobot" / "config.json"
+    path = _config_path(args)
     plan = plan_sync(voice_section(path), index, root, managed_by=None, prune=args.prune)
     for key in plan.wanted:
         w.validate_key(key)
     if plan.unknown:
         raise w.WeightsError(
             f"configured weights not in the index: {', '.join(plan.unknown)} "
-            "(pass the right --index / $NANOBOT_VOICE_INDEX)"
+            "(set the right channels.voice.index, or pass --index)"
         )
     # The CLI fetches through its own loop: notices prompt here, and every named key is
     # re-verified against its manifest (fetch is idempotent; --force refetches). A key the
@@ -107,7 +132,7 @@ def _config(args: argparse.Namespace) -> int:
 
     from nanobot_channel_voice.config import VoiceConfig
 
-    path = Path(args.config).expanduser() if args.config else Path.home() / ".nanobot" / "config.json"
+    path = _config_path(args)
     try:
         data = json.loads(path.read_text("utf-8"))
     except (OSError, ValueError) as exc:
@@ -195,7 +220,7 @@ def _list(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
         shown += 1
     if not shown:
         where = f" for --lang {args.lang}" if args.lang else ""
-        print(f"no weights{where}; add an index with --index or $NANOBOT_VOICE_INDEX")
+        print(f"no weights{where}; name an index in channels.voice.index, or pass --index")
     return 0
 
 
@@ -241,8 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         "--index",
         action="append",
         metavar="PATH_OR_URL",
-        help="weights index (JSON path, file:// or http(s):// URL); repeatable, later wins "
-        "per key; default: $NANOBOT_VOICE_INDEX, else a built-in community index URL",
+        help="weights index (JSON path, file:// or https:// URL); repeatable, later wins "
+        "per key; default: the config's channels.voice.index, else the built-in community index",
     )
     parser.add_argument(
         "--models-dir",
@@ -260,9 +285,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--force", action="store_true", help="refetch even if already installed")
     p.add_argument("-y", "--yes", action="store_true", help="accept license notices non-interactively")
+    p.add_argument("--config", metavar="FILE", help="nanobot config (default: ~/.nanobot/config.json)")
 
     p = sub.add_parser("list", help="show index entries and installed weights")
     p.add_argument("--lang", metavar="XX", help="only entries listing this language code")
+    p.add_argument("--config", metavar="FILE", help="nanobot config (default: ~/.nanobot/config.json)")
 
     p = sub.add_parser(
         "sync",
@@ -293,19 +320,21 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     root = Path(args.models_dir).expanduser() if args.models_dir else w.store_root()
-    env_index = os.environ.get("NANOBOT_VOICE_INDEX")
-    sources = args.index if args.index else ([env_index] if env_index else [])
     try:
         if args.cmd == "config":
             return _config(args)  # needs no weights index
         if args.cmd == "prune":
             return _prune(args, root)
+        sources = args.index or _configured_index(_config_path(args), required=args.cmd == "sync")
         try:
-            index = w.refresh_index(sources, root)  # also caches it for the WebUI form
+            # The configured index is cached for the panel as well; a one-run --index is not
+            # the panel's, so it leaves the cache alone.
+            index = w.load_index(sources) if args.index else w.refresh_index(sources, root)
         except w.WeightsError:
-            # Offline: `list` degrades to the installed keys. A source the user NAMED
-            # stays a hard error, and fetch/sync need an index.
-            if sources or args.cmd != "list":
+            # Offline: `list` degrades to the installed keys while the index is the built-in
+            # one. One the user NAMED (here, in the config or its defaults) stays a hard
+            # error, and fetch/sync need an index.
+            if args.cmd != "list" or args.index or sources != list(w.DEFAULT_INDEX_SOURCES):
                 raise
             print("warning: no reachable weights index; listing the local store only",
                   file=sys.stderr)

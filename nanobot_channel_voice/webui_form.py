@@ -13,6 +13,7 @@ import functools
 import json
 import types
 import typing
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -36,6 +37,7 @@ _COPY: dict[str, tuple[str, str | None]] = {
         "audio to a realtime speech-to-speech provider.",
     ),
     "device": ("Device", None),  # help follows the index, see _device_help
+    "index": ("Model index", None),  # help follows the cached index, see _index_help
     "allowFrom": ("Allowed senders", "Sender ids the channel answers, `*` for any. The microphone's sender id is `local`."),
     "audio.captureDevice": ("Microphone", "An ALSA device name such as `default` or `plughw:1,0`."),
     "audio.playbackDevice": ("Speaker", "An ALSA device name such as `default` or `plughw:1,0`."),
@@ -231,7 +233,7 @@ _UNITS = {
 # sets once, the internals the identity and pipeline rows already summarise, the tuning
 # numbers and the phrase lists. A set value stays in force while its row is hidden.
 _ADVANCED = frozenset({
-    "device", "audio.captureDevice", "audio.playbackDevice", "aec", "tts.audioFormat",
+    "device", "index", "audio.captureDevice", "audio.playbackDevice", "aec", "tts.audioFormat",
     "bargeIn.mode", "realtime.bargeIn",
     "vad.engine", "vad.firered.weights", "vad.silero.weights", "vad.hangoverMs",
     "vad.turn.engine", "vad.turn.weights",
@@ -255,6 +257,11 @@ _WEIGHTS_HELP_NO_INDEX = "No model index is cached. Enter a store key fetched wi
 _DEVICE_HELP = "The chip the on-device models are built for, empty for CPU builds only."
 _DEVICE_HELP_NO_INDEX = " No model index is cached, `rv1126b` is one such name."
 _DEVICE_HELP_NO_CHIPS = " The index has no chip builds."
+_INDEX_HELP = (
+    "Where the Model pills and Apply's downloads come from: `https://` URLs or files on this "
+    "machine, a later one winning for the same model. Empty is no index, only the models "
+    "already here."
+)
 _WAKE_HELP = (
     "Transcript matches the phrase in the transcription. A head also hears its phrase in the "
     "audio and fills Phrases with it, Custom takes a head of your own."
@@ -281,7 +288,7 @@ _AEC_CLOUD = ("webrtc", "hardware")
 _NOTE_GATE = "Not in use until Send audio is On speech or After wake word."
 _NOTE_WAKE_GATE = "Not in use until Send audio is After wake word."
 _NOTE_SERVE = "The provider transcribes for itself. Serve transcription runs an engine on this device for other clients."
-_DEVICE_HELP_UNUSED = " Not in use until an on-device detector or a served engine runs."
+_ON_DEVICE_UNUSED = " Not in use until an on-device detector or a served engine runs."
 
 
 def choice_label(path: str, value: str) -> str:
@@ -307,9 +314,11 @@ def build_form(cfg: VoiceConfig, store: Store | None = None) -> dict[str, Any]:
             out["note"] = note
         return out
 
-    sections = [section("general", "General", ["backend", "device"])]
+    sections = [section("general", "General", ["backend", "device", "index"])]
     if not _on_device(cfg):
-        sections[0]["fields"][1]["help"] += _DEVICE_HELP_UNUSED
+        for field in sections[0]["fields"][1:]:
+            field["help"] += _ON_DEVICE_UNUSED
+            field["advanced"] = True
     # Audio is the hardware facts alone, every row advanced: the panel shows the section
     # under Advanced only.
     audio = ["audio.captureDevice", "audio.playbackDevice", "audio.backend"]
@@ -452,11 +461,15 @@ class Store:
     index: dict[str, dict[str, Any]] | None
     installed: frozenset[str]
     platforms: tuple[str, ...]
+    sources: tuple[str, ...] | None = None  # what the cached index was loaded from
 
     @classmethod
     def read(cls, device: str | None) -> Store:
         cached = w.cached_index()
-        return cls(cached[0] if cached else None, frozenset(w.installed()), w.host_platforms(device))
+        return cls(
+            cached[0] if cached else None, frozenset(w.installed()), w.host_platforms(device),
+            tuple(cached[2]) if cached else None,
+        )
 
 
 # The pace knob of each on-device voice, named as the engine names it.
@@ -571,6 +584,13 @@ def _field(dumped: dict[str, Any], path: str, store: Store | None = None) -> dic
     if path == "device":
         assert store is not None
         help_text = _device_help(value, store)
+    if path == "index":
+        assert store is not None
+        help_text = _index_help(value, store)
+        # Where every download comes from: a trust decision, so an index other than the
+        # built-in one leaves Advanced, one a pasted section brought in included.
+        if value != list(w.DEFAULT_INDEX_SOURCES):
+            field.pop("advanced", None)
     if path == "stt.serve.port":
         help_text = _serve_base_help(dumped)
     if path.endswith(".weights"):
@@ -719,6 +739,23 @@ def _device_help(value: Any, store: Store) -> str:
     typed = str(value).strip().lower() if value else ""
     missing = f", none for `{value}`" if typed and typed not in socs else ""
     return f"{_DEVICE_HELP} The index has builds for {names}{missing}."
+
+
+def _index_help(sources: list[str], store: Store) -> str:
+    """Says where Apply downloads from when that is not where the index is: a copy of an
+    index on a mirror still names its files where it came from, unless it names them
+    relative to itself. Read off the cache only while the cache is this index."""
+    if store.index is None or store.sources != tuple(sources):
+        return _INDEX_HELP
+    urls = (
+        str((spec or {}).get("url") or "")
+        for entry in store.index.values() for spec in (entry.get("files") or {}).values()
+    )
+    hosts = {u.hostname for u in map(urllib.parse.urlsplit, urls) if u.scheme in ("http", "https")}
+    elsewhere = sorted(h for h in hosts - {urllib.parse.urlsplit(s).hostname for s in sources} if h)
+    if not elsewhere:
+        return _INDEX_HELP
+    return f"{_INDEX_HELP} This index lists its files at {_literals(elsewhere)}, so Apply downloads from there."
 
 
 def _literals(names: list[str], joiner: str = "and") -> str:

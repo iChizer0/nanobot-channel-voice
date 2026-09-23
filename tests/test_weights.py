@@ -56,19 +56,98 @@ def test_index_sources_merge_later_wins(tmp_path):
     assert merged["stt/m/onnx"]["license"] == "B"
 
 
-def test_no_sources_falls_back_to_the_default_urls_and_nothing_bundled(monkeypatch):
-    # The wheel ships no index DATA, only URLs to a community-served index, so an
-    # argument-less load must read exactly those and produce no entries of its own.
+def test_no_sources_is_no_index_and_the_built_in_one_is_urls_only(monkeypatch):
+    """The wheel ships no index DATA, only the URL of a community-served one, which is
+    ``channels.voice.index``'s default: a load reads exactly the sources it is given, none
+    being no index at all, and a source given replaces the built-in one."""
+    from nanobot_channel_voice.config import VoiceConfig
+
     assert w.DEFAULT_INDEX_SOURCES
     assert all(s.startswith("https://") for s in w.DEFAULT_INDEX_SOURCES)
+    assert VoiceConfig().index == list(w.DEFAULT_INDEX_SOURCES)
     seen = []
     monkeypatch.setattr(w, "_read_source", lambda s, _timeout: seen.append(s) or {"models": {}})
-    assert w.load_index() == {}
-    assert seen == list(w.DEFAULT_INDEX_SOURCES)
-    # An explicit source REPLACES the default rather than adding to it.
-    seen.clear()
+    assert w.load_index([]) == {} and seen == []
     w.load_index(["https://example.invalid/i.json"])
     assert seen == ["https://example.invalid/i.json"]
+
+
+def test_a_file_url_relative_to_its_index_follows_the_index(monkeypatch):
+    """A relative file url resolves against the index that listed it, so a copy of the
+    index on a mirror or a disk serves its files from there; an absolute one stays as
+    written, which is also why a copy of an index of absolute urls still downloads from
+    where it came from."""
+    listed = {"models": {"stt/m/onnx": {"files": {
+        "encoder.onnx": {"url": "models/stt/m/onnx/encoder.onnx", "sha256": "0" * 64},
+        "vocab.txt": {"url": "https://cdn.example/vocab.txt", "sha256": "0" * 64},
+    }}}}
+    monkeypatch.setattr(w, "_read_source", lambda _s, _t: json.loads(json.dumps(listed)))
+    for source in (
+        "https://huggingface.co/o/r/resolve/main/weights-index.json",
+        "https://hf-mirror.com/o/r/resolve/main/weights-index.json",
+        "file:///mnt/usb/weights-index.json",
+    ):
+        files = w.load_index([source])["stt/m/onnx"]["files"]
+        beside = source.rsplit("/", 1)[0]
+        assert files["encoder.onnx"]["url"] == f"{beside}/models/stt/m/onnx/encoder.onnx"
+        assert files["vocab.txt"]["url"] == "https://cdn.example/vocab.txt"
+
+
+def test_a_relative_index_on_disk_links_the_files_beside_it(store, tmp_path):
+    """A bare path is the file it names: an index copied to a disk with its files next to
+    it installs from there, the store linking each file in place."""
+    disk = tmp_path / "usb"
+    (disk / "models").mkdir(parents=True)
+    blob = b"weights!"
+    (disk / "models" / "encoder.onnx").write_bytes(blob)
+    (disk / "weights-index.json").write_text(json.dumps({"models": {"stt/m/onnx": {"files": {
+        "encoder.onnx": {"url": "models/encoder.onnx", "sha256": hashlib.sha256(blob).hexdigest()},
+    }}}}))
+    entry = w.load_index([str(disk / "weights-index.json")])["stt/m/onnx"]
+    assert entry["files"]["encoder.onnx"]["url"] == (disk / "models" / "encoder.onnx").as_uri()
+    installed = w.fetch("stt/m/onnx", entry) / "encoder.onnx"
+    assert installed.is_symlink() and installed.resolve() == (disk / "models" / "encoder.onnx").resolve()
+    # through a link it is the link's neighbours, a path and its file:// URL alike
+    link = tmp_path / "linked" / "weights-index.json"
+    link.parent.mkdir()
+    link.symlink_to(disk / "weights-index.json")
+    for named in (str(link), link.as_uri()):
+        files = w.load_index([named])["stt/m/onnx"]["files"]
+        assert files["encoder.onnx"]["url"] == (link.parent / "models" / "encoder.onnx").as_uri()
+
+
+def test_an_index_arrives_authenticated(monkeypatch):
+    """The index pins every file's sha256, so it is read over https, from a file, or over
+    plain http from this machine alone; the files it lists may come over anything."""
+    monkeypatch.setattr(w, "_read_source", lambda _s, _t: {"models": {}})
+    for fine in (
+        "https://a.example/i.json", "file:///srv/i.json", "/srv/i.json", "i.json",
+        "http://127.0.0.1:8000/i.json", "http://localhost/i.json", "http://[::1]/i.json",
+    ):
+        w.load_index([fine])
+    for refused, why in (
+        ("http://mirror.lan/i.json", "must be https or a file"),
+        ("http://10.0.0.2/i.json", "must be https or a file"),
+        ("http://localhost.example/i.json", "must be https or a file"),
+        ("ftp://a.example/i.json", "not an index scheme"),
+    ):
+        with pytest.raises(w.WeightsError, match=why) as caught:
+            w.load_index([refused])
+        assert refused in str(caught.value)  # the refusal names the index it refused
+
+
+def test_a_redirect_does_not_downgrade_an_index(monkeypatch):
+    """urllib follows a redirect from https down to plain http, so where the index lands
+    is held to the rule the index it was named as is."""
+    class Landed(io.BytesIO):
+        url = "http://mirror.lan/weights-index.json"  # where urlopen's answer came from
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: Landed(b'{"models": {}}'))
+    named = "https://hub.example/weights-index.json"
+    with pytest.raises(w.WeightsError, match=f"'{named}': it redirects to {Landed.url}, and an index must be https"):
+        w.load_index([named])
+    Landed.url = "https://cdn.example/c/abc/weights-index.json"  # still https: fine
+    assert w.load_index([named]) == {}
 
 
 def test_an_index_a_vendor_wrote_loosely_is_refused_or_survived(store, tmp_path, capsys):
@@ -133,6 +212,8 @@ def test_index_with_a_traversal_key_is_rejected(tmp_path):
         ({"stt/m/onnx": ["files"]}, "must be a JSON object"),
         ({"stt/m/onnx": {"files": ["encoder.onnx"]}}, r"\.files must be an object"),
         ({"stt/m/onnx": {"files": {"encoder.onnx": "https://x.test/e"}}}, r"must be an object"),
+        ({"stt/m/onnx": {"files": {"encoder.onnx": {"url": "https://[x.test/e"}}}}, r"\.url must be a URL"),
+        ({"stt/m/onnx": {"files": {"encoder.onnx": {"url": 7}}}}, r"\.url must be a URL"),
     ],
 )
 def test_malformed_index_shapes_are_errors_not_tracebacks(store, tmp_path, capsys, models, match):
@@ -707,18 +788,62 @@ def test_cli_list_survives_an_unreachable_builtin_index(store, tmp_path, monkeyp
     cap = capsys.readouterr()
     assert "stt/m/onnx" in cap.out and "not in index" in cap.out
     assert "warning" in cap.err
-    # A source the USER named still hard-errors: they asked for that one specifically.
+    # A source the USER named still hard-errors: they asked for that one specifically,
+    # here or in the config.
     assert cli_main(["--index", "https://example.invalid/i.json", "list"]) == 2
+    assert "error:" in capsys.readouterr().err
+    cfg = _write_config(tmp_path, {"index": ["https://example.invalid/i.json"]})
+    assert cli_main(["list", "--config", cfg]) == 2
     assert "error:" in capsys.readouterr().err
 
 
-def test_cli_env_index_default(store, tmp_path, monkeypatch, capsys):
+def test_cli_reads_the_index_the_config_names(store, tmp_path, monkeypatch, capsys):
+    """Without --index, list, fetch and sync read channels.voice.index from the config the
+    gateway reads, so the CLI caches the index the panel shows; --index overrides it for
+    one run, leaving that cache alone. With no config at all the index is the operator's
+    defaults' or the built-in one, except for sync, which needs the config anyway and says
+    so before downloading anything."""
+    import nanobot.config.loader as loader
+
     src = _src(tmp_path, "encoder.onnx")
-    monkeypatch.setenv(
-        "NANOBOT_VOICE_INDEX", _write_index(tmp_path, {"stt/m/onnx": _entry_for(src)})
-    )
+    index = _write_index(tmp_path, {"stt/m/onnx": _entry_for(src)})
+    cfg = _write_config(tmp_path, {"index": [index]})
+    assert cli_main(["list", "--config", cfg]) == 0
+    assert "stt/m/onnx" in capsys.readouterr().out
+    assert w.cached_index()[2] == [index]  # the same cache the panel reads, from the same index
+    assert cli_main(["fetch", "stt/m/onnx", "--config", cfg]) == 0
+    assert set(w.installed()) == {"stt/m/onnx"}
+    other = _write_index(tmp_path, {"stt/n/onnx": _entry_for(src)}, name="other.json")
+    assert cli_main(["--index", other, "list", "--config", cfg]) == 0
+    assert "stt/n/onnx" in capsys.readouterr().out
+    assert w.cached_index()[2] == [index]  # not the panel's index: the cache stays the config's
+    # no --config: the file the gateway reads
+    monkeypatch.setattr(loader, "get_config_path", lambda: tmp_path / "config.json")
     assert cli_main(["list"]) == 0
     assert "stt/m/onnx" in capsys.readouterr().out
+    seen = []
+    monkeypatch.setattr(w, "_read_source", lambda s, _t: seen.append(s) or {"models": {}})
+    nowhere = str(tmp_path / "none.json")
+    assert cli_main(["list", "--config", nowhere]) == 0
+    assert seen == list(w.DEFAULT_INDEX_SOURCES)
+    seen.clear()
+    # a board's baseline names its own index: what the gateway resolves for a fresh config
+    vendor = "https://vendor.example/weights-index.json"
+    monkeypatch.setenv("NANOBOT_VOICE_DEFAULTS", json.dumps({"index": [vendor]}))
+    assert cli_main(["list", "--config", nowhere]) == 0
+    assert seen == [vendor]
+    seen.clear()
+    monkeypatch.setenv("NANOBOT_VOICE_DEFAULTS", str(tmp_path / "gone-defaults.json"))
+    assert cli_main(["list", "--config", nowhere]) == 2
+    assert "NANOBOT_VOICE_DEFAULTS: cannot read" in capsys.readouterr().err and seen == []
+    monkeypatch.delenv("NANOBOT_VOICE_DEFAULTS")
+    capsys.readouterr()
+    assert cli_main(["sync", "--config", nowhere]) == 2
+    assert "cannot read nanobot config" in capsys.readouterr().err and seen == []
+    # an index the config names wrongly is the error, named with the config
+    bad = _write_config(tmp_path, {"index": ["http://mirror.lan/i.json"]})
+    assert cli_main(["list", "--config", bad]) == 2
+    assert "channels.voice.index entry 'http://mirror.lan/i.json'" in capsys.readouterr().err
 
 
 

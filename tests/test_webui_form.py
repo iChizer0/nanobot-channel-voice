@@ -409,3 +409,45 @@ def test_the_shared_backbone_is_not_a_head():
     assert "wake.openwakeword.modelPath" in rows  # the head row a picked head hides
     assert "selected head hears" not in rows["wake.phrases"].get("help", "")
     assert [c["value"] for c in rows["wake.openwakeword.weights"]["choices"] if c["value"]] == []
+
+
+def test_the_model_index_row_says_where_downloads_come_from():
+    """General's Model index follows Device. The built-in index is Advanced, as is any
+    index a setup running nothing on-device leaves unused; one other than the built-in
+    index shows without Advanced, since it is where every download comes from, a pasted
+    section's included. When the cached index lists its files on another host, which is
+    what a copy of an index of absolute urls does on a mirror, the help names that host,
+    and says nothing while the cache is still another index's."""
+    from nanobot_channel_voice import weights as w
+
+    mirror = w.DEFAULT_INDEX_SOURCES[0].replace("huggingface.co", "hf-mirror.com")
+
+    def row(section, cached_sources, url):
+        store = Store(
+            index={"stt/m/onnx": {"files": {"encoder.onnx": {"url": url}}}},
+            installed=frozenset(),
+            platforms=("onnx",),
+            sources=tuple(cached_sources),
+        )
+        form = build_form(VoiceConfig.model_validate(section), store)
+        general = next(s for s in form["sections"] if s["id"] == "general")
+        assert [f["key"] for f in general["fields"]] == ["backend", "device", "index"]
+        return general["fields"][2]
+
+    built_in = row({}, w.DEFAULT_INDEX_SOURCES, "https://huggingface.co/o/r/resolve/main/e.onnx")
+    assert built_in["label"] == "Model index" and built_in["kind"] == "list"
+    assert built_in["value"] == list(w.DEFAULT_INDEX_SOURCES) and built_in["advanced"] is True
+    assert built_in["help"].startswith("Where the Model pills and Apply's downloads come from")
+    assert "lists its files" not in built_in["help"]
+    trap = row({"index": [mirror]}, [mirror], "https://huggingface.co/o/r/resolve/main/e.onnx")
+    assert "advanced" not in trap
+    assert trap["help"].endswith("This index lists its files at `huggingface.co`, so Apply downloads from there.")
+    relative = row({"index": [mirror]}, [mirror], "https://hf-mirror.com/o/r/resolve/main/e.onnx")
+    assert "lists its files" not in relative["help"]
+    loading = row({"index": [mirror]}, w.DEFAULT_INDEX_SOURCES, "https://huggingface.co/e.onnx")
+    assert "lists its files" not in loading["help"]
+    none = row({"index": []}, [], "https://huggingface.co/e.onnx")
+    assert "value" not in none and "advanced" not in none
+    cloud = row({"backend": "openai", "index": [mirror]}, [mirror], "https://hf-mirror.com/e.onnx")
+    assert cloud["advanced"] is True
+    assert cloud["help"].endswith("Not in use until an on-device detector or a served engine runs.")

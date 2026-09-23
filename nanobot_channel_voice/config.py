@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
@@ -22,12 +23,16 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    TypeAdapter,
+    ValidationError,
     ValidationInfo,
     field_validator,
     model_validator,
 )
 from pydantic.alias_generators import to_camel, to_snake
 from pydantic_core import PydanticUndefined
+
+from nanobot_channel_voice import weights as w
 
 _UNSET = object()  # "no comparable default" for the twin fold
 
@@ -153,6 +158,39 @@ def _underlay(section: dict[str, Any], defaults: dict[str, Any]) -> dict[str, An
         elif isinstance(value, dict) and isinstance(out[present], dict):
             out[present] = _underlay(out[present], value)
     return out
+
+
+def check_index(sources: list[str]) -> list[str]:
+    """A model index as the schema takes it. ``ValueError`` names the entry at fault."""
+    out = []
+    for source in (s.strip() for s in sources):
+        if not source:
+            raise ValueError("index has an empty entry")
+        # As for $NANOBOT_VOICE_DEFAULTS: the gateway and a shell resolve a relative path
+        # against different working directories.
+        if not urllib.parse.urlsplit(source).scheme and not Path(source).expanduser().is_absolute():
+            raise ValueError(f"index entry '{source}' is a relative path, name the file absolutely")
+        try:
+            out.append(w.check_index_source(source))
+        except ValueError as exc:
+            raise ValueError(f"index entry '{source}': {exc}") from None
+    return out
+
+
+_INDEX = TypeAdapter(list[str])
+
+
+def section_index(section: dict[str, Any]) -> list[str]:
+    """The model index a resolved section names (the built-in one where it names none),
+    checked as the schema checks it: for the readers that act on the index alone, the
+    rest of the section whatever it holds. ``ValueError`` says what is wrong with it."""
+    if "index" not in section:
+        return list(w.DEFAULT_INDEX_SOURCES)
+    try:
+        sources = _INDEX.validate_python(section["index"])
+    except ValidationError:
+        raise ValueError("index must be a list of index URLs or paths") from None
+    return check_index(sources)
 
 
 PASTE_KEYS = ("importJson", "import_json")
@@ -1061,6 +1099,10 @@ class VoiceConfig(_VoiceBase):
     # (``rknn.<device>``) the WebUI offers next to the CPU builds, and every engine block's
     # RKNN target. None means CPU builds only.
     device: str | None = None
+    # Where the on-device models come from: index files merged in order, a later one winning
+    # per model; empty is no index. The WebUI's Model pills and Apply read it, and so does
+    # ``nanobot-voice`` without ``--index``.
+    index: list[str] = Field(default_factory=lambda: list(w.DEFAULT_INDEX_SOURCES))
     allow_from: list[str] = Field(default_factory=lambda: ["*"])  # BaseChannel allow-list
     streaming: bool = True  # core `supports_streaming`: send_delta() speaks the reply as it streams
     # Core's per-channel overrides of channels.sendProgress/sendToolHints/showReasoning,
@@ -1202,6 +1244,11 @@ class VoiceConfig(_VoiceBase):
         if not re.fullmatch(r"[a-z][a-z0-9]*", value):
             raise ValueError(f"device must be a SoC name such as rv1126b or rk3588, got {value!r}")
         return value
+
+    @field_validator("index")
+    @classmethod
+    def _index_is_readable(cls, value: list[str]) -> list[str]:
+        return check_index(value)
 
     @model_validator(mode="after")
     def _propagate_device(self) -> VoiceConfig:
