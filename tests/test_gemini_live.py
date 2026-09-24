@@ -190,6 +190,27 @@ def test_setup_payload_extended_thinking_manual_turns():
     }
 
 
+def test_thinking_level_goes_only_to_the_models_that_take_one():
+    """Live-verified refusals: an extended-thinking model rejects a setup without a level,
+    the base model one with it."""
+    think = VoiceConfig(backend="gemini", realtime={"model": "gemini-3.8-live-extended-thinking"})
+    setup = make_backend(think)[0]._hello_payload()["setup"]
+    assert setup["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "LOW"}
+    base = VoiceConfig(backend="gemini", realtime={"thinkingLevel": "high"})
+    generation = make_backend(base)[0]._hello_payload()["setup"]["generationConfig"]
+    assert "thinkingConfig" not in generation
+
+
+def test_proactive_audio_connects_where_it_exists(monkeypatch):
+    """Only the v1alpha surface knows `proactivity`; an explicit baseUrl still wins."""
+    monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+    backend = make_backend(VoiceConfig(backend="gemini", realtime={"proactiveAudio": True}))[0]
+    assert backend._connect_args()[0] == gl.PROACTIVE_BASE_URL + "?key=g-key"
+    assert ".v1alpha." in gl.PROACTIVE_BASE_URL
+    own = VoiceConfig(backend="gemini", realtime={"proactiveAudio": True, "baseUrl": "wss://x/ws"})
+    assert make_backend(own)[0]._connect_args()[0] == "wss://x/ws?key=g-key"
+
+
 def test_connect_url_carries_the_key_and_no_headers(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "g-key")
     backend, _, _ = make_backend()

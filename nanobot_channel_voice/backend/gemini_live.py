@@ -50,6 +50,8 @@ DEFAULT_BASE_URL = (
     "wss://generativelanguage.googleapis.com/ws/"
     "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 )
+# `proactivity` exists only on the v1alpha surface: v1beta refuses a setup naming it.
+PROACTIVE_BASE_URL = DEFAULT_BASE_URL.replace(".v1beta.", ".v1alpha.")
 DEFAULT_MODEL = "gemini-3.8-live"
 DEFAULT_VOICE = "Kore"
 INPUT_RATE = 16000
@@ -139,6 +141,15 @@ class GeminiLiveBackend(RealtimeTransport):
         super().__init__(config, sink=sink, metrics=metrics, aec=aec)
         self._model = config.realtime.model or DEFAULT_MODEL
         self._voice = config.realtime.voice or DEFAULT_VOICE
+        # The extended-thinking models refuse a setup without a thinking level and the base
+        # model one with it: sent to the former only, low unless configured.
+        level = config.realtime.thinking_level
+        self._thinking = (level or "low") if "extended-thinking" in self._model else None
+        if level and self._thinking is None:
+            self._log.warning(
+                "voice: realtime.thinkingLevel='{}' is ignored for {}: only the "
+                "extended-thinking models take one", level, self._model,
+            )
         # The delegated answer IS the reply the user waits for; a direct tool's result
         # can wait for the filler to finish.
         self._scheduling = (
@@ -247,7 +258,9 @@ class GeminiLiveBackend(RealtimeTransport):
     # ---- wire ---------------------------------------------------------------
 
     def _connect_args(self) -> tuple[str, dict[str, str]]:
-        base = self._rt.base_url or DEFAULT_BASE_URL
+        base = self._rt.base_url or (
+            PROACTIVE_BASE_URL if self._rt.proactive_audio else DEFAULT_BASE_URL
+        )
         sep = "&" if "?" in base else "?"
         return f"{base}{sep}key={self._api_key()}", {}
 
@@ -266,8 +279,8 @@ class GeminiLiveBackend(RealtimeTransport):
                 "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": self._voice}},
             },
         }
-        if self._rt.thinking_level:
-            generation["thinkingConfig"] = {"thinkingLevel": self._rt.thinking_level.upper()}
+        if self._thinking:
+            generation["thinkingConfig"] = {"thinkingLevel": self._thinking.upper()}
         setup: dict = {
             "model": model,
             "generationConfig": generation,

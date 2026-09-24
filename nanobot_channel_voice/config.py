@@ -794,9 +794,10 @@ class RealtimeConfig(_VoiceBase):
     # (Gemini transcribes both sides whenever set to anything: it has one switch, no model.)
     input_transcription_model: str | None = None
 
-    # Gemini only. thinkingLevel is accepted by gemini-3.8-live-extended-thinking alone
-    # (the base model rejects it); proactiveAudio lets the model decide whether speech was
-    # for it (bystanders go unanswered) - permanently on for extended thinking.
+    # Gemini only. thinkingLevel reaches the extended-thinking models alone, which require one
+    # (None = low); the base model refuses one, so it is ignored elsewhere. proactiveAudio lets
+    # the model decide whether speech was for it (bystanders go unanswered), permanently on
+    # for extended thinking; it connects via the v1alpha endpoint, the one that takes it.
     thinking_level: Literal["low", "medium", "high"] | None = None
     proactive_audio: bool = False
     # xAI only (think models). The vendor default "high" reasons before every answer, at
