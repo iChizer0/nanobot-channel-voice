@@ -5,7 +5,7 @@ Complete `~/.nanobot/config.json` files for common deployments, ready to copy an
 ## Foundation
 
 - API keys resolve config first, then environment: transcription through core's provider entry (`GROQ_API_KEY` in the examples), TTS and realtime from `tts.apiKey` / `realtime.apiKey` falling back to `OPENAI_API_KEY` - for *every* provider, so set keys explicitly when mixing vendors. The default `stt.provider: "nanobot"` delegates to core's transcription: with no key behind it every utterance decodes to silence, so startup warns and the WebUI pipeline check reports it - the channel does not otherwise look unhealthy.
-- The default is half-duplex: the mic is muted while the bot speaks. To interrupt mid-reply, pick an open-mic mode; without echo cancellation your voice must acoustically out-compete the playback before the VAD triggers.
+- The default is half-duplex: the mic is muted while the bot speaks, and a sentence the reply cuts off is dropped (say it again after the reply). To interrupt mid-reply, pick an open-mic mode; without echo cancellation your voice must acoustically out-compete the playback before the VAD triggers.
 - Long tool calls are masked by an agent-spoken status line, with opt-in canned filler (`prologue.enabled`) as the fallback.
 - If the configured TTS cannot be built, the channel degrades to the system voice (`espeak-ng`, `say` on macOS) with a warning rather than going silent - a robotic voice means read the log.
 
@@ -586,7 +586,7 @@ When the logs show `false barge-in (empty)` / `(echo)` / `(probe)` streaks and y
 }
 ```
 
-Every endpointed capture segment lands under `~/.local/share/nanobot-voice/dumps/<session>/` (override: `debug.dumpDir`) as `utt-<id>-<verdict>.wav` - `<id>` matches the `utt #N:` log line, verdict is one of `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `stop`, `gated`, `wake`, `interrupt`, `inject`, `goal`, `publish`. A `manifest.jsonl` carries one record per segment (id, verdict, duration, rms, STT cost, VAD confidence, ...; transcript only with `logTranscripts` on) for `jq` filtering before listening, and an `index.html` viewer lists the session - serve the directory to browse it. With `aec: "webrtc"` each segment gets a `.raw.wav` twin of the same span *before* cancellation. Reading the pair:
+Every endpointed capture segment lands under `~/.local/share/nanobot-voice/dumps/<session>/` (override: `debug.dumpDir`) as `utt-<id>-<verdict>.wav` - `<id>` matches the `utt #N:` log line, verdict is one of `empty`, `echo`, `ack`, `blip`, `probe`, `gap`, `muted`, `stop`, `gated`, `wake`, `interrupt`, `inject`, `goal`, `publish`. A `manifest.jsonl` carries one record per segment (id, verdict, duration, rms, STT cost, VAD confidence, ...; transcript only with `logTranscripts` on) for `jq` filtering before listening, and an `index.html` viewer lists the session - serve the directory to browse it. With `aec: "webrtc"` each segment gets a `.raw.wav` twin of the same span *before* cancellation. Reading the pair:
 
 - TTS clearly audible in the **post-AEC** file (`.wav`) -> the canceller is not converging (check `audio.playoutDelayMs`, give it a few seconds of clean playback to adapt, or the device is looping audio somewhere AEC3 can't model).
 - TTS audible only in the **`.raw.wav`** twin, post-AEC quiet -> AEC is doing its job; the trigger is something else (VAD floor, room noise, a real voice).

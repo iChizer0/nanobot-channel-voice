@@ -44,7 +44,7 @@ class _Harness:
         self.on_transcribe = None
 
 
-def _build(**cfg_over) -> _Harness:
+def _build(wake_detector=None, **cfg_over) -> _Harness:
     # aec="soft" turns open_mic on: half-duplex zeroes duckDb, so the duck
     # assertions would pass vacuously. minWords/ackPhrases are pinned, not defaulted.
     cfg = VoiceConfig.model_validate(
@@ -77,6 +77,7 @@ def _build(**cfg_over) -> _Harness:
         transcribe=transcribe,
         publish_text=publish,
         interrupt=interrupt,
+        wake_detector=wake_detector,
     )
 
     harness = _Harness(backend)
@@ -500,6 +501,44 @@ def test_capture_gap_with_no_open_utterance_is_silent():
     h = _build()
     _run(h.backend.on_capture_gap())
     assert h.backend._metrics.counters.get("capture_gap_drop") is None
+
+
+class _Wake:
+    last_score = None
+
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def push(self, pcm: bytes) -> bool:
+        return False
+
+    def reset(self) -> None:
+        self.resets += 1
+
+    def release(self) -> None:
+        pass
+
+
+def test_a_reply_muting_the_mic_drops_the_open_utterance():
+    """Half-duplex: a reply that starts while the user speaks mutes the mic under the open
+    utterance, which would then close on post-reopen silence as a stale fragment. The gated
+    tap keeps the wake detector fed, so its context stays."""
+    wake = _Wake()
+    h = _build(wake, aec="auto", wake={"mode": "gate", "phrases": ["hey nanobot"]})
+    b = h.backend
+    ep = b._endpointer
+    ep._in_speech = True
+    ep._buf = bytearray(b"\x00" * 640)
+    b._turn = VoiceState.SPEAKING
+    b._eager_valid = True
+    _run(b.push_gated_audio(b"\x00" * 640))
+    assert not ep.in_speech and b._eager_valid is False
+    assert b._metrics.counters.get("capture_muted_drop") == 1
+    assert wake.resets == 0
+    _run(b.push_gated_audio(b"\x00" * 640))  # nothing open any more
+    assert b._metrics.counters.get("capture_muted_drop") == 1
+    _run(b.on_capture_gap())  # a broken stream takes the detector's context too
+    assert wake.resets == 1
 
 
 # ---- AEC warmup carve-out ---------------------------------------------------

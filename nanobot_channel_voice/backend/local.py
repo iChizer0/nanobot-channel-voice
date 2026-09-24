@@ -1774,12 +1774,12 @@ class LocalBackend(TurnEventMixin):
         """Half-duplex wake tap: the shell routes the frames it drops while the bot speaks here,
         keeping the acoustic tier hot and making the wake word the ONLY barge-in channel there
         (no duck/confirm machinery runs). The gate-reopen flush keeps the phrase out of STT."""
-        if (
-            self._closing
-            or not pcm
-            or self._wake_detector is None
-            or self._wake_mode == "off"
-        ):
+        if self._closing or not pcm:
+            return
+        if self._endpointer.in_speech:
+            # A reply started while the user spoke: only a fragment can ever close.
+            await self._drop_open_utterance("muted")
+        if self._wake_detector is None or self._wake_mode == "off":
             return
 
         def _push() -> bool:
@@ -2063,9 +2063,15 @@ class LocalBackend(TurnEventMixin):
             _reset()  # light path: already serialized with the loop-side pushes
 
     async def on_capture_gap(self) -> None:
-        """The capture stream broke (device restart). The endpointer's clock is frame-counted:
-        with no frames flowing, an open utterance silently bridges the outage and merges two
-        sentences into one, so drop it, with its STT stream handle and any speculative duck."""
+        """The capture stream broke (device restart): drop the open utterance."""
+        await self._drop_open_utterance("gap")
+        # The restart re-opens the device: whatever backlog the debt described is gone.
+        self._capture_debt_ms = 0.0
+
+    async def _drop_open_utterance(self, verdict: str) -> None:
+        """Drop the utterance open across frames the endpointer never saw, with its STT stream
+        handle and any speculative duck: its clock is frame-counted, so it would bridge them
+        and merge two sentences. ``gap``: the stream broke; ``muted``: a reply gated the mic."""
         snap: bytes | None = None
         raw: bytes | None = None
 
@@ -2073,8 +2079,13 @@ class LocalBackend(TurnEventMixin):
             nonlocal snap, raw
             with self._hop_lock:
                 if self._endpointer.in_speech:
-                    self._log.warning("capture gap mid-utterance; dropping the open utterance")
-                    self._metrics.count("capture_gap_drop")
+                    # A gap is a fault; a mute is half-duplex doing its job.
+                    log = self._log.warning if verdict == "gap" else self._log.info
+                    log(
+                        "{} mid-utterance; dropping the open utterance",
+                        "capture gap" if verdict == "gap" else "reply muted the mic",
+                    )
+                    self._metrics.count(f"capture_{verdict}_drop")
                     if self._dumper is not None:
                         snap = self._endpointer.open_pcm()
                         raw = self._raw_tail(len(snap)) if snap else None
@@ -2082,12 +2093,14 @@ class LocalBackend(TurnEventMixin):
                 self._endpointer.reset()
                 self._recent.clear()
                 self._wake_claimed = False
-                if self._wake_detector is not None:
-                    # Discontinuous stream: context spliced across the gap scores garbage.
-                    self._wake_detector.reset()
-                if self._dump_raw is not None:
-                    # Pre-gap audio no longer abuts the stream; never splice into a later twin.
-                    self._dump_raw.clear()
+                if verdict == "gap":
+                    # Discontinuous stream: context spliced across the gap scores garbage (a
+                    # muted mic keeps feeding the detector through the gated tap).
+                    if self._wake_detector is not None:
+                        self._wake_detector.reset()
+                    if self._dump_raw is not None:
+                        # Pre-gap audio no longer abuts the stream; never splice into a later twin.
+                        self._dump_raw.clear()
 
         if self._threaded_hop:
             await asyncio.to_thread(_reset)
@@ -2095,17 +2108,15 @@ class LocalBackend(TurnEventMixin):
             _reset()
         if snap is not None and self._dumper is not None:
             self._dumper.submit(
-                "gap", snap, raw,
+                verdict, snap, raw,
                 seq=self._next_seg(), meta={"wall": round(time.time(), 3)},
             )
         # The dropped utterance's speculation dies with it, or a still-valid eager task hands
-        # the PRE-GAP transcript to the next utterance's close.
+        # its transcript to the next utterance's close.
         self._eager_valid = False
-        # The restart re-opens the device: whatever backlog the debt described is gone.
-        self._capture_debt_ms = 0.0
         if self._duck_onset is not None:
-            self._release_duck("gap")
-        await self._orphan_if_confirmed("gap")
+            self._release_duck(verdict)
+        await self._orphan_if_confirmed(verdict)
         if self._turn is VoiceState.CAPTURING:
             # Nothing will publish the dropped utterance: without this, CAPTURING stands forever.
             await self._set_turn(VoiceState.IDLE)

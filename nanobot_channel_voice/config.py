@@ -834,8 +834,8 @@ class TelemetryConfig(_VoiceBase):
 
 class DebugConfig(_VoiceBase):
     """Diagnostics. ``dumpAudio`` (local backend) writes every endpointed capture segment as a
-    WAV named by the pipeline's verdict (``publish``/``interrupt``/``inject``/``goal``/
-    ``empty``/``echo``/``ack``/``stop``/``gated``/``wake``/``blip``/``probe``/``gap``), so a
+    WAV named by the pipeline's verdict (``publish``/``interrupt``/``inject``/``goal``/``empty``/
+    ``echo``/``ack``/``stop``/``gated``/``wake``/``blip``/``probe``/``gap``/``muted``), so a
     false barge-in is diagnosed by ear; with ``aec="webrtc"`` a ``.raw.wav`` twin holds the same
     span pre-cancellation (TTS audible there but not post-AEC = the canceller works, the trigger
     is acoustic). Each session directory also holds ``manifest.jsonl`` (config header, then one
