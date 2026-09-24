@@ -1284,3 +1284,54 @@ def test_a_tail_that_rang_out_counts_as_heard_at_the_next_kill():
     b._spans_gen = h.sink.stream_generation  # its stream came and went
     assert not h.sink.stream_open
     assert _run(b._do_interrupt()) == "Let me check the weather."
+
+
+def test_a_successor_stream_is_not_settled_by_the_previous_drain():
+    """Core starts a successor turn (goal continuation, re-published steer, deferred cron)
+    while the last reply still plays: the drain its end scheduled must not settle IDLE
+    under the new stream, which settles at its own end."""
+    async def _case():
+        h = _build(tts=_ToneTts())
+        b = h.backend
+        states = await _start_voiced(h)
+        try:
+            h.transcript = "what is the plan"
+            await b._on_utterance(_utt())
+            a = "voice:voice:local:1000000000000000001"
+            nxt = "voice:voice:local:1000000000000000002"
+            await b.on_delta("Turn A says one thing. ", stream_id=a + ":0")
+            await b.on_stream_end(resuming=False, stream_id=a + ":0")
+            await b.on_delta("Turn B begins here. ", stream_id=nxt + ":0")
+            await asyncio.sleep(1.0)  # past A's audio, B's first sentence and the hangover
+            assert VoiceState.IDLE not in states and b._turn is VoiceState.SPEAKING
+            await b.on_stream_end(resuming=False, stream_id=nxt + ":0")
+            await _until(lambda: b._turn is VoiceState.IDLE)
+        finally:
+            await b.close()
+            await h.sink.stop()
+
+    _run(_case())
+
+
+def test_a_successor_tool_boundary_is_not_settled_by_the_previous_drain():
+    """The same with a successor that goes straight to a tool: its resuming end says the
+    turn goes on, so the wait it opens is THINKING, never the earlier drain's IDLE."""
+    async def _case():
+        h = _build(tts=_ToneTts())
+        b = h.backend
+        states = await _start_voiced(h)
+        try:
+            h.transcript = "what is the plan"
+            await b._on_utterance(_utt())
+            a = "voice:voice:local:1000000000000000001"
+            await b.on_delta("Turn A says one thing. ", stream_id=a + ":0")
+            await b.on_stream_end(resuming=False, stream_id=a + ":0")
+            await b.on_stream_end(resuming=True, stream_id="voice:voice:local:1000000000000000002:0")
+            await _until(lambda: b._turn is VoiceState.THINKING)
+            await asyncio.sleep(0.5)
+            assert VoiceState.IDLE not in states and b._turn is VoiceState.THINKING
+        finally:
+            await b.close()
+            await h.sink.stop()
+
+    _run(_case())

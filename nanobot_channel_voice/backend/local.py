@@ -3192,6 +3192,9 @@ class LocalBackend(TurnEventMixin):
         base = base_of(stream_id)
         if self._is_rejected(base):
             return
+        # More reply is coming (a successor core turn, a blank retry): a drain an earlier end
+        # scheduled would settle IDLE under it. This stream's own end schedules the next.
+        cancel_task(self._drain_task)
         if self._base_turn() in (VoiceState.IDLE, VoiceState.CAPTURING):
             # No published turn is live, so this stream IS an unsolicited delivery (cron fire
             # with streaming on) riding the recycled turn object: restart its audibility ledger,
@@ -3797,6 +3800,7 @@ class LocalBackend(TurnEventMixin):
     def _arm_midturn(self, spoke: bool) -> None:
         """Arm the tool-boundary watcher after a ``resuming`` stream end."""
         self._cancel_midturn()
+        cancel_task(self._drain_task)  # the turn goes on: an earlier end's drain must not settle it
         if self._closing:
             return
         self._cur_turn.midturn_task = asyncio.create_task(
