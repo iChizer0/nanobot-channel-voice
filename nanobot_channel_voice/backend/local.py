@@ -1108,6 +1108,14 @@ class LocalBackend(TurnEventMixin):
         ``abandon()``: no window lets a just-killed turn pass."""
         return token in self._dead_tokens
 
+    def is_stale_stream(self, token: str) -> bool:
+        """Does a stream under this token carry work a kill stopped? Core re-runs a cancelled
+        run's pending injections as their own turn under it. Only until a user turn follows the
+        kill: core may fold that turn into the re-run, whose stream then carries its answer."""
+        return token in self._dead_tokens and (
+            self._cur_turn.dead or not self._cur_turn.published_at
+        )
+
     def _is_rejected(self, base: str | None) -> bool:
         """Does this stream belong to a barged-out turn? Exact match first, else the watermark:
         the base embeds the turn's start ``time_ns`` (see :mod:`..streamid`), so a turn that

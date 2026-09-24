@@ -1335,3 +1335,43 @@ def test_a_successor_tool_boundary_is_not_settled_by_the_previous_drain():
             await h.sink.stop()
 
     _run(_case())
+
+
+def test_a_stopped_turns_rerun_is_silenced_and_stopped_once():
+    """Core re-publishes a cancelled run's pending injections as their own turn under the
+    killed token: silent, and /stop-ped once while it runs, until a user turn follows the
+    kill (core may then fold it into the re-run, whose stream carries its answer)."""
+    async def _t():
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+        from nanobot_channel_voice.streamid import TURN_META
+
+        h = _build()
+        b = h.backend
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = b
+        stops: list[int] = []
+
+        async def _stop() -> None:
+            stops.append(1)
+
+        channel._publish_stop = _stop  # type: ignore[method-assign]
+        b._cur_turn = _Turn("t1")
+        b._cur_turn.tokens.append("steer-1")  # injected while it worked
+        await b._do_interrupt()  # the user's stop
+        chat = channel.config.chat_id
+        rerun = f"voice:voice:local:{time.time_ns()}:0"
+        meta = {TURN_META: "steer-1"}
+        await channel.send_delta(chat, "About tomorrow: ", meta, stream_id=rerun)
+        await channel.send_delta(chat, "rain all day. ", meta, stream_id=rerun)
+        await channel.send_delta(chat, "", meta, stream_id=rerun, stream_end=True)
+        assert stops == [1]
+        assert b._tts_queue.empty() and b._turn is VoiceState.IDLE
+        h.transcript = "and what time is it"
+        await b._on_utterance(_utt())  # a user turn follows the kill
+        await channel.send_delta(chat, "It is noon. ", meta,
+                                 stream_id=f"voice:voice:local:{time.time_ns()}:0")
+        assert b._turn is VoiceState.SPEAKING and stops == [1]
+
+    _run(_t())

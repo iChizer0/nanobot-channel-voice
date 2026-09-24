@@ -12,6 +12,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from contextlib import suppress
 from typing import Any
 
@@ -388,6 +389,8 @@ class VoiceChannel(BaseChannel):
         self._pending_delegation: _DelegationCollector | None = None
         self._delegation_lock = asyncio.Lock()
         self._cloud_onsets = 0  # every user onset lands in _on_cloud_barge_in
+        # Local mode: killed-turn tokens whose core re-run was /stop-ped (once each).
+        self._stopped_reruns: deque[str] = deque(maxlen=16)
         # One per session, shared with backend and shell: segments join on call_id.
         self._metrics = VoiceMetrics()
         self._tracer = VoiceTracer(self.config.telemetry)
@@ -1222,6 +1225,14 @@ class VoiceChannel(BaseChannel):
             return
         local = self._local()
         if local is None:
+            return
+        turn = (metadata or {}).get(TURN_META)
+        if turn is not None and not _agent_initiated(metadata) and local.is_stale_stream(turn):
+            # Core re-runs a stopped turn's pending injections as their own turn (the cancelled
+            # run re-publishes its queue): keep it silent, and /stop it once while it still runs.
+            if (not stream_end or resuming) and turn not in self._stopped_reruns:
+                self._stopped_reruns.append(turn)
+                await self._publish_stop()
             return
         if _agent_initiated(metadata):
             # A cron/trigger turn streaming into this chat: mark BEFORE the delta plays,
