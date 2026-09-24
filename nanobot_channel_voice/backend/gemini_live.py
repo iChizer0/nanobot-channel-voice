@@ -183,6 +183,9 @@ class GeminiLiveBackend(RealtimeTransport):
         # (the shell flushed); dropped until the server's ``interrupted`` echo or the
         # activity's end, whichever first.
         self._dead_audio = False
+        # Audio was dropped as dead: that turn was cut, so the completion after the
+        # interrupted echo is swallowed even when none of its audio played.
+        self._dropped_dead = False
         # An uncommitted activity end (blip / bare summon): the model may still answer
         # the empty activity. That answer dies unheard; the NEXT committed activity's
         # plays (WS ordering: an answer to activity N precedes N+1's, and N+1's start
@@ -244,8 +247,9 @@ class GeminiLiveBackend(RealtimeTransport):
     # ---- ManualTurnBackend wire (gated uplink) ------------------------------
 
     async def _activity_begin_wire(self) -> None:
-        if self._generating:
-            self._dead_audio = True  # in flight until the server's interrupted echo
+        # Whether or not a reply is audible yet: one requested before this onset can still
+        # have audio in flight, and it answers what the user is now talking over.
+        self._dead_audio = True
         await self._send({"realtimeInput": {"activityStart": {}}})
 
     async def _activity_end_wire(self, *, commit: bool) -> None:
@@ -376,7 +380,10 @@ class GeminiLiveBackend(RealtimeTransport):
 
     async def _on_audio(self, blob: dict) -> None:
         if self._suppress_turn or self._dead_audio:
-            return  # answering an activity nobody committed / cut off already
+            # Answering an activity nobody committed / cut off already.
+            if self._dead_audio:
+                self._dropped_dead = True
+            return
         try:
             pcm = base64.b64decode(blob["data"])
         except (ValueError, TypeError):
@@ -436,7 +443,8 @@ class GeminiLiveBackend(RealtimeTransport):
     async def _on_interrupted(self) -> None:
         # Server-side VAD (or our activityStart) cut the model off. WS ordering: what
         # follows on the wire is new generation, never the dead turn's tail.
-        self._interrupted = self._generating
+        self._interrupted = self._generating or self._dropped_dead
+        self._dropped_dead = False
         self._generating = False
         self._in_progress = False
         self._dead_audio = False

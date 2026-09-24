@@ -472,6 +472,32 @@ def test_manual_barge_in_echo_after_the_commit_is_not_a_turn_end():
     assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING]
 
 
+def test_manual_onset_before_the_first_audio_drops_the_reply_in_flight():
+    """Q1's first audio was still on the wire when the user resumed: accepted, it took the
+    state to SPEAKING under the open activity (a half-duplex mic then gates and aborts the
+    new utterance) though the server cut Q1 anyway."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def _run():
+        backend, _, events = make_shell_backend(cfg)
+        await backend._handle_event({"setupComplete": {}})
+        await backend.begin_activity()
+        await backend.end_activity()  # Q1 committed, nothing generated yet
+        await backend.begin_activity()  # the user resumes
+        await backend._handle_event(audio_msg(b"\x08"))  # Q1's first audio, already sent
+        await backend._handle_event({"serverContent": {"interrupted": True,
+                                                       "turnComplete": True}})
+        assert backend._turn is VoiceState.CAPTURING
+        await backend.end_activity()
+        await backend._handle_event(audio_msg(b"\x02"))
+        await backend.close()
+        return events
+
+    events = asyncio.run(_run())
+    assert [e.pcm for e in events if isinstance(e, OutputAudio)] == [b"\x02"]
+    assert not any(isinstance(e, TurnDone) for e in events)  # the cut turn is no turn end
+
+
 def test_manual_unspoken_completion_settles_idle():
     """Manual turns get no THINKING at commit: a completion with nothing spoken
     (proactive audio declined) must settle now, not sit in CAPTURING for the deadman."""

@@ -519,7 +519,14 @@ class RealtimeBackend(RealtimeTransport):
         elif t == "response.created":
             rid = (evt.get("response") or {}).get("id")
             self._continuation_unborn = False
-            if time.monotonic() < self._stop_suppress_until or self._kill_at_birth:
+            if (
+                time.monotonic() < self._stop_suppress_until
+                or self._kill_at_birth
+                # Manual turns: born while the user's next activity is open, it answers audio
+                # they have talked over (their onset had no id to cancel); their commit
+                # answers both.
+                or (self._manual and self._user_speaking)
+            ):
                 # Kill the consumed stop's response (or the continuation barged in on
                 # while unborn) at birth; silence is the acknowledgment.
                 self._stop_suppress_until = 0.0

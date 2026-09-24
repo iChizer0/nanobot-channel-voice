@@ -532,6 +532,31 @@ def test_manual_onset_on_an_unborn_continuation_kills_it_at_birth():
     run(_run())
 
 
+def test_a_reply_born_under_the_next_activity_dies_at_birth():
+    """The user resumed before the committed utterance's response.created: their onset had
+    no id to cancel, so the reply born during their speech is the talked-over one. It dies
+    at birth, and their own commit answers both."""
+
+    async def _run():
+        backend, sent, events = make_shell_backend()
+        backend._ready.set()
+        await backend.begin_activity()
+        await backend.end_activity()  # Q1: commit + create
+        await backend.begin_activity()  # Q2, before Q1's reply is born
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        assert sent[-1] == {"type": "response.cancel", "response_id": "r1"}
+        await backend._handle_event({"type": "response.output_audio.delta",
+                                     "response_id": "r1", "delta": b64(b"\x01")})
+        assert backend._turn is VoiceState.CAPTURING
+        await backend.end_activity()
+        await backend._handle_event({"type": "response.created", "response": {"id": "r2"}})
+        assert "r2" not in backend._cancelled_responses
+        assert backend._turn is VoiceState.THINKING
+        await backend.close()
+
+    run(_run())
+
+
 def test_refused_commit_is_not_re_asked_while_the_user_speaks():
     """The deferred response.create re-issued on the cancelled done of the response the
     user just barged in on answers A over B, and B's own commit is refused again: it
