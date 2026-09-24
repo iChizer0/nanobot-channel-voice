@@ -218,6 +218,7 @@ def test_index_with_a_traversal_key_is_rejected(tmp_path):
         ({"stt/m/onnx": {"files": {"encoder.onnx": "https://x.test/e"}}}, r"must be an object"),
         ({"stt/m/onnx": {"files": {"encoder.onnx": {"url": "https://[x.test/e"}}}}, r"\.url must be a URL"),
         ({"stt/m/onnx": {"files": {"encoder.onnx": {"url": 7}}}}, r"\.url must be a URL"),
+        ({"stt/m/onnx": {"files": {"encoder.onnx": {"sha256": 7}}}}, r"\.sha256 must be"),
     ],
 )
 def test_malformed_index_shapes_are_errors_not_tracebacks(store, tmp_path, capsys, models, match):

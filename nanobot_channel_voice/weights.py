@@ -174,6 +174,9 @@ def _validate_entry(source: str, key: str, entry: Any) -> None:
         size = (spec or {}).get("size")
         if size is not None and not isinstance(size, int):
             raise WeightsError(f"{where}.files['{name}'].size must be a whole number of bytes")
+        sha = (spec or {}).get("sha256")
+        if sha is not None and not isinstance(sha, str):
+            raise WeightsError(f"{where}.files['{name}'].sha256 must be a hex string")
         url = (spec or {}).get("url")
         if url is not None and not _parses(url):
             raise WeightsError(f"{where}.files['{name}'].url must be a URL, or a path relative to the index")
