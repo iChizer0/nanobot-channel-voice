@@ -272,6 +272,12 @@ class AudioSink:
         """Identity of the stream ``played_ms()`` currently measures."""
         return self._generation
 
+    @property
+    def stream_open(self) -> bool:
+        """The stream ``played_ms()`` measures is still in the slot (live, draining or parked).
+        False once it ended, played out or killed: ``played_ms()`` reads 0 until the next opens."""
+        return self._stream is not None
+
     def _stream_live(self) -> bool:
         """Will the next write land on the current stream (rather than open a fresh one)?"""
         return (

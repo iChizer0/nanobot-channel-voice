@@ -12,9 +12,10 @@ import time
 
 import pytest
 
+from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
-from nanobot_channel_voice.backend.base import OutputAudio, VoiceState
+from nanobot_channel_voice.backend.base import OutputAudio, StateHint, VoiceState
 from nanobot_channel_voice.backend.local import LocalBackend, _PendingUtterance, _Turn
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.vad.base import Vad
@@ -44,7 +45,7 @@ class _Harness:
         self.on_transcribe = None
 
 
-def _build(wake_detector=None, **cfg_over) -> _Harness:
+def _build(wake_detector=None, tts=None, playback=None, **cfg_over) -> _Harness:
     # aec="soft" turns open_mic on: half-duplex zeroes duckDb, so the duck
     # assertions would pass vacuously. minWords/ackPhrases are pinned, not defaulted.
     cfg = VoiceConfig.model_validate(
@@ -55,7 +56,7 @@ def _build(wake_detector=None, **cfg_over) -> _Harness:
             **cfg_over,
         }
     )
-    sink = AudioSink(NullPlayback(), mode="stream")
+    sink = AudioSink(playback or NullPlayback(), mode="stream")
     vad = _SilentVad()
 
     async def transcribe(pcm: bytes) -> str:
@@ -72,7 +73,7 @@ def _build(wake_detector=None, **cfg_over) -> _Harness:
     backend = LocalBackend(
         cfg,
         vad=vad,
-        tts=None,
+        tts=tts,
         sink=sink,
         transcribe=transcribe,
         publish_text=publish,
@@ -1125,3 +1126,161 @@ def test_calibration_moves_the_floor_the_jit_cut_reads():
     b.apply_calibration(stt_cost_ms=None, tts_rtf=1.0, chunk_floor_pinned=False)
     assert b._chunk_floor == 60
     assert b._take_piece([text], 10) == "a" * 35 + "."
+
+
+# ---- turn succession --------------------------------------------------------
+
+class _ToneTts:
+    """Audible PCM of a fixed length per call, instantly."""
+
+    output_rate = 16000
+
+    def __init__(self, ms: int = 200) -> None:
+        self.calls: list[str] = []
+        self._pcm = b"\x10\x20" * (16 * ms)
+
+    async def synthesize_pcm(self, text: str) -> bytes:
+        self.calls.append(text)
+        return self._pcm
+
+    def release(self) -> None:
+        pass
+
+
+async def _start_voiced(h: _Harness) -> list[VoiceState]:
+    """Start the workers and the sink, playing OutputAudio through it; returns the states
+    the backend reports, in order."""
+    states: list[VoiceState] = []
+
+    async def on_event(ev) -> None:
+        if isinstance(ev, OutputAudio):
+            h.sink.enqueue(ev)
+        elif isinstance(ev, StateHint):
+            states.append(ev.state)
+
+    await h.sink.start()
+    await h.backend.start(instructions=None, tools=[], on_event=on_event)
+    return states
+
+
+async def _until(pred, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not pred():
+        assert time.monotonic() < deadline, "condition not reached"
+        await asyncio.sleep(0.01)
+
+
+def test_a_delivery_after_a_consumed_stop_can_itself_be_stopped():
+    """After a kill the dead turn object lingers until the next publish; a cron stream rode
+    it, and a stop over that found the turn already killed: no /stop went out and its
+    later deltas played on."""
+    async def _case():
+        h = _build()
+        b = h.backend
+        h.transcript = "what is the plan"
+        await b._on_utterance(_utt())
+        await b.on_delta("Here is a long answer. ", stream_id="voice:voice:local:1000000000000000001:0")
+        h.transcript = "stop"
+        await b._on_utterance(_utt(onset_interrupting=True))
+        assert h.interrupts == 1 and b._turn is VoiceState.IDLE
+        cron = f"voice:voice:local:{time.time_ns()}"
+        await b.on_delta("Reminder: take your medicine now. ", stream_id=cron + ":0")
+        assert b._turn is VoiceState.SPEAKING
+        await b._on_utterance(_utt(onset_interrupting=True))
+        assert h.interrupts == 2
+        assert b._is_rejected(cron)
+
+    _run(_case())
+
+
+class _HeldDrainStream(PlaybackStream):
+    """A device stream whose final drain waits until the test releases it."""
+
+    def __init__(self, released: asyncio.Event) -> None:
+        self._released = released
+
+    async def write(self, pcm: bytes) -> None:
+        await asyncio.sleep(0)
+
+    async def drain(self) -> None:
+        await self._released.wait()
+
+    async def kill(self) -> None:
+        self._released.set()
+
+
+class _HeldDrainPlayback(PlaybackSink):
+    def __init__(self) -> None:
+        self.released = asyncio.Event()
+
+    async def play_wav(self, wav_bytes: bytes) -> bool:
+        return True
+
+    async def abort(self) -> None:
+        pass
+
+    async def open_stream(self, rate: int) -> PlaybackStream:
+        return _HeldDrainStream(self.released)
+
+
+def test_a_status_line_that_rang_out_does_not_stall_the_answer():
+    """The next segment's first delta cancels the status line's settle inside the device
+    drain, and the sink parks the stream to ring out. Once it has, played_ms() reads 0:
+    trusted, its spans were runway the JIT waited on forever and the answer never spoke."""
+    async def _case():
+        tts = _ToneTts(1000)
+        playback = _HeldDrainPlayback()
+        h = _build(tts=tts, playback=playback)
+        b = h.backend
+        await _start_voiced(h)
+        try:
+            b._synth_mpc = 5.0  # seeded: the answer goes through the JIT schedule
+            b._cur_turn = _Turn("t")
+            sid = "voice:voice:local:1000000000000000001"
+            await b.on_delta("Let me check that. ", stream_id=sid + ":0")
+            await b.on_stream_end(resuming=True, stream_id=sid + ":0")
+            await _until(lambda: h.sink._draining is not None)  # the settle is in the drain
+            await b.on_delta("It", stream_id=sid + ":1")  # cancels it: the stream is parked
+            playback.released.set()  # its tail rings out
+            await _until(lambda: not h.sink.stream_open)
+            await b.on_delta(" is sunny.", stream_id=sid + ":1")
+            await b.on_stream_end(resuming=False, stream_id=sid + ":1")
+            await _until(lambda: any("sunny" in call for call in tts.calls))
+        finally:
+            await b.close()
+            await h.sink.stop()
+
+    _run(_case())
+
+
+def test_audio_cut_under_a_killed_turn_closes_its_spans():
+    """The timeout notice plays under the killed turn; a stop over it flushes without a
+    second /stop, and its spans must close with it: left open they measure runway against
+    the killed stream and read as heard at the next fold."""
+    async def _case():
+        h = _build()
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._cur_turn = _Turn("t0")
+        b._cur_turn.abandon()
+        b._spoken_spans = [("Sorry, I'm having trouble answering that.", 1500.0)]
+        b._spans_gen = h.sink.next_generation
+        h.transcript = "stop"
+        await b._on_utterance(_utt(onset_interrupting=True))
+        assert h.interrupts == 0
+        assert b._spoken_spans == []
+
+    _run(_case())
+
+
+def test_a_tail_that_rang_out_counts_as_heard_at_the_next_kill():
+    """A cancelled drain parks its stream to ring out. Once it has, played_ms() reads 0,
+    so a kill before the next chunk must fold those spans as heard, not report the status
+    line as never heard."""
+    h = _build()
+    b = h.backend
+    b._cur_turn = _Turn("t1")
+    b._spoken_spans = [("Let me check the weather.", 1200.0)]
+    b._spans_gen = h.sink.stream_generation  # its stream came and went
+    assert not h.sink.stream_open
+    assert _run(b._do_interrupt()) == "Let me check the weather."

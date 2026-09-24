@@ -1293,8 +1293,7 @@ class LocalBackend(TurnEventMixin):
                     self._preempted = True
                     self._early_heard = None
                     if self._sink.backlog_ms() > 0:
-                        cancel_task(self._drain_task)
-                        await self._sink.flush()
+                        await self._cut_dead_audio()
                 else:
                     self._preempted = True
                     self._metrics.count("barge_in_early_confirm")
@@ -2586,6 +2585,7 @@ class LocalBackend(TurnEventMixin):
         # moment and drain the SUCCESSOR turn's live stream (wiping its heard-up-to spans).
         cancel_task(self._drain_task)
         self._log.info("barge_in (state was {})", self._turn.value)
+        self._fold_ended_spans()
         played = await self._sink.flush()  # stop bot audio now (epoch++; resets the duck)
         if self._duck_onset is not None:
             # Onset -> silence (cloud analog: barge_in_ms.{truncate,cancel}).
@@ -2631,6 +2631,7 @@ class LocalBackend(TurnEventMixin):
         The boundary watch dies with the epoch, so the state flip happens here."""
         self._cancel_prologue()
         self._cancel_midturn()
+        self._fold_ended_spans()
         played = await self._sink.flush()  # epoch++; restores level and pause gate
         self._duck_onset = None  # VAD floor stays scaled, as in _do_interrupt
         self._duck_suspect = False
@@ -3072,8 +3073,7 @@ class LocalBackend(TurnEventMixin):
             # whatever this verdict publishes. A live wake ack (_canned_base IDLE) plays on;
             # a live current turn is a successor another verdict published, judged below.
             if self._canned_base is None and self._sink.backlog_ms() > 0:
-                cancel_task(self._drain_task)
-                await self._sink.flush()
+                await self._cut_dead_audio()
             return True, heard
         if not interrupting:
             return False, heard
@@ -3083,9 +3083,15 @@ class LocalBackend(TurnEventMixin):
             # Already killed (early confirm, or a prior verdict): never /stop twice, and no
             # heard-up-to against cleared spans. But audio started AFTER the kill (the timeout
             # notice) still plays: stop it and its drain watcher, or it talks over what follows.
-            cancel_task(self._drain_task)
-            await self._sink.flush()
+            await self._cut_dead_audio()
         return True, heard
+
+    async def _cut_dead_audio(self) -> None:
+        """Stop audio playing under an already-killed turn, and close its spans with it: left
+        open they measure runway against a killed stream (the JIT waits forever) and read as
+        heard at the next fold."""
+        cancel_task(self._drain_task)
+        self._take_heard(await self._sink.flush())
 
     async def _consume_stop(
         self, stop_text: str, heard: str | None, *, interrupting: bool, preempted: bool
@@ -3171,6 +3177,14 @@ class LocalBackend(TurnEventMixin):
         Sticky until the settle consumes it (see _set_turn)."""
         self._cur_turn.proactive = True
 
+    def _delivery_turn(self) -> None:
+        """An unsolicited delivery after a kill gets a live turn object of its own: on the dead
+        one, a stop over it finds the turn already killed (flush only, no /stop)."""
+        if self._cur_turn.dead:
+            turn = _Turn.idle()
+            turn.proactive = self._cur_turn.proactive  # the channel marks before it speaks
+            self._cur_turn = turn
+
     async def on_delta(self, delta: str, stream_id: str | None = None) -> None:
         """A streamed assistant text chunk (``_stream_delta``)."""
         if not delta:
@@ -3178,16 +3192,17 @@ class LocalBackend(TurnEventMixin):
         base = base_of(stream_id)
         if self._is_rejected(base):
             return
-        if base is not None:
-            self._cur_turn.base = base
         if self._base_turn() in (VoiceState.IDLE, VoiceState.CAPTURING):
             # No published turn is live, so this stream IS an unsolicited delivery (cron fire
             # with streaming on) riding the recycled turn object: restart its audibility ledger,
             # as speak_final does, or a stale emitted_audio latch swallows the silence fallback.
+            self._delivery_turn()
             turn = self._cur_turn
             turn.spoke_text = turn.emitted_audio = turn.fallback_done = False
             turn.answered = False
             self._heard_prefix = ""  # as speak_final does: not this delivery's words
+        if base is not None:
+            self._cur_turn.base = base
         self._cancel_canned()    # the reply is arriving; it owns the state from here
         self._cancel_midturn()   # a new segment began; the old boundary watch is stale
         self._cur_turn.last_activity = time.monotonic()
@@ -3267,6 +3282,8 @@ class LocalBackend(TurnEventMixin):
         if self._closing:
             return  # a bus delivery racing teardown: the workers that would speak it are gone
         fresh = self._base_turn() in (VoiceState.IDLE, VoiceState.CAPTURING)
+        if fresh:
+            self._delivery_turn()
         self._cancel_canned()  # this delivery owns the state from here
         self._cancel_midturn()
         # A final while a segment is open: the stream died without its end marker (core's
@@ -3405,11 +3422,38 @@ class LocalBackend(TurnEventMixin):
             size += len(nxt)
         return "".join(parts)
 
+    def _spans_live(self) -> bool:
+        """The span ledger measures the sink's current stream: same generation, still in the
+        slot. Once that stream ended (played out after a cancelled drain, or killed) played_ms()
+        reads 0, and the spans would count as unplayed runway forever."""
+        return (
+            bool(self._spoken_spans)
+            and self._spans_gen == self._sink.stream_generation
+            and self._sink.stream_open
+        )
+
+    def _fold_spans(self) -> None:
+        """Everything in the span ledger sounded: fold it into the heard prefix."""
+        spoken = " ".join(t for t, _ in self._spoken_spans).strip()
+        self._heard_prefix = f"{self._heard_prefix} {spoken}".strip()
+        self._spoken_spans.clear()
+
+    def _fold_ended_spans(self) -> None:
+        """Before a flush: spans whose stream already ended played out in full (a cancelled
+        drain parks its stream to ring out; every cut closes the ledger itself), and a flush
+        would read that stream as 0 ms played."""
+        if (
+            self._spoken_spans
+            and self._spans_gen <= self._sink.stream_generation
+            and not self._spans_live()
+        ):
+            self._fold_spans()
+
     def _runway_ms(self) -> float:
         """Unplayed audio ahead of the listener, CONTINUOUS: backlog_ms over-counts the in-flight
         sink item until its write returns (a step signal the deadline math cannot use), so prefer
-        the span ledger against played_ms. Falls back to backlog_ms between segments (no spans)."""
-        if self._spoken_spans and self._spans_gen == self._sink.stream_generation:
+        the span ledger against played_ms. Falls back to backlog_ms when the spans are not live."""
+        if self._spans_live():
             rem = (
                 self._spans_base_ms
                 + sum(dur for _, dur in self._spoken_spans)
@@ -3538,9 +3582,7 @@ class LocalBackend(TurnEventMixin):
                 # The spans' stream was EOF'd and replaced since they were anchored (a cancelled
                 # tool-boundary settle whose fold never ran, tail rung out in full): fold them
                 # as heard, since against a stale base the mapping garbles.
-                spoken = " ".join(t for t, _ in self._spoken_spans).strip()
-                self._heard_prefix = f"{self._heard_prefix} {spoken}".strip()
-                self._spoken_spans.clear()
+                self._fold_spans()
             if not self._spoken_spans:
                 # Segment start: anchor where THIS audio starts on its stream — past a
                 # filler still buffered ahead of it, which played_ms() has not reached.
@@ -3915,9 +3957,7 @@ class LocalBackend(TurnEventMixin):
         if self._closing or epoch != self._sink.epoch:
             return False
         if self._spoken_spans:  # played out in full -> fold into the heard-prefix
-            spoken = " ".join(t for t, _ in self._spoken_spans).strip()
-            self._heard_prefix = f"{self._heard_prefix} {spoken}".strip()
-            self._spoken_spans.clear()
+            self._fold_spans()
         return True
 
     async def _midturn_watch(self, epoch: int, spoke: bool) -> None:

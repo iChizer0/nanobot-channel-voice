@@ -456,10 +456,22 @@ def test_runway_prefers_the_span_ledger():
     backend._spoken_spans = [("a.", 1000.0), ("b.", 2000.0)]
     backend._spans_gen = sink.stream_generation
     backend._spans_base_ms = 500.0
+    sink._stream = object()  # the spans' stream is in the slot
     sink.played_ms = lambda: 1500  # type: ignore[method-assign]
     assert backend._runway_ms() == 2000.0
     backend._spans_gen = sink.stream_generation - 1  # stale stream: fall back
     assert backend._runway_ms() == 7000.0
+
+
+def test_runway_ignores_spans_whose_stream_ended():
+    """A stream that ended (played out after a cancelled drain, or killed) reads 0 played:
+    trusted, its spans would be runway forever and the JIT would never synthesize again."""
+    backend, tts, sink = _build()
+    sink.backlog_ms = lambda: 0.0  # type: ignore[method-assign]
+    backend._spoken_spans = [("Let me check.", 1000.0)]
+    backend._spans_gen = sink.stream_generation
+    assert sink._stream is None
+    assert backend._runway_ms() == 0.0
 
 
 def test_short_chunks_coalesce_into_one_call():
