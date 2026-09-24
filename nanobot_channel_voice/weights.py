@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import importlib
 import ipaddress
 import json
 import os
@@ -352,6 +353,15 @@ def _owner(manifest: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _current(d: Path, name: str, spec: dict[str, Any], prior: dict[str, Any]) -> bool:
+    """Whether the manifest's record of ``name`` (``prior``) still stands: the file, or the
+    directory it unpacked to, is there under the sha256 the entry pins, if it pins one."""
+    tar = _tar_parts(name) if spec.get("extract") else None
+    landed = d / tar[0] if tar and prior.get("unpacked") == tar[0] else d / name
+    want = spec.get("sha256")
+    return bool(prior) and landed.exists() and (not want or prior.get("sha256") == want)
+
+
 # Stream modes: one pass. Seeking back in a compressed stream decompresses it again.
 _TAR_MODES = {
     ".tar": "r|", ".tar.gz": "r|gz", ".tgz": "r|gz", ".tar.bz2": "r|bz2", ".tbz2": "r|bz2",
@@ -368,6 +378,20 @@ def _tar_parts(name: str) -> tuple[str, str] | None:
         if name.endswith(suffix) and name != suffix:
             return name[: -len(suffix)], mode
     return None
+
+
+# The module tarfile imports for each codec, the one a minimal build may lack.
+_CODEC_MODULES = {"gz": "zlib", "bz2": "bz2", "xz": "lzma"}
+
+
+def _can_unpack(mode: str) -> bool:
+    module = _CODEC_MODULES.get(mode.partition("|")[2])
+    if module is not None:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            return False
+    return True
 
 
 def _unpack(archive: Path, top: str, mode: str, into: Path) -> None:
@@ -486,11 +510,11 @@ def fetch(
             dest = d / name
             prior = have.get(name) or {}
             tar = _tar_parts(name) if spec.get("extract") else None
-            was_unpacked = bool(tar) and prior.get("unpacked") == tar[0]
-            landed = d / tar[0] if was_unpacked else dest
-            if landed.exists() and want and prior.get("sha256") == want:
+            if want and _current(d, name, spec, prior):
                 # Left packed (no codec then, or an older fetch): unpack in place, no download.
-                if not (tar and not was_unpacked and unpacked(dest, name, want, *tar)):
+                if not (
+                    tar and prior.get("unpacked") != tar[0] and unpacked(dest, name, want, *tar)
+                ):
                     recorded[name] = prior
                     log(f"  {name}: already fetched")
                 continue
@@ -582,6 +606,30 @@ def fetch(
         except OSError:
             log(f"  {p.name}: stale, could not remove")
     return d
+
+
+def fetch_size(entry: dict[str, Any], d: Path | None = None) -> int | None:
+    """Bytes a fetch of ``entry`` downloads (declared sizes): every file for a key not in
+    the store, over the installed one in ``d`` those missing or recorded with another
+    sha256. None when ``d`` holds the entry, 0 when the fetch only sweeps or unpacks."""
+    recorded = None if d is None else _manifest_files(d)
+    if d is None or recorded is None:
+        return entry_size(entry)
+    files: dict[str, Any] = entry.get("files") or {}
+    if not files:
+        return None  # an entry that lists nothing cannot replace what is there
+    stale, size = not recorded.keys() <= files.keys(), 0
+    for name, spec in files.items():
+        spec = spec or {}
+        prior = recorded.get(name)
+        prior = prior if isinstance(prior, dict) else {}
+        tar = _tar_parts(name) if spec.get("extract") else None
+        if not _current(d, name, spec, prior):
+            stale = True
+            size += spec["size"] if isinstance(spec.get("size"), int) else 0
+        elif tar and prior.get("unpacked") != tar[0] and _can_unpack(tar[1]):
+            stale = True  # left packed: the fetch unpacks it in place
+    return size if stale else None
 
 
 def installed(root: Path | None = None) -> dict[str, Path]:

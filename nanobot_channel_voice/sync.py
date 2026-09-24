@@ -2,8 +2,10 @@
 
 Shared by ``nanobot-voice sync`` and the WebUI's Apply flow. The plan is pure (index +
 store + the section), so a caller can show it before running; the run reports progress
-per chunk and stops between chunks when asked. Automatic cleanup removes only keys a
-``managed_by`` tag says the same flow installed: a hand-fetched model is the user's.
+per chunk and stops between chunks when asked. A wanted key the store holds otherwise
+than the index pins is fetched again, its changed files only. Automatic cleanup removes
+only keys a ``managed_by`` tag says the same flow installed: a hand-fetched model is the
+user's.
 """
 
 from __future__ import annotations
@@ -108,10 +110,11 @@ def voice_section(path: Path) -> dict[str, Any]:
 @dataclass
 class SyncPlan:
     wanted: list[str]               # keys the section names
-    fetch: list[str]                # wanted, not installed, in the index
+    fetch: list[str]                # wanted, in the index, not installed or not as it pins them
+    update: list[str]               # of fetch, the installed ones
     unknown: list[str]              # wanted, not installed, not in the index
     prune: list[str]                # installed keys the section no longer names
-    sizes: dict[str, int] = field(default_factory=dict)  # per fetch key (index-declared) and prune key (on disk)
+    sizes: dict[str, int] = field(default_factory=dict)  # fetch key: its download; prune key: on disk
     free_bytes: int = 0
     notices: dict[str, str] = field(default_factory=dict)  # fetch keys whose entry demands acceptance
 
@@ -136,18 +139,25 @@ def plan_sync(
     managed_by: str | None,
     prune: bool = True,
     used_only: bool = False,
+    updates: bool = True,
 ) -> SyncPlan:
     """``managed_by`` limits removal to keys that tag installed; None removes every
     installed key the section does not name (the CLI's ``--prune``). ``used_only`` wants
     what the resolved setup runs (the panel's Apply), else every key the section names
-    (the CLI's ``sync``). The one place a section is resolved: one the schema refuses
-    plans every key it names, backbone excluded."""
+    (the CLI's ``sync``); ``updates`` off leaves installed keys as they are. The one place
+    a section is resolved: one the schema refuses plans every key it names, backbone excluded."""
     cfg = _resolved(section)
     named = used_weights_keys(cfg) if used_only and cfg is not None else config_weights_keys(section)
     backbone = backbone_wanted(cfg, index) if cfg is not None else None
     wanted = sorted(named | ({backbone} if backbone else set()))
     have = w.installed(root)
-    fetch = [k for k in wanted if k not in have and k in index]
+    sizes: dict[str, int] = {}
+    for k in wanted:
+        if k not in index or (k in have and not updates):
+            continue
+        if (size := w.fetch_size(index[k], have.get(k))) is not None:
+            sizes[k] = size
+    fetch = list(sizes)
     unknown = [k for k in wanted if k not in have and k not in index]
     prune_keys = [
         k for k in have
@@ -157,9 +167,10 @@ def plan_sync(
     return SyncPlan(
         wanted=wanted,
         fetch=fetch,
+        update=[k for k in fetch if k in have],
         unknown=unknown,
         prune=prune_keys,
-        sizes={**{k: w.entry_size(index[k]) for k in fetch}, **{k: w.disk_usage(have[k]) for k in prune_keys}},
+        sizes={**sizes, **{k: w.disk_usage(have[k]) for k in prune_keys}},
         free_bytes=_free_bytes(root),
         notices={k: str(index[k]["accept"]) for k in fetch if index[k].get("accept")},
     )
@@ -198,17 +209,17 @@ def run_sync(
     log: Callable[[str], None] = lambda _line: None,
     progress: Callable[[str, str, int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
-) -> tuple[int, int]:
-    """Fetch, then remove; returns (bytes fetched, bytes freed). ``progress(key, file,
-    run bytes)`` only rises; ``should_stop`` is honoured between chunks, between keys and
-    before the removals. A failing model stops no other; a failed or stopped run removes
-    nothing, leaving the store as it was plus whole models."""
+) -> tuple[int, int, dict[str, str]]:
+    """Fetch, then remove; returns (bytes fetched, bytes freed, {update: why it failed}).
+    ``progress(key, file, run bytes)`` only rises; ``should_stop`` is honoured between
+    chunks, between keys and before the removals. Every model is tried: a failed update
+    keeps the installed one, which still runs, but a failed install or a stop removes nothing."""
     def check_stop() -> None:
         if should_stop is not None and should_stop():
             raise w.WeightsError("sync cancelled")
 
-    done = 0
-    failed: list[str] = []
+    done = fetched = 0
+    failed: dict[str, str] = {}
     for key in plan.fetch:
         check_stop()
         log(key)
@@ -222,17 +233,20 @@ def run_sync(
         except (w.WeightsError, OSError) as exc:
             if should_stop is not None and should_stop():
                 raise  # a cancel ends the run, with fetch's own message
-            failed.append(str(exc))
+            failed[key] = str(exc)
         # A download can overrun the declared size (a stale index, none declared): never step back.
-        done += max(plan.sizes[key], sum(files.values()))
-    if failed:
+        step = max(plan.sizes[key], sum(files.values()))
+        done += step
+        fetched += 0 if key in failed else step
+    if any(key not in plan.update for key in failed):
         landed = len(plan.fetch) - len(failed)
         raise w.WeightsError(
-            "; ".join(failed) + (f" ({landed} of {len(plan.fetch)} fetched)" if landed else "")
+            "; ".join(failed.values())
+            + (f" ({landed} of {len(plan.fetch)} fetched)" if landed else "")
         )
     check_stop()
     freed = 0
     for key in plan.prune:
         freed += w.prune(key, root)
         log(f"removed {key}")
-    return done, freed
+    return fetched, freed, failed

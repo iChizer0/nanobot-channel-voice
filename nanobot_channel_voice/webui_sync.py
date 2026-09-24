@@ -2,11 +2,12 @@
 
 Core's channel connector seam (``ChannelPlugin.connector``) drives this: a poll answering
 ``succeeded`` makes core enable the channel, which is when a pending patch applies. The
-run fetches what the resolved setup runs and removes what this same flow installed and it
-no longer runs. ``plan=true`` reports what a run would do from the cached index, or
-re-attaches one already going. ``refresh=true`` reloads the index in a background task,
-since core answers a socket's requests one at a time and the form would wait behind it,
-and so does a plan that finds the cache loaded from another index than the section names.
+run fetches what the resolved setup runs, again when the index has changed it, and
+removes what this same flow installed and it no longer runs. ``plan=true`` reports what a
+run would do from the cached index, or re-attaches one already going. ``refresh=true``
+reloads the index in a background task, since core answers a socket's requests one at a
+time and the form would wait behind it, and so does a plan that finds the cache loaded
+from another index than the section names.
 Nothing else here touches the network.
 """
 
@@ -41,7 +42,7 @@ class _Session:
     delivered: bool = False  # its last word reached a panel, and core with it
     # (key, file, bytes fetched so far) as run_sync counts them: one store, so no lock
     at: tuple[str | None, str | None, int] = (None, None, 0)
-    result: tuple[int, int] | None = None
+    result: tuple[int, int, dict[str, str]] | None = None  # run_sync's: fetched, freed, kept
     error: str | None = None
 
     @property
@@ -124,12 +125,12 @@ class VoiceSyncStore:
         """What a run would do, from the cache as it is now. Offline, the cache stands and
         the status carries the last reload's error."""
         root = w.store_root()
-        index, cached_unix, _ = _cached(root)
+        index, cached_unix, sources = _cached(root)
         return {
             "session_id": "",
             "status": "planned",
             "index": {"cached_unix": cached_unix, "refreshing": refreshing, "error": self._reload_error},
-            "plan": _plan_payload(self._plan(root, index), index),
+            "plan": _plan_payload(self._plan(root, index, sources), index),
         }
 
     async def _planned(self, *, refresh: bool) -> dict[str, Any]:
@@ -167,14 +168,25 @@ class VoiceSyncStore:
             if not isinstance(exc, (w.WeightsError, ChannelConnectError)):
                 logger.exception("voice: model index reload failed")
 
-    def _plan(self, root: Path, index: dict[str, dict[str, Any]]) -> SyncPlan:
+    def _plan(
+        self, root: Path, index: dict[str, dict[str, Any]], sources: list[str] | None,
+    ) -> SyncPlan:
         from nanobot.config.loader import get_config_path
+
+        from nanobot_channel_voice.config import section_index
 
         try:
             section = voice_section(get_config_path())
         except w.WeightsError as exc:
             raise ChannelConnectError(str(exc)) from None
-        return plan_sync(section, index, root, managed_by=MANAGED_BY, used_only=True)
+        try:
+            # An installed model is judged by the section's own index, never another's cache.
+            current = sources == section_index(section)
+        except ValueError:
+            current = False
+        return plan_sync(
+            section, index, root, managed_by=MANAGED_BY, used_only=True, updates=current,
+        )
 
     # ---- run --------------------------------------------------------------------
 
@@ -189,7 +201,7 @@ class VoiceSyncStore:
             raise ChannelConnectError("a voice model sync is already running", status=409)
         root = w.store_root()
         index, _cached_unix, sources = await asyncio.to_thread(_cached, root)
-        plan = await asyncio.to_thread(self._plan, root, index)
+        plan = await asyncio.to_thread(self._plan, root, index, sources)
         # Never a download from an index the section has moved away from: until the one it
         # names has loaded, the cache lists the other one's files. An Apply that downloads
         # nothing does not wait on it, offline or behind a blocked hub.
@@ -253,13 +265,22 @@ class VoiceSyncStore:
             "progress": session.snapshot(),
         }
         if session.result is not None:
-            fetched, freed = session.result
-            parts = []
-            if session.plan.fetch:
-                parts.append(f"fetched {len(session.plan.fetch)} ({fetched / 1e6:,.0f} MB)")
-            if session.plan.prune:
-                parts.append(f"removed {len(session.plan.prune)} ({freed / 1e6:,.0f} MB)")
-            payload.update(status="succeeded", message=f"Models {', '.join(parts)}.")
+            fetched, freed, kept = session.result
+            plan = session.plan
+            new, updated = len(plan.fetch) - len(plan.update), len(plan.update) - len(kept)
+            moved = [f"fetched {new}"] if new else []
+            if updated:
+                moved.append(f"updated {updated}")
+            parts = [f"{' and '.join(moved)} ({fetched / 1e6:,.0f} MB)"] if moved else []
+            if plan.prune:
+                parts.append(f"removed {len(plan.prune)} ({freed / 1e6:,.0f} MB)")
+            message = f"Models {', '.join(parts)}." if parts else "Models unchanged."
+            payload.update(status="succeeded", message=message)
+            if kept:
+                # The run still succeeds, since the installed models run: the panel shows why.
+                payload["warning"] = "; ".join(
+                    f"{key} stays as installed: {why}" for key, why in kept.items()
+                )
         elif session.error is not None:
             cancelled = session.stopped
             payload.update(status="cancelled" if cancelled else "failed", message=session.error)
@@ -305,6 +326,7 @@ def _plan_payload(plan: SyncPlan, index: dict[str, dict[str, Any]]) -> dict[str,
             {
                 "key": k,
                 "bytes": plan.sizes[k],
+                "update": k in plan.update,
                 "license": index[k].get("license"),
                 "notice": plan.notices.get(k),
             }

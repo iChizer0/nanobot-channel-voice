@@ -326,8 +326,8 @@ def test_plan_fetches_the_named_and_removes_only_what_the_flow_installed(store, 
     assert plan_sync(section, index, store, managed_by=None).prune == ["tts/mms/en/onnx", "vad/silero/v6/onnx"]
     assert plan_sync(section, index, store, managed_by=None, prune=False).prune == []
 
-    fetched, freed = run_sync(plan, index, store, managed_by=MANAGED_BY)
-    assert fetched == 100 and freed > 0
+    fetched, freed, kept = run_sync(plan, index, store, managed_by=MANAGED_BY)
+    assert fetched == 100 and freed > 0 and kept == {}
     assert set(w.installed(store)) == {"stt/whisper/base/onnx", "vad/silero/v6/onnx"}
     assert w.managed_by("stt/whisper/base/onnx", store) == MANAGED_BY
     assert w.managed_by("vad/silero/v6/onnx", store) is None
@@ -578,6 +578,95 @@ def test_connector_refuses_unaccepted_notices_unknown_keys_and_no_space(store, t
             await connector.handle("start", {"accept": ["tts/mms/en/onnx"]})
 
     _run(scenario())
+
+
+def test_apply_updates_what_the_index_changed_and_leaves_it_whose_it_was(store, tmp_path, monkeypatch, server):
+    """A model the setup runs that the index has since republished is fetched again, its
+    changed files only, and listed as an update; the user's model stays the user's."""
+    def entry(encoder):
+        server.blobs.update({"enc": encoder, "tok": b"t" * 10})
+        return {"files": {name: {"url": f"{server.base}/{blob}", "size": len(server.blobs[blob]),
+                                 "sha256": hashlib.sha256(server.blobs[blob]).hexdigest()}
+                          for name, blob in (("encoder.onnx", "enc"), ("tokens.txt", "tok"))}}
+
+    whisper, silero = "stt/whisper/base/onnx", "vad/silero/v6/onnx"
+    index = {whisper: entry(b"e" * 100), **_index(server, **{silero: ("silero-model.onnx", b"s" * 20)})}
+    w.fetch(whisper, index[whisper], root=store)  # by hand: the user's
+    section = {"stt": {"provider": "whisper", "whisper": {"weights": whisper}}}
+    assert plan_sync(section, index, store, managed_by=MANAGED_BY, used_only=True).empty
+    index[whisper] = entry(b"E" * 60)  # republished: a new encoder beside the same tokens
+    _cache(store, index)
+    _write_config(tmp_path, monkeypatch, {**section, "vad": {"engine": "silero", "silero": {"weights": silero}}})
+    connector = VoiceSyncStore()
+
+    async def scenario():
+        planned = (await connector.handle("start", {"plan": ["true"]}))["plan"]
+        assert [(f["key"], f["bytes"], f["update"]) for f in planned["fetch"]] == [(whisper, 60, True), (silero, 20, False)]
+        started = await connector.handle("start", {})
+        assert (await _drive(connector, started["session_id"]))["message"] == "Models fetched 1 and updated 1 (0 MB)."
+
+    _run(scenario())
+    assert (w.store_dir(whisper, store) / "encoder.onnx").read_bytes() == b"E" * 60
+    assert w.managed_by(whisper, store) is None
+    assert plan_sync({}, index, store, managed_by=MANAGED_BY, used_only=True).prune == [silero]
+
+
+def test_an_update_that_fails_keeps_the_installed_model_and_the_apply(store, tmp_path, monkeypatch, server):
+    """Offline or behind a blocked hub, an update fails: the installed model stays and runs,
+    so the run succeeds (core restarts the channel) and removes what it would, with a
+    warning. A model that is not installed failing still fails the run."""
+    whisper, mms, silero = "stt/whisper/base/onnx", "tts/mms/en/onnx", "vad/silero/v6/onnx"
+    index = _index(server, **{
+        whisper: ("whisper-encoder.onnx", b"w" * 100),
+        mms: ("mms-decoder.onnx", b"m" * 10),
+        silero: ("silero-model.onnx", b"s" * (1 << 20)),
+    })
+    w.fetch(whisper, index[whisper], root=store)
+    w.fetch(mms, index[mms], root=store, managed_by=MANAGED_BY)
+    # republished, and out of reach
+    index[whisper]["files"]["encoder.onnx"].update(url=f"{server.base}/gone", sha256="1" * 64, size=5_000_000)
+    _cache(store, index)
+    _write_config(tmp_path, monkeypatch, {
+        "stt": {"provider": "whisper", "whisper": {"weights": whisper}},
+        "vad": {"engine": "silero", "silero": {"weights": silero}},
+    })
+    connector = VoiceSyncStore()
+
+    async def scenario():
+        done = await _drive(connector, (await connector.handle("start", {}))["session_id"])
+        assert done["status"] == "succeeded" and done["message"] == "Models fetched 1 (1 MB), removed 1 (0 MB)."
+        assert done["warning"].startswith(f"{whisper} stays as installed: '{whisper}' encoder.onnx: download failed")
+
+    _run(scenario())
+    assert (w.store_dir(whisper, store) / "encoder.onnx").read_bytes() == b"w" * 100
+    assert set(w.installed(store)) == {whisper, silero}
+
+
+def test_an_installed_model_is_judged_only_by_the_index_the_section_names(store, tmp_path, monkeypatch, server):
+    """While the cache is another index's (the section just named a new one, maybe offline),
+    installed models stay as they are, not "updated" to its pins, and an Apply that installs
+    nothing goes ahead."""
+    key = "stt/whisper/base/onnx"
+    index = _index(server, **{key: ("whisper-encoder.onnx", b"w" * 100)})
+    w.fetch(key, index[key], root=store)
+    index[key]["files"]["encoder.onnx"]["sha256"] = "1" * 64  # that index's pin
+    _cache(store, index, sources=["https://old.example/index.json"])
+
+    def offline(*_args, **_kwargs):
+        raise w.WeightsError("cannot read weights index: offline")
+
+    monkeypatch.setattr(w, "refresh_index", offline)
+    section = {"stt": {"provider": "whisper", "whisper": {"weights": key}}}
+    _write_config(tmp_path, monkeypatch, section)
+    connector = VoiceSyncStore()
+
+    async def scenario():
+        assert (await connector.handle("start", {"plan": ["true"]}))["plan"]["fetch"] == []
+        assert (await connector.handle("start", {}))["status"] == "succeeded"
+        await connector.close()
+
+    _run(scenario())
+    assert plan_sync(section, index, store, managed_by=MANAGED_BY, used_only=True).update == [key]
 
 
 def test_connector_cancel_stops_between_chunks_and_leaves_no_partial(store, tmp_path, monkeypatch, server):

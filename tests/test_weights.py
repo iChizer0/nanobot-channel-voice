@@ -311,6 +311,36 @@ def test_an_update_that_fails_leaves_the_installed_revision_whole(store, monkeyp
     assert (d / "encoder.rknn").read_bytes() == b"encoder v2" and (d / "meta.json").read_bytes() == b"meta v2"
 
 
+def test_fetch_size_is_what_a_fetch_would_download(store, tmp_path):
+    """The declared bytes of the files a fetch would bring (all of a key not in the store,
+    else those missing or pinned to another sha256), 0 when it would only sweep a file the
+    entry dropped, None when the store holds the entry; an unpinned file while it resolves."""
+    enc, tok = _src(tmp_path, "encoder.onnx", b"e1"), _src(tmp_path, "tokens.txt", b"t1")
+    entry = _entry_for(enc, tok)
+    for spec in entry["files"].values():
+        spec["size"] = 2
+    assert w.fetch_size(entry) == 4
+    d = w.fetch("stt/m/onnx", entry)
+    assert w.fetch_size(entry, d) is None
+    enc.write_bytes(b"e2")  # republished: another pin for one file
+    entry["files"]["encoder.onnx"]["sha256"] = hashlib.sha256(b"e2").hexdigest()
+    assert w.fetch_size(entry, d) == 2
+    w.fetch("stt/m/onnx", entry)
+    assert w.fetch_size(entry, d) is None
+    (d / "tokens.txt").unlink()
+    assert w.fetch_size(entry, d) == 2
+    w.fetch("stt/m/onnx", entry)
+    del entry["files"]["tokens.txt"]
+    assert w.fetch_size(entry, d) == 0
+    w.fetch("stt/m/onnx", entry)
+    assert w.fetch_size(entry, d) is None and not (d / "tokens.txt").exists()
+    del entry["files"]["encoder.onnx"]["sha256"]
+    assert w.fetch_size(entry, d) is None
+    enc.unlink()  # the link dangles
+    assert w.fetch_size(entry, d) == 2
+    assert w.fetch_size({"files": {}}, d) is None  # an entry that lists nothing replaces nothing
+
+
 def test_a_model_keeps_whoever_installed_it(store, tmp_path):
     """A re-check or an update, forced or not, leaves the tag as the install set it: the
     CLI does not take the panel's models, nor the panel's update the user's."""
@@ -432,7 +462,7 @@ def test_an_archive_must_make_one_directory_of_files(store, monkeypatch):
 def test_a_python_without_the_codec_installs_the_archive_packed(store, monkeypatch):
     """Without bz2 (minimal builds) the archive installs packed and a hand-unpacked
     directory survives refetches; once the codec exists, a fetch unpacks it in place
-    without downloading."""
+    without downloading, and only then does the key read as stale."""
     served, calls = {}, []
     entry = _packed(served, _tar({"espeak-ng-data/phondata": b"v1"}))
     monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
@@ -441,13 +471,16 @@ def test_a_python_without_the_codec_installs_the_archive_packed(store, monkeypat
     d = w.fetch("tts/m/onnx", entry, log=lines.append)
     assert (d / "espeak-ng-data.tar.bz2").read_bytes() == served["https://x.test/pack"]
     assert any("left packed (bz2 module is not available)" in line for line in lines)
+    assert w.fetch_size(entry, d) is None  # a fetch here would change nothing
     (d / "espeak-ng-data").mkdir()  # unpacked by hand
     w.fetch("tts/m/onnx", entry)
     assert (d / "espeak-ng-data").is_dir() and (d / "espeak-ng-data.tar.bz2").is_file()
     sys.modules.pop("bz2")  # the codec arrives
+    assert w.fetch_size(entry, d) == 0
     w.fetch("tts/m/onnx", entry)
     assert (d / "espeak-ng-data" / "phondata").read_bytes() == b"v1"
     assert not (d / "espeak-ng-data.tar.bz2").exists() and len(calls) == 1
+    assert w.fetch_size(entry, d) is None
 
 
 def test_fetch_http_requires_a_pinned_sha256(store):
