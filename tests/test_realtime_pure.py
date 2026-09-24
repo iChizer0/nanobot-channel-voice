@@ -856,6 +856,65 @@ def test_new_speech_clears_the_suppress_window():
     asyncio.run(_case())
 
 
+def _barge_in_shell(b, events: list) -> None:
+    """``on_event`` does what VoiceShell._cloud_barge_in does: flush, then ``barge_in``."""
+
+    async def on_event(e):
+        events.append(e)
+        if isinstance(e, UserSpeechStarted):
+            await b.barge_in(await b._sink.flush())
+
+    b._on_event = on_event
+
+
+def test_a_late_stop_transcript_leaves_the_next_utterance_alone():
+    """The stop's transcript lands after the user started the next utterance, whose onset
+    owns the state: the stop must not settle it IDLE, nor arm the suppress window that
+    would kill its answer at birth."""
+    async def _case():
+        b, sent, events = make_stop_backend()
+        _barge_in_shell(b, events)
+        await b._handle_event(_created("r0"))  # a reply is live
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-stop"})
+        await b._handle_event(
+            {"type": "response.done", "response": {"id": "r0", "status": "cancelled"}}
+        )
+        await b._handle_event(_created("r-stop"))  # the server answers "stop"
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})  # "what time"
+        await b._handle_event(
+            {"type": "response.done", "response": {"id": "r-stop", "status": "cancelled"}}
+        )
+        await b._handle_event({**_stop_t(), "item_id": "i-stop"})
+        assert b._turn is VoiceState.CAPTURING
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-next"})
+        await b._handle_event(_created("r-answer"))
+        assert "r-answer" not in b._cancelled_responses
+        assert b._turn is VoiceState.THINKING
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_a_stop_for_the_latest_utterance_is_still_consumed():
+    async def _case():
+        b, sent, events = make_stop_backend()
+        _barge_in_shell(b, events)
+        await b._handle_event(_created("r0"))
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-stop"})
+        await b._handle_event(_created("r-stop"))
+        await b._handle_event({**_stop_t(), "item_id": "i-stop"})
+        assert {"type": "response.cancel", "response_id": "r-stop"} in sent
+        assert b._turn is VoiceState.IDLE
+        await b.close()
+
+    asyncio.run(_case())
+
+
 def test_without_transcription_model_the_matcher_is_inert():
     async def _case():
         b, sent, _ = make_stop_backend(VoiceConfig())

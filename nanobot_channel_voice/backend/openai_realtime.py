@@ -212,6 +212,11 @@ class RealtimeBackend(RealtimeTransport):
         # has no id to cancel, so it marks the newborn. Unbounded, unlike the stop window.
         self._continuation_unborn = False
         self._kill_at_birth = False
+        # Which utterance a transcript is for: onsets so far, the count when the latest one
+        # ended, and each committed user item's count (a stop only acts for the latest).
+        self._onsets = 0
+        self._end_onset = 0
+        self._item_onset: dict[str, int] = {}
 
     def _api_key(self) -> str:
         key = resolve_openai_key(self._rt.api_key)
@@ -505,6 +510,12 @@ class RealtimeBackend(RealtimeTransport):
         elif t == "input_audio_buffer.speech_stopped":
             if not self._manual:
                 self._on_speech_stopped()
+        elif t == "input_audio_buffer.committed":
+            item = evt.get("item_id")
+            if item:
+                self._item_onset[item] = self._end_onset
+                while len(self._item_onset) > 16:
+                    del self._item_onset[next(iter(self._item_onset))]
         elif t == "response.created":
             rid = (evt.get("response") or {}).get("id")
             self._continuation_unborn = False
@@ -549,8 +560,12 @@ class RealtimeBackend(RealtimeTransport):
             text = evt.get("transcript", "")
             if text:
                 await self._emit(InputTranscript(text))
+                # A transcript lands after its commit, often after the next onset, which then
+                # owns the state: a stop for an older utterance must not act on the new one.
+                latest = self._item_onset.get(evt.get("item_id"), self._onsets) >= self._onsets
                 if (
                     self._stop_match is not None
+                    and latest
                     and (
                         self._onset_interrupting
                         or self._active_response_id is not None
@@ -566,7 +581,12 @@ class RealtimeBackend(RealtimeTransport):
         # New speech also ends the suppression: whatever follows answers the NEW
         # utterance, not a consumed stop.
         self._stop_suppress_until = 0.0
+        self._onsets += 1
         await super()._on_speech_started()
+
+    def _on_speech_stopped(self) -> None:
+        self._end_onset = self._onsets  # the next committed item is this utterance
+        super()._on_speech_stopped()
 
     def _adopt_response(self, evt: dict) -> None:
         """Create-on-first-sight: a dialect may emit ``response.*`` before (or without)
