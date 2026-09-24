@@ -311,6 +311,21 @@ def test_an_update_that_fails_leaves_the_installed_revision_whole(store, monkeyp
     assert (d / "encoder.rknn").read_bytes() == b"encoder v2" and (d / "meta.json").read_bytes() == b"meta v2"
 
 
+def test_a_model_keeps_whoever_installed_it(store, tmp_path):
+    """A re-check or an update, forced or not, leaves the tag as the install set it: the
+    CLI does not take the panel's models, nor the panel's update the user's."""
+    src = _src(tmp_path, "encoder.onnx", b"e1")
+    w.fetch("stt/panel/onnx", _entry_for(src), managed_by="webui")
+    w.fetch("stt/panel/onnx", _entry_for(src))
+    w.fetch("stt/panel/onnx", _entry_for(src), force=True)
+    assert w.managed_by("stt/panel/onnx") == "webui"
+    w.fetch("stt/mine/onnx", _entry_for(src))
+    src.write_bytes(b"e2")
+    w.fetch("stt/mine/onnx", _entry_for(src), managed_by="webui")
+    assert (w.store_dir("stt/mine/onnx") / "encoder.onnx").read_bytes() == b"e2"
+    assert w.managed_by("stt/mine/onnx") is None
+
+
 def test_a_partial_left_under_this_pid_is_never_written_through(store, monkeypatch, tmp_path):
     """Under a pid reused after a reboot, a crashed run's partial may be a staged link:
     the download replaces it rather than writing into its target."""

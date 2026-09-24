@@ -370,6 +370,22 @@ def test_the_panel_plans_what_the_resolved_setup_runs(store, server):
     assert refused.wanted == sorted(config_weights_keys(section))
 
 
+def test_a_cli_recheck_leaves_the_panels_model_the_panels(store, tmp_path, monkeypatch, server):
+    """``nanobot-voice sync`` re-verifies every named key, forced or not: a model Apply
+    installed is still Apply's to remove once the setup stops running it."""
+    from nanobot_channel_voice.cli import main as cli_main
+
+    key = "stt/whisper/base/onnx"
+    index = _index(server, **{key: ("whisper-encoder.onnx", b"w" * 100)})
+    w.fetch(key, index[key], root=store, managed_by=MANAGED_BY)
+    index_file = tmp_path / "index.json"
+    index_file.write_text(json.dumps({"version": 1, "models": index}))
+    _write_config(tmp_path, monkeypatch, {"index": [str(index_file)], "stt": {"provider": "whisper", "whisper": {"weights": key}}})
+    assert cli_main(["sync"]) == 0 and cli_main(["sync", "--force"]) == 0
+    assert w.managed_by(key, store) == MANAGED_BY
+    assert plan_sync({}, index, store, managed_by=MANAGED_BY, used_only=True).prune == [key]
+
+
 # ---- connector -----------------------------------------------------------------
 
 

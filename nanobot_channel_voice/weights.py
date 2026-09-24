@@ -330,16 +330,26 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _manifest_files(d: Path) -> dict[str, Any] | None:
-    """The manifest's recorded files, None when there is no readable manifest: a truncated
-    one (a power cut between write and flush) must not read as a fetched model."""
+def _manifest(d: Path) -> dict[str, Any] | None:
+    """The manifest, None when there is no readable one: a truncated one (a power cut
+    between write and flush) must not read as a fetched model."""
     try:
         payload = json.loads((d / MANIFEST).read_text("utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
-        return None
-    return payload["files"]
+    return payload if isinstance(payload, dict) and isinstance(payload.get("files"), dict) else None
+
+
+def _manifest_files(d: Path) -> dict[str, Any] | None:
+    """The manifest's recorded files, None when there is no readable manifest."""
+    manifest = _manifest(d)
+    return None if manifest is None else manifest["files"]
+
+
+def _owner(manifest: dict[str, Any]) -> str | None:
+    """The flow a manifest says installed its key, else None."""
+    value = manifest.get("managed_by")
+    return value if isinstance(value, str) and value else None
 
 
 # Stream modes: one pass. Seeking back in a compressed stream decompresses it again.
@@ -418,9 +428,9 @@ def fetch(
     stay, ``force`` refetches). Files stage as ``.partial-*`` and move in only once all
     verify: a failed fetch leaves the key as it was. An ``extract`` archive lands unpacked,
     or packed when this Python lacks its codec (a later fetch unpacks it in place).
-    ``managed_by`` tags the manifest, so automatic cleanup removes only its own keys;
-    ``progress(name, bytes)`` runs per chunk; ``should_stop`` is polled between chunks
-    and aborts with :class:`WeightsError`."""
+    ``managed_by`` tags a key this call installs (a re-check or an update keeps the tag), so
+    automatic cleanup removes only its own keys; ``progress(name, bytes)`` runs per chunk;
+    ``should_stop`` is polled between chunks and aborts with :class:`WeightsError`."""
     d = store_dir(key, root)
     # nested keys would let the stale-file sweep rmtree the inner installation
     for other in installed(root):
@@ -445,7 +455,9 @@ def fetch(
     for p in d.glob(".partial-*"):  # a dead run's leftovers: free the room first
         if _abandoned(p.name):
             _discard(p)
-    have = ({} if force else _manifest_files(d)) or {}
+    before = _manifest(d)
+    have = {} if force or before is None else before["files"]
+    owner = managed_by if before is None else _owner(before)
     recorded: dict[str, Any] = {}
     moves: dict[Path, Path] = {}  # staged -> final
     scratch: list[Path] = []  # removed at the end, success or not
@@ -549,8 +561,8 @@ def fetch(
         for path in scratch:
             _discard(path)
     payload: dict[str, Any] = {"key": key, "fetched_unix": int(time.time()), "files": recorded}
-    if managed_by:
-        payload["managed_by"] = managed_by
+    if owner:
+        payload["managed_by"] = owner
     _write_json(d / MANIFEST, payload)
     # Sweep what the entry no longer names (a stale <stem>.* would shadow resolution),
     # after the manifest write so a failed fetch deletes nothing. An archive's directory
@@ -609,11 +621,10 @@ def installed(root: Path | None = None) -> dict[str, Path]:
 def managed_by(key: str, root: Path | None = None) -> str | None:
     """What installed a fetched key (its manifest's ``managed_by``), else None."""
     try:
-        data = json.loads((store_dir(key, root) / MANIFEST).read_text("utf-8"))
-    except (OSError, ValueError, WeightsError):
+        manifest = _manifest(store_dir(key, root))
+    except WeightsError:
         return None
-    value = data.get("managed_by") if isinstance(data, dict) else None
-    return value if isinstance(value, str) and value else None
+    return None if manifest is None else _owner(manifest)
 
 
 def disk_usage(d: Path) -> int:
