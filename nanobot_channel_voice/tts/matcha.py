@@ -687,7 +687,8 @@ def _zh_en_frontend(cfg: MatchaTtsConfig, token2id: dict[str, int]) -> LexiconFr
         logger.warning(
             "voice: no espeak-ng-data beside this zh-en matcha model, so "
             "its English phonemes come from the installed espeak-ng and "
-            "may not match training (set tts.matcha.espeakDataDir)"
+            "may not match training (`nanobot-voice sync` unpacks the pack an index "
+            "package ships; else set tts.matcha.espeakDataDir)"
         )
     return LexiconFrontend(
         _load_lexicons(cfg.lexicon_path, cfg.lexicon_overrides_path, token2id), token2id,

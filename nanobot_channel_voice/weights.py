@@ -9,10 +9,14 @@ plus sha256::
         "license": "MIT", "accept": "non-commercial use only",
         "langs": ["en", "ja", "de"],
         "files": {"encoder.onnx": {"url": "https://...", "sha256": "...", "size": 42000000},
-                  "decoder.onnx": {"url": "file:///srv/models/decoder.onnx"}}}}}
+                  "decoder.onnx": {"url": "file:///srv/models/decoder.onnx"},
+                  "espeak-ng-data.tar.bz2": {"url": "...", "sha256": "...", "extract": true}}}}}
 
 ``accept`` makes ``fetch`` print the notice and demand confirmation (``--yes`` to
-script it); per-file ``size`` (bytes) only feeds ``list``'s estimate. The wheel ships NO
+script it); per-file ``size`` (bytes) feeds size estimates and progress. ``extract`` marks
+a tar archive ``fetch`` unpacks into the one directory its name gives. A ``deprecated``
+entry is an old key kept for configs that name it (``renamed_to``: its new key): it
+installs, but nothing offers it. The wheel ships NO
 entries and NO weights: they come from the index files ``channels.voice.index`` names
 (:data:`DEFAULT_INDEX_SOURCES` unless it names others), or ``--index``. An index is read
 over https or from a file, since it pins the hashes. A file ``url`` may be relative to
@@ -37,11 +41,12 @@ import json
 import os
 import re
 import shutil
+import tarfile
 import time
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Sequence
-from pathlib import Path
+from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 MANIFEST = ".manifest.json"
@@ -297,6 +302,12 @@ def entry_size(entry: dict[str, Any]) -> int:
     return sum(s for s in sizes if isinstance(s, int))
 
 
+def renamed_to(entry: dict[str, Any] | None) -> str | None:
+    """The key a ``deprecated`` entry goes by now, None when it names none."""
+    new = (entry or {}).get("renamed_to")
+    return new if isinstance(new, str) and new else None
+
+
 def key_platform(key: str) -> str:
     return key.rsplit("/", 1)[-1]
 
@@ -331,6 +342,67 @@ def _manifest_files(d: Path) -> dict[str, Any] | None:
     return payload["files"]
 
 
+# Stream modes: one pass. Seeking back in a compressed stream decompresses it again.
+_TAR_MODES = {
+    ".tar": "r|", ".tar.gz": "r|gz", ".tgz": "r|gz", ".tar.bz2": "r|bz2", ".tbz2": "r|bz2",
+    ".tar.xz": "r|xz", ".txz": "r|xz",
+}
+# 3.11.4+; _unpack's own check covers the releases before it.
+_TAR_FILTER: dict[str, Any] = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+
+
+def _tar_parts(name: str) -> tuple[str, str] | None:
+    """(directory it unpacks to, open mode) for a tar archive's name, else None. The
+    mode names the codec: a Python built without it raises ``tarfile.CompressionError``."""
+    for suffix, mode in _TAR_MODES.items():
+        if name.endswith(suffix) and name != suffix:
+            return name[: -len(suffix)], mode
+    return None
+
+
+def _unpack(archive: Path, top: str, mode: str, into: Path) -> None:
+    """Unpack under ``into`` (scratch), refusing any member that is not a regular file or
+    directory under ``top``."""
+    _discard(into)
+
+    def checked(tar: tarfile.TarFile) -> Iterator[tarfile.TarInfo]:
+        for member in tar:
+            parts = PurePosixPath(member.name).parts
+            if not parts or parts[0] != top or ".." in parts or not (member.isfile() or member.isdir()):
+                raise ValueError(f"it holds '{member.name}', not a file or directory under {top}/")
+            yield member
+
+    with tarfile.open(archive, mode) as tar:
+        tar.extractall(into, members=checked(tar), **_TAR_FILTER)
+    if not (into / top).is_dir():
+        raise ValueError(f"it makes no {top}/")
+    if hasattr(os, "sync"):
+        os.sync()  # durable before the manifest vouches for them: one flush, not one per file
+
+
+def _discard(path: Path) -> None:
+    """Remove a file, a link or a directory tree, if it is there."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _abandoned(partial: str) -> bool:
+    """Whether a ``.partial-<pid>-*`` outlived its process (a crash, a power cut). POSIX
+    only: on Windows ``os.kill`` terminates what it probes."""
+    pid = partial.removeprefix(".partial-").partition("-")[0]
+    if os.name != "posix" or not pid.isdigit():
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, OverflowError):  # EPERM: alive, another user's
+        return False
+    return False
+
+
 def fetch(
     key: str,
     entry: dict[str, Any],
@@ -342,14 +414,13 @@ def fetch(
     progress: Callable[[str, int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> Path:
-    """Verify-and-install one index entry into the store; idempotent. Files already
-    present with the index's sha256 (per the manifest) are kept; ``force`` refetches
-    everything. Each file stages as a ``.partial-*`` beside its name and none moves in
-    until all have verified: a fetch that fails leaves the key as it was, never a partial
-    on a final name nor two revisions mixed. ``managed_by`` is recorded in the manifest
-    (what installed the key, so an automatic cleanup removes only its own); ``progress``
-    gets (file name, bytes so far) per chunk and ``should_stop`` is polled between
-    chunks: True abandons the download as a :class:`WeightsError`."""
+    """Verify and install one index entry; idempotent (files whose manifest sha256 matches
+    stay, ``force`` refetches). Files stage as ``.partial-*`` and move in only once all
+    verify: a failed fetch leaves the key as it was. An ``extract`` archive lands unpacked,
+    or packed when this Python lacks its codec (a later fetch unpacks it in place).
+    ``managed_by`` tags the manifest, so automatic cleanup removes only its own keys;
+    ``progress(name, bytes)`` runs per chunk; ``should_stop`` is polled between chunks
+    and aborts with :class:`WeightsError`."""
     d = store_dir(key, root)
     # nested keys would let the stale-file sweep rmtree the inner installation
     for other in installed(root):
@@ -360,27 +431,59 @@ def fetch(
     files: dict[str, Any] = entry.get("files") or {}
     if not files:
         raise WeightsError(f"index entry '{key}' lists no files")
-    for name in files:
+    for name, spec in files.items():
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise WeightsError(f"index entry '{key}' has an unsafe file name '{name}'")
+        if (spec or {}).get("extract") and _tar_parts(name) is None:
+            raise WeightsError(
+                f"index entry '{key}' marks '{name}' extract, but only a .tar, .tar.gz, "
+                ".tar.bz2 or .tar.xz unpacks"
+            )
     if dangling(key, root):  # mkdir raises FileExistsError on a link whose target is gone
         raise WeightsError(f"'{key}' is a relocated leaf whose target is gone; prune it first")
     d.mkdir(parents=True, exist_ok=True)
+    for p in d.glob(".partial-*"):  # a dead run's leftovers: free the room first
+        if _abandoned(p.name):
+            _discard(p)
     have = ({} if force else _manifest_files(d)) or {}
     recorded: dict[str, Any] = {}
-    staged: dict[Path, Path] = {}  # partial -> the name it moves in as
+    moves: dict[Path, Path] = {}  # staged -> final
+    scratch: list[Path] = []  # removed at the end, success or not
+
+    def unpacked(archive: Path, name: str, digest: str, top: str, mode: str) -> bool:
+        """Stage ``archive`` unpacked; False when this Python lacks its codec."""
+        tree = d / f".partial-{os.getpid()}-{name}.d"
+        scratch.append(tree)
+        try:
+            _unpack(archive, top, mode, tree)
+        except tarfile.CompressionError as exc:  # minimal builds (Buildroot, Yocto)
+            log(f"  {name}: left packed ({exc}); unpack it beside the model files")
+            return False
+        except Exception as exc:  # noqa: BLE001 - codec errors, refused members
+            raise WeightsError(f"'{key}' {name}: cannot unpack: {exc}") from None
+        moves[tree / top] = d / top
+        recorded[name] = {"sha256": digest, "unpacked": top}
+        log(f"  {name}: unpacked to {top}/")
+        return True
+
     try:
         for name, spec in files.items():
-            url = str((spec or {}).get("url") or "")
-            want = (spec or {}).get("sha256")
+            spec = spec or {}
+            url = str(spec.get("url") or "")
+            want = spec.get("sha256")
             dest = d / name
             prior = have.get(name) or {}
-            if dest.exists() and want and prior.get("sha256") == want:
-                recorded[name] = prior
-                log(f"  {name}: already fetched")
+            tar = _tar_parts(name) if spec.get("extract") else None
+            was_unpacked = bool(tar) and prior.get("unpacked") == tar[0]
+            landed = d / tar[0] if was_unpacked else dest
+            if landed.exists() and want and prior.get("sha256") == want:
+                # Left packed (no codec then, or an older fetch): unpack in place, no download.
+                if not (tar and not was_unpacked and unpacked(dest, name, want, *tar)):
+                    recorded[name] = prior
+                    log(f"  {name}: already fetched")
                 continue
             part = d / f".partial-{os.getpid()}-{name}"
-            # One a crashed run left under a reused pid may be a link: never written through.
+            # A reused pid's leftover may be a link: open("wb") would write through it.
             part.unlink(missing_ok=True)
             scheme = urllib.parse.urlsplit(url).scheme
             if scheme == "file":
@@ -392,16 +495,18 @@ def fetch(
                     raise WeightsError(
                         f"'{key}' {name}: sha256 mismatch (index {want[:12]}..., file {digest[:12]}...)"
                     )
-                staged[part] = dest
-                part.symlink_to(src)  # link, not copy: the source stays the one copy on disk
-                recorded[name] = {"sha256": digest, "linked": str(src)}
-                log(f"  {name}: linked -> {src}")
+                if not (tar and unpacked(src, name, digest, *tar)):
+                    scratch.append(part)
+                    part.symlink_to(src)  # link, not copy: the source stays the one copy on disk
+                    moves[part] = dest
+                    recorded[name] = {"sha256": digest, "linked": str(src)}
+                    log(f"  {name}: linked -> {src}")
             elif scheme in ("http", "https"):
                 if not want:
                     raise WeightsError(
                         f"'{key}' {name}: remote files must pin a sha256 in the index"
                     )
-                staged[part] = dest
+                scratch.append(part)
                 digester = hashlib.sha256()
                 total = 0
                 try:
@@ -415,7 +520,7 @@ def fetch(
                             if progress is not None:
                                 progress(name, total)
                         out.flush()
-                        os.fsync(out.fileno())  # on disk before a manifest can vouch for it
+                        os.fsync(out.fileno())  # durable before the manifest vouches for it
                 # A truncated chunked body raises IncompleteRead: HTTPException, NOT OSError.
                 except (OSError, http.client.HTTPException) as exc:
                     raise WeightsError(f"'{key}' {name}: download failed: {exc}") from None
@@ -424,30 +529,38 @@ def fetch(
                     raise WeightsError(
                         f"'{key}' {name}: sha256 mismatch after download "
                         f"(index {want[:12]}..., got {digest[:12]}...); refusing to install "
-                        "(most likely the file changed after the index was made)"
+                        "(a damaged download, or an index older than the file)"
                     )
-                recorded[name] = {"sha256": digest}
                 log(f"  {name}: fetched {total / 1e6:.1f} MB")
+                if not (tar and unpacked(part, name, digest, *tar)):
+                    moves[part] = dest
+                    recorded[name] = {"sha256": digest}
             else:
                 raise WeightsError(
                     f"'{key}' {name}: unsupported url '{url or '<missing>'}' (need http(s):// or file://)"
                 )
-        if staged:
+        if moves:
             (d / MANIFEST).unlink(missing_ok=True)  # a crash among the moves reads as not fetched
-            for part, dest in staged.items():
-                os.replace(part, dest)
-    finally:  # covers Ctrl-C too; a no-op for a partial that has moved in
-        for part in staged:
-            part.unlink(missing_ok=True)
+            for staged, final in moves.items():
+                if staged.is_dir():
+                    _discard(final)  # os.replace cannot replace a non-empty directory
+                os.replace(staged, final)
+    finally:  # covers Ctrl-C too; a no-op for what has moved in
+        for path in scratch:
+            _discard(path)
     payload: dict[str, Any] = {"key": key, "fetched_unix": int(time.time()), "files": recorded}
     if managed_by:
         payload["managed_by"] = managed_by
     _write_json(d / MANIFEST, payload)
-    # A file dropped by a later revision of the entry would poison <stem>.* resolution
-    # forever. Sweep AFTER the manifest write: a fetch that raised deletes nothing.
+    # Sweep what the entry no longer names (a stale <stem>.* would shadow resolution),
+    # after the manifest write so a failed fetch deletes nothing. An archive's directory
+    # stays (unpacked here or by hand); the archive itself goes once unpacked.
+    kept = {n for n, r in recorded.items() if not r.get("unpacked")} | {
+        t[0] for n, s in files.items() if (s or {}).get("extract") and (t := _tar_parts(n))
+    }
     for p in d.iterdir():
         # Another fetcher's partial (or its manifest temp) is its business, not stale.
-        if p.name == MANIFEST or p.name in recorded or p.name.startswith((".partial-", MANIFEST + ".")):
+        if p.name == MANIFEST or p.name in kept or p.name.startswith((".partial-", MANIFEST + ".")):
             continue
         try:
             if p.is_dir() and not p.is_symlink():

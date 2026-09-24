@@ -48,6 +48,9 @@ def _fetch_one(key: str, entry: dict[str, Any], *, force: bool, yes: bool, root:
     if entry.get("source"):
         line += f"  ({entry['source']})"
     print(line)
+    if entry.get("deprecated"):  # still installs: configs may name it
+        new = w.renamed_to(entry)
+        print(f"  DEPRECATED: renamed to {new}, name that instead" if new else "  DEPRECATED")
     if entry.get("accept"):  # e.g. a non-commercial license notice
         print(f"  NOTICE: {entry['accept']}")
         _confirm("  Accept and download?", yes, f"'{key}' requires accepting its notice")
@@ -85,8 +88,12 @@ def _report(keys: list[str], failed: dict[str, str], skipped: dict[str, str]) ->
 
 
 def _fetch(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
-    # A key that resolves to nothing is a typo in the command: said before any download.
-    keys = list(dict.fromkeys(_resolve_key(t, index, "try: nanobot-voice list") for t in args.keys))
+    # Resolved before any download, so a typo fails fast. Prefixes match current keys
+    # only: an alias answers to its exact name.
+    current = {k: e for k, e in index.items() if not e.get("deprecated")}
+    keys = list(dict.fromkeys(
+        t if t in index else _resolve_key(t, current, "try: nanobot-voice list") for t in args.keys
+    ))
     failed = _fetch_all(keys, index, force=args.force, yes=args.yes, root=root)
     if len(keys) == 1 and failed:
         raise w.WeightsError(failed[keys[0]])
@@ -240,7 +247,7 @@ def _fmt_mb(n: int) -> str:
 
 def _list(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     have = w.installed(root)
-    keys = sorted(set(index) | set(have))
+    keys = sorted({k for k, e in index.items() if not e.get("deprecated")} | set(have))
     shown = 0
     for key in keys:
         entry = index.get(key)
@@ -255,6 +262,8 @@ def _list(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
         notes = [s for s in ((entry or {}).get("license"), " ".join(langs) or None) if s]
         if entry is None:
             notes.append("not in index")
+        elif entry.get("deprecated"):
+            notes.append(f"renamed to {new}" if (new := w.renamed_to(entry)) else "deprecated")
         print(f"{key:<44} [{status}]" + (f"  {' | '.join(notes)}" if notes else ""))
         shown += 1
     if not shown:

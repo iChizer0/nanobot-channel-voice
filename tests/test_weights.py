@@ -10,6 +10,9 @@ import hashlib
 import io
 import json
 import os
+import sys
+import tarfile
+import threading
 import urllib.request
 
 import pytest
@@ -321,6 +324,116 @@ def test_a_partial_left_under_this_pid_is_never_written_through(store, monkeypat
     entry = {"files": {"model.onnx": {"url": "https://x.test/m", "sha256": hashlib.sha256(blob).hexdigest()}}}
     w.fetch("vad/firered/onnx", entry)
     assert src.read_bytes() == b"the user's own copy" and (d / "model.onnx").read_bytes() == blob
+
+
+def test_a_fetch_first_frees_what_a_dead_run_left(store, tmp_path):
+    """A dead pid's partials (a crash, a power cut) go before the download: a key with no
+    manifest cannot be pruned. A live fetcher's stay."""
+    src = _src(tmp_path, "encoder.onnx")
+    d = w.store_dir("stt/m/onnx")
+    (d / ".partial-4194305-pack.tar.bz2.d" / "espeak-ng-data").mkdir(parents=True)  # above any pid_max
+    (d / ".partial-4194305-decoder.onnx").write_bytes(b"x")
+    live = d / f".partial-{os.getppid()}-decoder.onnx"
+    live.write_bytes(b"y")
+    w.fetch("stt/m/onnx", _entry_for(src))
+    assert sorted(p.name for p in d.iterdir()) == sorted([w.MANIFEST, live.name, "encoder.onnx"])
+
+
+def _tar(members: dict) -> bytes:
+    """A .tar.bz2 of name -> bytes (a file), None (a directory) or a str (a link to it)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:bz2") as tar:
+        for name, body in members.items():
+            info = tarfile.TarInfo(name)
+            if body is None:
+                info.type = tarfile.DIRTYPE
+            elif isinstance(body, str):
+                info.type, info.linkname = tarfile.SYMTYPE, body
+            else:
+                info.size = len(body)
+            tar.addfile(info, io.BytesIO(body) if isinstance(body, bytes) else None)
+    return buf.getvalue()
+
+
+def _packed(served, pack, name="espeak-ng-data.tar.bz2"):
+    """An entry of one ``extract`` archive, served at https://x.test/pack."""
+    served["https://x.test/pack"] = pack
+    sha = hashlib.sha256(pack).hexdigest()
+    return {"files": {name: {"url": "https://x.test/pack", "sha256": sha, "extract": True}}}
+
+
+def test_an_extract_archive_lands_as_the_directory_it_unpacks_to(store, monkeypatch, tmp_path):
+    """The directory stays, the archive does not: a refetch downloads nothing, a new
+    revision replaces the directory whole, and a local archive unpacks rather than links."""
+    served, calls = {}, []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
+    key = "tts/m/rknn.rv1126b"
+    v1 = _packed(served, _tar({"espeak-ng-data": None, "espeak-ng-data/phondata": b"v1", "espeak-ng-data/voices/!v/adam": b"a"}))
+    d = w.fetch(key, v1)
+    assert sorted(p.name for p in d.iterdir()) == [w.MANIFEST, "espeak-ng-data"]
+    assert (d / "espeak-ng-data" / "phondata").read_bytes() == b"v1"
+    assert json.loads((d / w.MANIFEST).read_text())["files"]["espeak-ng-data.tar.bz2"]["unpacked"] == "espeak-ng-data"
+    w.fetch(key, v1)
+    assert len(calls) == 1 and (d / "espeak-ng-data" / "voices").is_dir()
+    w.fetch(key, _packed(served, _tar({"espeak-ng-data/phondata": b"v2"})))
+    assert (d / "espeak-ng-data" / "phondata").read_bytes() == b"v2"
+    assert not (d / "espeak-ng-data" / "voices").exists()  # replaced whole, never merged
+    src = tmp_path / "espeak-ng-data.tar.bz2"
+    src.write_bytes(_tar({"espeak-ng-data/phondata": b"local"}))
+    local = {"files": {src.name: {"url": src.as_uri(), "extract": True}}}
+    unpacked = w.fetch("tts/l/onnx", local) / "espeak-ng-data"
+    assert not unpacked.is_symlink() and (unpacked / "phondata").read_bytes() == b"local"
+
+
+def test_an_archive_unpacks_in_one_pass(tmp_path):
+    """A pipe reads forward only: listing then extracting would seek back, which in a
+    compressed stream means decompressing it twice."""
+    pipe = tmp_path / "espeak-ng-data.tar.bz2"
+    os.mkfifo(pipe)
+    pack = _tar({"espeak-ng-data/phondata": b"v1"})
+    writer = threading.Thread(target=pipe.write_bytes, args=(pack,), daemon=True)
+    writer.start()
+    w._unpack(pipe, *w._tar_parts(pipe.name), tmp_path / "out")
+    writer.join(timeout=10)
+    assert (tmp_path / "out" / "espeak-ng-data" / "phondata").read_bytes() == b"v1"
+
+
+def test_an_archive_must_make_one_directory_of_files(store, monkeypatch):
+    """A member beside the directory, one escaping it, or a link fails the key and leaves
+    nothing; so does extract on a name that is no tar archive."""
+    served = {}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(served[url]))
+    for members in (
+        {"espeak-ng-data/a": b"x", "tokens.txt": b"beside"},
+        {"espeak-ng-data/../../escaped": b"x"},
+        {"espeak-ng-data/phondata": "/etc/passwd"},
+    ):
+        with pytest.raises(w.WeightsError, match="espeak-ng-data.tar.bz2: cannot unpack: it holds"):
+            w.fetch("tts/m/onnx", _packed(served, _tar(members)))
+        assert list(w.store_dir("tts/m/onnx").iterdir()) == []
+    with pytest.raises(w.WeightsError, match="marks 'pack.zip' extract, but only a .tar"):
+        w.fetch("tts/m/onnx", _packed(served, b"zip", name="pack.zip"))
+
+
+def test_a_python_without_the_codec_installs_the_archive_packed(store, monkeypatch):
+    """Without bz2 (minimal builds) the archive installs packed and a hand-unpacked
+    directory survives refetches; once the codec exists, a fetch unpacks it in place
+    without downloading."""
+    served, calls = {}, []
+    entry = _packed(served, _tar({"espeak-ng-data/phondata": b"v1"}))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
+    monkeypatch.setitem(sys.modules, "bz2", None)
+    lines = []
+    d = w.fetch("tts/m/onnx", entry, log=lines.append)
+    assert (d / "espeak-ng-data.tar.bz2").read_bytes() == served["https://x.test/pack"]
+    assert any("left packed (bz2 module is not available)" in line for line in lines)
+    (d / "espeak-ng-data").mkdir()  # unpacked by hand
+    w.fetch("tts/m/onnx", entry)
+    assert (d / "espeak-ng-data").is_dir() and (d / "espeak-ng-data.tar.bz2").is_file()
+    sys.modules.pop("bz2")  # the codec arrives
+    w.fetch("tts/m/onnx", entry)
+    assert (d / "espeak-ng-data" / "phondata").read_bytes() == b"v1"
+    assert not (d / "espeak-ng-data.tar.bz2").exists() and len(calls) == 1
 
 
 def test_fetch_http_requires_a_pinned_sha256(store):
@@ -838,6 +951,23 @@ def test_cli_fetch_of_several_keys_goes_past_one_that_fails(store, tmp_path, cap
     assert cli_main(["--index", index, "fetch", "tts/b/onnx", "tts/b"]) == 2  # one key, named twice
     out, err = capsys.readouterr()
     assert err.startswith("error: 'tts/b/onnx' encoder.onnx: sha256 mismatch") and "failed" not in out
+
+
+def test_a_renamed_keys_alias_installs_but_nothing_offers_it(store, tmp_path, capsys):
+    """An alias installs by its exact name, noting its new key; prefixes and the list mean
+    current keys, the alias listed once installed."""
+    src = _src(tmp_path, "model.onnx")
+    new, old = "vad/silero/v6/onnx", "vad/silero/onnx"
+    index = _write_index(tmp_path, {new: _entry_for(src), old: {**_entry_for(src), "deprecated": True, "renamed_to": new}})
+    assert cli_main(["--index", index, "list"]) == 0
+    out = capsys.readouterr().out
+    assert new in out and old not in out
+    assert cli_main(["--index", index, "fetch", "vad/silero"]) == 0  # not ambiguous
+    assert set(w.installed()) == {new}
+    assert cli_main(["--index", index, "fetch", old]) == 0
+    assert f"  DEPRECATED: renamed to {new}, name that instead" in capsys.readouterr().out
+    assert cli_main(["--index", index, "list"]) == 0
+    assert f"renamed to {new}" in capsys.readouterr().out
 
 
 def test_cli_sync_leaves_an_installed_key_this_index_does_not_carry(store, tmp_path, capsys):

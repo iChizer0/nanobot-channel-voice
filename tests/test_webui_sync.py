@@ -170,6 +170,28 @@ def test_one_pill_per_stem_with_the_builds_as_a_second_level(store):
     ]
 
 
+def test_a_renamed_keys_alias_is_no_pill_and_says_where_it_went(store):
+    """As a pill an alias would sort first, so the Silero pick would write it. A config
+    still naming it shows it under Custom, with help naming the new key."""
+    new, old = "vad/silero/v6/rknn.rv1126b", "vad/silero/rknn.rv1126b"
+    files = {"m.rknn": {"url": "https://x/s", "sha256": "0" * 64}}
+    _cache(store, {new: {"files": files}, old: {"files": files, "deprecated": True, "renamed_to": new}})
+
+    def fields(section):
+        cfg = VoiceConfig.model_validate({"device": "rv1126b", **section})
+        return {f["key"]: f for s in build_form(cfg)["sections"] for f in s["fields"]}
+
+    silero = next(c for c in fields({"vad": {"engine": "firered"}})["vad.engine"]["choices"] if c["value"] == "silero")
+    assert silero["sets"]["vad.silero.weights"] == new
+    picked = fields({"vad": {"engine": "silero"}})["vad.silero.weights"]
+    assert [c["value"] for c in picked["choices"]] == [new] and "renamed" not in picked["help"]
+    kept = fields({"vad": {"engine": "silero", "silero": {"weights": old}}})["vad.silero.weights"]
+    assert kept["value"] == old and [c["value"] for c in kept["choices"]] == [new]
+    assert kept["help"] == (
+        f"The index renamed this model to `{new}` and drops the old key later: pick it here to move over."
+    )
+
+
 def test_host_platforms_follow_the_device_alone():
     """One definition: CPU builds always, the RKNN build for the SoC the section names."""
     assert w.host_platforms(None) == ("onnx",)
@@ -599,7 +621,7 @@ def test_a_model_that_fails_does_not_keep_the_others_off_the_device(store, monke
         run_sync(plan, index, store, managed_by=MANAGED_BY, progress=lambda _key, _name, done: seen.append(done))
     message = str(failed.value)
     assert message.startswith("'tts/matcha/zh-en/rknn.rv1126b' decoder.rknn: sha256 mismatch after download")
-    assert "changed after the index was made" in message and message.endswith("(2 of 3 fetched)")
+    assert "an index older than the file" in message and message.endswith("(2 of 3 fetched)")
     assert set(w.installed(store)) == {"stt/whisper/base/onnx", "vad/silero/v6/onnx", "tts/mms/en/onnx"}
     assert seen == sorted(seen) and seen[-1] == 170
     again = plan_sync(section, index, store, managed_by=MANAGED_BY)

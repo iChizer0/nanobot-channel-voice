@@ -607,6 +607,11 @@ def _field(dumped: dict[str, Any], path: str, store: Store | None = None) -> dic
             help_text = _wake_field(field, dumped, store, models, help_text)
             if _lookup(dumped, "wake.engine") != "openwakeword":
                 value = None  # a key without the engine is not the tier in force
+        if value and (new := w.renamed_to((store.index or {}).get(value))):
+            help_text = (
+                f"The index renamed this model to `{new}` and drops the old key later: "
+                "pick it here to move over."
+            )
     if path == "wake.phrases" and _lookup(dumped, "wake.engine") == "openwakeword":
         assert store is not None
         help_text = _phrase_help(_lookup(dumped, "wake.openwakeword.weights"), value or [], store) or help_text
@@ -857,11 +862,14 @@ def _weights_choices(prefix: str, store: Store) -> list[dict[str, Any]]:
     """The store keys a weights field can take here, one pill per stem: the cached index's
     entries under ``prefix`` for a platform the section runs, plus whatever is installed
     under it. A stem with several builds carries them as ``builds`` (CPU first, the device
-    build last and the pill's own value, so it is the default); the languages ride along."""
+    build last and the pill's own value, so it is the default); the languages ride along.
+    Deprecated aliases are no pills: they duplicate a model, and an engine pick takes the
+    first pill."""
     index = store.index or {}
     keys = {
         k for k in set(index) | set(store.installed)
         if k.startswith(prefix) and w.key_platform(k) in store.platforms
+        and not (index.get(k) or {}).get("deprecated")
     }
     by_stem: dict[str, list[str]] = {}
     for key in keys:
