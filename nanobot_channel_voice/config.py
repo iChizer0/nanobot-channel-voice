@@ -1277,9 +1277,11 @@ class VoiceConfig(_VoiceBase):
 
     @model_validator(mode="after")
     def _engines_support_rate(self) -> VoiceConfig:
-        """Every EXPLICITLY selected engine must run at the configured capture rate:
+        """Every EXPLICITLY selected engine must run at the local pipeline's capture rate:
         statically knowable, and the runtime alternative is a silent downgrade (the energy
         VAD, silence-only endpointing, transcript-only wake) behind one log line."""
+        if self.backend != "local":
+            return self  # rate unread: a gated uplink captures at 16 kHz, served STT resamples
         rate = self.audio.sample_rate
         selected = (
             ("vad.engine", self.vad.engine,

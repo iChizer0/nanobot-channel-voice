@@ -170,6 +170,11 @@ def test_vad_engine_rate_mismatch_is_rejected_at_parse_time():
     VoiceConfig.model_validate({"vad": {"engine": "webrtc"}, "audio": {"sampleRate": 48000}})
     VoiceConfig.model_validate({"vad": {"engine": "silero"}, "audio": {"sampleRate": 16000}})
     VoiceConfig.model_validate({"vad": {"engine": "silero"}, "audio": {"sampleRate": 8000}})
+    # A cloud backend never captures at audio.sampleRate: the gate runs its detectors at 16 kHz.
+    VoiceConfig.model_validate({
+        "backend": "gemini", "vad": {"engine": "silero"}, "audio": {"sampleRate": 48000},
+        "realtime": {"uplink": "vad"},
+    })
 
 
 def test_silero_hysteresis_pair_is_ordered_at_parse_time():
