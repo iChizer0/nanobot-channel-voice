@@ -851,8 +851,10 @@ class BargeInConfig(_VoiceBase):
     # What the confirm window does to live playback. "duck": attenuate by duckDb and keep
     # playing (a false alarm is barely audible). "pause": stop the stream and resume where it
     # left off on a false verdict — the bot's leak vanishes from the mic during the user's
-    # utterance, at the cost of a confirm-window-long silent gap on a false alarm. Stream-mode
-    # open-mic only; blob mode keeps the static duckDb bake.
+    # utterance, at the cost of a confirm-window-long silent gap on a false alarm. Under
+    # wake.mode="strict" with echo cancellation it pauses only while the phrase can still come:
+    # an utterance's first 2.5 s, or a shorter one until its verdict. Stream-mode open-mic only;
+    # blob mode keeps the static duckDb bake.
     mode: Literal["duck", "pause"] = "duck"
     # Early-confirm bar: a decode holding this many words that are neither our own TTS (echo)
     # nor ack phrases confirms the interrupt before the endpoint verdict — streaming partials
@@ -993,12 +995,14 @@ class WakeConfig(_VoiceBase):
 
     ``mode="gate"``: a cold start needs the wake phrase; once engaged, follow-ups and barge-in
     stay natural for ``windowS`` after each turn. ``mode="strict"`` additionally requires the
-    phrase to interrupt a live reply (non-wake speech neither ducks nor stops it) and gates
-    speech while the agent is WORKING once the window is shut — the posture for public rooms,
-    where a hit is the whole barge-in verdict. Detection is two-tier: the transcript prefix
-    (``phrases``, any language the STT covers) always counts, ``engine="openwakeword"`` adds an
-    acoustic detector that hears through the bot's own playback. A leading wake phrase is
-    stripped from the published text, repeats included ("小娜小娜" is one summon); an utterance
+    phrase to interrupt a live reply (non-wake speech never stops it; under echo cancellation,
+    ``bargeIn.mode="pause"`` pauses it for an utterance's first 2.5 s, or a shorter one until
+    its verdict, so the phrase is heard clear of the canceller's double-talk suppression) and
+    gates speech while the agent is WORKING once the window is shut — the posture for public
+    rooms, where a hit is the whole barge-in verdict. Detection is two-tier: the transcript
+    prefix (``phrases``, any language the STT covers) always counts, ``engine="openwakeword"``
+    adds an acoustic detector that hears through the bot's own playback. A leading wake phrase
+    is stripped from the published text, repeats included ("小娜小娜" is one summon); an utterance
     that is ONLY the phrase publishes nothing and just opens the attention window, silently
     unless ``ack`` speaks. A bare summon while the agent is WORKING never cancels the query.
     Half-duplex contract: detection trails the phrase and the mic-reopen flush discards audio up

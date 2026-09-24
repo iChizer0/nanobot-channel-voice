@@ -135,6 +135,12 @@ class Endpointer:
         the way a wall clock would."""
         return (self._frames - self._silence_run) * self._frame_ms
 
+    @property
+    def elapsed_ms(self) -> int:
+        """Audio since the confirming run's first frame, pauses included (frame-domain, as
+        ``last_speech_ms``)."""
+        return self._frames * self._frame_ms
+
     def eager_still_current(self) -> bool:
         """No speech since the eager snapshot, so that decode still describes the whole
         utterance (mirror of the consult tier's ``_consult_active`` pin)."""

@@ -123,7 +123,8 @@ _FALSE_WARN_N = 10
 _LEAK_REASONS = frozenset({"probe", "partial", "eager", "echo", "empty"})
 
 # A wake hit binds to the utterance whose VAD onset it follows within this window (detection
-# trails the phrase's END, the onset precedes its START). An unconsumed hit goes stale.
+# trails the phrase's END, the onset precedes its START). An unconsumed hit goes stale, and
+# strict's pause-mode wake probe lets the reply play on.
 _WAKE_ATTACH_S = 2.5
 
 # Floor on the wake echo veto's lookback: TTS this recent may still sit in the acoustic
@@ -824,8 +825,9 @@ class LocalBackend(TurnEventMixin):
         self._min_fresh_words = config.barge_in.min_words
         # Wake-word gate: "gate" requires the phrase to START a conversation from cold (window
         # shut); "strict" additionally to barge into a live reply (while SPEAKING, non-wake
-        # speech neither ducks nor confirms — hit-or-ignore) and to steer a shut-window THINKING
-        # turn. Two tiers feed one claim: the acoustic detector (hop) and the transcript prefix.
+        # speech never confirms and ducks only as pause mode's wake probe — hit-or-ignore) and
+        # to steer a shut-window THINKING turn. Two tiers feed one claim: the acoustic detector
+        # (hop) and the transcript prefix.
         wake_phrase = (
             WakePhrase(self._wake_entries()) if config.wake.mode != "off" else None
         )
@@ -1318,6 +1320,14 @@ class LocalBackend(TurnEventMixin):
                 <= self._leak_death_ms
             ):
                 await self._drop_candidate("probe")
+        if (
+            self._wake_probe()
+            and self._candidate_contested()
+            and self._endpointer.elapsed_ms >= _WAKE_ATTACH_S * 1000.0
+        ):
+            # The wake probe heard no leading phrase: the reply plays over the rest.
+            self._release_duck("unwoken")
+            self._acquitted_open = True
         if self._stt_stream is not None:
             # Streaming: the transcript materializes by finishing THIS utterance's own handle;
             # taking it OUT of the slot isolates the finish thread from the next utterance.
@@ -1922,9 +1932,10 @@ class LocalBackend(TurnEventMixin):
                             and not self._preempted
                             and not self._early_confirm
                             and utterance is None
+                            and not self._unclaimed_strict()  # only the phrase confirms it
                         )
-                        # Strict mode's text-tier unlock: with no claim nothing can engage,
-                        # so partials are scanned for the wake prefix, not fresh words.
+                        # Strict mode's text-tier unlock: an unclaimed candidate confirms on
+                        # the wake prefix alone, so partials are scanned for it, not fresh words.
                         poll_wake = (
                             self._wake_mode == "strict"
                             and not self._wake_claimed
@@ -2787,11 +2798,10 @@ class LocalBackend(TurnEventMixin):
             and (self._duck_gain < 1.0 or self._duck_pause)
             # Strict: unclaimed speech over a live reply never ducks, so the reply plays
             # through crowds and the duck/acquit machinery stays cold until a hit claims the
-            # utterance. Canned audio (filler/ack) is not a reply and yields to anyone.
+            # utterance, save pause mode's wake probe while the phrase can still come.
             and (
-                self._wake_mode != "strict"
-                or self._wake_claimed
-                or self._canned_base is not None
+                not self._unclaimed_strict()
+                or (self._wake_probe() and self._endpointer.elapsed_ms < _WAKE_ATTACH_S * 1000.0)
             )
             # The fast ack plays inside the summon's trailing hangover: stale in-speech is not
             # the user talking; the first fresh speech frame zeroes silence_run and re-arms.
@@ -2802,6 +2812,25 @@ class LocalBackend(TurnEventMixin):
             )
             # Post-acquittal holdoff: resumed playback re-leaks and the loop flaps at ~1 Hz.
             and time.monotonic() >= self._probe_holdoff_until
+        )
+
+    def _unclaimed_strict(self) -> bool:
+        """Strict mode over speech no phrase has claimed: only the phrase may confirm it.
+        Canned audio (filler/ack) is not a reply and yields to anyone."""
+        return (
+            self._wake_mode == "strict" and not self._wake_claimed and self._canned_base is None
+        )
+
+    def _wake_probe(self) -> bool:
+        """Unclaimed strict speech begun over the reply, under pause and a real canceller, whose
+        double-talk suppression can hide the phrase: paused from the onset (soft duplex hears
+        the raw mix, as the half-duplex tap does)."""
+        return (
+            self._unclaimed_strict()
+            and self._duck_pause
+            and self._full_duplex
+            and self._endpointer.in_speech
+            and self._onset_speaking
         )
 
     def _engage_duck(self, *, suspect: bool) -> None:
@@ -2854,16 +2883,10 @@ class LocalBackend(TurnEventMixin):
             or not self._endpointer.in_speech  # closed: the endpoint verdict owns it
         ):
             return
-        if (
-            self._wake_mode == "strict"
-            and not self._wake_claimed
-            and self._wake_phrase is not None
-            and self._turn is VoiceState.SPEAKING
-            and self._canned_base is None  # canned audio takes the normal verdict
-        ):
+        if self._unclaimed_strict() and self._turn is VoiceState.SPEAKING:
             # Batch analog of the strict partial scan: an unclaimed candidate takes no
             # fresh-words verdict, only the wake-prefix unlock. Latch only; the loop vets.
-            if self._wake_strip_leaky(task.result() or "")[0]:
+            if self._wake_phrase is not None and self._wake_strip_leaky(task.result() or "")[0]:
                 self._wake_hit_at = time.monotonic()
                 self._wake_claimed = True
             return

@@ -13,7 +13,7 @@ import pytest
 from eval_harness import _FRAME, EvalConversation
 
 from nanobot_channel_voice.backend.base import VoiceState
-from nanobot_channel_voice.backend.local import _WAKE_ACK_FALLBACK, LocalBackend
+from nanobot_channel_voice.backend.local import _WAKE_ACK_FALLBACK, _WAKE_ATTACH_S, LocalBackend
 from nanobot_channel_voice.echo_reject import SelfEchoFilter
 from nanobot_channel_voice.wake.base import WakeDetector
 
@@ -606,6 +606,203 @@ def test_probe_drop_preserves_a_held_wake_claim():
             conv.backend._wake_hit_at = time.monotonic()
             await conv.backend._drop_candidate("probe")
             assert conv.backend._wake_claimed is True
+
+    _run(_case())
+
+
+# ---- strict + pause under echo cancellation: the wake probe -----------------
+
+_LONG_REPLY = " ".join([_REPLY] * 8)
+_PROBE_FRAMES = int(_WAKE_ATTACH_S * 1000) // 20
+
+
+def _strict_pause(aec: str = "hardware", mode: str = "pause") -> dict:
+    return {**_wake("strict"), "aec": aec, "bargeIn": {"mode": mode, "stopPhrases": ["stop"]}}
+
+
+async def _long_reply(conv: EvalConversation) -> None:
+    await conv.user_says("hey nanobot tell me a story")
+    await conv.agent_replies(_LONG_REPLY)
+    await conv.wait_state(VoiceState.SPEAKING)
+    await conv.wait_played_ms(30)
+
+
+class _PartialStt:
+    """Streaming stand-in: every partial and the finish read ``text``."""
+
+    streaming = True
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def stream_start(self):
+        return SimpleNamespace(accept=lambda frame: None, partial=lambda: self.text, finish=lambda: self.text)
+
+
+def test_strict_pause_probe_lets_the_phrase_be_heard_and_kill():
+    """A canceller's double-talk suppression can hide a phrase said over the reply: the pause
+    lets it be heard, and its hit kills as ever."""
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_strict_pause()) as conv:
+            await _long_reply(conv)
+            conv._stt.append("turn off the lights")
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            assert conv.sink.paused and conv.interrupts == 0
+            await _push_frames(conv, 5, fire_at=0, det=det)
+            await _close_utterance(conv)
+            assert conv.interrupts == 1 and conv.counter("barge_in_early_confirm") == 1
+            assert conv.texts()[-1].startswith("turn off the lights")
+
+    _run(_case())
+
+
+def test_strict_pause_probe_waits_for_the_onset():
+    """A residual blip under vad.startFrames never gaps the reply."""
+    async def _case():
+        async with EvalConversation(**_strict_pause()) as conv:
+            await _long_reply(conv)
+            await conv.user_noise(speech_frames=3, silence_frames=1)
+            assert not conv.sink.paused and conv.counter("barge_in_duck") == 0
+
+    _run(_case())
+
+
+def test_strict_pause_probe_resumes_without_the_phrase():
+    async def _case():
+        async with EvalConversation(**_strict_pause()) as conv:
+            await _long_reply(conv)
+            conv._stt.append("no no stop that")
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            assert conv.sink.paused
+            await _push_frames(conv, _PROBE_FRAMES)
+            assert not conv.sink.paused
+            await _push_frames(conv, 20)
+            assert not conv.sink.paused  # the rest of the utterance plays over it
+            await _close_utterance(conv)
+            assert conv.interrupts == 0 and conv.counter("wake_gated") == 1
+            assert conv.counter("barge_in_duck") == 1
+            assert conv.counter("barge_in_false_resume.unwoken") == 1
+
+    _run(_case())
+
+
+def test_strict_pause_probe_takes_no_fresh_words():
+    """The probe's candidate is unclaimed: partial words, a stop among them, never confirm."""
+    async def _case():
+        async with EvalConversation(wake_detector=_ScriptDetector(), **_strict_pause()) as conv:
+            await _long_reply(conv)
+            conv.backend._stt_stream = _PartialStt("please stop this now")
+            conv.vad.flag = True
+            await _push_frames(conv, 30)
+            assert conv.sink.paused and conv.counter("barge_in_early_confirm") == 0
+            await _close_utterance(conv)
+            assert conv.interrupts == 0 and conv.counter("wake_gated") == 1
+
+    _run(_case())
+
+
+def test_strict_pause_probe_eager_decode_never_confirms():
+    """Acoustic-only (no matchable prefix): the eager decode still takes no fresh words."""
+    async def _case():
+        async with EvalConversation(wake_detector=_ScriptDetector(), **_strict_pause()) as conv:
+            await _long_reply(conv)
+            b = conv.backend
+            b._wake_phrase = None
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            assert conv.sink.paused
+            task = asyncio.get_running_loop().create_future()
+            task.set_result("please stop this now")
+            b._eager_task, b._eager_valid = task, True
+            b._eager_confirm_cb(task)
+            assert not b._early_confirm
+
+    _run(_case())
+
+
+def test_strict_probe_needs_pause_over_echo_cancellation():
+    """Soft duplex hears the raw mix, as the half-duplex tap does, and duck mode keeps the
+    reply at full level for unclaimed speech: hit-or-ignore as before."""
+    async def _case(aec: str, mode: str) -> tuple[int, int]:
+        async with EvalConversation(**_strict_pause(aec, mode)) as conv:
+            await _long_reply(conv)
+            await conv.user_says("loud bystander chatter here")
+            return conv.counter("barge_in_duck"), conv.interrupts
+
+    assert _run(_case("soft", "pause")) == (0, 0)
+    assert _run(_case("hardware", "duck")) == (0, 0)
+
+
+def test_strict_pause_probe_skips_speech_begun_before_the_reply():
+    """Speech begun while the agent worked said its phrase, if any, before the reply."""
+    async def _case():
+        async with EvalConversation(**_strict_pause()) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            conv._stt.append("and make it short")
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            await conv.agent_replies(_LONG_REPLY)
+            await conv.wait_state(VoiceState.SPEAKING)
+            await _push_frames(conv, 5)
+            assert not conv.sink.paused and conv.counter("barge_in_duck") == 0
+            await _close_utterance(conv)
+
+    _run(_case())
+
+
+def test_strict_pause_probe_leaves_speech_begun_over_a_filler_to_its_verdict():
+    """The filler's pause carries into the reply: no probe, so no release at the bound, and
+    the in-window follow-up kills the reply at its verdict."""
+    async def _case():
+        async with EvalConversation(
+            **_strict_pause(), prologue={"enabled": True, "afterMs": 0, "phrases": ["x" * 400]},
+        ) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler
+            conv._stt.append("and make it short")
+            conv.vad.flag = True
+            await _push_frames(conv, 10)
+            assert conv.sink.paused
+            await conv.agent_replies(_LONG_REPLY)
+            await _push_frames(conv, _PROBE_FRAMES)
+            assert conv.sink.paused and conv.counter("barge_in_false_resume.unwoken") == 0
+            await _close_utterance(conv)
+            assert conv.interrupts == 1 and conv.texts()[-1] == "and make it short"
+
+    _run(_case())
+
+
+def test_pause_holds_for_the_verdict_outside_the_probe():
+    """Only strict's probe lets the reply play on at the bound, however long the utterance."""
+    async def _case(mode: str) -> tuple[bool, int]:
+        async with EvalConversation(**{**_strict_pause(), **_wake(mode)}) as conv:
+            await _long_reply(conv)
+            conv._stt.append("no no stop that")
+            conv.vad.flag = True
+            await _push_frames(conv, _PROBE_FRAMES + 10)
+            paused = conv.sink.paused
+            await _close_utterance(conv)
+            return paused, conv.interrupts
+
+    assert _run(_case("gate")) == _run(_case("off")) == (True, 1)
+
+
+def test_strict_pause_probe_never_engages_past_its_window():
+    async def _case():
+        async with EvalConversation(**_strict_pause()) as conv:
+            await _long_reply(conv)
+            conv.backend._probe_holdoff_until = float("inf")  # kept from its onset
+            conv._stt.append("loud bystander chatter here")
+            conv.vad.flag = True
+            await _push_frames(conv, _PROBE_FRAMES + 5)
+            conv.backend._probe_holdoff_until = 0.0
+            await _push_frames(conv, 5)
+            assert not conv.sink.paused and conv.counter("barge_in_duck") == 0
+            await _close_utterance(conv)
+            assert conv.counter("wake_gated") == 1
 
     _run(_case())
 
