@@ -193,6 +193,32 @@ def test_playback_ring_covers_the_sinks_write_ahead():
     assert opened["periodsize"] * opened["periods"] / 24000 * 1000 >= _PLAYBACK_LEAD_MS
 
 
+def test_capture_backlog_outlasts_the_uplink_unpark(monkeypatch):
+    """A gated uplink's un-park blocks the capture pump for up to its resume budget; a
+    shallower hand-off drops the middle of the first utterance after a park."""
+    from nanobot_channel_voice.audio.pyalsa import PyAlsaCapture
+    from nanobot_channel_voice.backend.transport import _RESUME_TIMEOUT_S
+
+    class _Pcm:
+        def read(self):
+            time.sleep(0.02)
+            return 320, b"\x00" * 640
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(PyAlsaCapture, "_open_pcm", lambda self: _Pcm())
+
+    async def _case():
+        cap = PyAlsaCapture("null", 16000, 20)
+        await cap.start()
+        depth_ms = cap._queue.maxsize * 20
+        await cap.stop()
+        return depth_ms
+
+    assert asyncio.run(_case()) >= _RESUME_TIMEOUT_S * 1000
+
+
 def test_capture_push_survives_a_loop_closed_under_the_reader():
     """The reader thread pushes OUTSIDE its device-error guard: an unguarded
     call_soon_threadsafe on a closed loop killed the thread with a bare traceback."""

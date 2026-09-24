@@ -31,6 +31,10 @@ _WIDTH_TO_FORMAT = {1: "PCM_FORMAT_U8", 2: "PCM_FORMAT_S16_LE", 4: "PCM_FORMAT_S
 # write-ahead underruns on any hiccup between blocks (libasound's default is 4 periods).
 _PLAYBACK_LEAD_MS = 240
 
+# Capture held while the pump stalls (a gated uplink's un-park blocks it up to 5 s), as
+# the arecord path's pipe and reader do; drop-oldest past it bounds latency.
+_CAPTURE_BACKLOG_MS = 6000
+
 
 def _playback_periods(rate: int, periodsize: int) -> int:
     period_ms = max(1, periodsize * 1000 // max(1, rate))
@@ -55,7 +59,7 @@ class PyAlsaCapture(CaptureSource):
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue(maxsize=50)  # ~1 s at 20 ms frames; drop-oldest bounds latency
+        self._queue = asyncio.Queue(maxsize=_CAPTURE_BACKLOG_MS // self._frame_ms)
         # On the executor (dsnoop setup can block); a bad/busy device must surface
         # later as b"", not raise out of start() and crash channel startup.
         try:
