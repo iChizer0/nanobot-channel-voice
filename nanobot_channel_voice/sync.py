@@ -168,9 +168,8 @@ def _free_bytes(root: Path) -> int:
 def _key_progress(
     progress: Callable[[str, str, int], None], key: str, base: int, files: dict[str, int],
 ) -> Callable[[str, int], None]:
-    """The per-file byte counts :func:`weights.fetch` reports (kept in ``files``), as one
-    rising number: the files this key has finished plus the one in flight, over the keys
-    before it."""
+    """:func:`weights.fetch`'s per-file byte counts (kept in ``files``) as one run total:
+    ``base`` plus this key's files so far."""
 
     def report(name: str, so_far: int) -> None:
         files[name] = so_far
@@ -189,12 +188,10 @@ def run_sync(
     progress: Callable[[str, str, int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> tuple[int, int]:
-    """Fetch, then remove; returns (bytes fetched, bytes freed). ``progress`` gets
-    (key, file name, bytes fetched so far by the whole run), which only rises;
-    ``should_stop`` is honoured between chunks, between keys and before the removals.
-    A model that fails does not keep the others off the device, and a run with any
-    failure removes nothing: a failed or stopped run leaves the store as it was, plus
-    whole models."""
+    """Fetch, then remove; returns (bytes fetched, bytes freed). ``progress(key, file,
+    run bytes)`` only rises; ``should_stop`` is honoured between chunks, between keys and
+    before the removals. A failing model stops no other; a failed or stopped run removes
+    nothing, leaving the store as it was plus whole models."""
     def check_stop() -> None:
         if should_stop is not None and should_stop():
             raise w.WeightsError("sync cancelled")
@@ -213,10 +210,9 @@ def run_sync(
             )
         except (w.WeightsError, OSError) as exc:
             if should_stop is not None and should_stop():
-                raise  # a cancel ends the run, naming the download it cut off
+                raise  # a cancel ends the run, with fetch's own message
             failed.append(str(exc))
-        # What it downloaded when that ran past the size declared (an index older than the
-        # file, or one declaring none), so the next key's count starts where this one's ended.
+        # A download can overrun the declared size (a stale index, none declared): never step back.
         done += max(plan.sizes[key], sum(files.values()))
     if failed:
         landed = len(plan.fetch) - len(failed)

@@ -61,9 +61,7 @@ def _fetch_one(key: str, entry: dict[str, Any], *, force: bool, yes: bool, root:
 def _fetch_all(
     keys: list[str], index: dict[str, Any], *, force: bool, yes: bool, root: Path,
 ) -> dict[str, str]:
-    """Fetch each key in turn, why each one that failed did. A failure (a stale index's
-    hash, a dead link, a notice not accepted) never keeps the rest off the device, and
-    leaves its own key as it was."""
+    """Fetch every key, returning the failures by key: one failure never stops the rest."""
     failed: dict[str, str] = {}
     for key in keys:
         try:
@@ -74,7 +72,7 @@ def _fetch_all(
 
 
 def _report(keys: list[str], failed: dict[str, str], skipped: dict[str, str]) -> None:
-    """Each key's outcome, last, so a long run ends on what did not land."""
+    """Per-key outcomes, printed last so a long run ends on what failed."""
     ok = len(keys) - len(failed) - len(skipped)
     print(f"{ok} ok, {len(failed)} failed" + (f", {len(skipped)} skipped" if skipped else ""))
     for key in keys:
@@ -144,9 +142,8 @@ def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
                 "(use: nanobot-voice prune --all)"
             )
         return 0
-    # The CLI fetches through its own loop: notices prompt here, and every named key is
-    # re-verified against its manifest (fetch is idempotent; --force refetches). A key the
-    # store holds but this index does not name stays as it is: it was fetched from another.
+    # Its own loop, not run_sync: notices prompt here and every named key is re-verified
+    # (fetch is idempotent). An installed key this index lacks came from another: skipped.
     skipped = {
         k: "installed, not in this index (not re-verified)"
         for k in plan.wanted if k not in index and k not in plan.unknown
@@ -157,7 +154,6 @@ def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     failed |= _fetch_all(listed, index, force=args.force, yes=args.yes, root=root)
     _report(plan.wanted, failed, skipped)
     if failed:
-        # A sync that failed removes nothing: the store is as it was, plus whole models.
         unpruned = ", nothing pruned" if args.prune and plan.prune else ""
         which = ", ".join(k for k in plan.wanted if k in failed)
         raise w.WeightsError(f"{len(failed)} of {len(plan.wanted)} weights failed: {which}{unpruned}")

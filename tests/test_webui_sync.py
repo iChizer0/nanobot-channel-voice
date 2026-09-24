@@ -595,11 +595,9 @@ def test_connector_reports_a_crashed_run_and_a_cancel_before_the_removals(store,
 
 
 def test_a_model_that_fails_does_not_keep_the_others_off_the_device(store, monkeypatch, server):
-    """A model whose download does not verify (the hash and size an index older than the
-    file still pins) fails alone: the ones after it are fetched, the bar only rises past
-    it though it ran over its declared size, the run names it and how many landed and
-    removes nothing, and the next Apply wants just it. A cancel stays the whole run's,
-    even landing as a model's failed download."""
+    """A model failing verification (stale pin and size) fails alone: the rest land, the
+    count never steps back though it overran, the error names it and how many landed,
+    nothing is removed, and the next plan wants just it. A cancel still ends the run."""
     index = _index(server, **{
         "stt/whisper/base/onnx": ("whisper-encoder.onnx", b"w" * 100),
         "tts/matcha/zh-en/rknn.rv1126b": ("matcha-decoder.rknn", b"m" * 50),
