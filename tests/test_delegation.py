@@ -397,3 +397,39 @@ def test_missing_tool_gateway_says_the_tool_mode_is_inert():
         assert warned == []
 
     run(_case())
+
+
+def test_supervisor_mode_warns_under_a_unified_session(monkeypatch):
+    """A delegated request is a bus turn too: in one shared session it can be folded into
+    another channel's turn, whose reply the delegation never collects. Direct mode runs
+    tools alone, no turns, so it stays quiet."""
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice import channel as channel_mod
+    from nanobot_channel_voice.config import VoiceConfig
+
+    monkeypatch.setattr(channel_mod, "unified_session", lambda: True)
+
+    class _Gateway:
+        async def get_tool_definitions(self):
+            return []
+
+    async def _case():
+        cfg = VoiceConfig.model_validate(
+            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+        )
+        channel = VoiceChannel(cfg, MessageBus(), tool_gateway=_Gateway())
+        warned: list[str] = []
+
+        class _Log:
+            def info(self, msg, *a): pass
+            def warning(self, msg, *a): warned.append(msg.format(*a))
+
+        channel.logger = _Log()  # type: ignore[assignment]
+        await channel._cloud_tools(True, "supervisor")
+        assert len(warned) == 1 and "unifiedSession" in warned[0]
+        warned.clear()
+        await channel._cloud_tools(True, "direct")
+        assert warned == []
+
+    run(_case())

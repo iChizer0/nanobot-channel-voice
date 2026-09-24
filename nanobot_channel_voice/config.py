@@ -74,6 +74,17 @@ def transcription_gap() -> str | None:
     return None
 
 
+def unified_session() -> bool:
+    """Whether nanobot runs every channel's turns in one session
+    (``agents.defaults.unifiedSession``); False when core's shape is unrecognized."""
+    try:
+        from nanobot.config.loader import load_config
+
+        return load_config().agents.defaults.unified_session is True
+    except Exception:  # noqa: BLE001 - a core without the setting simply gets no check
+        return False
+
+
 def parse_import_blob(raw: Any) -> dict[str, Any]:
     """Parse the WebUI ``importJson`` paste into a plain section dict: the bare
     ``channels.voice`` object, or one still wrapped in ``{"channels": {"voice": ...}}`` /

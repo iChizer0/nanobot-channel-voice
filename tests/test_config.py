@@ -780,6 +780,28 @@ def test_transcription_gap_reports_an_unusable_delegate():
                 del sys.modules[name]
 
 
+def test_unified_session_reads_core_and_tolerates_a_core_without_it(tmp_path, monkeypatch):
+    """``agents.defaults.unifiedSession`` exactly as core's own loader reads it, core's
+    default without a file; a loader that fails reads as off, never as a false alarm."""
+    import nanobot.config.loader as loader
+
+    import nanobot_channel_voice.config as voice_config
+
+    path = tmp_path / "config.json"
+    monkeypatch.setattr(loader, "get_config_path", lambda: path)
+    assert voice_config.unified_session() is False  # no config file: core's default
+    path.write_text('{"agents": {"defaults": {"unifiedSession": true}}}')
+    assert voice_config.unified_session() is True
+    path.write_text('{"agents": {"defaults": {"unifiedSession": false}}}')
+    assert voice_config.unified_session() is False
+
+    def unreadable():
+        raise RuntimeError("config.json is not valid JSON")
+
+    monkeypatch.setattr(loader, "load_config", unreadable)
+    assert voice_config.unified_session() is False
+
+
 def test_the_model_index_is_https_or_a_file_named_absolutely(monkeypatch):
     """``index`` names where the on-device models come from, the built-in index unless
     set, empty for none; each entry an https URL or a file on this machine, named

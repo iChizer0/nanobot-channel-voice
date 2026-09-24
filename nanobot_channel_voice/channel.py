@@ -36,6 +36,7 @@ from nanobot_channel_voice.config import (
     consume_import_json,
     resolve_openai_key,
     transcription_gap,
+    unified_session,
 )
 from nanobot_channel_voice.context_tool import (
     VoiceContextBridge,
@@ -440,6 +441,7 @@ class VoiceChannel(BaseChannel):
                 # Nothing here binds to a loop — Queue/Event bind lazily on first use.
                 self._stt = await self._load(make_stt, self.config.stt)
                 self._warn_if_transcription_unconfigured()
+                await self._warn_if_unified_session()
                 shell, backend, tts, blocks = await self._load(self._build_local)
                 instructions, tools = "", []
                 if self._running:  # a cancelled start() must not register a dead bridge
@@ -795,6 +797,7 @@ class VoiceChannel(BaseChannel):
             self.logger.info(
                 "voice: supervisor tool mode, realtime model delegates reasoning to nanobot"
             )
+            await self._warn_if_unified_session()
             # Not execute_tool: a delegated request is a whole turn, driven over the bus.
             return [_SUPERVISOR_TOOL], self._delegate_to_nanobot
 
@@ -1026,6 +1029,20 @@ class VoiceChannel(BaseChannel):
                 "transcription, but {} — the channel will start and hear NOTHING. Configure "
                 "it, or set stt.provider to an on-device engine.",
                 gap,
+            )
+
+    async def _warn_if_unified_session(self) -> None:
+        """Voice owns the turns it publishes: a barge-in stops them, and it waits for their
+        reply. Core folds a message that lands mid-turn into the running turn, which in one
+        shared session crosses channels. Off the loop: the check parses the whole config."""
+        if await asyncio.to_thread(unified_session):
+            self.logger.warning(
+                "voice: agents.defaults.unifiedSession runs every channel in one session, so "
+                "turns cross channels: a message sent elsewhere while voice is mid-turn joins "
+                "that turn and is answered aloud, speech during another channel's turn is "
+                "answered there while voice waits for a reply that never comes, and a spoken "
+                "stop or a barge-in cancels whichever turn is running. Turn unifiedSession off "
+                "to keep each channel's turns its own."
             )
 
     def _drop_bridge(self) -> None:

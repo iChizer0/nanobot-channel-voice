@@ -182,6 +182,31 @@ def test_a_start_cancelled_mid_load_frees_the_adapter_that_lands_late(monkeypatc
         assert ch._stt is None
 
 
+def test_a_start_under_a_unified_session_warns_that_turns_cross_channels(monkeypatch):
+    """Under ``agents.defaults.unifiedSession`` core folds another channel's message into
+    the running voice turn, and a barge-in's /stop cancels theirs: the local start says so."""
+    from loguru import logger
+
+    from nanobot_channel_voice import channel as channel_mod
+
+    seen: list[str] = []
+    sink = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    try:
+        for unified in (False, True):
+            monkeypatch.setattr(channel_mod, "unified_session", lambda u=unified: u)
+            ch = _channel({"tts": {"enabled": False}}, monkeypatch, lambda cfg: _FakeStt())
+
+            async def run(ch=ch):
+                task = await _start_until(ch, lambda: ch._shell is not None)
+                await ch.stop()
+                await task
+
+            _run(run())
+            assert sum("unifiedSession" in m for m in seen) == (1 if unified else 0)
+    finally:
+        logger.remove(sink)
+
+
 def test_a_failed_start_releases_the_loaded_stt(monkeypatch):
     """A build or bind failure after the load re-raises AND frees the adapter, for both
     the local build and the serve endpoint."""
