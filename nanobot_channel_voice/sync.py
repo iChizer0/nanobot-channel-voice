@@ -60,21 +60,32 @@ def used_weights_keys(cfg: Any) -> set[str]:
     if local and cfg.tts.enabled:
         voice = getattr(cfg.tts, cfg.tts.provider, None)
         blocks += [voice, getattr(voice, "secondary", None)]
-    if cfg.wake.mode != "off" and cfg.wake.engine == "openwakeword" and (local or cfg.realtime.uplink == "wake"):
+    if _wake_listens(cfg):
         blocks.append(cfg.wake.openwakeword)
     return {block.weights for block in blocks if getattr(block, "weights", None)}
 
 
+def _wake_listens(cfg: Any) -> bool:
+    """The acoustic wake detector runs: locally, or as a cloud backend's wake gate."""
+    return cfg.wake.mode != "off" and cfg.wake.engine == "openwakeword" and (
+        cfg.backend == "local" or cfg.realtime.uplink == "wake"
+    )
+
+
 def backbone_wanted(cfg: Any, index: dict[str, dict[str, Any]]) -> str | None:
-    """The openWakeWord backbone a head of your own needs: named by no ``weights`` key, so
-    the structural scan misses it. The plan wants the build this host runs — the chip's
-    when the index carries it, else the CPU one — not whichever build happens to be
-    installed, which is the runtime's question (:func:`weights.backbone_key`)."""
+    """The openWakeWord feature models the detector runs, which no ``weights`` key names: the
+    NPU build when the index carries it, else the CPU one, None when the head's own package
+    is that build. What the host runs from the store is :func:`weights.backbone_key`."""
     oww = cfg.wake.openwakeword
-    if cfg.wake.mode == "off" or cfg.wake.engine != "openwakeword" or oww.weights or not oww.model_path:
+    if not _wake_listens(cfg) or oww.embedding_path or not (oww.weights or oww.model_path):
         return None
-    keys = [w.backbone_key_for(platform) for platform in w.host_platforms(oww.resolved_target)]
-    return next((k for k in reversed(keys) if k in index), keys[0])
+    platforms = w.backbone_platforms(oww.resolved_target, oww.weights)
+    for platform in reversed(platforms):
+        if oww.weights and w.key_platform(oww.weights) == platform:
+            return None
+        if (key := w.backbone_key_for(platform)) in index:
+            return key
+    return w.backbone_key_for(platforms[0])
 
 
 def voice_section(path: Path) -> dict[str, Any]:

@@ -271,7 +271,7 @@ def cached_index(
 
 
 # openWakeWord: every phrase head ships the same feature models (mel + embedding, one
-# pair per platform). A head of your own needs just that pair, so the index gains one
+# pair per platform), and any head runs on any platform's pair. So the index gains one
 # ``backbone`` entry per platform, derived from any head's files minus the head itself —
 # unless the index carries its own.
 WAKE_PREFIX = "wake/openwakeword/"
@@ -683,19 +683,36 @@ def backbone_key_for(platform: str) -> str:
     return f"{WAKE_PREFIX}{BACKBONE_STEM}/{platform}"
 
 
-def backbone_key(device: str | None, root: Path | None = None) -> str:
-    """The openWakeWord backbone package this host RUNS: the device build when the store
-    has it, else the CPU one (the head itself stays ONNX either way). What the store
-    should hold is the plan's question (:func:`sync.backbone_wanted`)."""
-    keys = [backbone_key_for(p) for p in host_platforms(device)]
-    have = installed(root)
-    return next((k for k in reversed(keys) if k in have), keys[0])
+def backbone_platforms(device: str | None, head: str | None = None) -> tuple[str, ...]:
+    """Builds the openWakeWord feature models may run in, CPU first: the device's, else
+    (no device named) the one the head comes in."""
+    own = key_platform(head) if head else "onnx"
+    return host_platforms(device) if device or own == "onnx" else ("onnx", own)
 
 
-def fill_engine_paths(block: Any) -> Any:
-    """Copy of an engine block with unset ``*_path`` fields resolved from the store dir
-    named by ``block.weights``; explicit paths always win."""
-    key = getattr(block, "weights", None)
+def backbone_key(device: str | None, head: str | None = None, root: Path | None = None) -> str:
+    """The key whose package supplies the openWakeWord feature models this host runs: the
+    NPU build when the store has it (``head``'s own package counts), else the CPU one,
+    else ``head``'s. What the store should hold is :func:`sync.backbone_wanted`."""
+
+    def have(key: str) -> bool:
+        try:
+            return _manifest_files(store_dir(key, root)) is not None
+        except WeightsError:  # a free-text block target spells no key
+            return False
+
+    for platform in reversed(backbone_platforms(device, head)):
+        if head is not None and key_platform(head) == platform and have(head):
+            return head
+        if have(key := backbone_key_for(platform)):
+            return key
+    return head or backbone_key_for("onnx")
+
+
+def fill_engine_paths(block: Any, key: str | None = None, fields: Sequence[str] | None = None) -> Any:
+    """Copy of an engine block with unset ``*_path`` fields (``fields``, default all) resolved
+    from the store dir of ``key`` (default ``block.weights``); explicit paths always win."""
+    key = key or getattr(block, "weights", None)
     if not key:
         return block
     d = store_dir(key)
@@ -703,7 +720,7 @@ def fill_engine_paths(block: Any) -> Any:
     if known is None:
         raise NotFetchedError(key)
     updates: dict[str, str] = {}
-    for name in type(block).model_fields:
+    for name in type(block).model_fields if fields is None else fields:
         if not name.endswith("_path") or getattr(block, name) is not None:
             continue
         # Manifest-recorded names only: a hand-dropped file must not shadow the entry.
@@ -729,17 +746,29 @@ def fill_engine_paths(block: Any) -> Any:
     return block.model_copy(update=updates) if updates else block
 
 
+# openWakeWord block fields: its one mel frontend (either file) and what a head's package adds.
+_MEL_FIELDS = ("mel_path", "mel_filters_path")
+_HEAD_FIELDS = ("model_path", "meta_path")
+
+
 def apply_weights(cfg: Any, block_name: str) -> Any:
-    """``cfg`` with the named engine block store-resolved (a bilingual ``secondary``
-    sub-block resolves too); a no-op when nothing names a ``weights`` key. An openWakeWord
-    block with a head of its own and no key resolves its feature models from the store's
-    backbone package for its platform. Local filesystem only."""
+    """``cfg`` with the named engine block (and a ``secondary`` sub-block) resolved from the
+    store by its ``weights`` key, except openWakeWord's feature models: those come from
+    :func:`backbone_key` unless ``embeddingPath`` is set. Local filesystem only."""
     block = getattr(cfg, block_name, None)
     if block is None:
         return cfg
-    if block_name == "openwakeword" and not block.weights and block.model_path and not block.embedding_path:
-        block = block.model_copy(update={"weights": backbone_key(block.resolved_target)})
-    filled = fill_engine_paths(block) if getattr(block, "weights", None) else block
+    filled, fields = block, None
+    if block_name == "openwakeword":
+        # One mel frontend: a path set by hand holds the slot, whichever file it names.
+        mel = () if block.mel_path or block.mel_filters_path else _MEL_FIELDS
+        fields = (*mel, "embedding_path", *_HEAD_FIELDS)
+        if (block.weights or block.model_path) and not block.embedding_path:
+            source = backbone_key(block.resolved_target, block.weights)
+            filled = fill_engine_paths(block, source, (*mel, "embedding_path"))
+            fields = _HEAD_FIELDS
+    if getattr(filled, "weights", None):
+        filled = fill_engine_paths(filled, fields=fields)
     second = getattr(filled, "secondary", None)
     if second is not None and getattr(second, "weights", None):
         filled = filled.model_copy(update={"secondary": fill_engine_paths(second)})

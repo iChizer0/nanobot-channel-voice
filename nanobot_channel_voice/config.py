@@ -924,7 +924,7 @@ class OpenWakeWordConfig(OnDeviceRuntime):
     mel_path: str | None = None          # melspectrogram.onnx (ONNX mel frontend)
     mel_filters_path: str | None = None  # mel_filters.npy (numpy frontend); exactly one of the two
     embedding_path: str | None = None    # embedding_model.onnx (Google speech_embedding re-export)
-    model_path: str | None = None        # the wake-phrase classifier head
+    model_path: str | None = None        # the wake-phrase classifier head (.onnx, run on the CPU)
     # Package sidecar (meta.json) from the weights store: advisory checks that the head's
     # declared phrase is in wake.phrases (a mismatch breaks stripping) and .rknn matches target.
     meta_path: str | None = None

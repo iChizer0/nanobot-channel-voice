@@ -76,6 +76,8 @@ def _meta_advisories(cfg: WakeConfig) -> None:
         target
         and oww.resolved_target
         and (oww.embedding_path or "").endswith(".rknn")
+        # The head's own pair: a backbone package's is picked by platform.
+        and Path(oww.embedding_path).parent == Path(oww.meta_path).parent
         and target != oww.resolved_target
     ):
         logger.warning(

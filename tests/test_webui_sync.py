@@ -142,10 +142,11 @@ def test_one_pill_per_stem_with_the_builds_as_a_second_level(store):
     not offered; an installed key shows without an index; wake pills read by phrase."""
     (store / w.INDEX_CACHE).parent.mkdir(parents=True)
     (store / w.INDEX_CACHE).write_text(json.dumps({"fetched_unix": 1, "models": {
-        "wake/openwakeword/alexa/onnx": {"files": {"m.onnx": {"url": "https://x/a", "sha256": "0" * 64, "size": 3}}},
-        "wake/openwakeword/alexa/rknn.rv1126b": {"files": {"m.rknn": {"url": "https://x/b", "sha256": "0" * 64, "size": 2}}},
+        "wake/openwakeword/alexa/onnx": {"files": {"m.onnx": {"url": "https://x/a", "sha256": "0" * 64}}},
+        "wake/openwakeword/alexa/rknn.rv1126b": {"files": {"m.rknn": {"url": "https://x/b", "sha256": "0" * 64}}},
         "wake/openwakeword/alexa/rknn.rk3588": {"files": {"m.rknn": {"url": "https://x/c", "sha256": "0" * 64}}},
-        "vad/smartturn/v3.2/rknn.rv1126b": {"files": {"m.rknn": {"url": "https://x/t", "sha256": "0" * 64}}},
+        "vad/smartturn/v3.2/onnx": {"files": {"m.onnx": {"url": "https://x/s", "sha256": "0" * 64, "size": 3}}},
+        "vad/smartturn/v3.2/rknn.rv1126b": {"files": {"m.rknn": {"url": "https://x/t", "sha256": "0" * 64, "size": 2}}},
     }}))
     d = w.store_dir("wake/openwakeword/hey-house/onnx", store)
     d.mkdir(parents=True)
@@ -160,14 +161,32 @@ def test_one_pill_per_stem_with_the_builds_as_a_second_level(store):
         ("wake/openwakeword/alexa/rknn.rv1126b", "alexa", False),
         ("wake/openwakeword/hey-house/onnx", "hey-house", True),  # no meta, no index: the stem
     ]
-    assert [(b["value"], b["label"], b["bytes"]) for b in choices[1]["builds"]] == [
-        ("wake/openwakeword/alexa/onnx", "CPU", 3), ("wake/openwakeword/alexa/rknn.rv1126b", "RV1126B", 2),
-    ]
-    assert "builds" not in choices[2]
     # the turn block is vad.turn in the config but vad/smartturn/ in the store
-    assert [(c["value"], c["label"]) for c in fields["vad.turn.weights"]["choices"]] == [
-        ("vad/smartturn/v3.2/rknn.rv1126b", "v3.2"),
+    turn = fields["vad.turn.weights"]["choices"]
+    assert [(c["value"], c["label"]) for c in turn] == [("vad/smartturn/v3.2/rknn.rv1126b", "v3.2")]
+    assert [(b["value"], b["label"], b["bytes"]) for b in turn[0]["builds"]] == [
+        ("vad/smartturn/v3.2/onnx", "CPU", 3), ("vad/smartturn/v3.2/rknn.rv1126b", "RV1126B", 2),
     ]
+
+
+def test_a_wake_head_is_one_pill_whatever_build_it_comes_in(store):
+    """Its feature models follow the device, so no Build row; a configured CPU build keeps
+    the pill rather than showing as a key of its own."""
+    cpu, chip = "wake/openwakeword/alexa/onnx", "wake/openwakeword/alexa/rknn.rv1126b"
+    _cache(store, {
+        cpu: {"files": {"m.onnx": {"url": "https://x/a", "sha256": "0" * 64, "size": 3}}},
+        chip: {"files": {"m.rknn": {"url": "https://x/b", "sha256": "0" * 64, "size": 2}}},
+    })
+
+    def model(**oww):
+        wake = {"mode": "gate", "phrases": ["alexa"], "engine": "openwakeword", "openwakeword": oww}
+        cfg = VoiceConfig.model_validate({"device": "rv1126b", "wake": wake})
+        return next(f for s in build_form(cfg)["sections"] for f in s["fields"] if f["key"] == "wake.openwakeword.weights")
+
+    assert [(c["value"], c["label"], c["bytes"], "builds" in c) for c in model()["choices"][1:]] == [(chip, "alexa", 2, False)]
+    held = model(weights=cpu)
+    assert held["value"] == cpu
+    assert [(c["value"], c["label"], c["bytes"], "builds" in c) for c in held["choices"][1:]] == [(cpu, "alexa", 3, False)]
 
 
 def test_a_renamed_keys_alias_is_no_pill_and_says_where_it_went(store):

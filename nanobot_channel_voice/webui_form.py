@@ -795,9 +795,11 @@ def _wake_field(
     it hears. Custom is a head of your own: it clears the key like Transcript does, so
     ``customOpen`` (the engine without a key) tells the two apart."""
     phrases = _lookup(dumped, "wake.phrases") or []
+    configured = _lookup(dumped, "wake.openwakeword.weights") or ""
     # Only the phrase the selected head hears goes with it: the rest were typed here.
-    current = _head_phrase(_lookup(dumped, "wake.openwakeword.weights") or "", store)
+    current = _head_phrase(configured, store)
     kept = [p for p in phrases if not current or p.casefold() != current.casefold()]
+    heads = [_one_build(head, configured) for head in heads]
     for head in heads:
         phrase = _head_phrase(head["value"], store)
         head["sets"] = dict(_ACOUSTIC_TIER)
@@ -821,6 +823,13 @@ def _wake_field(
     if local:
         return _WAKE_HELP if heads else _WAKE_HELP_NO_HEAD
     return _WAKE_HELP_CLOUD if heads else _WAKE_HELP_CLOUD_NO_HEAD
+
+
+def _one_build(head: dict[str, Any], configured: str) -> dict[str, Any]:
+    """A head's pill without a Build row: its feature models follow the device whichever
+    build it comes in. The configured build keeps the pill, else the device's does."""
+    held = next((b for b in head.pop("builds", []) if b["value"] == configured), None)
+    return {**held, "label": head["label"]} if held else head
 
 
 def _phrase_help(key: str | None, phrases: list[str], store: Store) -> str:

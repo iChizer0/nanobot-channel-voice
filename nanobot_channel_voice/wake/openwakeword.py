@@ -5,8 +5,9 @@ frontend (``melspectrogram.onnx``, or its frozen filterbank ``mel_filters.npy`` 
 :class:`PythonMelFrontend` for NPU packages) taking raw int16-VALUED float samples and
 applying the fixed ``x/10 + 2`` transform, the shared ``embedding_model.onnx`` (76 mel
 frames -> one 96-dim embedding, stride 8 = one per 80 ms chunk), and a per-phrase
-classifier head (a window of embeddings -> one sigmoid score). livekit-wakeword heads
-share the backbone contract. 16 kHz only; one decision per 1280-sample chunk (~12.5 Hz).
+classifier head, always ONNX on the CPU (a window of embeddings -> one sigmoid score).
+livekit-wakeword heads share the backbone contract. 16 kHz only; one decision per
+1280-sample chunk (~12.5 Hz).
 """
 
 from __future__ import annotations
@@ -101,6 +102,10 @@ class OpenWakeWord(WakeDetector):
                 "openWakeWord needs exactly one mel frontend: melPath "
                 "(melspectrogram.onnx) or melFiltersPath (mel_filters.npy)"
             )
+        if not model_path.endswith(".onnx"):
+            raise ValueError(
+                f"openWakeWord runs its classifier head as ONNX on the CPU, got {model_path}"
+            )
         # The prime raising is the EXPECTED make_wake_detector degrade path, so the
         # ExitStack must release every claimed session on it.
         with ExitStack() as models:
@@ -118,7 +123,10 @@ class OpenWakeWord(WakeDetector):
             self._emb = models.enter_context(
                 OnDeviceModel(embedding_path, rknn_input_permutation=(0, 2, 3, 1), **kw)
             )
-            self._head = models.enter_context(OnDeviceModel(model_path, **kw))
+            # CPU whatever providers the block names.
+            self._head = models.enter_context(
+                OnDeviceModel(model_path, **{**kw, "providers": None, "provider_options": None})
+            )
             self._mel_in = self._first_input(self._mel, "input")
             self._emb_in = self._first_input(self._emb, "input_1")
             self._head_in = self._first_input(self._head, "input_1")

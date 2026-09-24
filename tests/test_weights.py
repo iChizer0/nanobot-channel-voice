@@ -692,8 +692,72 @@ def test_a_head_of_your_own_runs_on_the_stores_backbone(store, tmp_path):
     w.fetch("wake/openwakeword/backbone/rknn.rv1126b", index["wake/openwakeword/backbone/rknn.rv1126b"])
     oww = w.apply_weights(board.wake, "openwakeword").openwakeword
     assert oww.embedding_path.endswith("backbone/rknn.rv1126b/embedding.rknn") and oww.mel_filters_path.endswith("mel_filters.npy")
-    # a head from the store keeps its own files; a block with the pair set by hand is left alone
+    # a block with the pair set by hand is left alone
     assert w.apply_weights(WakeConfig.model_validate({"openwakeword": {"modelPath": "/m.onnx", "embeddingPath": "/e.onnx"}}), "openwakeword").openwakeword.mel_path is None
+
+
+def test_the_embedding_takes_the_npu_build_whenever_there_is_one(store, tmp_path):
+    """The device's, from the backbone package the plan fetches beside a head in another
+    build (whose own pair stands in until then), or with no device the head's own."""
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.sync import plan_sync
+
+    mel, emb, head, meta = (_src(tmp_path, n, n.encode()) for n in ("mel.onnx", "embedding.onnx", "model.onnx", "meta.json"))
+    filt, emb_rknn = (_src(tmp_path, n, n.encode()) for n in ("mel_filters.npy", "embedding.rknn"))
+    cpu, chip = "wake/openwakeword/hey-jarvis/onnx", "wake/openwakeword/hey-jarvis/rknn.rv1126b"
+    pair, cpu_pair = "wake/openwakeword/backbone/rknn.rv1126b", "wake/openwakeword/backbone/onnx"
+    index = w.with_backbones({cpu: _entry_for(mel, emb, head, meta), chip: _entry_for(filt, emb_rknn, head, meta)})
+
+    def section(key, device=None, **oww):
+        wake = {"mode": "gate", "phrases": ["hey jarvis"], "engine": "openwakeword", "openwakeword": {"weights": key, **oww}}
+        return {"wake": wake, **({"device": device} if device else {})}
+
+    def wanted(values, **kw):
+        return plan_sync(values, index, store, managed_by=None, **kw).wanted
+
+    assert wanted(section(cpu, "rv1126b")) == [pair, cpu]
+    assert wanted(section(chip, "rv1126b")) == wanted(section(chip)) == [chip]
+    assert wanted(section(chip, "rk3588")) == [cpu_pair, chip]  # another chip's build is no option
+    assert wanted(section(cpu)) == [cpu]
+    assert wanted(section(cpu, "rv1126b", embeddingPath="/e.rknn")) == [cpu]
+    assert wanted({**section(cpu, "rv1126b"), "backend": "openai"}, used_only=True) == []
+
+    board = VoiceConfig.model_validate(section(cpu, "rv1126b")).wake
+    w.fetch(cpu, index[cpu])
+    d, p = w.store_dir(cpu), w.store_dir(pair)
+    assert w.apply_weights(board, "openwakeword").openwakeword.embedding_path == str(d / "embedding.onnx")
+    w.fetch(pair, index[pair])
+    oww = w.apply_weights(board, "openwakeword").openwakeword
+    assert (oww.mel_path, oww.mel_filters_path, oww.embedding_path) == (None, str(p / "mel_filters.npy"), str(p / "embedding.rknn"))
+    assert (oww.model_path, oww.meta_path) == (str(d / "model.onnx"), str(d / "meta.json"))
+    cpu_host = VoiceConfig.model_validate(section(cpu)).wake
+    assert w.apply_weights(cpu_host, "openwakeword").openwakeword.embedding_path == str(d / "embedding.onnx")
+    assert w.backbone_key("rk 3588", cpu) == cpu  # a block target no key can spell
+    w.fetch(chip, index[chip])
+    w.fetch(cpu_pair, index[cpu_pair])
+    for device in ("rv1126b", None):
+        own = w.apply_weights(VoiceConfig.model_validate(section(chip, device)).wake, "openwakeword").openwakeword
+        assert own.embedding_path == str(w.store_dir(chip) / "embedding.rknn")
+
+
+def test_a_mel_frontend_set_by_hand_holds_the_slot(store, tmp_path):
+    """Whichever file the package carries: two mel frontends refuse to start."""
+    from nanobot_channel_voice.config import VoiceConfig
+
+    files = (_src(tmp_path, n, n.encode()) for n in ("mel.onnx", "embedding.onnx", "model.onnx", "mel_filters.npy", "embedding.rknn"))
+    mel, emb, head, filt, emb_rknn = files
+    cpu, pair = "wake/openwakeword/hey-jarvis/onnx", "wake/openwakeword/backbone/rknn.rv1126b"
+    w.fetch(cpu, _entry_for(mel, emb, head))
+    w.fetch(pair, _entry_for(filt, emb_rknn))
+
+    def resolve(device=None, **oww):
+        cfg = VoiceConfig.model_validate({"wake": {"openwakeword": {"weights": cpu, **oww}}, **({"device": device} if device else {})})
+        return w.apply_weights(cfg.wake, "openwakeword").openwakeword
+
+    mine = resolve("rv1126b", melPath="/m.onnx")
+    assert (mine.mel_path, mine.mel_filters_path, mine.embedding_path) == ("/m.onnx", None, str(w.store_dir(pair) / "embedding.rknn"))
+    mine = resolve(embeddingPath="/e.rknn", melFiltersPath="/f.npy")
+    assert (mine.mel_path, mine.mel_filters_path, mine.model_path) == (None, "/f.npy", str(w.store_dir(cpu) / "model.onnx"))
 
 
 def test_ambiguous_store_files_are_an_error(store, tmp_path):

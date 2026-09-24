@@ -368,6 +368,22 @@ def test_rknn_embedding_input_is_pretransposed(monkeypatch):
     assert "rknn_input_permutation" not in kws["head.onnx"]
 
 
+def test_the_head_is_onnx_on_the_cpu_whatever_the_block_names(monkeypatch):
+    made = {"mel.onnx": FakeMel(), "emb.onnx": FakeEmb(), "head.onnx": FakeHead()}
+    kws: dict[str, dict] = {}
+
+    def spy(path, **kw):
+        kws[path] = kw
+        return made[path]
+
+    monkeypatch.setattr(oww_mod, "OnDeviceModel", spy)
+    _detector(providers=["CUDAExecutionProvider"], provider_options=[{}])
+    assert kws["emb.onnx"]["providers"] == ["CUDAExecutionProvider"]
+    assert kws["head.onnx"]["providers"] is None and kws["head.onnx"]["provider_options"] is None
+    with pytest.raises(ValueError, match="as ONNX on the CPU"):
+        _detector(model_path="head.rknn")
+
+
 def test_rknn_input_permutation_validates_at_construction():
     from nanobot_channel_voice.ondevice.runtime import OnDeviceModel
 
@@ -510,6 +526,23 @@ def test_meta_advisories_match_is_silent_and_garbage_tolerated(fakes, tmp_path):
     meta.write_text('{"phrase": 42, "target": ["rv1126b"]}')
     det, msgs = _warns_during(lambda: make_wake_detector(cfg, 16000, 20))
     assert isinstance(det, OpenWakeWord) and not msgs
+
+
+def test_meta_target_judges_only_the_heads_own_pair(tmp_path):
+    from nanobot_channel_voice.wake import _meta_advisories
+
+    meta = tmp_path / "meta.json"
+    meta.write_text('{"target": "rv1126b"}')
+
+    def warned(embedding: str) -> bool:
+        cfg = _wake_cfg(openwakeword={
+            "melFiltersPath": "f.npy", "embeddingPath": embedding, "modelPath": "head.onnx",
+            "metaPath": str(meta), "target": "rk3588",
+        })
+        return any("targets 'rv1126b'" in m for m in _warns_during(lambda: _meta_advisories(cfg))[1])
+
+    assert warned(str(tmp_path / "embedding.rknn"))
+    assert not warned("/store/wake/openwakeword/backbone/rknn.rk3588/embedding.rknn")
 
 
 def test_incompatible_rate_degrades_to_text_tier(fakes):
