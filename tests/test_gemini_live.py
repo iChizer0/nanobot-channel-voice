@@ -973,6 +973,34 @@ def test_a_notice_answered_with_nothing_still_ends_its_turn():
     asyncio.run(_run())
 
 
+def test_a_supervisor_answer_waits_for_a_notice_being_voiced():
+    """INTERRUPT would cut the notice (a reminder) mid-sentence: while its turn is live the
+    answer waits WHEN_IDLE, and interrupts again once it has ended."""
+    cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
+
+    async def _run():
+        backend, sent, _ = make_backend(cfg)
+        ev = backend._handle_event
+        await ev({"setupComplete": {}})
+        await ev({"toolCall": {"functionCalls": [
+            {"id": "c1", "name": "ask_nanobot", "args": {}},
+            {"id": "c2", "name": "ask_nanobot", "args": {}},
+        ]}})
+        await ev({"serverContent": {"turnComplete": True}})
+        await backend.announce("Your meeting starts in five minutes.")
+        await backend._notice_task
+        await ev(audio_msg(b"\x01"))  # the notice is being read out
+        await backend.submit_tool_result("c1", "It is sunny.")
+        await ev({"serverContent": {"turnComplete": True}})
+        await backend.submit_tool_result("c2", "It is windy.")
+        schedules = [m["toolResponse"]["functionResponses"][0]["response"]["scheduling"]
+                     for m in sent if "toolResponse" in m]
+        assert schedules == ["WHEN_IDLE", "INTERRUPT"]
+        await backend.close()
+
+    asyncio.run(_run())
+
+
 def test_an_abandoned_answer_leaves_a_notice_on_its_way_its_wait():
     """The last call is answered as abandoned while a notice's answer is still to come: the
     wait is the notice's now, and settles when its turn ends, not before its audio."""

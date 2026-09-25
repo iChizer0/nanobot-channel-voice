@@ -223,9 +223,12 @@ class GeminiLiveBackend(RealtimeTransport):
             return
         name = self._pending_calls.pop(call_id)
         cut = isinstance(output, AbandonedResult)  # stopped or replaced: resumes nothing
-        # An answer landing while the user holds the floor waits for them to finish.
+        # An answer landing while the user holds the floor, or a notice is being voiced,
+        # waits for them to finish (INTERRUPT would cut the notice off).
         scheduling = (
-            "SILENT" if cut else "WHEN_IDLE" if self._user_speaking else self._scheduling
+            "SILENT" if cut
+            else "WHEN_IDLE" if self._user_speaking or self._notice_turn
+            else self._scheduling
         )
         try:
             result = json.loads(output)  # a JSON tool result rides as structure
