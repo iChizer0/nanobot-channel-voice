@@ -1242,13 +1242,19 @@ class VoiceConfig(_VoiceBase):
         return merged
 
     @model_validator(mode="after")
-    def _allow_from_is_not_empty(self) -> VoiceConfig:
-        """An empty list denies everyone, and voice has no pairing flow to recover through:
-        the mic would publish nothing while the channel reports healthy."""
+    def _allow_from_admits_the_mic(self) -> VoiceConfig:
+        """Every utterance is published as senderId, and voice has no pairing flow to
+        recover through: a list that denies it leaves the mic publishing nothing while the
+        channel reports healthy."""
         if not self.allow_from:
             raise ValueError(
                 "allowFrom is empty, which denies every speaker and leaves the channel "
                 'deaf with no way to pair; use ["*"] (the default) or list sender ids'
+            )
+        if "*" not in self.allow_from and self.sender_id not in self.allow_from:
+            raise ValueError(
+                f'allowFrom lists neither "*" nor senderId {self.sender_id!r}, so core '
+                'denies every utterance; use ["*"] (the default) or add the senderId'
             )
         return self
 

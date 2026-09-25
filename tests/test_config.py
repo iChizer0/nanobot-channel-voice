@@ -57,6 +57,7 @@ def test_materialized_default_twin_never_clobbers_hand_data():
             "logTranscripts": False,  # materialized manifest default
             "allow_from": ["console"],
             "allowFrom": ["*"],  # materialized manifest default
+            "sender_id": "console",
             "audio": {"capture_device": "plug:dsnoop", "captureDevice": "default"},
             "realtime": {"api_key": "sk-hand", "apiKey": ""},  # '' = unset-secret filler
         }
@@ -485,7 +486,9 @@ def test_import_paste_never_carries_enabled(tmp_path):
 
     from nanobot_channel_voice.config import consume_import_json, parse_import_blob
 
-    paste = json.dumps({"enabled": False, "allowFrom": ["u1"], "vad": {"hangoverMs": 800}})
+    paste = json.dumps({
+        "enabled": False, "allowFrom": ["u1"], "senderId": "u1", "vad": {"hangoverMs": 800},
+    })
     assert "enabled" not in parse_import_blob(paste)
     cfg = VoiceConfig.model_validate({"enabled": True, "importJson": paste})
     assert cfg.enabled is True
@@ -742,7 +745,16 @@ def test_empty_allow_from_is_rejected():
     with pytest.raises(ValidationError, match="denies every speaker"):
         VoiceConfig.model_validate({"allowFrom": []})
     assert VoiceConfig().allow_from == ["*"]
-    assert VoiceConfig.model_validate({"allowFrom": ["me"]}).allow_from == ["me"]
+    assert VoiceConfig.model_validate({"allowFrom": ["local"]}).allow_from == ["local"]
+
+
+def test_allow_from_must_admit_the_mics_sender():
+    """The mic publishes every utterance as senderId: a list naming other ids (copied from
+    a chat channel) makes core drop each one, and the turn sits THINKING to the deadman."""
+    with pytest.raises(ValidationError, match="nor senderId 'local'"):
+        VoiceConfig.model_validate({"allowFrom": ["telegram-4711"]})
+    cfg = VoiceConfig.model_validate({"allowFrom": ["kitchen"], "senderId": "kitchen"})
+    assert cfg.allow_from == ["kitchen"]
 
 
 def test_transcription_gap_reports_an_unusable_delegate():
