@@ -225,6 +225,9 @@ class RealtimeBackend(RealtimeTransport):
         self._onsets = 0
         self._end_onset = 0
         self._item_onset: dict[str, int] = {}
+        # The last utterance ended when the active response was born: a stop only aims at a
+        # reply born before its own commit, never at its own reply.
+        self._active_end_onset = 0
 
     def _api_key(self) -> str:
         key = resolve_openai_key(self._rt.api_key)
@@ -557,6 +560,7 @@ class RealtimeBackend(RealtimeTransport):
                 return
             self._cancel_drain()
             self._active_response_id = rid
+            self._active_end_onset = self._end_onset
             if rid:
                 self._response_had_tools.setdefault(rid, False)
             if not self._manual:
@@ -594,13 +598,18 @@ class RealtimeBackend(RealtimeTransport):
                 await self._emit(InputTranscript(text))
                 # A transcript lands after its commit, often after the next onset, which then
                 # owns the state: a stop for an older utterance must not act on the new one.
-                latest = self._item_onset.get(evt.get("item_id"), self._onsets) >= self._onsets
+                item_onset = self._item_onset.get(evt.get("item_id"), self._onsets)
                 if (
                     self._stop_match is not None
-                    and latest
+                    and item_onset >= self._onsets
                     and (
                         self._onset_interrupting
-                        or self._active_response_id is not None
+                        # A reply asked for before the stop was said; a cold stop's own
+                        # reply is not one (the stop may answer "say stop to cancel").
+                        or (
+                            self._active_response_id is not None
+                            and self._active_end_onset < item_onset
+                        )
                         or time.monotonic() - self._last_stop_consume <= _STOP_GRACE_S
                     )
                     and self._stop_match.pure(tokens_of(text))
@@ -633,6 +642,7 @@ class RealtimeBackend(RealtimeTransport):
         ):
             self._cancel_drain()
             self._active_response_id = rid
+            self._active_end_onset = self._end_onset
             self._response_had_tools.setdefault(rid, False)
             self._arm_watchdog()
             self._log.debug("adopted response {} (no response.created seen)", rid)

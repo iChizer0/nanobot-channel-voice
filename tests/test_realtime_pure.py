@@ -766,6 +766,8 @@ def _stop_t(text: str = "stop") -> dict:
 def test_stop_transcript_cancels_the_live_ack_response():
     async def _case():
         b, sent, events = make_stop_backend()
+        b._turn = VoiceState.SPEAKING  # "stop" said over a reply
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
         await b._handle_event(_created("r1"))  # the ack response is already live
         epoch = b._sink.epoch
         await b._handle_event(_stop_t())
@@ -818,6 +820,61 @@ def test_cold_stop_is_forwarded_not_consumed():
         assert sent == []  # nothing live, no grace: the model may answer contextually
         await b._handle_event(_created("r3"))
         assert b._turn is VoiceState.THINKING  # the response lives
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_a_cold_stop_is_forwarded_even_when_its_reply_is_born_first():
+    """The usual order: the reply to "stop" is born before its transcript lands. That reply
+    is the stop's own, not one it aims at: forwarded, it may answer "say stop to cancel"."""
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})  # IDLE onset
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-stop"})
+        await b._handle_event(_created("r-stop"))
+        await b._handle_event({**_stop_t(), "item_id": "i-stop"})
+        assert sent == []
+        assert "barge_in_stop" not in b._metrics.counters
+        assert b._turn is VoiceState.THINKING  # the reply lives
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_a_cold_stop_is_forwarded_when_its_reply_is_adopted():
+    """A dialect that skips response.created: the reply adopted at its first event is still
+    the stop's own."""
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-stop"})
+        await b._handle_event({"type": "response.audio_transcript.delta",
+                               "response_id": "r-stop", "delta": "Okay"})
+        assert b._active_response_id == "r-stop"
+        await b._handle_event({**_stop_t(), "item_id": "i-stop"})
+        assert sent == []
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_a_stop_said_before_the_reply_it_stops_is_born_still_consumes_it():
+    """A question, then "stop" before its reply started: the reply born during the stop
+    is the one the user meant, so the stop consumes it."""
+    async def _case():
+        b, sent, _ = make_stop_backend()
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-ask"})
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})  # still CAPTURING
+        await b._handle_event(_created("r-ask"))
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-stop"})
+        await b._handle_event({**_stop_t(), "item_id": "i-stop"})
+        assert {"type": "response.cancel", "response_id": "r-ask"} in sent
         await b.close()
 
     asyncio.run(_case())
