@@ -635,6 +635,41 @@ def test_mic_gating_under_an_open_utterance_aborts_it():
     asyncio.run(_run())
 
 
+class _ResetCountingWake(ScriptWake):
+    def __init__(self) -> None:
+        super().__init__(set())
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+def test_the_mute_edge_keeps_the_wake_detector_hearing():
+    """Half-duplex: the tap feeds the detector on without a gap, so dropping the open
+    utterance at the mute keeps its context (a phrase said as the reply starts); a capture
+    gap is discontinuous audio and still resets it."""
+
+    async def _run():
+        wake = _ResetCountingWake()
+        gate, inner, _, on_event = build(
+            "wake", vad=ScriptVad([True] * 4 + [False] * 5), detector=wake,
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await inner.emit(StateHint(VoiceState.IDLE))  # window open (conversation)
+        await feed(gate, 3)  # onset: activity open
+        await inner.emit(StateHint(VoiceState.SPEAKING))
+        await gate.push_gated_audio(frame(3))  # the mute drops the open utterance
+        assert inner.calls[-1] == ("end", False)
+        assert wake.resets == 0
+        await gate.on_capture_gap()
+        assert wake.resets == 1
+        await gate.close()
+
+    asyncio.run(_run())
+
+
 def test_adoption_mark_does_not_outlive_a_lost_session():
     """A session lost under an adopted (same-breath) activity must not leave its
     speech mark behind: the next plain onset would be judged against it."""

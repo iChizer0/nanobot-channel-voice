@@ -206,9 +206,10 @@ class GatedUplink:
         if self._active or self._ep.in_speech:
             # The mic gated under an open utterance (a reply started while the user
             # spoke): frame-counted, it would never close, then commit garbage at the
-            # reopen. Same rule as a capture gap.
+            # reopen. This tap keeps feeding the wake detector without a gap, so its
+            # context survives: a phrase said as the reply starts still counts.
             self._metrics.count("gate_activity_gated")
-            await self._abort_open()
+            await self._abort_open(keep_wake=True)
         if self._wake is None:
             return
         if await asyncio.to_thread(self._gated_hop, pcm):
@@ -228,11 +229,11 @@ class GatedUplink:
     async def on_capture_gap(self) -> None:
         await self._abort_open()
 
-    async def _abort_open(self) -> None:
+    async def _abort_open(self, *, keep_wake: bool = False) -> None:
         """Discontinuous audio: nothing open survives it, on either side."""
         with self._hop_lock:
             self._ep.reset()
-            if self._wake is not None:
+            if self._wake is not None and not keep_wake:
                 self._wake.reset()
         self._eou_gen = None
         cancel_task(self._consult_task)
