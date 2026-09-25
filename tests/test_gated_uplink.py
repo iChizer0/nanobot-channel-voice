@@ -58,6 +58,7 @@ class ScriptWake(WakeDetector):
 
 class FakeInner:
     pace_output_audio = False
+    voices_notices = True
 
     def __init__(self):
         self.calls: list = []
@@ -386,6 +387,9 @@ def test_a_notice_reaches_the_inner_and_holds_the_park():
             vad=ScriptVad([]), capture_rate=RATE, uplink_rate=RATE, open_mic=False,
         )
         await gate.start(instructions=None, tools=[], on_event=_recorder())
+        inner.voices_notices = False  # the channel asks before it announces
+        assert gate.voices_notices is False
+        inner.voices_notices = True
         assert gate._park_task is not None and not gate._park_task.done()
         await gate.announce("Dinner is ready.")
         await asyncio.sleep(0)

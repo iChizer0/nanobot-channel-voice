@@ -1305,6 +1305,13 @@ class VoiceChannel(BaseChannel):
         if announce is None:
             self.logger.warning("voice: no session to voice an agent message: '{}'", shown)
             return
+        if not getattr(self._backend, "voices_notices", True):
+            self._metrics.count("notice_unvoiced")
+            self.logger.warning(
+                "voice: backend '{}' takes no text input, so an agent message is not "
+                "voiced: '{}'", self.config.backend, shown,
+            )
+            return
         self.logger.info("voice: the model voices an agent message: '{}'", shown)
         await announce(text)
 

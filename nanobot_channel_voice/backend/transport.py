@@ -251,6 +251,11 @@ class RealtimeTransport(TurnEventMixin):
 
     # ---- messages the agent sent on its own -----------------------------------
 
+    @property
+    def voices_notices(self) -> bool:
+        """The model takes a text turn, so ``announce`` can voice a notice."""
+        return True
+
     async def announce(self, text: str) -> None:
         """Have the model voice a message the agent sent on its own (a reminder, a report,
         a message from another channel) once the session is quiet; a parked socket is

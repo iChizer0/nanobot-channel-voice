@@ -56,6 +56,9 @@ class RealtimeProfile:
     interrupt: InterruptKind = "truncate"
     supports_tools: bool = True
     needs_response_create_after_tools: bool = True
+    # A user text item (conversation.item.create, input_text) the model answers: how a
+    # message the agent sends on its own is voiced.
+    supports_text_input: bool = True
     # Flatten tool JSON Schemas (nullable unions, anyOf/allOf/oneOf) for providers that
     # reject them (Qwen-Omni). OFF by default: the GA family keeps full schemas.
     flatten_tool_schema: bool = False
@@ -217,6 +220,8 @@ PROFILES: dict[str, RealtimeProfile] = {
         supports_tools=False,
         needs_response_create_after_tools=True,
         flatten_tool_schema=True,  # Qwen-Omni rejects nullable-union types + combinators
+        # Its conversation.item.create documents tool results only (no user text item).
+        supports_text_input=False,
     ),
     # Zhipu GLM-Realtime. The vendor session default is client_vad; the plugin's always-on
     # server VAD overrides it. Voices: tongtong, female-tianmei, male-qn-daxuesheng,

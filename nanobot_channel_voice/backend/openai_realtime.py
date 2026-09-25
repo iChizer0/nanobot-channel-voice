@@ -884,6 +884,10 @@ class RealtimeBackend(RealtimeTransport):
     def _waiting_on_tools(self) -> bool:
         return any(cids & self._dispatched for cids in self._tools_pending.values())
 
+    @property
+    def voices_notices(self) -> bool:
+        return self._profile.supports_text_input
+
     def _notice_quiet(self) -> bool:
         return (
             not self._user_speaking

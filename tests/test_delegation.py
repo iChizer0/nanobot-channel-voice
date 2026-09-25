@@ -195,6 +195,37 @@ def test_cloud_voices_what_the_agent_sends_on_its_own():
     run(_case())
 
 
+def test_a_provider_without_text_input_logs_an_agent_message_instead():
+    """Qwen-Omni documents no user text item: sent anyway, the notice's response.create would
+    answer nothing new, so the message is logged, not voiced."""
+    from nanobot.bus.events import OutboundMessage
+
+    from nanobot_channel_voice.audio.null import NullPlayback
+    from nanobot_channel_voice.backend.audio_sink import AudioSink
+    from nanobot_channel_voice.backend.openai_realtime import RealtimeBackend
+    from nanobot_channel_voice.backend.profiles import PROFILES
+
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        sink = AudioSink(NullPlayback(), mode="stream")
+        announced: list[str] = []
+
+        async def announce(text: str) -> None:
+            announced.append(text)
+
+        for key in ("qwen", "glm"):
+            backend = RealtimeBackend(channel.config, sink=sink, profile=PROFILES[key])
+            backend.announce = announce  # type: ignore[method-assign]
+            channel._backend = backend
+            await channel.send(OutboundMessage(
+                channel="voice", chat_id=channel.config.chat_id, content=f"From {key}.",
+            ))
+        assert announced == ["From glm."]
+        assert channel._metrics.snapshot()["counters"]["notice_unvoiced"] == 1
+
+    run(_case())
+
+
 def test_a_streamed_agent_turn_is_voiced_whole():
     async def _case():
         channel, _, _ = _supervisor_channel()

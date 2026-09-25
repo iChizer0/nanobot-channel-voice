@@ -221,6 +221,10 @@ class GatedUplink:
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         await self._inner.submit_tool_result(call_id, output)
 
+    @property
+    def voices_notices(self) -> bool:
+        return self._inner.voices_notices
+
     async def announce(self, text: str) -> None:
         # The inner resumes a parked socket for it; the IDLE after its reply re-arms the park.
         self._cancel_park()
