@@ -2474,8 +2474,15 @@ class LocalBackend(TurnEventMixin):
                 # Inside a tool, so what plays is a status line: cut the audio, never the run.
                 # Cleared by the first post-tool delta (talking over the ANSWER is a barge-in).
                 self._cur_turn.continuation_pending
-                # Or nothing audible to talk over in the first place.
-                or (verdict_state is VoiceState.THINKING and not pending.onset_speaking)
+                # Or nothing of THIS turn was audible at the onset: talking over an older
+                # reply, since killed, is not talking over this one.
+                or (
+                    verdict_state is VoiceState.THINKING
+                    and not (
+                        pending.onset_speaking
+                        and pending.onset_at >= self._cur_turn.published_at
+                    )
+                )
             )
         )
 

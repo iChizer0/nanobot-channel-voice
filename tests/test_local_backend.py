@@ -368,9 +368,37 @@ def test_talk_over_audio_kills_even_if_audio_ended_by_the_verdict():
         _, first = h.published[0]
         h.backend._turn = VoiceState.THINKING  # audio done; tools still running
         h.transcript = "make it red instead"
-        await h.backend._on_utterance(_utt(onset_speaking=True))
+        # Onset during THIS turn's audio (after its publish).
+        await h.backend._on_utterance(_utt(onset_speaking=True, onset_at=time.monotonic()))
         assert h.backend.is_dead_turn(first)
         assert h.interrupts == 1
+
+    _run(_case())
+
+
+def test_a_second_utterance_over_the_killed_reply_steers_the_new_turn():
+    """Two utterances spoken over reply T1: the first kills it and publishes T2. The second
+    talked over T1, not T2 (still THINKING, silent): it is injected into T2, never kills it."""
+    async def _case():
+        h = _build()
+        h.backend._turn = VoiceState.IDLE
+        h.transcript = "tell me about tokyo"
+        await h.backend._on_utterance(_utt())
+        h.backend._turn = VoiceState.SPEAKING
+        onset = time.monotonic()  # both utterances began over T1's audio
+        h.transcript = "no wait, paris"
+        await h.backend._on_utterance(
+            _utt(onset_interrupting=True, onset_speaking=True, onset_at=onset)
+        )
+        _, second = h.published[-1]
+        assert h.interrupts == 1 and h.backend._turn is VoiceState.THINKING
+        h.transcript = "and the weather there"
+        verdict = await h.backend._on_utterance(
+            _utt(onset_interrupting=True, onset_speaking=True, onset_at=onset)
+        )
+        assert verdict == "inject"
+        assert h.interrupts == 1
+        assert not h.backend.is_dead_turn(second)
 
     _run(_case())
 
