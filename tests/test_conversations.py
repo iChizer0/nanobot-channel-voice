@@ -507,6 +507,24 @@ def test_a_steer_gets_an_audible_receipt():
     _run(_case())
 
 
+def test_silent_tool_boundaries_do_not_hold_the_filler_off():
+    """Core ends every segment, text or none: a model chaining quick tool calls without a
+    word restarted the filler timer at each, so the wait the fillers exist for stayed
+    silent."""
+    async def _case():
+        async with EvalConversation(
+            prologue={"enabled": True, "afterMs": 300, "intervalMs": 5000},
+        ) as c:
+            b = c.backend
+            await c.user_says("run the whole pipeline")
+            for _ in range(8):
+                await asyncio.sleep(0.1)
+                await b.on_stream_end(resuming=True)  # a tool call, nothing said
+            assert c.counter("prologue_filler") == 1
+
+    _run(_case())
+
+
 def test_quiet_notice_speaks_while_the_core_is_busy():
     """The audible clock, not the core clock: a tool chain pushes last_activity with
     every progress event, so the old single-clock deadman could never speak during

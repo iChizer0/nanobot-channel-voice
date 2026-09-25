@@ -4051,6 +4051,9 @@ class LocalBackend(TurnEventMixin):
                     if self._closing or epoch != self._sink.epoch:
                         return
                 await self._set_turn(VoiceState.THINKING)  # tools running; mic back open
+            task = self._cur_turn.prologue_task
+            if not spoke and task is not None and not task.done():
+                return  # nothing was said here: the wait, and its filler schedule, run on
             self._arm_prologue(
                 initial_ms=self._cfg.prologue.interval_ms if spoke else None,
                 start_step=1 if spoke else 0,

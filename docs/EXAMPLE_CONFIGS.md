@@ -619,7 +619,7 @@ Two layers mask long waits: the voice context asks the agent to speak a short st
 ```
 
 - `afterMs` is a floor, not the actual delay: the first filler waits past the session's typical first-reply latency, so it marks *anomalously* long waits only.
-- `phrases` is an escalation script, consumed in order, repeating the last every `intervalMs`. Omit it for built-in phrases matched to the engine's language (en/zh/ja/ko/de); `[]` disables. An agent-spoken status line counts as the opener: the first canned filler then waits a full `intervalMs` and continues from the second phrase.
+- `phrases` is an escalation script, consumed in order, repeating the last every `intervalMs`. Omit it for built-in phrases matched to the engine's language (en/zh/ja/ko/de); `[]` disables. An agent-spoken status line counts as the opener: the first canned filler then waits a full `intervalMs` and continues from the second phrase. A tool call made without a word changes nothing: the script keeps its clock.
 - Phrases are synthesized once at warmup with the session's own voice (local engines only; cloud TTS pays lazily) and cached; an unspeakable phrase is warned about at warmup.
 - Fillers are killed by barge-in like any reply audio and don't count toward latency metrics. Keep them short: in half-duplex the mic is gated while one plays.
 
