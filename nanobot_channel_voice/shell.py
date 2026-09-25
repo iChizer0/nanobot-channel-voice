@@ -34,6 +34,7 @@ from .backend.base import (
     StateHint,
     ToolCall,
     ToolDef,
+    ToolsAbandoned,
     ToolStarted,
     TurnDone,
     UserSpeechStarted,
@@ -42,11 +43,11 @@ from .backend.base import (
 )
 from .backend.common import loggable_text
 
-# (name, arguments_json) -> tool result (str or JSON-encodable). Cloud tool seam.
-ExecToolFn = Callable[[str, str], Awaitable[Any]]
-# After a cloud barge-in (sink flushed, backend told): the channel abandons an in-flight
-# ask_nanobot delegation the user talked over.
-BargeInFn = Callable[[], Awaitable[None]]
+# (name, arguments_json, turn) -> tool result (str or JSON-encodable). Cloud tool seam;
+# ``turn`` is ToolCall.turn, which a delegation keys its replacement on.
+ExecToolFn = Callable[[str, str, str], Awaitable[Any]]
+# A consumed stop ended the pending tool work: the channel stops a delegation in flight.
+AbandonFn = Callable[[], Awaitable[None]]
 # After the shell tore itself down on a fatal backend error; without it the channel's
 # start() blocks forever on a stop event nobody sets, presenting a healthy dead shell.
 FatalFn = Callable[[], Awaitable[None]]
@@ -64,7 +65,7 @@ class VoiceShell:
         backend: VoiceBackend,
         open_mic: bool,
         exec_tool: ExecToolFn | None = None,
-        on_barge_in: BargeInFn | None = None,
+        on_abandon: AbandonFn | None = None,
         on_fatal: FatalFn | None = None,
         tool_mode: str = "direct",
         metrics: VoiceMetrics | None = None,
@@ -87,7 +88,7 @@ class VoiceShell:
         # realtime.bargeIn ("aec" => open, "gated" => gated while SPEAKING).
         self._open_mic = open_mic
         self._exec_tool = exec_tool
-        self._on_barge_in = on_barge_in
+        self._on_abandon = on_abandon
         self._on_fatal = on_fatal
         self._log_transcripts = config.log_transcripts
         # "half" == gated while SPEAKING; the rest name the mechanism keeping it open.
@@ -270,6 +271,9 @@ class VoiceShell:
             await self._cloud_barge_in()
         elif isinstance(event, ToolCall):
             self._spawn_tool_task(event)
+        elif isinstance(event, ToolsAbandoned):
+            if self._on_abandon is not None:
+                await self._on_abandon()
         elif isinstance(event, OutputTranscript):
             pass  # observational; nothing here consumes assistant text
         elif isinstance(event, InputTranscript):
@@ -308,13 +312,7 @@ class VoiceShell:
         # Cloud only. State is already CAPTURING (StateHint precedes UserSpeechStarted);
         # flush, then hand played-ms on for item.truncate.
         played_ms = await self._sink.flush()
-        try:
-            await self._backend.barge_in(played_ms)
-        finally:
-            # Not gated on the wire step: a dead socket would otherwise keep paying
-            # for a turn nobody will hear.
-            if self._on_barge_in is not None:
-                await self._on_barge_in()
+        await self._backend.barge_in(played_ms)
 
     def _spawn_tool_task(self, ev: ToolCall) -> None:
         """Run a tool call OFF the event-dispatch path: ``_on_event`` is awaited on the
@@ -337,7 +335,7 @@ class VoiceShell:
                 output = "Error: tool execution is unavailable in this voice session."
             else:
                 try:
-                    result = await self._exec_tool(ev.name, ev.arguments)
+                    result = await self._exec_tool(ev.name, ev.arguments, ev.turn)
                     if getattr(result, "is_error", False):
                         outcome = "error"
                     output = result if isinstance(result, str) else json.dumps(result)

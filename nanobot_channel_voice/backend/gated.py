@@ -128,6 +128,9 @@ class GatedUplink:
         self._window_s = wake.window_s
         self._window_until = 0.0 if self._mode == "wake" else math.inf
         self._spent = False
+        # A bare phrase heard while the agent works: strict admits the next onset (the
+        # command after the phrase) until this, or until a reply speaks or the turn ends.
+        self._claim_until = 0.0
         self._phrase = WakePhrase(list(wake.phrases) + list(wake.aliases))
         self._phrase_echo_until = 0.0
         self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
@@ -291,7 +294,8 @@ class GatedUplink:
         self._log.info("wake hit{}", f" (score={score:.2f})" if score is not None else "")
         if self._active:
             return False  # the name mid-upload changes nothing (the window stays inf)
-        self._window_until = now + self._window_s
+        # max: never shortens an engaged turn's window (inf until IDLE).
+        self._window_until = max(self._window_until, now + self._window_s)
         self._spent = False
         if self._ep.in_speech:
             # Same breath ("hey nanobot, what's the weather"): adopt the open utterance
@@ -305,15 +309,19 @@ class GatedUplink:
                 self._hit_active_ms = self._ep.active_ms
             return self._active
         if self._live():
-            # A bare summon over a reply: kill it and listen (the local _wake_kill).
-            await self._kill_reply()
+            # Claimed first: the kill can settle THINKING (a tool still owes its answer).
+            self._claim_until = now + self._window_s
+            if self._state is VoiceState.SPEAKING:
+                # A bare summon over the audible reply: kill it and listen (the local
+                # _wake_kill). While the agent works the query survives, as locally.
+                await self._kill_reply()
         return False
 
     async def _on_onset(self, now: float) -> None:
         if not self._window_open(now):
             self._metrics.count("gate_dropped_onsets")  # a later hit may still adopt it
             return
-        if self._live() and self._wake_mode == "strict":
+        if self._live() and self._wake_mode == "strict" and now >= self._claim_until:
             # Public-room posture: only the phrase interrupts; a hit later in this same
             # utterance adopts it (see _on_wake_hit).
             self._metrics.count("gate_dropped_onsets")
@@ -323,6 +331,7 @@ class GatedUplink:
     async def _open_activity(self, pcm: bytes) -> None:
         self._cancel_park()
         self._hit_active_ms = None  # an adoption sets it after; a lost session left it
+        self._claim_until = 0.0  # spent on this utterance
         try:
             await self._inner.begin_activity()
         except asyncio.CancelledError:
@@ -371,6 +380,7 @@ class GatedUplink:
             # command — the local path publishes nothing either.
             self._metrics.count("gate_bare_summon")
             self._log.debug("bare summon: nothing after the phrase; window open")
+            self._claim_until = time.monotonic() + self._window_s  # see _on_wake_hit
             await self._inner.end_activity(commit=False)
             return
         if self._attention == "sentence":
@@ -378,8 +388,9 @@ class GatedUplink:
         await self._inner.end_activity(commit=True)
 
     async def _kill_reply(self) -> None:
-        """Cancel the live reply and settle to IDLE with the window open: begin (the shell
-        flushes + the adapter cancels) then an uncommitted end (nothing to answer)."""
+        """Cancel the live reply and settle with the window open (THINKING while a tool
+        still owes its answer): begin (the shell flushes + the adapter cancels) then an
+        uncommitted end (nothing to answer)."""
         self._cancel_park()
         try:
             await self._inner.begin_activity()
@@ -428,6 +439,8 @@ class GatedUplink:
     async def _on_inner_event(self, event) -> None:
         if isinstance(event, StateHint):
             prev, self._state = self._state, event.state
+            if event.state in (VoiceState.SPEAKING, VoiceState.IDLE):
+                self._claim_until = 0.0
             if (
                 event.state in (VoiceState.THINKING, VoiceState.SPEAKING)
                 and prev in (VoiceState.IDLE, VoiceState.CAPTURING)

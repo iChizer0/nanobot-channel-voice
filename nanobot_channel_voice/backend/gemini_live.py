@@ -33,6 +33,7 @@ from nanobot_channel_voice.metrics import VoiceMetrics
 
 from .audio_sink import AudioSink
 from .base import (
+    AbandonedResult,
     InputTranscript,
     OutputAudio,
     OutputTranscript,
@@ -160,6 +161,8 @@ class GeminiLiveBackend(RealtimeTransport):
         # The handle's clock: its receipt, then the session's termination (what the
         # validity is documented from).
         self._handle_since = 0.0
+        # Model turns ended (turnComplete or interrupted), across sessions: a call's turn.
+        self._turns = 0
         self._reset_turn_state()
 
     # ---- turn/session bookkeeping -------------------------------------------
@@ -173,7 +176,6 @@ class GeminiLiveBackend(RealtimeTransport):
             self._log.warning("dropping {} unanswered tool obligation(s) on {}", dropped, reason)
         # Announced, unanswered (this session): id -> name (FunctionResponse.name is required).
         self._pending_calls: dict[str, str] = {}
-        self._cut_calls: set[str] = set()  # pending at a user onset: answered SILENT
         self._generating = False   # audio/text seen since the last turn boundary
         self._in_progress = False  # extended thinking: background work continues
         # The server cut the model off (its VAD, or our activityStart): that turn's
@@ -206,10 +208,7 @@ class GeminiLiveBackend(RealtimeTransport):
     async def barge_in(self, played_ms: int) -> None:
         # No truncate on this protocol: the server keeps what it already sent; the shell
         # already flushed the sink. `_generating` stays: _activity_begin_wire reads it
-        # after this to arm the dead-audio guard.
-        # A call the user talked over resumes nothing: its result must neither interrupt
-        # the new utterance nor speak a stale answer after it.
-        self._cut_calls.update(self._pending_calls)
+        # after this to arm the dead-audio guard. A pending call outlives the onset.
         self._record_barge_in("interrupt")
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
@@ -218,8 +217,11 @@ class GeminiLiveBackend(RealtimeTransport):
             self._log.debug("dropping tool result for call {} (not pending)", call_id)
             return
         name = self._pending_calls.pop(call_id)
-        cut = call_id in self._cut_calls
-        self._cut_calls.discard(call_id)
+        cut = isinstance(output, AbandonedResult)  # stopped or replaced: resumes nothing
+        # An answer landing while the user holds the floor waits for them to finish.
+        scheduling = (
+            "SILENT" if cut else "WHEN_IDLE" if self._user_speaking else self._scheduling
+        )
         try:
             result = json.loads(output)  # a JSON tool result rides as structure
         except (ValueError, TypeError):
@@ -231,10 +233,7 @@ class GeminiLiveBackend(RealtimeTransport):
                 "functionResponses": [{
                     "id": call_id,
                     "name": name,
-                    "response": {
-                        "result": result,
-                        "scheduling": "SILENT" if cut else self._scheduling,
-                    },
+                    "response": {"result": result, "scheduling": scheduling},
                 }],
             },
         })
@@ -401,6 +400,7 @@ class GeminiLiveBackend(RealtimeTransport):
         ))
 
     async def _on_turn_complete(self, status: str | None) -> None:
+        self._turns += 1
         self._generating = False
         if self._interrupted:
             # The cut-off turn's end: the shell already flushed and the onset owns the
@@ -413,8 +413,9 @@ class GeminiLiveBackend(RealtimeTransport):
             # until the next committed activity (nothing else is owed an answer).
             if not self._user_speaking:  # else the open activity owns state + deadman
                 self._cancel_watchdog()
-                if self._turn is not VoiceState.IDLE:
-                    await self._set_turn(VoiceState.IDLE)
+                await self._set_turn(
+                    VoiceState.THINKING if self._pending_calls else VoiceState.IDLE
+                )
             return
         if status == "IN_PROGRESS" or self._pending_calls:
             # The filler is spoken, the work goes on (extended thinking's background
@@ -443,6 +444,7 @@ class GeminiLiveBackend(RealtimeTransport):
     async def _on_interrupted(self) -> None:
         # Server-side VAD (or our activityStart) cut the model off. WS ordering: what
         # follows on the wire is new generation, never the dead turn's tail.
+        self._turns += 1
         self._interrupted = self._generating or self._dropped_dead
         self._dropped_dead = False
         self._generating = False
@@ -473,7 +475,9 @@ class GeminiLiveBackend(RealtimeTransport):
             arguments = json.dumps(args if args is not None else {}, ensure_ascii=False)
             self._log.debug("tool call ready: {}({})", name, arguments)
             self._metrics.call_dispatched(cid, self._sink.epoch)
-            await self._emit(ToolCall(call_id=cid, name=name, arguments=arguments))
+            await self._emit(
+                ToolCall(call_id=cid, name=name, arguments=arguments, turn=str(self._turns))
+            )
         if self._pending_calls:
             self._cancel_watchdog()  # the shell's tool task has its own budget
 
@@ -483,9 +487,11 @@ class GeminiLiveBackend(RealtimeTransport):
         self._metrics.calls_abandoned(self._pending_calls.keys() & ids)
         for cid in ids:
             self._pending_calls.pop(cid, None)
-        self._cut_calls -= ids
 
     # ---- transport hooks ----------------------------------------------------
+
+    def _waiting_on_tools(self) -> bool:
+        return bool(self._pending_calls)
 
     async def _watchdog_recover(self) -> str | None:
         if self._generating:

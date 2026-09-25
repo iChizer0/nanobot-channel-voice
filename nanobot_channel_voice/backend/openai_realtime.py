@@ -8,9 +8,11 @@ owns mic capture, playback and tool routing.
 Transport (socket, reconnect, park, sender queue, deadman, drain) is
 :class:`~.transport.RealtimeTransport`; this module is the wire. A tool turn spans >= 2
 responses: each ``function_call`` registers an obligation, the continuation fires exactly
-once (triggering response done, all outputs submitted, not cancelled), and ``TurnDone``
-comes only from the turn's final ``response.done``. ``_handle_event``'s only send is that
-continuation, so it is testable against canned server frames.
+once (triggering response done, all outputs submitted, the user heard out), and ``TurnDone``
+comes only from the turn's final ``response.done``. A dispatched call survives talk during
+the wait and its response being cancelled; a consumed stop or an ``AbandonedResult`` ends
+it. ``_handle_event``'s only send is that continuation, so it is testable against canned
+server frames.
 """
 
 from __future__ import annotations
@@ -34,12 +36,14 @@ from nanobot_channel_voice.phrases import (
 
 from .audio_sink import AudioSink
 from .base import (
+    AbandonedResult,
     Error,
     InputTranscript,
     OutputAudio,
     OutputTranscript,
     ToolCall,
     ToolDef,
+    ToolsAbandoned,
     ToolStarted,
     TurnDone,
     VoiceState,
@@ -192,6 +196,9 @@ class RealtimeBackend(RealtimeTransport):
         # (the new session rejects unknown call_ids). Cancelled responses KEEP entries:
         # still answered, they just resume nothing.
         self._session_calls: set[str] = set()
+        # Calls handed to the shell (ToolCall emitted): an answer will come, so they outlive
+        # their response being cancelled; only a stop or an AbandonedResult drops them.
+        self._dispatched: set[str] = set()
         # Insertion-ordered: the size bound must evict the OLDEST rid, not a
         # hash-arbitrary one whose late deltas still stream.
         self._cancelled_responses: dict[str, None] = {}
@@ -323,6 +330,14 @@ class RealtimeBackend(RealtimeTransport):
         else:
             # Nothing live to cancel: the response answering THIS stop is still unborn.
             self._stop_suppress_until = time.monotonic() + _STOP_SUPPRESS_S
+        # The stop also ends the work pending tool calls serve: their answers resume nothing
+        # (nor may a deferred re-ask), and the channel stops a delegation in flight.
+        self._retry_create = False
+        waited = [r for r, cids in self._tools_pending.items() if cids]
+        for waited_rid in waited:
+            self._discard_response_tools(waited_rid)
+        if waited:
+            await self._emit(ToolsAbandoned())
         await self._sink.flush()
         # The item dies with the flush: played_ms() restarts at 0, so a later barge-in
         # against the old base would truncate a partially-heard item at 0. Cleared, the
@@ -354,6 +369,7 @@ class RealtimeBackend(RealtimeTransport):
             # The issuing session is gone (reconnect); this one would reject the call_id.
             self._log.debug("dropping tool result for unknown call_id {} (session lost)", call_id)
             return
+        abandoned = isinstance(output, AbandonedResult)
         output = self._clamp_tool_output(output)
         payload = {
             "type": "conversation.item.create",
@@ -364,11 +380,15 @@ class RealtimeBackend(RealtimeTransport):
         await self._send(payload)
         # Answered exactly once: drop the bookkeeping, incl. the duplicate-submit guard.
         self._session_calls.discard(call_id)
+        self._dispatched.discard(call_id)
         rid = self._call_to_response.pop(call_id, None)
         self._fn_names.pop(call_id, None)
         self._fn_args.pop(call_id, None)
         self._log.debug("submit_tool_result call_id={} -> rid={}", call_id, rid)
         if rid is None:
+            return
+        if abandoned:
+            self._discard_response_tools(rid)  # the work was stopped or replaced
             return
         pending = self._tools_pending.get(rid)
         if pending is not None:
@@ -387,14 +407,13 @@ class RealtimeBackend(RealtimeTransport):
         await self._send({"type": "input_audio_buffer.clear"})
         if not self._retry_create:
             return
-        rid = self._active_response_id
-        if not rid:
-            # The trigger ended while this activity spoke (the re-ask was deferred): no
-            # done will re-ask now, and the committed audio is still owed an answer.
+        if self._waiting_on_tools():
+            self._retry_create = False  # the tool continuation's create answers it too
+        elif not self._live_response():
+            # What was owed an answer (committed audio, a tool's output) waited on this
+            # activity, and no done will re-ask now: ask here.
             self._retry_create = False
             await self._send({"type": "response.create"})
-        elif self._response_had_tools.get(rid):
-            self._retry_create = False  # the tool continuation's create answers it too
 
     # ---- wire ---------------------------------------------------------------
 
@@ -538,6 +557,10 @@ class RealtimeBackend(RealtimeTransport):
             self._active_response_id = rid
             if rid:
                 self._response_had_tools.setdefault(rid, False)
+            if not self._manual:
+                # Created after any deferred tool answer was submitted (the server answers
+                # the user's utterance, or our own re-ask): it sees that answer.
+                self._retry_create = False
             self._last_error = None  # only errors seen inside THIS response may detail it
             self._metrics.turn_thinking()
             await self._set_turn(VoiceState.THINKING)
@@ -706,24 +729,24 @@ class RealtimeBackend(RealtimeTransport):
             args = self._fn_args.get(cid, "")
         self._log.debug("tool call ready: {}({})", name, args)
         self._metrics.call_dispatched(cid, self._sink.epoch)
-        await self._emit(ToolCall(call_id=cid, name=name, arguments=args))
+        self._dispatched.add(cid)
+        await self._emit(ToolCall(call_id=cid, name=name, arguments=args, turn=rid or ""))
 
     async def _on_response_done(self, evt: dict) -> None:
         self._conversation_t = time.monotonic()  # a turn the resumption cache just took
         rid = (evt.get("response") or {}).get("id")
-        # Read before the handler pops it: a tool turn's own continuation is that
-        # response.create; the refused commit's turn rides behind it.
-        continues = bool(rid and self._response_had_tools.get(rid))
         await self._handle_response_done(evt)
-        # Not under an open activity (a cancelled done lands mid-utterance): the user's
-        # own commit carries the refused audio too, and its create clears the flag.
+        # A tool answer still owed asks for itself when it lands, and answers this too. Not
+        # under an open activity (a cancelled done lands mid-utterance): the user's own
+        # commit carries the refused audio too, and its create clears the flag.
         if (
-            self._retry_create and not continues and not self._closing
+            self._retry_create and not self._waiting_on_tools() and not self._closing
             and not self._user_speaking
         ):
             self._retry_create = False
-            self._log.debug("re-issuing the response.create refused while rid={} ran", rid)
+            self._log.debug("re-issuing the response.create deferred while rid={} ran", rid)
             await self._send({"type": "response.create"})
+            self._continuation_unborn = True  # an onset before its birth kills it there
             self._arm_watchdog()
 
     async def _handle_response_done(self, evt: dict) -> None:
@@ -736,7 +759,7 @@ class RealtimeBackend(RealtimeTransport):
             # Already declared dead (barge-in/watchdog): falling through to completed would
             # fire a second TurnDone + turn_end (wiping the new utterance's anchor) and
             # drain CAPTURING -> IDLE mid-speech.
-            self._discard_response_tools(rid)
+            self._drop_undispatched(rid)
             if rid == self._active_response_id:
                 self._active_response_id = None
             # The deadman's ONLY re-arm point on the GA path: without it one interruption
@@ -747,7 +770,7 @@ class RealtimeBackend(RealtimeTransport):
         if status == "cancelled":
             if rid:
                 self._note_cancelled(rid)
-                self._discard_response_tools(rid)
+                self._drop_undispatched(rid)
                 if rid == self._active_response_id:
                     self._active_response_id = None
             # SERVER-initiated cancel (turn_detected): the paired speech_started may arrive
@@ -762,7 +785,7 @@ class RealtimeBackend(RealtimeTransport):
             # forever: drop them like a cancellation, but still end the turn cleanly.
             if rid:
                 self._note_cancelled(rid)
-                self._discard_response_tools(rid)
+                self._drop_undispatched(rid)
                 if rid == self._active_response_id:
                     self._active_response_id = None
             # Providers may put the reason in a top-level `error` event just BEFORE the
@@ -774,42 +797,49 @@ class RealtimeBackend(RealtimeTransport):
                                        fatal=False))
             else:  # incomplete: a routine cap (max tokens / content filter), not an Error
                 self._log.warning("realtime response incomplete: {}", detail or "no detail")
+            if self._answer_owed():
+                self._start_hold_thinking()
+                return
             self._metrics.turn_end()
             await self._emit(TurnDone())
             self._start_drain()
             return
-        # completed
+        # completed: nothing live is left to cancel, and a late event for it must not be
+        # adopted as a new live response (the note outlives _cleanup_response).
         if rid:
             self._response_done.add(rid)  # _maybe_respond's "trigger finished" gate
+            self._note_cancelled(rid)
+            if rid == self._active_response_id:
+                self._active_response_id = None
         if rid and self._response_had_tools.get(rid):
-            # Turn still LIVE, so the response stays "active": a barge-in during the tool
-            # run must be able to cancel it, or the abandoned results re-trigger
-            # response.create over the user's new speech.
             await self._maybe_respond(rid)
             if self._tools_pending.get(rid):
                 self._start_hold_thinking()  # the filler played; the tool run is a wait
-        else:
-            if rid == self._active_response_id:
-                self._active_response_id = None  # finished turn: nothing left to cancel
-            if rid:
-                # Outlives _cleanup_response: a late event for this finished response must
-                # not be adopted as a new live one.
-                self._note_cancelled(rid)
-                self._cleanup_response(rid)
-            self._metrics.turn_end()  # release the anchor; the next turn re-arms it
-            await self._emit(TurnDone())  # informational; drain owns the -> IDLE
-            self._start_drain()
+            return
+        if rid:
+            self._cleanup_response(rid)
+        if self._answer_owed():
+            # The user spoke into a tool's wait: its answer, not this reply, ends the turn.
+            self._start_hold_thinking()
+            return
+        self._metrics.turn_end()  # release the anchor; the next turn re-arms it
+        await self._emit(TurnDone())  # informational; drain owns the -> IDLE
+        self._start_drain()
 
     async def _maybe_respond(self, rid: str) -> None:
         pending = self._tools_pending.get(rid)
-        self._log.debug("_maybe_respond rid={} pending={} done={} cancelled={}",
-                        rid, pending, rid in self._response_done, rid in self._cancelled_responses)
+        self._log.debug("_maybe_respond rid={} pending={} done={}",
+                        rid, pending, rid in self._response_done)
         if pending:
             return  # more tool outputs outstanding
         if rid not in self._response_done:
             return  # triggering response not finished yet
-        if rid in self._cancelled_responses:
-            self._cleanup_response(rid)  # barged out: outputs submitted, no new response
+        if self._user_speaking or self._live_response():
+            # The user spoke into the wait: never answer over them. Their turn's response
+            # sees this output; else the next response end (or a discarded blip) re-asks.
+            if self._needs_response_create_after_tools:
+                self._retry_create = True
+            self._cleanup_response(rid)
             return
         # Re-anchor before the frame: what follows is continuation latency, not TTFA.
         self._metrics.turn_continuation()
@@ -819,6 +849,7 @@ class RealtimeBackend(RealtimeTransport):
         else:
             # Auto-continuing dialects resume on the function_call_output alone.
             self._log.debug("auto-continuing dialect; no response.create for rid={}", rid)
+        self._retry_create = False  # this create answers everything outstanding
         self._continuation_unborn = True
         # response.done cancelled the watchdog: the create -> response.created gap is the
         # one window with no deadman, and a continuation never started wedges the session
@@ -831,10 +862,39 @@ class RealtimeBackend(RealtimeTransport):
         self._response_done.discard(rid)
         self._response_had_tools.pop(rid, None)
 
+    def _live_response(self) -> bool:
+        rid = self._active_response_id
+        return rid is not None and rid not in self._cancelled_responses
+
+    def _waiting_on_tools(self) -> bool:
+        return any(cids & self._dispatched for cids in self._tools_pending.values())
+
+    def _answer_owed(self) -> bool:
+        """A dispatched call still runs, or an answer waits on the re-ask a response end
+        sends (``_on_response_done``)."""
+        return self._waiting_on_tools() or self._retry_create
+
+    def _drop_undispatched(self, rid: str) -> None:
+        """A response died (barge-in, server cancel, deadman, failure). Calls it never handed
+        to the shell will never be answered: their obligations go. A dispatched call keeps
+        its own, and its answer still continues the turn once the user is heard out."""
+        kept = self._tools_pending.get(rid, set()) & self._dispatched
+        if not kept:
+            self._discard_response_tools(rid)
+            return
+        orphans = self._tools_pending[rid] - kept
+        self._metrics.calls_abandoned(orphans)
+        for cid in orphans:
+            self._call_to_response.pop(cid, None)
+            self._fn_names.pop(cid, None)
+            self._fn_args.pop(cid, None)
+        self._tools_pending[rid] = kept
+        self._response_done.add(rid)  # its trigger is over: only the answers remain
+
     def _discard_response_tools(self, rid: str) -> None:
-        """Drop a cancelled response's tool bookkeeping. A call already dispatched to the
-        shell still gets answered (``_session_calls`` keeps it); it just resumes nothing,
-        its rid mapping being gone."""
+        """Drop a response's tool bookkeeping (stopped, replaced, or never dispatched). A
+        call already dispatched to the shell still gets answered (``_session_calls`` keeps
+        it); it just resumes nothing, its rid mapping being gone."""
         orphans = self._tools_pending.pop(rid, set())
         self._metrics.calls_abandoned(orphans)
         for cid in orphans:
@@ -848,11 +908,13 @@ class RealtimeBackend(RealtimeTransport):
         err = evt.get("error") or {}
         code = err.get("code", "")
         msg = err.get("message", "unknown realtime error")
-        if code == "conversation_already_has_active_response" and self._manual:
-            # The gate committed while the previous turn's response was still being
-            # created: the audio is in the conversation, the response is owed. Re-ask
-            # when the active one ends.
+        if code == "conversation_already_has_active_response":
+            # A create landed while another response was live (the gate's commit, or a
+            # tool continuation racing the reply to the user's utterance): what it answers
+            # is in the conversation, so re-ask when the active one ends. Never born.
             self._retry_create = True
+            # Never born, so a kill a barge-in aimed at it must not hit the next response.
+            self._continuation_unborn = self._kill_at_birth = False
             self._log.debug("response.create refused (active response); deferred")
             return
         # Benign: cancelling with nothing active, truncate races, etc.
@@ -883,10 +945,10 @@ class RealtimeBackend(RealtimeTransport):
         rid, self._active_response_id = self._active_response_id, None
         self._continuation_unborn = self._kill_at_birth = False  # the turn is given up
         if rid:
-            # Recover, not just report: stragglers drop via _is_live, a late tool result
-            # cannot re-trigger the response, and the server stops generating.
+            # Recover, not just report: stragglers drop via _is_live and the server stops
+            # generating. A dispatched call's answer still continues once it lands.
             self._note_cancelled(rid)
-            self._discard_response_tools(rid)
+            self._drop_undispatched(rid)
             with suppress(Exception):
                 await self._send(self._cancel_frame(rid))
         return "realtime turn timed out"

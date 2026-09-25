@@ -111,12 +111,28 @@ class ToolStarted:
 @dataclass(frozen=True, slots=True)
 class ToolCall:
     """CLOUD ONLY. The shell EXECUTEs the tool and returns the result via
-    ``backend.submit_tool_result(call_id, output)``, ``call_id`` echoed verbatim. The
-    backend's cancelled-response bookkeeping stops a late result reviving a dead turn."""
+    ``backend.submit_tool_result(call_id, output)``, ``call_id`` echoed verbatim. Talk during
+    the wait keeps the call alive; only an ``AbandonedResult`` resumes nothing."""
 
     call_id: str
     name: str
     arguments: str  # JSON string; passed straight to ToolRegistry.execute (it coerces)
+    # The model turn that issued it: calls of one turn share it, so a call from another
+    # was asked after the user was heard again.
+    turn: str = ""
+
+
+class AbandonedResult(str):
+    """A tool result for work the user stopped, or a newer request replaced: the backend
+    submits it so the call is answered, and resumes nothing from it."""
+
+    __slots__ = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ToolsAbandoned:
+    """CLOUD ONLY. A consumed stop ended the work pending tool calls serve: the channel
+    stops a delegation in flight. Talking during the wait alone never abandons it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +153,7 @@ class Error:
 
 VoiceEvent = (
     OutputAudio | StateHint | OutputTranscript | InputTranscript
-    | UserSpeechStarted | ToolStarted | ToolCall | TurnDone | Error
+    | UserSpeechStarted | ToolStarted | ToolCall | ToolsAbandoned | TurnDone | Error
 )
 
 OnEvent = Callable[[VoiceEvent], Awaitable[None]]

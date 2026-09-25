@@ -1,11 +1,12 @@
 """Supervisor delegation: the collector's terminals, token identity on the bus glue, and
-the handler's barge-in / sweep / queueing paths."""
+the handler's stop / replace / sweep / queueing paths."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 
+from nanobot_channel_voice.backend.base import AbandonedResult
 from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel, _DelegationCollector
 from nanobot_channel_voice.metrics import VoiceMetrics
 
@@ -162,29 +163,97 @@ async def _answer(channel: VoiceChannel, text: str) -> None:
                              stream_id="s:1:0", stream_end=True)
 
 
-def test_barge_in_stops_the_live_delegation_and_moots_the_queued_one():
-    """Two ask_nanobot calls in one response: the second queues on the lock. A barge-in
-    cancels the response that asked, so the queued call must not spend a whole nanobot
-    turn on an answer the backend would drop as stale."""
+def _ask(channel: VoiceChannel, request: str, turn: str = "r1"):
+    return asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args(request), turn))
+
+
+def test_a_stop_stops_the_live_delegation_and_moots_the_queued_one():
+    """Two ask_nanobot calls of one turn: the second queues on the lock. A consumed stop ends
+    the work they serve, so the live one is /stop-ped and the queued one must not spend a
+    whole nanobot turn on an answer nobody wants. A later call runs normally."""
     async def _case():
         channel, published, stops = _supervisor_channel()
-        first = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("one")))
+        first = _ask(channel, "one")
         await asyncio.sleep(0)
-        second = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("two")))
+        second = _ask(channel, "two")
         await asyncio.sleep(0.01)
         assert [t for t, _ in published] == ["one"]
-        await channel._on_cloud_barge_in()
-        assert await first == "(interrupted by the user)"
-        assert await second == "(interrupted by the user)"
+        await channel._on_cloud_abandon()
+        assert await first == "(stopped by the user)"
+        assert await second == "(stopped by the user)"
+        assert isinstance(await first, AbandonedResult)  # the backend resumes nothing
         assert [t for t, _ in published] == ["one"]  # "two" never ran
         assert stops == [True]
-        assert channel._metrics.snapshot()["counters"]["delegation_interrupted"] == 2
-        # A call made AFTER the barge-in runs normally.
-        third = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("three")))
+        assert channel._metrics.snapshot()["counters"]["delegation_stopped"] == 2
+        third = _ask(channel, "three", "r2")
         await asyncio.sleep(0.01)
         await _answer(channel, "3")
         assert await third == "3"
         assert channel._pending_delegation is None
+
+    run(_case())
+
+
+def test_a_later_turn_replaces_the_running_delegation_and_the_queued_one():
+    """The user was heard again and the model asked anew: that request replaces everything
+    asked before it, running (/stop-ped) or queued (never run)."""
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        first = _ask(channel, "one")
+        await asyncio.sleep(0)
+        second = _ask(channel, "two")
+        await asyncio.sleep(0.01)
+        third = _ask(channel, "three", "r2")
+        await asyncio.sleep(0.01)
+        assert await first == "(replaced by a newer request)"
+        assert await second == "(replaced by a newer request)"
+        assert [t for t, _ in published] == ["one", "three"]
+        assert stops == [True]
+        await _answer(channel, "3")
+        assert await third == "3"
+        assert channel._metrics.snapshot()["counters"]["delegation_replaced"] == 2
+
+    run(_case())
+
+
+def test_calls_of_one_turn_queue_and_each_is_answered():
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        first = _ask(channel, "one")
+        await asyncio.sleep(0)
+        second = _ask(channel, "two")
+        await asyncio.sleep(0.01)
+        await _answer(channel, "1")
+        assert await first == "1"
+        await asyncio.sleep(0.01)
+        assert [t for t, _ in published] == ["one", "two"]
+        await _answer(channel, "2")
+        assert await second == "2"
+        assert stops == []
+
+    run(_case())
+
+
+async def _answer_once_published(channel, published, count: int, text: str) -> None:
+    while len(published) < count:
+        await asyncio.sleep(0.001)
+    await _answer(channel, text)
+
+
+def test_an_answered_delegation_is_neither_replaced_nor_stopped():
+    """The answer resolved but its handler has not returned yet: a stop or a later turn's
+    call in that tick must not /stop the nanobot turn that just finished."""
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        first = _ask(channel, "one")
+        await asyncio.sleep(0.01)
+        channel._pending_delegation.set_final("1")
+        await channel._on_cloud_abandon()
+        answering = asyncio.create_task(_answer_once_published(channel, published, 2, "3"))
+        third = await channel._delegate_to_nanobot("ask_nanobot", _args("three"), "r2")
+        assert await first == "1" and third == "3"
+        assert stops == []
+        await answering
 
     run(_case())
 
@@ -194,7 +263,7 @@ def test_a_swept_delegation_stops_its_turn():
     nanobot turn is stopped like a timed-out one instead of burning tokens."""
     async def _case():
         channel, published, stops = _supervisor_channel()
-        task = asyncio.create_task(channel._delegate_to_nanobot("ask_nanobot", _args("q")))
+        task = _ask(channel, "q")
         await asyncio.sleep(0.01)
         task.cancel()
         try:
@@ -212,6 +281,7 @@ def test_non_string_arguments_are_taken_as_text():
         channel, published, stops = _supervisor_channel()
         task = asyncio.create_task(channel._delegate_to_nanobot(
             "ask_nanobot", json.dumps({"request": {"city": "Oslo"}, "relevant_context": 7}),
+            "r1",
         ))
         await asyncio.sleep(0.01)
         assert published[0][0] == "{'city': 'Oslo'}\n\n[context from the conversation: 7]"

@@ -167,6 +167,11 @@ class RealtimeTransport(TurnEventMixin):
         the fault to report, or None when silence was a legitimate outcome."""
         return "realtime turn timed out"
 
+    def _waiting_on_tools(self) -> bool:
+        """A tool call the shell runs still owes its answer: a settle lands on THINKING (the
+        wait goes on), never IDLE, which a gated uplink may park, losing the answer."""
+        return False
+
     async def _activity_begin_wire(self) -> None:
         """Manual turns: the vendor's start marker, if any."""
 
@@ -261,7 +266,9 @@ class RealtimeTransport(TurnEventMixin):
             # has nothing to guard. Any other state is a reply in flight, whose deadman
             # (and state) stays.
             self._cancel_watchdog()
-            await self._set_turn(VoiceState.IDLE)
+            await self._set_turn(
+                VoiceState.THINKING if self._waiting_on_tools() else VoiceState.IDLE
+            )
 
     async def park(self) -> None:
         if self._parked or self._closing:
@@ -578,7 +585,9 @@ class RealtimeTransport(TurnEventMixin):
             # SPEAKING, and the task exception would surface only at GC.
             self._log.warning("realtime turn watchdog failed ({}); forcing IDLE", exc)
         with suppress(Exception):  # the same dispatcher that just raised
-            await self._set_turn(VoiceState.IDLE)
+            await self._set_turn(
+                VoiceState.THINKING if self._waiting_on_tools() else VoiceState.IDLE
+            )
 
 
 __all__ = ["RealtimeTransport", "_load_connect"]

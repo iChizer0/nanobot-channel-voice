@@ -26,7 +26,7 @@ from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
 from nanobot_channel_voice.backend import gemini_live
 from nanobot_channel_voice.backend.audio_sink import AudioSink
-from nanobot_channel_voice.backend.base import ToolDef, VoiceState
+from nanobot_channel_voice.backend.base import AbandonedResult, ToolDef, VoiceState
 from nanobot_channel_voice.backend.gated import GatedUplink
 from nanobot_channel_voice.backend.gemini_live import GeminiLiveBackend, resolve_gemini_key
 from nanobot_channel_voice.backend.local import LocalBackend
@@ -71,10 +71,12 @@ _DIRECT_RULES = (
 
 # Silence-is-the-ack, model-side half: enforcement is backend._consume_stop's
 # transcript-gated response.cancel, which needs input transcription and can lose the race
-# to a fast ack. Appended in EVERY mode.
+# to a fast ack. Appended in EVERY mode; the second sentence is the only cover for a
+# stopped tool's answer where no transcript abandons the work.
 _STOP_RULE = (
     "If the user only tells you to stop, be quiet, or wait, do not answer — "
-    "produce no speech at all."
+    "produce no speech at all. A request they stopped stays stopped: do not read out "
+    "its result when it arrives."
 )
 
 # Supervisor mode (Responder-Thinker): the realtime model owns the conversational surface
@@ -98,7 +100,9 @@ _SUPERVISOR_TOOL = ToolDef(
         "Delegate the user's request to the nanobot agent, which can reason over "
         "multiple steps, use tools, and access memory and files. Call this whenever "
         "the user wants an action taken or a fact you do not already know. Always "
-        "speak a brief neutral filler to the user BEFORE calling this."
+        "speak a brief neutral filler to the user BEFORE calling this. A new call "
+        "replaces one still running: include anything from that request the user "
+        "still wants."
     ),
     parameters={
         "type": "object",
@@ -119,9 +123,10 @@ _SUPERVISOR_TOOL = ToolDef(
     },
 )
 
-# The ask_nanobot result on a mid-delegation barge-in: satisfies the function call, and
-# each dialect lets a result for a talked-over call resume nothing.
-_DELEGATION_INTERRUPTED = "(interrupted by the user)"
+# The ask_nanobot result for work the user stopped, or a newer request replaced: satisfies
+# the function call, and resumes nothing (see AbandonedResult).
+_DELEGATION_STOPPED = AbandonedResult("(stopped by the user)")
+_DELEGATION_REPLACED = AbandonedResult("(replaced by a newer request)")
 
 # Tags our own priority commands: core copies INBOUND metadata onto the command ack
 # ("Stopped 1 task(s)."), so _speakable can drop it — untagged, every barge-in speaks it.
@@ -303,10 +308,14 @@ class _DelegationCollector:
         self._resolve("\n".join(part for part in (self._text(), text.strip()) if part))
 
     def abandon(self, text: str) -> None:
-        """Release with no answer (interrupted): a delta landing in the tick before the
-        slot clears must not be timed as one."""
+        """Release with no answer (stopped or replaced): a delta landing in the tick before
+        the slot clears must not be timed as one."""
         self._first_token = True
         self._resolve(text)
+
+    @property
+    def resolved(self) -> bool:
+        return self._future.done()
 
     def _text(self) -> str:
         return "".join(self._parts).strip()
@@ -388,7 +397,8 @@ class VoiceChannel(BaseChannel):
         # serializes them.
         self._pending_delegation: _DelegationCollector | None = None
         self._delegation_lock = asyncio.Lock()
-        self._cloud_onsets = 0  # every user onset lands in _on_cloud_barge_in
+        self._asked_turn: str | None = None  # the model turn of the newest delegation
+        self._cloud_stops = 0  # every consumed stop that ended tool work (_on_cloud_abandon)
         # Local mode: killed-turn tokens whose core re-run was /stop-ped (once each).
         self._stopped_reruns: deque[str] = deque(maxlen=16)
         # One per session, shared with backend and shell: segments join on call_id.
@@ -707,7 +717,7 @@ class VoiceChannel(BaseChannel):
             backend=self._backend,
             open_mic=open_mic,
             exec_tool=exec_tool,
-            on_barge_in=self._on_cloud_barge_in,  # abandon a delegation talked over
+            on_abandon=self._on_cloud_abandon,  # a consumed stop ends a delegation
             on_fatal=self.stop,
             tool_mode=rt.tool_mode,
             metrics=self._metrics,
@@ -808,14 +818,14 @@ class VoiceChannel(BaseChannel):
         # does, so cloud tools share the voice session's working dir / memory.
         tools = [ToolDef.from_nanobot_schema(s) for s in await gw.get_tool_definitions()]
 
-        async def exec_tool(name: str, args: str):
+        async def exec_tool(name: str, args: str, turn: str):
             return await gw.execute_tool(
                 name, args, channel=self.name, chat_id=self.config.chat_id,
             )
 
         return tools, exec_tool
 
-    async def _delegate_to_nanobot(self, name: str, args: str) -> str:
+    async def _delegate_to_nanobot(self, name: str, args: str, turn: str) -> str:
         """``ask_nanobot`` handler (supervisor mode): run a full nanobot turn over the bus
         and return its final text for the realtime model to speak.
 
@@ -841,13 +851,25 @@ class VoiceChannel(BaseChannel):
         # Queue wait is its own component: a delegation can wait on the lock as long as it
         # then takes to run, and folding them would blame the AgentLoop.
         queued_at = time.monotonic()
-        onset = self._cloud_onsets
+        stops = self._cloud_stops
+        if turn != self._asked_turn:
+            # A later model turn (the user was heard again): this request replaces every
+            # one asked before, running or queued. Calls of one turn queue instead.
+            self._asked_turn = turn
+            pending = self._pending_delegation
+            if pending is not None and not pending.resolved:
+                self._metrics.count("delegation_replaced")
+                pending.abandon(_DELEGATION_REPLACED)
+                await self._publish_stop()
         timeout_s = self.config.realtime.delegation_timeout_s
         async with self._delegation_lock:
-            if onset != self._cloud_onsets:
-                # Barged in while queued: the asking response is cancelled, the answer stale.
-                self._metrics.count("delegation_interrupted")
-                return _DELEGATION_INTERRUPTED
+            if stops != self._cloud_stops:
+                # A stop ended the pending work while this call queued behind it.
+                self._metrics.count("delegation_stopped")
+                return _DELEGATION_STOPPED
+            if turn != self._asked_turn:
+                self._metrics.count("delegation_replaced")
+                return _DELEGATION_REPLACED
             self._metrics.observe(
                 "delegation_wait_ms", (time.monotonic() - queued_at) * 1000.0
             )
@@ -875,16 +897,16 @@ class VoiceChannel(BaseChannel):
                 if self._pending_delegation is collector:
                     self._pending_delegation = None
 
-    async def _on_cloud_barge_in(self) -> None:
-        """Every user onset lands here. Supervisor mode: a talked-over ask_nanobot delegation
-        is /stop-ped and released, and one queued behind it gives up."""
-        self._cloud_onsets += 1
+    async def _on_cloud_abandon(self) -> None:
+        """A consumed stop ended the pending tool work: a delegation in flight is /stop-ped
+        and answered as stopped, and one queued behind it gives up."""
+        self._cloud_stops += 1
         collector = self._pending_delegation
-        if collector is None:
+        if collector is None or collector.resolved:
             return
-        self._metrics.count("delegation_interrupted")
+        self._metrics.count("delegation_stopped")
+        collector.abandon(_DELEGATION_STOPPED)
         await self._publish_stop()
-        collector.abandon(_DELEGATION_INTERRUPTED)
 
     async def _start_stt_server(self):
         """``stt.serve``: expose the loaded on-device STT as a local OpenAI-compatible

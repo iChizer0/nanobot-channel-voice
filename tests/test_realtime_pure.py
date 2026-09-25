@@ -18,12 +18,14 @@ from nanobot_channel_voice.backend import openai_realtime as rt
 from nanobot_channel_voice.backend import transport
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
+    AbandonedResult,
     Error,
     InputTranscript,
     OutputAudio,
     StateHint,
     ToolCall,
     ToolDef,
+    ToolsAbandoned,
     ToolStarted,
     TurnDone,
     UserSpeechStarted,
@@ -915,6 +917,56 @@ def test_a_stop_for_the_latest_utterance_is_still_consumed():
     asyncio.run(_case())
 
 
+async def _dispatched_wait(b) -> None:
+    await b._handle_event(_created("r1"))
+    await b._handle_event({"type": "response.function_call_arguments.done", "response_id": "r1",
+                           "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+    await b._handle_event({"type": "response.done",
+                           "response": {"id": "r1", "status": "completed"}})
+
+
+def test_a_consumed_stop_abandons_the_pending_tool_work():
+    """"stop" said into a delegation's wait ends the work, not only the reply: the channel
+    is told (ToolsAbandoned), and the answer, whenever it lands, resumes nothing."""
+    async def _case():
+        b, sent, events = make_stop_backend()
+        await _dispatched_wait(b)
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "i-stop"})
+        await b._handle_event(_created("r-stop"))
+        await b._handle_event({**_stop_t(), "item_id": "i-stop"})
+        assert sum(isinstance(e, ToolsAbandoned) for e in events) == 1
+        assert b._turn is VoiceState.IDLE
+        sent.clear()
+        await b.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_a_refused_create_takes_its_kill_at_birth_with_it():
+    """An onset marks the unborn continuation to die at birth; when the server refuses that
+    create instead, the mark must not kill the next response born, the user's own."""
+    async def _case():
+        b, sent, events = make_stop_backend()
+        _barge_in_shell(b, events)
+        await _dispatched_wait(b)
+        await b.submit_tool_result("c1", "ok")
+        assert b._continuation_unborn
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert b._kill_at_birth
+        await b._handle_event({"type": "error", "error": {
+            "code": "conversation_already_has_active_response", "message": "busy"}})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event(_created("r2"))
+        assert "r2" not in b._cancelled_responses
+        await b.close()
+
+    asyncio.run(_case())
+
+
 def test_without_transcription_model_the_matcher_is_inert():
     async def _case():
         b, sent, _ = make_stop_backend(VoiceConfig())
@@ -1193,11 +1245,10 @@ def test_a_tool_run_after_the_filler_holds_thinking_not_speaking():
                   "item": {"type": "function_call", "call_id": "c1", "name": "ask_nanobot"}})
         await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
                   "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
-        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed",
-                  "output": [{"type": "function_call", "call_id": "c1"}]}})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
         await backend._drain_task
         assert backend._turn is VoiceState.THINKING
-        assert backend._active_response_id == "r1"  # a barge-in can still cancel it
+        assert backend._active_response_id is None  # the call, not the response, is live
         await backend.submit_tool_result("c1", "answer")
         assert [p["type"] for p in sent[-2:]] == ["conversation.item.create", "response.create"]
         assert backend._turn is VoiceState.THINKING
@@ -1214,26 +1265,50 @@ def test_a_tool_run_after_the_filler_holds_thinking_not_speaking():
     asyncio.run(_run())
 
 
-def test_barge_in_during_the_tool_wait_cancels_the_continuation_without_a_truncate():
-    """The user speaks into the THINKING wait (the filler fully played): the trigger
-    response is cancelled so the late tool result resumes nothing, and no truncate is sent
-    for the drained filler item (the server would refuse an end past its length)."""
+async def _tool_wait(ev, rid: str = "r1", cid: str = "c1") -> None:
+    """A filler, then a dispatched ask_nanobot call, then the response's completion."""
+    await ev({"type": "response.created", "response": {"id": rid}})
+    await ev({"type": "response.output_item.added", "response_id": rid,
+              "item": {"type": "message", "id": f"item-{rid}"}})
+    await ev({"type": "response.audio.delta", "response_id": rid, "item_id": f"item-{rid}",
+              "delta": b64(b"\x00" * 3200)})
+    await ev({"type": "response.function_call_arguments.done", "response_id": rid,
+              "call_id": cid, "name": "ask_nanobot", "arguments": "{}"})
+    await ev({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+
+
+async def _aside(ev, rid: str) -> None:
+    """The user speaks and the server answers it (server VAD), audibly."""
+    await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+    await ev({"type": "input_audio_buffer.speech_stopped"})
+    await ev({"type": "input_audio_buffer.committed", "item_id": f"u-{rid}"})
+    await ev({"type": "response.created", "response": {"id": rid}})
+    await ev({"type": "response.audio.delta", "response_id": rid, "delta": b64(b"\x00" * 320)})
+
+
+def _tool_wait_backend(sink: AudioSink):
+    backend, sent = make_sending_backend(sink)
+    events: list = []
+
+    async def on_event(e):
+        events.append(e)
+
+    backend._on_event = on_event
+    return backend, sent, events
+
+
+def test_talk_during_the_tool_wait_keeps_the_call_for_the_users_turn():
+    """Speech into the THINKING wait: no truncate for the drained filler (the server refuses
+    an end past its length), and the call stays owed. Its answer, landing mid-speech, never
+    cuts in: the user's own response is created after it and sees it, so nothing re-asks."""
 
     async def _run():
         sink = AudioSink(NullPlayback(), mode="stream")
         await sink.start()
-        backend, sent = make_sending_backend(sink)
+        backend, sent, events = _tool_wait_backend(sink)
         ev = backend._handle_event
         await ev({"type": "session.updated"})
-        await ev({"type": "response.created", "response": {"id": "r1"}})
-        await ev({"type": "response.output_item.added", "response_id": "r1",
-                  "item": {"type": "message", "id": "item-filler"}})
-        await ev({"type": "response.audio.delta", "response_id": "r1", "item_id": "item-filler",
-                  "delta": b64(b"\x00" * 3200)})
-        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
-                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
-        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed",
-                  "output": [{"type": "function_call", "call_id": "c1"}]}})
+        await _tool_wait(ev)
         await backend._drain_task
         assert backend._turn is VoiceState.THINKING
         sent.clear()
@@ -1241,10 +1316,272 @@ def test_barge_in_during_the_tool_wait_cancels_the_continuation_without_a_trunca
         assert backend._turn is VoiceState.CAPTURING
         await backend.barge_in(100)
         assert not any(p["type"] == "conversation.item.truncate" for p in sent)
-        await backend.submit_tool_result("c1", "(interrupted by the user)")
-        assert [p["type"] for p in sent if p["type"] != "response.cancel"] == [
-            "conversation.item.create"
-        ]  # the call is answered, nothing is re-triggered over the user
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        await ev({"type": "input_audio_buffer.speech_stopped"})
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        assert backend._turn is VoiceState.IDLE
+        assert sum(isinstance(e, TurnDone) for e in events) == 1
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_an_answer_landing_under_the_reply_to_an_aside_is_asked_for_after_it():
+    """The user's aside is answered while the delegation runs, and the answer lands under
+    that reply: it never cuts in, the turn holds THINKING past the aside's end (no
+    TurnDone, no IDLE), and a re-ask speaks it."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await _aside(ev, "r2")
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        assert not any(isinstance(e, TurnDone) for e in events)
+        await ev({"type": "response.created", "response": {"id": "r3"}})
+        await ev({"type": "response.done", "response": {"id": "r3", "status": "completed"}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.IDLE
+        assert sum(isinstance(e, TurnDone) for e in events) == 1
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_the_reply_to_an_aside_ends_in_the_wait_not_the_turn():
+    """The aside's reply ends before the delegation does: the turn goes on in THINKING,
+    and the answer landing afterwards asks for its own continuation."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await _aside(ev, "r2")
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        assert not any(isinstance(e, TurnDone) for e in events)
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_filler_cut_mid_stream_keeps_its_dispatched_call():
+    """Talking over the filler cancels its response, not the work: the dispatched call keeps
+    its obligation (its answer continues the turn once the user is heard out), while a
+    call only announced, whose arguments never finished, is dropped."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.audio.delta", "response_id": "r1",
+                  "delta": b64(b"\x00" * 3200)})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        await ev({"type": "response.output_item.added", "response_id": "r1",
+                  "item": {"type": "function_call", "call_id": "c2", "name": "ask_nanobot"}})
+        await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+        await backend.barge_in(50)
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "cancelled"}})
+        assert backend._tools_pending == {"r1": {"c1"}}
+        assert [e.turn for e in events if isinstance(e, ToolCall)] == ["r1"]
+        await ev({"type": "input_audio_buffer.speech_stopped"})
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_an_abandoned_result_answers_the_call_and_resumes_nothing():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        sent.clear()
+        await backend.submit_tool_result("c1", AbandonedResult("(replaced by a newer request)"))
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        assert backend._tools_pending == {} and not backend._answer_owed()
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_re_ask_talked_over_before_its_birth_dies_there():
+    """The deferred answer's re-ask is a continuation like any other: an onset before its
+    response.created kills it at birth instead of letting it play over the user."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        _barge_in_shell(backend, events)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await _aside(ev, "r2")
+        await backend.submit_tool_result("c1", "the answer")
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        assert sent[-1] == {"type": "response.create"}
+        await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+        await ev({"type": "response.created", "response": {"id": "r3"}})
+        assert sent[-1] == {"type": "response.cancel", "response_id": "r3"}
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_an_auto_continuing_dialect_is_never_re_asked():
+    """Where the server resumes on the function_call_output itself, a deferred answer is
+    not asked for again: that would be a second continuation."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        backend._needs_response_create_after_tools = False
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await _aside(ev, "r2")
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_failed_response_keeps_the_call_it_dispatched():
+    """The response that asked failed after dispatching: the call still owes its answer, so
+    the turn waits in THINKING (no TurnDone) and the answer continues it."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "failed"}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        assert not any(isinstance(e, TurnDone) for e in events)
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_the_deadman_gives_up_a_stalled_response_not_its_call():
+    """The response that asked stalls with no done: the deadman cancels the response, and
+    the dispatched call's answer still continues the turn from THINKING."""
+
+    async def _run():
+        cfg = VoiceConfig.model_validate({"realtime": {"turnTimeoutS": 0.05}})
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend = rt.RealtimeBackend(cfg, sink=sink, profile=PROFILES["openai"])
+        sent: list[dict] = []
+        events: list = []
+
+        async def record(payload):
+            sent.append(payload)
+
+        async def on_event(e):
+            events.append(e)
+
+        backend._send = record
+        backend._on_event = on_event
+        ev = backend._handle_event
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        for _ in range(80):
+            await asyncio.sleep(0.01)
+            if backend._watchdog_task.done():
+                break
+        assert hints(events)[-1] is VoiceState.THINKING
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_the_deadman_during_a_tool_wait_settles_thinking():
+    """The watchdog armed at an aside's onset fires with the delegation still running: the
+    wait goes on in THINKING (IDLE would let a gated uplink park and lose the answer)."""
+
+    async def _run():
+        cfg = VoiceConfig.model_validate({"realtime": {"turnTimeoutS": 0.05}})
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend = rt.RealtimeBackend(cfg, sink=sink, profile=PROFILES["openai"])
+        events: list = []
+
+        async def on_event(e):
+            events.append(e)
+
+        backend._on_event = on_event
+        ev = backend._handle_event
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await ev({"type": "input_audio_buffer.speech_started"})
+        await ev({"type": "input_audio_buffer.speech_stopped"})
+        for _ in range(80):
+            await asyncio.sleep(0.01)
+            if backend._watchdog_task is not None and backend._watchdog_task.done():
+                break
+        assert hints(events)[-1] is VoiceState.THINKING
         await backend.close()
         await sink.stop()
 

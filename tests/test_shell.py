@@ -19,6 +19,7 @@ from nanobot_channel_voice.backend.base import (
     OutputTranscript,
     StateHint,
     ToolCall,
+    ToolsAbandoned,
     TurnDone,
     VoiceState,
 )
@@ -45,7 +46,6 @@ class _StubCapture(CaptureSource):
 class _StubBackend:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
-        self.raise_on_barge_in = False
 
     async def start(self, *, instructions, tools, on_event) -> None:
         self.calls.append(("start", None))
@@ -56,8 +56,6 @@ class _StubBackend:
 
     async def barge_in(self, played_ms: int) -> None:
         self.calls.append(("barge_in", played_ms))
-        if self.raise_on_barge_in:
-            raise RuntimeError("socket is gone")
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         self.calls.append(("result", (call_id, output)))
@@ -105,11 +103,6 @@ def test_cloud_barge_in_hands_the_backend_the_flush_result():
             return await real_flush()
 
         sink.flush = spy_flush
-
-        async def on_barge_in():
-            order.append("abandon")
-
-        shell._on_barge_in = on_barge_in
         await shell._cloud_barge_in()
         await sink.stop()
         return backend
@@ -117,29 +110,9 @@ def test_cloud_barge_in_hands_the_backend_the_flush_result():
     backend = _run(_case())
     kinds = [c[0] for c in backend.calls]
     assert kinds == ["barge_in"]
-    assert order == ["flush", "abandon"]  # flush -> backend -> abandon
+    assert order == ["flush"]
     (_, played_ms), = [c for c in backend.calls if c[0] == "barge_in"]
     assert played_ms > 0  # a real number, not the post-flush zero
-
-
-def test_delegation_is_abandoned_even_if_the_wire_step_fails():
-    abandoned: list[bool] = []
-
-    async def _case():
-        shell, backend, sink = _shell()
-        backend.raise_on_barge_in = True
-
-        async def on_barge_in():
-            abandoned.append(True)
-
-        shell._on_barge_in = on_barge_in
-        try:
-            await shell._cloud_barge_in()
-        except RuntimeError:
-            pass
-
-    _run(_case())
-    assert abandoned == [True]
 
 
 # ---- mic gate ---------------------------------------------------------------
@@ -191,7 +164,7 @@ def test_tool_failure_is_classified_from_is_error_not_from_exceptions():
     """nanobot's ToolRegistry never raises for a tool failure: it returns a
     ToolResult (a str subclass) with is_error set. Keying success off exceptions
     would report ~0% failures forever."""
-    async def exec_tool(name, args):
+    async def exec_tool(name, args, turn):
         return _ErrResult("boom")
 
     async def _case():
@@ -205,7 +178,7 @@ def test_tool_failure_is_classified_from_is_error_not_from_exceptions():
 
 
 def test_tool_exception_is_reported_back_to_the_model():
-    async def exec_tool(name, args):
+    async def exec_tool(name, args, turn):
         raise ValueError("nope")
 
     async def _case():
@@ -218,6 +191,35 @@ def test_tool_exception_is_reported_back_to_the_model():
     call_id, output = [c[1] for c in backend.calls if c[0] == "result"][0]
     assert call_id == "c2"
     assert "nope" in output
+
+
+def test_the_seam_gets_the_turn_that_issued_the_call():
+    seen: list[str] = []
+
+    async def exec_tool(name, args, turn):
+        seen.append(turn)
+        return "ok"
+
+    async def _case():
+        shell, _, _ = _shell(exec_tool=exec_tool)
+        await shell._on_tool_call(ToolCall(call_id="c1", name="t", arguments="{}", turn="r7"))
+
+    _run(_case())
+    assert seen == ["r7"]
+
+
+def test_abandoned_tools_reach_the_channel():
+    abandoned: list[bool] = []
+
+    async def on_abandon():
+        abandoned.append(True)
+
+    async def _case():
+        shell, _, _ = _shell(on_abandon=on_abandon)
+        await shell._on_event(ToolsAbandoned())
+
+    _run(_case())
+    assert abandoned == [True]
 
 
 def test_missing_tool_seam_answers_the_model_instead_of_hanging():

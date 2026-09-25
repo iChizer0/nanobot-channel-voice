@@ -557,6 +557,55 @@ def test_a_reply_born_under_the_next_activity_dies_at_birth():
     run(_run())
 
 
+async def _dispatched_wait(backend) -> None:
+    await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+    await backend._handle_event({"type": "response.function_call_arguments.done",
+                                 "response_id": "r1", "call_id": "c1", "name": "ask_nanobot",
+                                 "arguments": "{}"})
+    await backend._handle_event({"type": "response.done",
+                                 "response": {"id": "r1", "status": "completed"}})
+
+
+def test_a_blip_during_the_tool_wait_returns_to_thinking():
+    """A discarded activity during a delegation's wait settles back to THINKING, not IDLE:
+    the gate parks an IDLE socket, and the answer would land on a closed session."""
+
+    async def _run():
+        backend, sent, _ = make_shell_backend()
+        backend._ready.set()
+        await _dispatched_wait(backend)
+        await backend.begin_activity()
+        await backend.end_activity(commit=False)
+        assert backend._turn is VoiceState.THINKING
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+
+    run(_run())
+
+
+def test_an_answer_landing_during_a_blip_is_asked_for_when_it_is_discarded():
+    """The answer never cuts into an open activity; when that activity turns out to be a
+    blip, nothing else would ask for the answer, so the discard does."""
+
+    async def _run():
+        backend, sent, _ = make_shell_backend()
+        backend._ready.set()
+        await _dispatched_wait(backend)
+        await backend.begin_activity()
+        sent.clear()
+        await backend.submit_tool_result("c1", "the answer")
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        await backend.end_activity(commit=False)
+        assert [p["type"] for p in sent] == [
+            "conversation.item.create", "input_audio_buffer.clear", "response.create",
+        ]
+        await backend.close()
+
+    run(_run())
+
+
 def test_refused_commit_is_not_re_asked_while_the_user_speaks():
     """The deferred response.create re-issued on the cancelled done of the response the
     user just barged in on answers A over B, and B's own commit is refused again: it

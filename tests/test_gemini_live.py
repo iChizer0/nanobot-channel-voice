@@ -9,6 +9,7 @@ from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend import gemini_live as gl
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
+    AbandonedResult,
     Error,
     InputTranscript,
     ManualTurnBackend,
@@ -682,26 +683,76 @@ def test_schema_infers_object_for_an_implicit_object_property():
     assert wire["properties"]["where"]["properties"]["city"] == {"type": "string"}
 
 
-def test_a_call_the_user_talked_over_answers_silently():
-    """A barge-in lands while a call is pending: its late result joins the context SILENT
-    (INTERRUPT would talk over the new utterance, WHEN_IDLE speak a stale answer after it)
-    and arms no deadman. A call announced after the onset keeps its schedule."""
-    cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
+def test_a_talked_over_call_still_answers_once_the_user_is_done():
+    """An onset no longer cuts a pending call: its answer lands WHEN_IDLE while the user
+    holds the floor (a manual activity open), on the configured schedule otherwise. Only
+    an AbandonedResult (stopped or replaced) joins the context SILENT, arming no deadman."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"},
+                      realtime={"uplink": "vad", "toolMode": "supervisor"})
 
     async def after(backend):
+        backend._ready.set()
+        await backend.begin_activity()
         await backend.barge_in(0)
-        await backend.submit_tool_result("c1", "(interrupted by the user)")
-        assert backend._watchdog_task is None or backend._watchdog_task.done()
-        await backend._handle_event(
-            {"toolCall": {"functionCalls": [{"id": "c2", "name": "ask_nanobot", "args": {}}]}}
-        )
-        await backend.submit_tool_result("c2", "fresh answer")
+        await backend.submit_tool_result("c1", "answer one")
+        await backend.end_activity()
+        await backend.submit_tool_result("c2", "answer two")
+        armed = backend._watchdog_task
+        await backend.submit_tool_result("c3", AbandonedResult("(stopped by the user)"))
+        assert backend._watchdog_task is armed  # no deadman for an answer nobody awaits
 
     _, sent, _ = drive([
-        {"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}}]}},
+        {"setupComplete": {}},
+        {"toolCall": {"functionCalls": [
+            {"id": "c1", "name": "ask_nanobot", "args": {}},
+            {"id": "c2", "name": "ask_nanobot", "args": {}},
+            {"id": "c3", "name": "ask_nanobot", "args": {}},
+        ]}},
     ], config=cfg, after=after)
     schedules = [
         m["toolResponse"]["functionResponses"][0]["response"]["scheduling"]
         for m in sent if "toolResponse" in m
     ]
-    assert schedules == ["SILENT", "INTERRUPT"]
+    assert schedules == ["WHEN_IDLE", "INTERRUPT", "SILENT"]
+
+
+def test_calls_carry_the_model_turn_that_issued_them():
+    """Calls of one model turn share its turn; a call after a turnComplete or an
+    interruption comes from a later turn, which is what a newer request is."""
+    _, _, events = drive([
+        {"setupComplete": {}},
+        {"toolCall": {"functionCalls": [{"id": "a", "name": "t", "args": {}},
+                                        {"id": "b", "name": "t", "args": {}}]}},
+        {"toolCall": {"functionCalls": [{"id": "c", "name": "t", "args": {}}]}},
+        {"serverContent": {"turnComplete": True}},
+        {"toolCall": {"functionCalls": [{"id": "d", "name": "t", "args": {}}]}},
+        audio_msg(b"\x01"),
+        {"serverContent": {"interrupted": True}},
+        {"toolCall": {"functionCalls": [{"id": "e", "name": "t", "args": {}}]}},
+    ])
+    turns = {e.call_id: e.turn for e in events if isinstance(e, ToolCall)}
+    assert turns["a"] == turns["b"] == turns["c"]
+    assert len({turns["c"], turns["d"], turns["e"]}) == 3
+
+
+def test_a_blip_during_a_tool_wait_stays_thinking():
+    """The gate's discarded activity, and the model's unheard answer to it, both settle
+    THINKING while a call still runs: IDLE would let the gate park the socket, losing
+    the answer."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def after(backend):
+        backend._ready.set()
+        await backend.begin_activity()
+        await backend.end_activity(commit=False)
+        assert backend._turn is VoiceState.THINKING
+        await backend._handle_event(audio_msg(b"\x01"))
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        assert backend._turn is VoiceState.THINKING
+
+    _, _, events = drive([
+        {"setupComplete": {}},
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}},
+        {"serverContent": {"turnComplete": True}},
+    ], config=cfg, after=after)
+    assert VoiceState.IDLE not in hints(events)

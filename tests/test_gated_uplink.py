@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import math
 
+import pytest
+
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
@@ -62,6 +64,7 @@ class FakeInner:
         self.on_event = None
         self.fail_begin = False
         self.live = False  # begin emits UserSpeechStarted when a reply is live
+        self.waiting = False  # a tool call owes its answer: a discard settles THINKING
 
     async def start(self, *, instructions, tools, on_event):
         self.on_event = on_event
@@ -80,7 +83,9 @@ class FakeInner:
     async def end_activity(self, *, commit=True):
         self.calls.append(("end", commit))
         if not commit:
-            await self.on_event(StateHint(VoiceState.IDLE))
+            await self.on_event(
+                StateHint(VoiceState.THINKING if self.waiting else VoiceState.IDLE)
+            )
 
     async def park(self):
         self.calls.append(("park",))
@@ -268,6 +273,102 @@ def test_bare_summon_over_a_reply_kills_it_and_opens_the_window():
         inner.calls.clear()
         await feed(gate, 10, start=2)  # the command, inside the window
         assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_bare_summon_while_the_agent_works_keeps_the_query_and_admits_the_command():
+    """Over THINKING (a delegation's wait) the bare phrase cancels nothing, as locally; in
+    strict mode it is what lets the command after it through, that one only."""
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await feed(gate, 2)  # hit on frame 2, no speech
+        assert inner.calls == []
+        await feed(gate, 10, start=2)  # the command after the beat
+        assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        inner.calls.clear()
+        await feed(gate, 9, start=12)  # more talk in the same wait, no phrase
+        assert inner.calls == []
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_bare_summon_during_a_tool_wait_admits_the_command_after_it():
+    """The adopted phrase alone is taken back and the adapter settles THINKING again (a
+    call still owes its answer): strict still lets the command after the beat through."""
+    async def _run():
+        vad = ScriptVad([True] * 5 + [False] * 5 + [True] * 6 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}, back_bytes=FRAME),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        inner.waiting = True
+        await feed(gate, 10)
+        assert inner.calls[-1] == ("end", False)
+        assert gate._state is VoiceState.THINKING
+        inner.calls.clear()
+        await feed(gate, 11, start=10)
+        assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("then", [
+    [VoiceState.SPEAKING],  # the answer is audible
+    [VoiceState.IDLE, VoiceState.THINKING],  # a later turn works
+])
+def test_a_summons_claim_ends_with_its_wait(then):
+    """The phrase unlocked the command during that wait only: strict needs it again once
+    the answer speaks, and in any later turn."""
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await feed(gate, 2)
+        for state in then:
+            await inner.emit(StateHint(state))
+        await feed(gate, 10, start=2)
+        assert inner.kinds() == []
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_bare_summon_while_the_agent_works_keeps_the_engaged_window():
+    """The turn owns attention until IDLE: a phrase said during a long wait must not shrink
+    the window to windowS, or a later onset in the same wait would be dropped."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({11}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await inner.emit(StateHint(VoiceState.IDLE))  # window open (conversation)
+        await feed(gate, 9)  # an utterance, committed
+        assert inner.calls[-1] == ("end", True)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        assert gate._window_until == math.inf
+        await feed(gate, 2, start=9)  # frame 11: a bare hit during the wait
+        assert gate._metrics.snapshot()["counters"]["wake_hit"] == 1
+        assert gate._window_until == math.inf
         await gate.close()
 
     asyncio.run(_run())
