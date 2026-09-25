@@ -211,6 +211,31 @@ def test_a_streamed_agent_turn_is_voiced_whole():
     run(_case())
 
 
+def test_a_reply_cut_at_the_token_limit_is_collected_as_one_message():
+    """Core ends a segment cut at the token limit with merge_next and streams the rest of
+    the sentence as the next one: a delegation's reply and a notice read on unbroken."""
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        pending = channel._pending_delegation = _ReplyCollector(VoiceMetrics())
+        chat, meta = channel.config.chat_id, {_DELEGATION_META: pending.token}
+        await channel.send_delta(chat, "The capital of Fra", meta, stream_id="s:1:0")
+        await channel.send_delta(chat, "", meta, stream_id="s:1:0", stream_end=True,
+                                 resuming=True, merge_next=True)
+        await channel.send_delta(chat, "nce is Paris.", meta, stream_id="s:1:1")
+        await channel.send_delta(chat, "", meta, stream_id="s:1:1", stream_end=True)
+        assert await pending.result() == "The capital of France is Paris."
+        await _stream(channel, "Time to stre", _CRON)
+        await channel.send_delta(chat, "", _CRON, stream_id="voice:local:1:0",
+                                 stream_end=True, resuming=True, merge_next=True)
+        assert backend.said == []
+        await _stream(channel, "tch.", _CRON, sid="voice:local:1:1")
+        await _stream(channel, "", _CRON, sid="voice:local:1:1", end=True)
+        assert backend.said == ["Time to stretch."]
+
+    run(_case())
+
+
 def test_an_agent_turn_whose_last_segment_streamed_nothing_ends_in_its_final():
     from nanobot.bus.events import OutboundMessage
 

@@ -1317,11 +1317,17 @@ class VoiceChannel(BaseChannel):
         stream_id: str | None = None,
         stream_end: bool = False,
         resuming: bool = False,
+        merge_next: bool = False,
     ) -> None:
         # The manager passes stream framing as kwargs unconditionally, so declaring these
         # parameters is load-bearing: an override without them fails every delta.
         if chat_id != self.config.chat_id:
             return  # addressed elsewhere; see send()
+        if stream_end and merge_next:
+            # A reply cut at the token limit: the next segment continues this sentence, often
+            # mid-word, so this end is no boundary (the manager passes merge_next only to a
+            # send_delta that declares it).
+            stream_end = resuming = False
         if _delegation_reply(self._pending_delegation, metadata or {}):
             _collect(self._pending_delegation, delta, stream_end=stream_end, resuming=resuming)
             return

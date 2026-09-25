@@ -896,6 +896,39 @@ def test_agent_initiated_deltas_mark_the_turn_proactive():
     _run(_t())
 
 
+def test_a_reply_cut_at_the_token_limit_is_spoken_as_one_sentence():
+    """Core streams the rest of a reply cut at the token limit as the next segment, often
+    mid-word, after an end marked merge_next: no fragment is spoken alone, no tool wait."""
+    async def _t():
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+        from nanobot_channel_voice.streamid import TURN_META
+
+        h = _build()
+        b = h.backend
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = b
+        b._cur_turn = _Turn("t1")
+        await b._set_turn(VoiceState.THINKING)
+        chat, meta = channel.config.chat_id, {TURN_META: "t1"}
+        base = f"voice:voice:local:{time.time_ns()}"
+        await channel.send_delta(chat, "The capital of Fra", meta, stream_id=f"{base}:0")
+        await channel.send_delta(chat, "", meta, stream_id=f"{base}:0", stream_end=True,
+                                 resuming=True, merge_next=True)
+        assert b._cur_turn.midturn_task is None
+        assert not b._cur_turn.continuation_pending
+        await channel.send_delta(chat, "nce is Paris.", meta, stream_id=f"{base}:1")
+        await channel.send_delta(chat, "", meta, stream_id=f"{base}:1", stream_end=True)
+        spoken = []
+        while not b._tts_queue.empty():
+            spoken.append(b._tts_queue.get_nowait()[1])
+        assert spoken == ["The capital of France is Paris."]
+        assert "agent_prologue" not in b._metrics.snapshot()["counters"]
+
+    _run(_t())
+
+
 def test_agent_initiated_final_bypasses_the_dead_token_gate():
     # A cron job snapshots its CREATION turn's token into origin_metadata and every
     # fire echoes it. If that turn was ever barged out, the gate would eat the
