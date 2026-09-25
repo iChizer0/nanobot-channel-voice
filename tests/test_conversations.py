@@ -429,6 +429,31 @@ def test_a_give_up_turn_says_so_instead_of_going_silent():
     _run(_case())
 
 
+def test_a_blank_terminal_under_a_playing_status_line_holds_the_turn():
+    """The same blank terminal landing while the status line still plays (a fast tool):
+    read as the end of an answer, it cancelled the deadman and settled IDLE under the run,
+    and core's plain final then arrived as a stranger's delivery."""
+    async def _case():
+        async with EvalConversation(agentTimeoutS=30.0) as c:
+            b = c.backend
+            await c.user_says("check the weather")
+            await b.on_delta("Let me look that up for you right now.")
+            await b.on_stream_end(resuming=True)
+            assert b._turn is VoiceState.SPEAKING
+            await b.on_stream_end(resuming=False)       # blank, the line still playing
+            await c.wait_state(VoiceState.THINKING, timeout=2.0)
+            await asyncio.sleep(0.05)
+            assert b._turn is VoiceState.THINKING       # the wait goes on
+            assert not b._cur_turn.timeout_task.done()  # deadman still guarding
+
+            await b.speak_final("It is sunny in Tokyo today.")  # core's plain final
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_state(VoiceState.IDLE)
+            assert b._cur_turn.answered
+
+    _run(_case())
+
+
 def test_a_terminal_clears_the_steer_latch():
     """`continuation_pending` is a turn latch and the IDLE placeholder is shared, so every
     terminal must clear it: a final arriving as a plain send after a tool boundary (the

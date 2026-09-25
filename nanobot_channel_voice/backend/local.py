@@ -3284,13 +3284,15 @@ class LocalBackend(TurnEventMixin):
             self._cur_turn.continuation_pending = True
             self._arm_midturn(spoke)
             return
-        self._cur_turn.continuation_pending = False
+        # Still pending: not one delta since the tool boundary, a blank segment.
+        blank, self._cur_turn.continuation_pending = self._cur_turn.continuation_pending, False
         if spoke:
             self._cur_turn.answered = True
-        elif self._base_turn() is VoiceState.THINKING:
-            # Core fires a non-resuming end on its blank-response RETRY path too, so an empty
-            # terminal does not prove the turn is over (and nothing plays, so nothing drains).
-            # Hold: let the final or the deadman decide, never disarm under a live run.
+        elif blank or self._base_turn() is VoiceState.THINKING:
+            # Core fires a non-resuming end on its blank-response RETRY path too, and follows a
+            # blank last segment with a plain final: an empty terminal does not prove the turn
+            # is over, even while its status line still plays (the boundary watch settles
+            # that). Hold: let the final or the deadman decide, never disarm under a live run.
             return
         self._schedule_drain()
 
