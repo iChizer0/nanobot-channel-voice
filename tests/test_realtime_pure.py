@@ -1555,6 +1555,256 @@ def test_the_deadman_gives_up_a_stalled_response_not_its_call():
     asyncio.run(_run())
 
 
+async def _settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def _notice_frames(sent: list[dict]) -> list[str]:
+    return [p["item"]["content"][0]["text"] for p in sent
+            if p["type"] == "conversation.item.create" and p["item"]["type"] == "message"]
+
+
+def test_a_notice_is_voiced_once_the_session_is_quiet():
+    """Held while a reply plays and while the user speaks; voiced as its own response at
+    the next quiet settle, a marked user text item plus a create, one per settle."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await backend.announce("Reminder: check the oven.")
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == []
+        await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "cancelled"}})
+        await _settle()
+        assert _notice_frames(sent) == []  # the user holds the floor
+        await ev({"type": "input_audio_buffer.speech_stopped"})
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Reminder: check the oven."]
+        assert sent[-1] == {"type": "response.create"} and backend._continuation_unborn
+        await ev({"type": "response.created", "response": {"id": "r3"}})
+        await ev({"type": "response.done", "response": {"id": "r3", "status": "completed"}})
+        await backend._drain_task
+        await _settle()
+        assert _notice_frames(sent)[-1] == "[notice] Dinner is ready."
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_waits_for_a_reply_the_user_is_talking_under():
+    """Server VAD: a reply born while the user speaks settles IDLE under their speech when it
+    ends; the notice still waits for them to finish."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await backend._drain_task
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == []
+        await ev({"type": "input_audio_buffer.speech_stopped"})
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_waits_for_the_reply_to_an_aside_during_a_tool_wait():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await backend._drain_task
+        await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+        await ev({"type": "input_audio_buffer.speech_stopped"})
+        await ev({"type": "response.created", "response": {"id": "r2"}})  # not audible yet
+        assert backend._turn is VoiceState.THINKING and backend._waiting_on_tools()
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == []
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_second_notice_waits_for_the_first_ones_reply():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await backend.announce("Reminder: check the oven.")
+        await _settle()
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Reminder: check the oven."]
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        await backend._drain_task
+        await _settle()
+        assert _notice_frames(sent)[-1] == "[notice] Dinner is ready."
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_goes_out_during_a_tool_wait():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await backend._drain_task
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_waits_for_a_session_and_outlives_a_lost_one():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == []  # no session yet
+        await backend._on_session_lost()
+        await _settle()
+        await backend._handle_event({"type": "session.updated"})
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_talked_over_while_it_is_sent_dies_at_birth():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        _barge_in_shell(backend, events)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        record = backend._send
+
+        async def racing_send(payload):
+            await record(payload)
+            if payload["type"] == "conversation.item.create":
+                await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+
+        backend._send = racing_send
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        assert sent[-1] == {"type": "response.cancel", "response_id": "r1"}
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_whose_send_fails_waits_for_the_next_session():
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        record = backend._send
+        broken = [True]
+
+        async def failing_send(payload):
+            if broken[0]:
+                raise ConnectionError("socket closed")
+            await record(payload)
+
+        backend._send = failing_send
+        await ev({"type": "session.updated"})
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert list(backend._notices) == ["Dinner is ready."]
+        broken[0] = False
+        await backend._on_session_lost()
+        await ev({"type": "session.updated"})
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_create_is_unborn_before_its_frame_goes_out():
+    """The user's onset can be handled while response.create is still being sent: the
+    continuation must already count as unborn then, or it is born over the user."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, events = _tool_wait_backend(sink)
+        _barge_in_shell(backend, events)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "ask_nanobot", "arguments": "{}"})
+        await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+        record = backend._send
+
+        async def racing_send(payload):
+            await record(payload)
+            if payload == {"type": "response.create"}:
+                await ev({"type": "input_audio_buffer.speech_started", "audio_start_ms": 0})
+
+        backend._send = racing_send
+        await backend.submit_tool_result("c1", "the answer")
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        assert sent[-1] == {"type": "response.cancel", "response_id": "r2"}
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
 def test_the_deadman_during_a_tool_wait_settles_thinking():
     """The watchdog armed at an aside's onset fires with the delegation still running: the
     wait goes on in THINKING (IDLE would let a gated uplink park and lose the answer)."""

@@ -33,6 +33,7 @@ from nanobot_channel_voice.metrics import VoiceMetrics
 
 from .audio_sink import AudioSink
 from .base import (
+    NOTICE_MARK,
     AbandonedResult,
     InputTranscript,
     OutputAudio,
@@ -193,6 +194,9 @@ class GeminiLiveBackend(RealtimeTransport):
         # plays (WS ordering: an answer to activity N precedes N+1's, and N+1's start
         # interrupts it if still streaming).
         self._suppress_turn = False
+        # A notice went out and the model's turn answering it has not ended: nothing else
+        # may go (a client turn interrupts any generation).
+        self._notice_turn = False
 
     def _api_key(self) -> str:
         key = resolve_gemini_key(self._rt.api_key)
@@ -334,6 +338,7 @@ class GeminiLiveBackend(RealtimeTransport):
             self._ready.set()
             self._ever_ready = True
             self._auth_fails = 0
+            self._schedule_notice()
         elif "serverContent" in msg:
             await self._on_server_content(msg["serverContent"] or {}, _status_of(msg))
         elif "toolCall" in msg:
@@ -405,6 +410,7 @@ class GeminiLiveBackend(RealtimeTransport):
     async def _on_turn_complete(self, status: str | None) -> None:
         self._turns += 1
         self._generating = False
+        self._notice_turn = False
         if self._interrupted:
             # The cut-off turn's end: the shell already flushed and the onset owns the
             # state; a drain here would flip CAPTURING -> IDLE mid-speech and TurnDone
@@ -448,6 +454,7 @@ class GeminiLiveBackend(RealtimeTransport):
         # Server-side VAD (or our activityStart) cut the model off. WS ordering: what
         # follows on the wire is new generation, never the dead turn's tail.
         self._turns += 1
+        self._notice_turn = False
         self._interrupted = self._generating or self._dropped_dead
         self._dropped_dead = False
         self._generating = False
@@ -496,7 +503,25 @@ class GeminiLiveBackend(RealtimeTransport):
     def _waiting_on_tools(self) -> bool:
         return bool(self._pending_calls)
 
+    def _notice_quiet(self) -> bool:
+        # An open activity (CAPTURING) and generation (SPEAKING) are never quiet.
+        return not self._in_progress and not self._notice_turn and (
+            self._turn is VoiceState.IDLE
+            or (self._turn is VoiceState.THINKING and bool(self._pending_calls))
+        )
+
+    async def _voice_notice(self, text: str) -> None:
+        # A turn the client completes: its answer plays even after a discarded activity.
+        self._notice_turn = True
+        self._suppress_turn = False
+        await self._send({"clientContent": {
+            "turns": [{"role": "user", "parts": [{"text": f"{NOTICE_MARK} {text}"}]}],
+            "turnComplete": True,
+        }})
+        self._arm_watchdog()
+
     async def _watchdog_recover(self) -> str | None:
+        self._notice_turn = False
         if self._generating:
             # Audio stalled mid-stream: a real fault.
             self._generating = False

@@ -96,6 +96,9 @@ class FakeInner:
     async def submit_tool_result(self, call_id, output):
         self.calls.append(("result", call_id))
 
+    async def announce(self, text):
+        self.calls.append(("announce", text))
+
     async def close(self):
         self.calls.append(("close",))
 
@@ -369,6 +372,25 @@ def test_a_bare_summon_while_the_agent_works_keeps_the_engaged_window():
         await feed(gate, 2, start=9)  # frame 11: a bare hit during the wait
         assert gate._metrics.snapshot()["counters"]["wake_hit"] == 1
         assert gate._window_until == math.inf
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_reaches_the_inner_and_holds_the_park():
+    async def _run():
+        config = VoiceConfig(realtime={"uplink": "vad", "idleParkS": 60}, vad=VAD_CFG)
+        inner = FakeInner()
+        gate = GatedUplink(
+            inner, config=config, sink=AudioSink(NullPlayback(), mode="stream"),
+            vad=ScriptVad([]), capture_rate=RATE, uplink_rate=RATE, open_mic=False,
+        )
+        await gate.start(instructions=None, tools=[], on_event=_recorder())
+        assert gate._park_task is not None and not gate._park_task.done()
+        await gate.announce("Dinner is ready.")
+        await asyncio.sleep(0)
+        assert inner.calls == [("announce", "Dinner is ready.")]
+        assert gate._park_task.done()  # the settle after its reply re-arms it
         await gate.close()
 
     asyncio.run(_run())

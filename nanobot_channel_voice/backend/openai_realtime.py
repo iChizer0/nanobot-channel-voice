@@ -36,6 +36,7 @@ from nanobot_channel_voice.phrases import (
 
 from .audio_sink import AudioSink
 from .base import (
+    NOTICE_MARK,
     AbandonedResult,
     Error,
     InputTranscript,
@@ -516,6 +517,7 @@ class RealtimeBackend(RealtimeTransport):
             self._ready.set()
             self._ever_ready = True
             self._auth_fails = 0
+            self._schedule_notice()
         elif t == "conversation.created":
             cid = (evt.get("conversation") or {}).get("id")
             if cid and self._profile.resumption_ttl_s:
@@ -745,9 +747,7 @@ class RealtimeBackend(RealtimeTransport):
         ):
             self._retry_create = False
             self._log.debug("re-issuing the response.create deferred while rid={} ran", rid)
-            await self._send({"type": "response.create"})
-            self._continuation_unborn = True  # an onset before its birth kills it there
-            self._arm_watchdog()
+            await self._ask_response()
 
     async def _handle_response_done(self, evt: dict) -> None:
         resp = evt.get("response") or {}
@@ -843,19 +843,24 @@ class RealtimeBackend(RealtimeTransport):
             return
         # Re-anchor before the frame: what follows is continuation latency, not TTFA.
         self._metrics.turn_continuation()
+        self._retry_create = False  # this continuation answers everything outstanding
         if self._needs_response_create_after_tools:
             self._log.debug("firing response.create for rid={}", rid)
-            await self._send({"type": "response.create"})
+            await self._ask_response()
         else:
             # Auto-continuing dialects resume on the function_call_output alone.
             self._log.debug("auto-continuing dialect; no response.create for rid={}", rid)
-        self._retry_create = False  # this create answers everything outstanding
-        self._continuation_unborn = True
-        # response.done cancelled the watchdog: the create -> response.created gap is the
-        # one window with no deadman, and a continuation never started wedges the session
-        # (mic gated while SPEAKING, so nothing can recover it).
-        self._arm_watchdog()
+            self._continuation_unborn = True
+            self._arm_watchdog()
         self._cleanup_response(rid)
+
+    async def _ask_response(self) -> None:
+        """Ask for the response owed output gets (a tool's answer, a notice). Unborn BEFORE
+        the frame, so an onset during the send still kills it at birth; the deadman covers
+        the create -> response.created gap, where a lost create would wedge the session."""
+        self._continuation_unborn = True
+        await self._send({"type": "response.create"})
+        self._arm_watchdog()
 
     def _cleanup_response(self, rid: str) -> None:
         self._tools_pending.pop(rid, None)
@@ -868,6 +873,29 @@ class RealtimeBackend(RealtimeTransport):
 
     def _waiting_on_tools(self) -> bool:
         return any(cids & self._dispatched for cids in self._tools_pending.values())
+
+    def _notice_quiet(self) -> bool:
+        return (
+            not self._user_speaking
+            and not self._live_response()
+            and not self._continuation_unborn
+            and (
+                self._turn is VoiceState.IDLE
+                or (self._turn is VoiceState.THINKING and self._waiting_on_tools())
+            )
+        )
+
+    async def _voice_notice(self, text: str) -> None:
+        self._continuation_unborn = True  # its response is owed from the first frame on
+        self._retry_create = False  # its create answers whatever else is owed too
+        await self._send({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": f"{NOTICE_MARK} {text}"}],
+            },
+        })
+        await self._ask_response()
 
     def _answer_owed(self) -> bool:
         """A dispatched call still runs, or an answer waits on the re-ask a response end

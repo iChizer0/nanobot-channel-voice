@@ -759,6 +759,62 @@ def test_a_blip_during_a_tool_wait_stays_thinking():
     assert VoiceState.IDLE not in hints(events)
 
 
+def _notices(sent: list[dict]) -> list[str]:
+    return [m["clientContent"]["turns"][0]["parts"][0]["text"]
+            for m in sent if "clientContent" in m]
+
+
+def test_a_notice_is_a_client_turn_and_the_next_waits_for_its_answer():
+    """A client turn interrupts any generation: a notice goes only while the model is
+    silent, and the next only once the turn answering it has ended."""
+
+    async def settle():
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def _run():
+        backend, sent, _ = make_backend()
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event(audio_msg(b"\x01"))
+        await backend.announce("Reminder: check the oven.")
+        await settle()
+        assert _notices(sent) == []  # the model is still speaking
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        await settle()
+        assert _notices(sent) == ["[notice] Reminder: check the oven."]
+        await backend.announce("Dinner is ready.")
+        await settle()
+        assert len(_notices(sent)) == 1  # the answer to the first has not begun
+        await backend._handle_event(audio_msg(b"\x02"))
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        await settle()
+        assert _notices(sent)[-1] == "[notice] Dinner is ready."
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_a_notice_waits_out_background_reasoning():
+    async def _run():
+        backend, sent, _ = make_backend()
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event({
+            "toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]},
+            "interactionStatus": "IN_PROGRESS",
+        })
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        await backend.announce("Dinner is ready.")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert _notices(sent) == []
+        await backend.close()
+
+    asyncio.run(_run())
+
+
 class _HeldStream(PlaybackStream):
     def __init__(self, released: asyncio.Event) -> None:
         self._released = released

@@ -26,7 +26,8 @@ from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
 from nanobot_channel_voice.backend import gemini_live
 from nanobot_channel_voice.backend.audio_sink import AudioSink
-from nanobot_channel_voice.backend.base import AbandonedResult, ToolDef, VoiceState
+from nanobot_channel_voice.backend.base import NOTICE_MARK, AbandonedResult, ToolDef, VoiceState
+from nanobot_channel_voice.backend.common import loggable_text
 from nanobot_channel_voice.backend.gated import GatedUplink
 from nanobot_channel_voice.backend.gemini_live import GeminiLiveBackend, resolve_gemini_key
 from nanobot_channel_voice.backend.local import LocalBackend
@@ -47,7 +48,7 @@ from nanobot_channel_voice.context_tool import (
 )
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
-from nanobot_channel_voice.streamid import TURN_META, unique_token
+from nanobot_channel_voice.streamid import TURN_META, base_of, unique_token
 from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, write_temp_wav
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
@@ -77,6 +78,13 @@ _STOP_RULE = (
     "If the user only tells you to stop, be quiet, or wait, do not answer — "
     "produce no speech at all. A request they stopped stays stopped: do not read out "
     "its result when it arrives."
+)
+
+# How the model voices what the agent sends on its own (backend announce). Every mode.
+_NOTICE_RULE = (
+    f"A user message that starts with {NOTICE_MARK} was not said by the user: it is a "
+    "message for them (a reminder, a report, a message from another channel). Say it "
+    "to them as written, then stop."
 )
 
 # Supervisor mode (Responder-Thinker): the realtime model owns the conversational surface
@@ -171,7 +179,8 @@ def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: boo
     never deletes the delegation contract or the filler preamble."""
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
     return "\n\n".join(
-        part for part in (persona or _DEFAULT_PERSONA, rules, _STOP_RULE) if part
+        part for part in (persona or _DEFAULT_PERSONA, rules, _STOP_RULE, _NOTICE_RULE)
+        if part
     )
 
 
@@ -257,19 +266,20 @@ def _voice_context_blocks(
 _DELEGATION_META = "_voice_delegation"
 
 
-class _DelegationCollector:
-    """Collects one delegated nanobot turn's reply off the bus (supervisor mode). Streaming
-    ON: deltas accumulate and an end that closes a segment WITH content resolves (the turn's
-    final never reaches a channel: core drops it). Streaming OFF, or a last segment that
-    streamed nothing: the regular ``send`` resolves, joined behind what streamed."""
+class _ReplyCollector:
+    """Collects one nanobot turn's reply off the bus: a supervisor delegation's, or (cloud)
+    one the agent started itself. Streaming ON: deltas accumulate and an end that closes a
+    segment WITH content resolves (the turn's final never reaches a channel: core drops
+    it). Streaming OFF, or a last segment that streamed nothing: the regular ``send``
+    resolves, joined behind what streamed."""
 
-    def __init__(self, metrics: VoiceMetrics) -> None:
+    def __init__(self, metrics: VoiceMetrics, *, timed: bool = True) -> None:
         self._future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self._parts: list[str] = []
         self._segment = False  # content since the last boundary
         self._metrics = metrics
         self._started_at = time.monotonic()
-        self._first_token = False
+        self._first_token = not timed  # only a delegation's first token is a latency
         self.token = unique_token()
         self.foreign = 0  # deliveries into our chat that were not ours, while we waited
 
@@ -317,6 +327,10 @@ class _DelegationCollector:
     def resolved(self) -> bool:
         return self._future.done()
 
+    @property
+    def reply(self) -> str:
+        return self._future.result() if self._future.done() else ""
+
     def _text(self) -> str:
         return "".join(self._parts).strip()
 
@@ -326,6 +340,36 @@ class _DelegationCollector:
 
     async def result(self) -> str:
         return await self._future
+
+
+def _delegation_reply(pending: _ReplyCollector | None, metadata: dict[str, Any]) -> bool:
+    """Whether a delivery is the pending delegation's reply; anything else into the chat
+    meanwhile counts as foreign. A trigger turn echoes the stamp of the turn that created
+    it, so a trigger-stamped delivery is never the reply."""
+    if pending is None:
+        return False
+    if metadata.get(_DELEGATION_META) == pending.token and not _agent_initiated(metadata):
+        return True
+    pending.foreign += 1
+    return False
+
+
+def _straggler(metadata: dict[str, Any]) -> bool:
+    """A delegation's traffic after it was answered, stopped or replaced (a trigger turn
+    carries its creator's stamp, see _delegation_reply)."""
+    return metadata.get(_DELEGATION_META) is not None and not _agent_initiated(metadata)
+
+
+def _collect(collector: _ReplyCollector, delta: str, *, stream_end: bool, resuming: bool) -> None:
+    """One streamed piece of a reply. A resuming end is only a tool boundary: resolving
+    there would truncate to the pre-tool status line."""
+    if stream_end:
+        if resuming:
+            collector.note_boundary()
+        else:
+            collector.finish(fallback=delta or "")
+    else:
+        collector.add(delta or "")
 
 
 # One model load at a time, process-wide: a restart waits for the load it cancelled
@@ -395,7 +439,10 @@ class VoiceChannel(BaseChannel):
         # Supervisor mode only: the in-flight ask_nanobot delegation the bus glue collects.
         # One slot — a bus reply can't be correlated to a concurrent delegation, so the lock
         # serializes them.
-        self._pending_delegation: _DelegationCollector | None = None
+        self._pending_delegation: _ReplyCollector | None = None
+        # Cloud: a streamed reply of a turn the agent started itself, and its stream base.
+        self._notice: _ReplyCollector | None = None
+        self._notice_base: str | None = None
         self._delegation_lock = asyncio.Lock()
         self._asked_turn: str | None = None  # the model turn of the newest delegation
         self._cloud_stops = 0  # every consumed stop that ended tool work (_on_cloud_abandon)
@@ -873,7 +920,7 @@ class VoiceChannel(BaseChannel):
             self._metrics.observe(
                 "delegation_wait_ms", (time.monotonic() - queued_at) * 1000.0
             )
-            collector = _DelegationCollector(self._metrics)
+            collector = _ReplyCollector(self._metrics)
             self._pending_delegation = collector
             try:
                 await self._publish_user_text(
@@ -1187,10 +1234,7 @@ class VoiceChannel(BaseChannel):
             # One speaker, one chat: a delivery addressed elsewhere (the message tool takes
             # an arbitrary channel/chat) must neither be spoken nor touch this turn's state.
             return
-        if self._pending_delegation is not None:
-            if meta.get(_DELEGATION_META) != self._pending_delegation.token:
-                self._pending_delegation.foreign += 1
-                return
+        if _delegation_reply(self._pending_delegation, meta):
             if _speakable(msg):
                 text = (msg.content or "").strip()
                 if text:
@@ -1198,6 +1242,8 @@ class VoiceChannel(BaseChannel):
             return
         local = self._local()
         if local is None:
+            if self.config.backend != "local":
+                await self._cloud_send(msg, meta)
             return
         # ANY traffic for our chat proves the core is alive on this session: feed the
         # deadman BEFORE filtering, so it measures a silent core, not a long tool run.
@@ -1217,6 +1263,51 @@ class VoiceChannel(BaseChannel):
             local.note_proactive()
         await local.speak_final(text)
 
+    async def _cloud_send(self, msg: OutboundMessage, meta: dict[str, Any]) -> None:
+        """Cloud: the model voices what the agent sent on its own (a cron or trigger turn's
+        reply, a message another channel sent here, a heartbeat report). A delegation's
+        straggler and non-reply traffic stay silent."""
+        if not _speakable(msg) or _straggler(meta):
+            return
+        text = (msg.content or "").strip()
+        if self._notice is not None and _agent_initiated(meta):
+            # The collected turn ends here: its last segment streamed nothing.
+            self._notice.set_final(text)
+            await self._take_notice()
+        elif text:
+            await self._announce(text)
+
+    async def _cloud_delta(
+        self, delta: str, meta: dict[str, Any], stream_id: str | None, *,
+        stream_end: bool, resuming: bool,
+    ) -> None:
+        if _straggler(meta):
+            return
+        base = base_of(stream_id)
+        if self._notice is None or base != self._notice_base:
+            if stream_end and not delta:
+                return  # nothing collected to end (an aborted stream's close)
+            # A new turn; one that never ended with content is dropped.
+            self._notice = _ReplyCollector(self._metrics, timed=False)
+            self._notice_base = base
+        _collect(self._notice, delta, stream_end=stream_end, resuming=resuming)
+        if self._notice.resolved:
+            await self._take_notice()
+
+    async def _take_notice(self) -> None:
+        notice, self._notice = self._notice, None
+        if notice is not None and notice.reply:
+            await self._announce(notice.reply)
+
+    async def _announce(self, text: str) -> None:
+        announce = getattr(self._backend, "announce", None)
+        shown = loggable_text(text, self.config.log_transcripts)
+        if announce is None:
+            self.logger.warning("voice: no session to voice an agent message: '{}'", shown)
+            return
+        self.logger.info("voice: the model voices an agent message: '{}'", shown)
+        await announce(text)
+
     async def send_delta(
         self,
         chat_id: str,
@@ -1228,25 +1319,18 @@ class VoiceChannel(BaseChannel):
         resuming: bool = False,
     ) -> None:
         # The manager passes stream framing as kwargs unconditionally, so declaring these
-        # parameters is load-bearing: an override without them fails every delta. Supervisor
-        # mode accumulates the delegated reply here; a resuming end is only a tool boundary,
-        # so resolving there would truncate to the pre-tool status line.
+        # parameters is load-bearing: an override without them fails every delta.
         if chat_id != self.config.chat_id:
             return  # addressed elsewhere; see send()
-        if self._pending_delegation is not None:
-            if (metadata or {}).get(_DELEGATION_META) != self._pending_delegation.token:
-                self._pending_delegation.foreign += 1
-                return
-            if stream_end:
-                if resuming:
-                    self._pending_delegation.note_boundary()  # segment break, keep collecting
-                else:
-                    self._pending_delegation.finish(fallback=delta or "")
-            else:
-                self._pending_delegation.add(delta or "")
+        if _delegation_reply(self._pending_delegation, metadata or {}):
+            _collect(self._pending_delegation, delta, stream_end=stream_end, resuming=resuming)
             return
         local = self._local()
         if local is None:
+            if self.config.backend != "local":
+                await self._cloud_delta(
+                    delta, metadata or {}, stream_id, stream_end=stream_end, resuming=resuming,
+                )
             return
         turn = (metadata or {}).get(TURN_META)
         if turn is not None and not _agent_initiated(metadata) and local.is_stale_stream(turn):

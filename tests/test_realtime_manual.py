@@ -606,6 +606,49 @@ def test_an_answer_landing_during_a_blip_is_asked_for_when_it_is_discarded():
     run(_run())
 
 
+def test_a_notice_resumes_a_parked_session():
+    async def _run():
+        backend, sent, _ = make_backend()
+        resumed: list[bool] = []
+
+        async def resume():
+            resumed.append(True)
+            backend._parked = False
+            backend._ready.set()
+
+        backend._parked = True
+        backend._resume = resume  # type: ignore[method-assign]
+        await backend.announce("Dinner is ready.")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert resumed == [True]
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_notice_answers_a_re_ask_left_owed():
+    """A refused commit leaves a re-ask owed; a notice's create answers it too, so the
+    notice's reply ending must not ask again."""
+
+    async def _run():
+        backend, sent, _ = make_backend()
+        backend._ready.set()
+        await backend._handle_event({"type": "error", "error": {
+            "code": "conversation_already_has_active_response", "message": "busy"}})
+        await backend.announce("Dinner is ready.")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r1", "status": "completed"}})
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        await backend.close()
+
+    run(_run())
+
+
 def test_refused_commit_is_not_re_asked_while_the_user_speaks():
     """The deferred response.create re-issued on the cancelled done of the response the
     user just barged in on answers A over B, and B's own commit is refused again: it

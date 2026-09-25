@@ -7,7 +7,7 @@ import asyncio
 import json
 
 from nanobot_channel_voice.backend.base import AbandonedResult
-from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel, _DelegationCollector
+from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel, _ReplyCollector
 from nanobot_channel_voice.metrics import VoiceMetrics
 
 
@@ -17,7 +17,7 @@ def run(coro):
 
 def test_streaming_terminal_joins_deltas():
     async def _case():
-        c = _DelegationCollector(VoiceMetrics())
+        c = _ReplyCollector(VoiceMetrics())
         c.add("Hello ")
         c.add("world")
         c.finish()
@@ -28,7 +28,7 @@ def test_streaming_terminal_joins_deltas():
 
 def test_finish_falls_back_to_end_frame_content():
     async def _case():
-        c = _DelegationCollector(VoiceMetrics())
+        c = _ReplyCollector(VoiceMetrics())
         c.finish(fallback="only the end frame had text")
         assert await c.result() == "only the end frame had text"
 
@@ -37,7 +37,7 @@ def test_finish_falls_back_to_end_frame_content():
 
 def test_first_terminal_wins():
     async def _case():
-        c = _DelegationCollector(VoiceMetrics())
+        c = _ReplyCollector(VoiceMetrics())
         c.set_final("first")
         c.finish(fallback="second")
         c.set_final("third")
@@ -49,7 +49,7 @@ def test_first_terminal_wins():
 def test_abandon_resolves_without_a_first_token_sample():
     async def _case():
         m = VoiceMetrics()
-        c = _DelegationCollector(m)
+        c = _ReplyCollector(m)
         c.abandon("(interrupted)")
         assert await c.result() == "(interrupted)"
         # A delta landing in the tick before the slot clears is not an answer's timing.
@@ -64,7 +64,7 @@ def test_blank_retry_end_keeps_collecting_past_the_status_line():
     on_stream_end(resuming=False) and RETRIES), then the answer: the blank end must not
     resolve, or the status line is read aloud as the answer and the real one is lost."""
     async def _case():
-        c = _DelegationCollector(VoiceMetrics())
+        c = _ReplyCollector(VoiceMetrics())
         c.add("Let me check.")
         c.note_boundary()       # end(resuming=True): the tool runs
         c.finish()              # end(resuming=False) with nothing streamed: the blank retry
@@ -80,49 +80,15 @@ def test_regular_final_joins_behind_what_streamed():
     """A last segment that streamed nothing (blank retries exhausted) ends in core's
     regular final send; what the earlier segments streamed still belongs to the reply."""
     async def _case():
-        c = _DelegationCollector(VoiceMetrics())
+        c = _ReplyCollector(VoiceMetrics())
         c.add("Checking.")
         c.note_boundary()
         c.finish()
         c.set_final("I could not produce a response.")
         assert await c.result() == "Checking.\nI could not produce a response."
-        alone = _DelegationCollector(VoiceMetrics())
+        alone = _ReplyCollector(VoiceMetrics())
         alone.set_final("whole reply")  # streaming off: nothing streamed
         assert await alone.result() == "whole reply"
-
-    run(_case())
-
-
-def test_stream_identity_is_the_token_on_every_delta():
-    """Core echoes the inbound metadata onto every delta and end, so the delegation token
-    is the identity: a /stop-ped predecessor's straggler carries the old token, a cron
-    turn none, whatever their stream ids look like."""
-    async def _case():
-        m = VoiceMetrics()
-        current = _DelegationCollector(m)
-        stale = _DelegationCollector(m)
-
-        class _Cfg:
-            chat_id = "voice"
-
-        class _Stub:
-            config = _Cfg()
-            _pending_delegation = current
-
-        async def delta(text, meta, *, end=False, resuming=False):
-            await VoiceChannel.send_delta(
-                _Stub(), "voice", text, meta, stream_id="whatever:format",
-                stream_end=end, resuming=resuming,
-            )
-
-        await delta("old answer", {_DELEGATION_META: stale.token})
-        await delta("", {_DELEGATION_META: stale.token}, end=True)
-        await delta("reminder text", None)
-        assert not current._future.done()
-        await delta("real ", {_DELEGATION_META: current.token})
-        await delta("answer", {_DELEGATION_META: current.token})
-        await delta("", {_DELEGATION_META: current.token}, end=True)
-        assert await current.result() == "real answer"
 
     run(_case())
 
@@ -161,6 +127,137 @@ async def _answer(channel: VoiceChannel, text: str) -> None:
                              stream_id="s:1:0")
     await channel.send_delta(channel.config.chat_id, "", {_DELEGATION_META: token},
                              stream_id="s:1:0", stream_end=True)
+
+
+class _Announcer:
+    """A cloud backend: records what the model is asked to voice."""
+
+    def __init__(self) -> None:
+        self.said: list[str] = []
+
+    async def announce(self, text: str) -> None:
+        self.said.append(text)
+
+
+_CRON = {"_cron_trigger": {"job_id": "j1", "run_id": "r1"}}
+
+
+async def _stream(channel, text, meta, *, sid="voice:local:1:0", end=False, resuming=False):
+    await channel.send_delta(
+        channel.config.chat_id, text, meta, stream_id=sid, stream_end=end, resuming=resuming,
+    )
+
+
+def test_stream_identity_is_the_token_on_every_delta():
+    """Core echoes the inbound metadata onto every delta and end, so the delegation token
+    is the identity: a /stop-ped predecessor's straggler carries the old token, and a cron
+    turn's reply streaming meanwhile is voiced, never collected."""
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        current = channel._pending_delegation = _ReplyCollector(VoiceMetrics())
+        stale = _ReplyCollector(VoiceMetrics())
+        await _stream(channel, "old answer", {_DELEGATION_META: stale.token})
+        await _stream(channel, "", {_DELEGATION_META: stale.token}, end=True)
+        await _stream(channel, "reminder text", _CRON, sid="voice:local:2:0")
+        await _stream(channel, "", _CRON, sid="voice:local:2:0", end=True)
+        assert not current._future.done()
+        await _stream(channel, "real ", {_DELEGATION_META: current.token})
+        await _stream(channel, "answer", {_DELEGATION_META: current.token})
+        await _stream(channel, "", {_DELEGATION_META: current.token}, end=True)
+        assert await current.result() == "real answer"
+        assert backend.said == ["reminder text"]
+
+    run(_case())
+
+
+def test_cloud_voices_what_the_agent_sends_on_its_own():
+    """A message another channel sends here, or a heartbeat report, is voiced; the /stop
+    ack, an already-streamed final, a finished delegation's straggler and another chat's
+    delivery are not."""
+    from nanobot.bus.events import OutboundMessage
+
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+
+        def msg(text, chat=None, **meta):
+            return OutboundMessage(channel="voice", chat_id=chat or channel.config.chat_id,
+                                   content=text, metadata=meta)
+
+        await channel.send(msg("Dinner is ready."))
+        await channel.send(msg("Stopped 1 task(s).", _voice_cmd=True))
+        await channel.send(msg("streamed already", _streamed=True))
+        await channel.send(msg("late answer", **{_DELEGATION_META: "old-token"}))
+        await channel.send(msg("elsewhere", chat="voice:other"))
+        assert backend.said == ["Dinner is ready."]
+
+    run(_case())
+
+
+def test_a_streamed_agent_turn_is_voiced_whole():
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        await _stream(channel, "Checking.", _CRON)
+        await _stream(channel, "", _CRON, end=True, resuming=True)  # a tool boundary
+        assert backend.said == []
+        await _stream(channel, "Oven ", _CRON, sid="voice:local:1:1")
+        await _stream(channel, "time.", _CRON, sid="voice:local:1:1")
+        await _stream(channel, "", _CRON, sid="voice:local:1:1", end=True)
+        assert backend.said == ["Checking.\nOven time."]
+        assert "delegation_first_token_ms" not in channel._metrics.snapshot()["latency_ms"]
+
+    run(_case())
+
+
+def test_an_agent_turn_whose_last_segment_streamed_nothing_ends_in_its_final():
+    from nanobot.bus.events import OutboundMessage
+
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        await _stream(channel, "Checking.", _CRON)
+        await _stream(channel, "", _CRON, end=True, resuming=True)
+        await _stream(channel, "", _CRON, sid="voice:local:1:1", end=True)  # a blank retry
+        assert backend.said == []
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="Done.", metadata=_CRON,
+        ))
+        assert backend.said == ["Checking.\nDone."]
+
+    run(_case())
+
+
+def test_a_trigger_stamped_with_the_pending_token_is_not_the_delegations_reply():
+    """A cron job snapshots the turn that created it, so a reminder the running delegation
+    scheduled carries its token: the reminder is voiced, the delegation keeps waiting."""
+    from nanobot.bus.events import OutboundMessage
+
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        pending = channel._pending_delegation = _ReplyCollector(VoiceMetrics())
+        await channel.send(OutboundMessage(
+            channel="voice", chat_id=channel.config.chat_id, content="Take a break.",
+            metadata={_DELEGATION_META: pending.token, **_CRON},
+        ))
+        assert not pending._future.done()
+        assert backend.said == ["Take a break."]
+
+    run(_case())
+
+
+def test_a_new_agent_stream_drops_one_that_never_ended_and_a_lone_end_frame_counts():
+    async def _case():
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        await _stream(channel, "cut off mid", _CRON, sid="voice:local:1:0")
+        await _stream(channel, "", _CRON, sid="voice:local:1:0", end=True, resuming=True)
+        await _stream(channel, "One frame.", _CRON, sid="voice:local:2:0", end=True)
+        assert backend.said == ["One frame."]
+
+    run(_case())
 
 
 def _ask(channel: VoiceChannel, request: str, turn: str = "r1"):
@@ -292,43 +389,30 @@ def test_non_string_arguments_are_taken_as_text():
 
 
 def test_late_reply_from_stopped_delegation_cannot_resolve_next():
-    """Regression: with bus streaming OFF, a /stop-ped delegation's turn can
-    finish late and its bare final send used to resolve the NEXT delegation
-    with the previous question's answer. The request carries a token the
-    AgentLoop echoes onto its final, so only an exact match resolves: an
-    unstamped delivery into this chat is another turn's, never our answer."""
+    """A /stop-ped delegation's late final (streaming OFF) must not resolve the NEXT one:
+    only its exact token does. A stale one is dropped, and an unstamped delivery (a cron
+    fire, another channel's send) is the agent's own message: voiced, never collected."""
     from nanobot.bus.events import OutboundMessage
 
     async def _case():
-        m = VoiceMetrics()
-        stale = _DelegationCollector(m)  # delegation A timed out; its turn is still running
-        current = _DelegationCollector(m)  # delegation B, awaiting its answer
-
-        class _Cfg:
-            chat_id = "voice"
-
-        class _Stub:
-            config = _Cfg()
-            _pending_delegation = current
-            logger = __import__("loguru").logger
+        channel, _, _ = _supervisor_channel()
+        backend = channel._backend = _Announcer()
+        stale = _ReplyCollector(VoiceMetrics())
+        current = channel._pending_delegation = _ReplyCollector(VoiceMetrics())
 
         def reply(text: str, **meta) -> OutboundMessage:
             return OutboundMessage(
-                channel="voice", chat_id="voice", content=text, metadata=meta
+                channel="voice", chat_id=channel.config.chat_id, content=text, metadata=meta
             )
 
-        # A's late final lands while B waits: must be swallowed.
-        await VoiceChannel.send(_Stub(), reply("old answer", **{_DELEGATION_META: stale.token}))
+        await channel.send(reply("old answer", **{_DELEGATION_META: stale.token}))
         assert not current._future.done()
-        await VoiceChannel.send(_Stub(), reply("real answer", **{_DELEGATION_META: current.token}))
+        await channel.send(reply("real answer", **{_DELEGATION_META: current.token}))
         assert await current.result() == "real answer"
-
-        # An unstamped delivery into the same chat (a cron fire, a message-tool send)
-        # is somebody else's turn: it must not be read aloud as the delegated answer.
-        tokenless = _DelegationCollector(m)
-        _Stub._pending_delegation = tokenless
-        await VoiceChannel.send(_Stub(), reply("your 3pm reminder"))
+        tokenless = channel._pending_delegation = _ReplyCollector(VoiceMetrics())
+        await channel.send(reply("your 3pm reminder"))
         assert not tokenless._future.done()
+        assert backend.said == ["your 3pm reminder"]
 
     run(_case())
 
@@ -367,7 +451,7 @@ def test_foreign_chat_delivery_is_neither_spoken_nor_collected():
         assert (spoken, deltas, touched) == ([], [], [])
 
         # A delegation in flight must not collect it either.
-        collector = _DelegationCollector(VoiceMetrics())
+        collector = _ReplyCollector(VoiceMetrics())
         channel._pending_delegation = collector
         await channel.send(OutboundMessage(
             channel="voice", chat_id=foreign, content="not our answer",
@@ -394,7 +478,7 @@ def test_foreign_chat_delivery_is_neither_spoken_nor_collected():
 def test_first_token_recorded_once():
     async def _case():
         m = VoiceMetrics()
-        c = _DelegationCollector(m)
+        c = _ReplyCollector(m)
         c.add("a")
         c.add("b")
         c.finish()
@@ -407,7 +491,7 @@ def test_first_token_recorded_once():
 def test_tool_boundary_does_not_latch_first_token():
     async def _t():
         m = VoiceMetrics()
-        c = _DelegationCollector(m)
+        c = _ReplyCollector(m)
         # A tool-first delegation: the boundary arrives before any model token.
         c.note_boundary()
         assert "delegation_first_token_ms" not in m.snapshot()["latency_ms"]

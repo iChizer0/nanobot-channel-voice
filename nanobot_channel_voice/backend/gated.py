@@ -220,6 +220,11 @@ class GatedUplink:
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         await self._inner.submit_tool_result(call_id, output)
 
+    async def announce(self, text: str) -> None:
+        # The inner resumes a parked socket for it; the IDLE after its reply re-arms the park.
+        self._cancel_park()
+        await self._inner.announce(text)
+
     async def on_capture_gap(self) -> None:
         await self._abort_open()
 

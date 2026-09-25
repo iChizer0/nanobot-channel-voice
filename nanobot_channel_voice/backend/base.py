@@ -122,6 +122,11 @@ class ToolCall:
     turn: str = ""
 
 
+# Opens the text turn that has a cloud model voice a message the agent sent on its own; the
+# session instructions say what it means.
+NOTICE_MARK = "[notice]"
+
+
 class AbandonedResult(str):
     """A tool result for work the user stopped, or a newer request replaced: the backend
     submits it so the call is answered, and resumes nothing from it."""

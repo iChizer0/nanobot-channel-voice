@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from contextlib import suppress
 
 from loguru import logger
@@ -137,6 +138,10 @@ class RealtimeTransport(TurnEventMixin):
         self._onset_interrupting = False
         # The only span in which uplink frames may feed the deadman (see the sender loop).
         self._user_speaking = False
+        # Messages the agent sent on its own, waiting for a quiet session (see announce);
+        # they outlive a lost session.
+        self._notices: deque[str] = deque()
+        self._notice_task: asyncio.Task | None = None
         self._log = logger.bind(component="voice")
 
     # ---- subclass hooks -----------------------------------------------------
@@ -171,6 +176,14 @@ class RealtimeTransport(TurnEventMixin):
         """A tool call the shell runs still owes its answer: a settle lands on THINKING (the
         wait goes on), never IDLE, which a gated uplink may park, losing the answer."""
         return False
+
+    def _notice_quiet(self) -> bool:
+        """Nobody is talking and no reply is in flight or owed: a notice may take the floor."""
+        raise NotImplementedError
+
+    async def _voice_notice(self, text: str) -> None:
+        """The dialect's text turn for a notice, and the response it asks for."""
+        raise NotImplementedError
 
     async def _activity_begin_wire(self) -> None:
         """Manual turns: the vendor's start marker, if any."""
@@ -226,14 +239,61 @@ class RealtimeTransport(TurnEventMixin):
         # because VoiceShell.stop shields _teardown, so nothing cancels close() from above.
         for task in (
             self._drain_task, self._watchdog_task, self._sender_task, self._rx_task,
-            *self._orphan_rx,
+            self._notice_task, *self._orphan_rx,
         ):
             await cancel_and_wait(task)
         self._drain_task = self._watchdog_task = self._sender_task = self._rx_task = None
+        self._notice_task = None
         ws, self._ws = self._ws, None
         if ws is not None:
             with suppress(Exception):
                 await ws.close()
+
+    # ---- messages the agent sent on its own -----------------------------------
+
+    async def announce(self, text: str) -> None:
+        """Have the model voice a message the agent sent on its own (a reminder, a report,
+        a message from another channel) once the session is quiet; a parked socket is
+        resumed for it."""
+        if self._closing:
+            return
+        self._notices.append(text)
+        self._schedule_notice()
+
+    def _schedule_notice(self) -> None:
+        if self._notices and not self._closing and (
+            self._notice_task is None or self._notice_task.done()
+        ):
+            self._notice_task = asyncio.create_task(self._flush_notice())
+
+    async def _flush_notice(self) -> None:
+        """One notice per quiet moment: its own reply's settle schedules the next. One that
+        cannot go out now waits for the next session."""
+        try:
+            if self._parked:
+                await self._resume()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("could not reconnect for a notice ({}); it waits", exc)
+            return
+        if not self._notices or not self._ready.is_set() or not self._notice_quiet():
+            return
+        text = self._notices.popleft()
+        try:
+            await self._voice_notice(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._notices.appendleft(text)
+            self._log.warning("could not voice a notice ({}); it waits", exc)
+            return
+        self._metrics.count("notice_voiced")
+
+    async def _set_turn(self, state: VoiceState) -> None:
+        await super()._set_turn(state)
+        if state in (VoiceState.IDLE, VoiceState.THINKING):
+            self._schedule_notice()  # a settle may be the quiet a waiting notice needs
 
     # ---- ManualTurnBackend (gated uplink) -----------------------------------
 
@@ -555,7 +615,10 @@ class RealtimeTransport(TurnEventMixin):
             self._arm_watchdog()
             return
         if settle is VoiceState.THINKING and self._turn is not VoiceState.SPEAKING:
-            return  # nothing was spoken: the wait is THINKING already
+            # Nothing audible ended, so no transition: the wait is THINKING already, and a
+            # waiting notice may still take this quiet.
+            self._schedule_notice()
+            return
         with suppress(Exception):  # a raising dispatcher must not strand SPEAKING
             await self._set_turn(settle)
 

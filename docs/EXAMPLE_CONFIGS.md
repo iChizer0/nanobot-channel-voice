@@ -649,6 +649,8 @@ Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, `"stepfun"` 
 
 Tool calls are the caveat. The model's calls can route through nanobot's guarded `ToolRegistry` only when core hands the channel a tool gateway at construction, and the official nanobot does not - so on a stock install every realtime backend is **persona-only**: the model answers from its own knowledge, `realtime.toolMode` and `delegationTimeoutS` have no effect (startup says so when you set them), and the local backend remains the full agent. The tool wiring below is for a core build that passes the gateway.
 
+Messages the agent sends on its own still reach you in every mode: a reminder it scheduled, a heartbeat report, or a message another channel sends to voice goes to the realtime model as a notice, which it reads out as written once nobody is talking and no reply plays (a parked gated uplink reconnects for it).
+
 ### Minimal
 
 Default gated barge-in: you interrupt after the bot finishes a phrase.
