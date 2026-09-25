@@ -2192,7 +2192,6 @@ class LocalBackend(TurnEventMixin):
         (``empty``/``echo``/``wake``/``gated``/``stop``/``ack``/``inject``/``goal``/
         ``interrupt``/``publish``) - the audio dump names the segment's file with it."""
         pcm = pending.pcm
-        interrupting = self._turn in (VoiceState.THINKING, VoiceState.SPEAKING)
         preempted, heard = pending.preempted, pending.heard
         t0 = time.monotonic()
         self._worker_decoding = True  # the next utterance's eager must not stack on this
@@ -2201,9 +2200,9 @@ class LocalBackend(TurnEventMixin):
         finally:
             self._worker_decoding = False
         stt_ms = int((time.monotonic() - t0) * 1000)
-        # Recomputed, not merely downgraded: the pre-STT snapshot exists so a turn that
-        # FINISHED during the window is not /stop-ped, but one that STARTED in it (a cron
-        # delivery) is just as live, and its drain watcher would settle whatever we publish.
+        # Judged after the decode: a turn that FINISHED during it is not /stop-ped, and one
+        # that STARTED in it (a cron delivery) is just as live, its drain watcher settling
+        # whatever we publish.
         interrupting = self._turn in (VoiceState.THINKING, VoiceState.SPEAKING)
 
         def _summary(verdict: str) -> str:
@@ -2254,53 +2253,10 @@ class LocalBackend(TurnEventMixin):
         if not text:
             if pending.wake_hit:
                 # Acoustic wake with nothing left after the trim: attention, not content.
-                self._metrics.count("wake_only")
-                if self._adaptive is not None:
-                    self._adaptive.drop_anchor()
                 self._touch_wake()
-                acked_fast = self._take_fast_ack()
-                if not preempted and (
-                    self._ack_playing()
-                    or (
-                        acked_fast
-                        and self._turn in (VoiceState.IDLE, VoiceState.CAPTURING)
-                    )
-                ):
-                    # An ack already speaks for this summon: let it finish — it owns the
-                    # state, and flush-and-restart is an audible stutter.
-                    self._clear_duck()
-                    if (
-                        self._canned_base is not VoiceState.IDLE
-                        and self._turn is VoiceState.CAPTURING
-                    ):
-                        await self._set_turn(VoiceState.IDLE)
-                    return _summary("wake")
-                if (
-                    not preempted
-                    and pending.onset_interrupting
-                    and not pending.onset_speaking
-                ):
-                    # Summoned during THINKING ("are you there?"): never kill the query. A
-                    # reply that arrived meanwhile IS the answer, a playing filler already
-                    # speaks, otherwise reassure. No kill -> no note, no settle.
-                    self._clear_duck()
-                    if self._turn is VoiceState.THINKING:
-                        self._reassure()
-                    elif self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
-                        self._arm_wake_ack()
-                    return _summary("wake")
-                killed, k_heard = await self._kill_live_reply(
-                    interrupting=interrupting, preempted=preempted, heard=heard
+                await self._bare_wake(
+                    pending, interrupting=interrupting, preempted=preempted, heard=heard
                 )
-                if killed:
-                    self._last_kill = time.monotonic()
-                    self._pending_note = _wake_note(k_heard)
-                    if not preempted:  # a preempted kill was observed at confirm
-                        self._observe_wake_kill()
-                self._clear_duck()
-                if self._turn is not VoiceState.IDLE:
-                    await self._set_turn(VoiceState.IDLE)
-                self._arm_wake_ack()
                 return _summary("wake")
             if self._adaptive is not None:
                 self._adaptive.drop_anchor()  # not the user's turn: nothing to resume from
@@ -2390,53 +2346,10 @@ class LocalBackend(TurnEventMixin):
                     await self._set_turn(VoiceState.IDLE)
                 return _summary("gated")
             if gate == "wake":
-                # The bare wake phrase: attention, not content. Kill a live reply, open the
-                # window, publish nothing. The kill arms the same grace and pending note a
-                # consumed stop leaves: a follow-up bare "stop" must stay consumable, and the
-                # next turn's agent must know the reply was cut.
-                self._metrics.count("wake_only")
-                if self._adaptive is not None:
-                    self._adaptive.drop_anchor()
-                acked_fast = self._take_fast_ack()
-                if not preempted and (
-                    self._ack_playing()
-                    or (
-                        acked_fast
-                        and self._turn in (VoiceState.IDLE, VoiceState.CAPTURING)
-                    )
-                ):
-                    # An ack already speaks for this summon: let it finish (see above).
-                    self._clear_duck()
-                    if (
-                        self._canned_base is not VoiceState.IDLE
-                        and self._turn is VoiceState.CAPTURING
-                    ):
-                        await self._set_turn(VoiceState.IDLE)
-                    return _summary("wake")
-                if (
-                    not preempted
-                    and pending.onset_interrupting
-                    and not pending.onset_speaking
-                ):
-                    # Summoned during THINKING: reassure, never kill (see above).
-                    self._clear_duck()
-                    if self._turn is VoiceState.THINKING:
-                        self._reassure(wake_name)
-                    elif self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
-                        self._arm_wake_ack(wake_name)
-                    return _summary("wake")
-                killed, heard = await self._kill_live_reply(
-                    interrupting=interrupting, preempted=preempted, heard=heard
+                await self._bare_wake(
+                    pending, interrupting=interrupting, preempted=preempted, heard=heard,
+                    matched=wake_name,
                 )
-                if killed:
-                    self._last_kill = time.monotonic()
-                    self._pending_note = _wake_note(heard)
-                    if not preempted:  # a preempted kill was observed at confirm
-                        self._observe_wake_kill()
-                self._clear_duck()
-                if self._turn is not VoiceState.IDLE:
-                    await self._set_turn(VoiceState.IDLE)
-                self._arm_wake_ack(wake_name)
                 return _summary("wake")
 
         # Stop command aimed at a live reply: kill it and CONSUME the utterance — publishing
@@ -2593,6 +2506,50 @@ class LocalBackend(TurnEventMixin):
         # "goal" over "interrupt"/"publish": interrupt= already flags a live turn, and a
         # mis-fired trigger is what needs finding in the dump (named by this verdict).
         return _summary("goal" if goal else "interrupt" if killed else "publish")
+
+    async def _bare_wake(
+        self, pending: _PendingUtterance, *, interrupting: bool, preempted: bool,
+        heard: str | None, matched: str | None = None,
+    ) -> None:
+        """The bare wake phrase (either tier): attention, not content. Kill a live reply and
+        publish nothing; the kill leaves a consumed stop's grace and note. ``matched`` = the
+        phrase the transcript tier saw (ack routing), None = acoustic."""
+        self._metrics.count("wake_only")
+        if self._adaptive is not None:
+            self._adaptive.drop_anchor()
+        acked_fast = self._take_fast_ack()
+        if not preempted and (
+            self._ack_playing()
+            or (acked_fast and self._turn in (VoiceState.IDLE, VoiceState.CAPTURING))
+        ):
+            # An ack already speaks for this summon: let it finish — it owns the state, and
+            # flush-and-restart is an audible stutter.
+            self._clear_duck()
+            if self._canned_base is not VoiceState.IDLE and self._turn is VoiceState.CAPTURING:
+                await self._set_turn(VoiceState.IDLE)
+            return
+        if not preempted and pending.onset_interrupting and not pending.onset_speaking:
+            # Summoned during THINKING ("are you there?"): never kill the query. A reply that
+            # arrived meanwhile IS the answer, a playing filler already speaks, otherwise
+            # reassure. No kill -> no note, no settle.
+            self._clear_duck()
+            if self._turn is VoiceState.THINKING:
+                self._reassure(matched)
+            elif self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
+                self._arm_wake_ack(matched)
+            return
+        killed, heard = await self._kill_live_reply(
+            interrupting=interrupting, preempted=preempted, heard=heard
+        )
+        if killed:
+            self._last_kill = time.monotonic()
+            self._pending_note = _wake_note(heard)
+            if not preempted:  # a preempted kill was observed at confirm
+                self._observe_wake_kill()
+        self._clear_duck()
+        if self._turn is not VoiceState.IDLE:
+            await self._set_turn(VoiceState.IDLE)
+        self._arm_wake_ack(matched)
 
     async def _do_interrupt(self) -> str | None:
         """Cancel-then-send barge-in: invalidate the dead turn, stop audio, /stop. Invalidating

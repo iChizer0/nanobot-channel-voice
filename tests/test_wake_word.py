@@ -670,6 +670,42 @@ def test_ack_pool_follows_the_tts_not_the_called_name():
     asyncio.run(_t())
 
 
+def test_a_bare_summon_answers_in_the_called_names_language():
+    """The verdict hands the called name on, to the ack at rest and to the reassure over
+    a working turn: with a mixed ack list, each answers in that name's language."""
+    import asyncio
+
+    from eval_harness import EvalConversation
+
+    wake = {"mode": "gate", "phrases": ["hey nanobot", "小娜"],
+            "ack": {"enabled": True, "phrases": ["在呢。", "I'm here."]}}
+
+    async def _answered(working: bool) -> list[str]:
+        async with EvalConversation(wake=wake) as c:
+            b = c.backend
+            asked: list[str] = []
+            synth = b._synth_filler
+
+            async def spy(text: str) -> bytes:
+                asked.append(text)
+                return await synth(text)
+
+            b._synth_filler = spy
+            if working:
+                await c.user_says("hey nanobot what time is it")
+            await c.user_says("hey nanobot")
+            for task in (b._ack_task, b._cur_turn.prologue_task):
+                if task is not None:
+                    await task
+            return asked
+
+    async def _t():
+        assert await _answered(working=False) == ["I'm here."]
+        assert await _answered(working=True) == ["I'm here."]
+
+    asyncio.run(_t())
+
+
 def test_skeleton_and_fuzzy_wake():
     from nanobot_channel_voice.wake.phrase import FuzzyWake, _skeleton
 
