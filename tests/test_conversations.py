@@ -10,7 +10,7 @@ import time
 from eval_harness import _FRAME, EvalConversation
 
 from nanobot_channel_voice.backend import local as local_mod
-from nanobot_channel_voice.backend.base import VoiceState
+from nanobot_channel_voice.backend.base import NOTICE_BACKLOG, VoiceState
 
 _REPLY = "The weather in tokyo is sunny today. Tomorrow will be cloudy all day."
 
@@ -834,6 +834,21 @@ def test_a_waiting_message_leaves_room_to_answer_the_reply(monkeypatch):
             await c.user_says("yes please")
             assert c.texts()[-1] == "yes please"
             assert "Dinner" not in " ".join(said)
+
+    _run(_case())
+
+
+def test_waiting_messages_keep_only_the_newest():
+    """Bus traffic fills the queue for as long as a run lasts: past the cap the oldest
+    goes, counted, instead of banking every message for one long read-out."""
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            await c.user_says("run the whole pipeline")  # the live turn holds them all
+            for i in range(NOTICE_BACKLOG + 2):
+                await b.announce(f"Message {i}.")
+            assert list(b._notices) == [f"Message {i}." for i in range(2, NOTICE_BACKLOG + 2)]
+            assert c.counter("notice_dropped") == 2
 
     _run(_case())
 

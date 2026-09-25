@@ -18,6 +18,7 @@ from nanobot_channel_voice.backend import openai_realtime as rt
 from nanobot_channel_voice.backend import transport
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
+    NOTICE_BACKLOG,
     AbandonedResult,
     Error,
     InputTranscript,
@@ -1960,6 +1961,24 @@ def test_a_notice_waits_for_a_session_and_outlives_a_lost_one():
         await backend._handle_event({"type": "session.updated"})
         await _settle()
         assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_notices_waiting_out_an_outage_keep_only_the_newest():
+    """They outlive a lost session, so an outage must not bank every message for a
+    read-out at reconnect: past the cap the oldest goes, counted."""
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        for i in range(NOTICE_BACKLOG + 2):
+            await backend.announce(f"Message {i}.")
+        await _settle()
+        assert list(backend._notices) == [f"Message {i}." for i in range(2, NOTICE_BACKLOG + 2)]
+        assert backend._metrics.counters.get("notice_dropped") == 2
         await backend.close()
         await sink.stop()
 

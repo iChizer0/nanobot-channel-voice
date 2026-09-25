@@ -477,7 +477,7 @@ Drop-in tuning for any local-backend example above:
 - `bargeIn.mode: "pause"` halts playback during the confirm window instead of ducking to `duckDb`, resuming exactly where it stopped on a false alarm.
 - `bargeIn.stopPhrases` (defaults cover en/zh/ja): a bare "stop"/"别说了"/"やめて" kills the reply *silently* - consumed, never forwarded - while "stop, use Tokyo instead" still publishes as a normal interruption.
 - Many false barge-in candidates per minute? Usually `aec: "webrtc"` or `bargeIn.mode: "duck"`.
-- A heartbeat report, or a message another chat sends to voice, never lands inside a turn: it waits until nobody is talking and no reply is owed or playing, then plays after a short pause that leaves room to answer the reply that just ended.
+- A heartbeat report, or a message another chat sends to voice, never lands inside a turn: it waits until nobody is talking and no reply is owed or playing, then plays after a short pause that leaves room to answer the reply that just ended. At most eight wait; past that the oldest is dropped.
 
 ### Open mic with Smart Turn
 
@@ -650,7 +650,7 @@ Set `backend` to `"openai"`, `"xai"`, `"azure"`, `"qwen"`, `"glm"`, `"stepfun"` 
 
 Tool calls are the caveat. The model's calls can route through nanobot's guarded `ToolRegistry` only when core hands the channel a tool gateway at construction, and the official nanobot does not - so on a stock install every realtime backend is **persona-only**: the model answers from its own knowledge, `realtime.toolMode` and `delegationTimeoutS` have no effect (startup says so when you set them), and the local backend remains the full agent. The tool wiring below is for a core build that passes the gateway.
 
-Messages the agent sends on its own still reach you in every mode: a reminder it scheduled, a heartbeat report, or a message another channel sends to voice goes to the realtime model as a notice, which it reads out as written once nobody is talking and no reply plays (a parked gated uplink reconnects for it). Qwen-Omni is the exception: its realtime API takes no text input, so there such a message is only logged.
+Messages the agent sends on its own still reach you in every mode: a reminder it scheduled, a heartbeat report, or a message another channel sends to voice goes to the realtime model as a notice, which it reads out as written once nobody is talking and no reply plays (a parked gated uplink reconnects for it). Notices wait out a lost connection, at most eight; past that the oldest is dropped. Qwen-Omni is the exception: its realtime API takes no text input, so there such a message is only logged.
 
 ### Minimal
 

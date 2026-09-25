@@ -63,7 +63,7 @@ from nanobot_channel_voice.vad.adaptive import AdaptiveHangover
 from nanobot_channel_voice.wake.phrase import FuzzyWake, WakePhrase
 
 from .audio_sink import AudioSink, scale_pcm, trim_lead_silence, trim_tail_silence
-from .base import OnEvent, OutputAudio, ToolDef, VoiceState
+from .base import NOTICE_BACKLOG, OnEvent, OutputAudio, ToolDef, VoiceState
 from .common import TurnEventMixin, loggable_text
 
 TranscribeFn = Callable[[bytes], Awaitable[str]]
@@ -960,7 +960,7 @@ class LocalBackend(TurnEventMixin):
         self._tts_task: asyncio.Task | None = None
         self._drain_task: asyncio.Task | None = None
         # Messages from outside the chat's runs, waiting for a quiet moment (see announce).
-        self._notices: deque[str] = deque()
+        self._notices: deque[str] = deque(maxlen=NOTICE_BACKLOG)
         self._notice_task: asyncio.Task | None = None
         # Per-char synth cost (ms) EMA for the JIT schedule; the worker's first chunk seeds it.
         self._synth_mpc: float | None = None
@@ -3359,6 +3359,8 @@ class LocalBackend(TurnEventMixin):
         if not self._notices and self._quiet():
             await self.speak_final(text)
             return
+        if len(self._notices) == self._notices.maxlen:
+            self._metrics.count("notice_dropped")
         self._notices.append(text)
         self._metrics.count("notice_held")
         self._schedule_notice(0.0)

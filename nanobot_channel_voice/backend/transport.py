@@ -33,7 +33,7 @@ from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.metrics import VoiceMetrics
 
 from .audio_sink import AudioSink
-from .base import Error, OnEvent, ToolDef, UserSpeechStarted, VoiceState
+from .base import NOTICE_BACKLOG, Error, OnEvent, ToolDef, UserSpeechStarted, VoiceState
 from .common import TurnEventMixin
 
 _SEND_Q_MAX = 64  # ~1.3s of 20ms frames; drop-oldest past this
@@ -140,7 +140,7 @@ class RealtimeTransport(TurnEventMixin):
         self._user_speaking = False
         # Messages the agent sent on its own, waiting for a quiet session (see announce);
         # they outlive a lost session.
-        self._notices: deque[str] = deque()
+        self._notices: deque[str] = deque(maxlen=NOTICE_BACKLOG)
         self._notice_task: asyncio.Task | None = None
         self._log = logger.bind(component="voice")
 
@@ -262,6 +262,8 @@ class RealtimeTransport(TurnEventMixin):
         resumed for it."""
         if self._closing:
             return
+        if len(self._notices) == self._notices.maxlen:
+            self._metrics.count("notice_dropped")
         self._notices.append(text)
         self._schedule_notice()
 

@@ -125,6 +125,9 @@ class ToolCall:
 # Opens the text turn that has a cloud model voice a message the agent sent on its own; the
 # session instructions say what it means.
 NOTICE_MARK = "[notice]"
+# Such messages waiting for a quiet session, per backend. Bus traffic fills the queue and an
+# outage or a long run can outlast any rate: past this the oldest goes.
+NOTICE_BACKLOG = 8
 
 
 class AbandonedResult(str):
