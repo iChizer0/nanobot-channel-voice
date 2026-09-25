@@ -284,9 +284,9 @@ def test_bare_summon_over_a_reply_kills_it_and_opens_the_window():
 
 def test_a_bare_summon_while_the_agent_works_keeps_the_query_and_admits_the_command():
     """Over THINKING (a delegation's wait) the bare phrase cancels nothing, as locally; in
-    strict mode it is what lets the command after it through, that one only."""
+    strict mode it opens the window that lets the command after it through."""
     async def _run():
-        vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
@@ -297,10 +297,52 @@ def test_a_bare_summon_while_the_agent_works_keeps_the_query_and_admits_the_comm
         assert inner.calls == []
         await feed(gate, 10, start=2)  # the command after the beat
         assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
-        await inner.emit(StateHint(VoiceState.THINKING))
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+@pytest.mark.parametrize("attention, follow_up_at, admitted", [
+    ("conversation", 1020.0, True),   # the hit's window shut at 1015; the commit re-opened it
+    ("conversation", 1030.0, False),  # ... for windowS only
+    ("sentence", 1012.0, False),      # the commit spent the hit's window
+])
+def test_strict_follow_ups_over_a_working_turn_follow_the_window_as_locally(
+    monkeypatch, attention, follow_up_at, admitted,
+):
+    """Local strict needs the phrase to steer a working turn only once the attention
+    window is shut; the gate keeps the same window, not a narrower one."""
+    from nanobot_channel_voice.backend import gated
+
+    clock = _Clock()
+    monkeypatch.setattr(gated, "time", clock)
+
+    async def _run():
+        # A same-breath summoned command (hit on its second frame), then a follow-up.
+        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15,
+                  "attention": attention},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 6)  # the phrase at 1000, the command runs on
+        clock.t = 1010.0
+        await feed(gate, 5, start=6)  # committed at 1010
+        assert inner.calls[-1] == ("end", True)
+        await inner.emit(StateHint(VoiceState.THINKING))  # the agent works
         inner.calls.clear()
-        await feed(gate, 9, start=12)  # more talk in the same wait, no phrase
-        assert inner.calls == []
+        clock.t = follow_up_at
+        await feed(gate, 9, start=11)  # a follow-up without the phrase
+        assert (inner.kinds()[:1] == ["begin"]) is admitted
         await gate.close()
 
     asyncio.run(_run())
@@ -329,13 +371,9 @@ def test_a_bare_summon_during_a_tool_wait_admits_the_command_after_it():
     asyncio.run(_run())
 
 
-@pytest.mark.parametrize("then", [
-    [VoiceState.SPEAKING],  # the answer is audible
-    [VoiceState.IDLE, VoiceState.THINKING],  # a later turn works
-])
-def test_a_summons_claim_ends_with_its_wait(then):
-    """The phrase unlocked the command during that wait only: strict needs it again once
-    the answer speaks, and in any later turn."""
+def test_strict_needs_the_phrase_over_a_reply_even_inside_the_window():
+    """The window frees steering a working turn only: over an audible reply strict needs
+    the phrase in the utterance itself, as locally."""
     async def _run():
         vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
@@ -344,9 +382,8 @@ def test_a_summons_claim_ends_with_its_wait(then):
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
         await inner.emit(StateHint(VoiceState.THINKING))
-        await feed(gate, 2)
-        for state in then:
-            await inner.emit(StateHint(state))
+        await feed(gate, 2)  # a bare summon: the window opens
+        await inner.emit(StateHint(VoiceState.SPEAKING))  # the answer is audible
         await feed(gate, 10, start=2)
         assert inner.kinds() == []
         await gate.close()

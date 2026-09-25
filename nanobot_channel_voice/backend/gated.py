@@ -128,9 +128,10 @@ class GatedUplink:
         self._window_s = wake.window_s
         self._window_until = 0.0 if self._mode == "wake" else math.inf
         self._spent = False
-        # A bare phrase heard while the agent works: strict admits the next onset (the
-        # command after the phrase) until this, or until a reply speaks or the turn ends.
-        self._claim_until = 0.0
+        # Strict admits an onset over a working turn (THINKING) until this, as locally: a
+        # hit opens it for windowS, a committed utterance re-opens it ("conversation") or
+        # spends it ("sentence"). A reply (SPEAKING) always needs the phrase itself.
+        self._steer_until = 0.0
         self._phrase = WakePhrase(list(wake.phrases) + list(wake.aliases))
         self._phrase_echo_until = 0.0
         self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
@@ -290,9 +291,6 @@ class GatedUplink:
     def _window_open(self, now: float) -> bool:
         return now < self._window_until
 
-    def _live(self) -> bool:
-        return self._state in (VoiceState.THINKING, VoiceState.SPEAKING)
-
     async def _on_wake_hit(self, now: float) -> bool:
         """True when the hit adopted the open utterance (buffer uploaded, this frame in)."""
         if now < self._phrase_echo_until:
@@ -302,8 +300,9 @@ class GatedUplink:
         self._metrics.count("wake_hit")
         score = getattr(self._wake, "last_score", None)
         self._log.info("wake hit{}", f" (score={score:.2f})" if score is not None else "")
+        self._steer_until = now + self._window_s
         if self._active:
-            return False  # the name mid-upload changes nothing (the window stays inf)
+            return False  # the name mid-upload changes nothing else (the window stays inf)
         # max: never shortens an engaged turn's window (inf until IDLE).
         self._window_until = max(self._window_until, now + self._window_s)
         self._spent = False
@@ -318,22 +317,22 @@ class GatedUplink:
             if self._active:
                 self._hit_active_ms = self._ep.active_ms
             return self._active
-        if self._live():
-            # Claimed first: the kill can settle THINKING (a tool still owes its answer).
-            self._claim_until = now + self._window_s
-            if self._state is VoiceState.SPEAKING:
-                # A bare summon over the audible reply: kill it and listen (the local
-                # _wake_kill). While the agent works the query survives, as locally.
-                await self._kill_reply()
+        if self._state is VoiceState.SPEAKING:
+            # A bare summon over the audible reply: kill it and listen (the local
+            # _wake_kill). While the agent works the query survives, as locally.
+            await self._kill_reply()
         return False
 
     async def _on_onset(self, now: float) -> None:
         if not self._window_open(now):
             self._metrics.count("gate_dropped_onsets")  # a later hit may still adopt it
             return
-        if self._live() and self._wake_mode == "strict" and now >= self._claim_until:
-            # Public-room posture: only the phrase interrupts; a hit later in this same
-            # utterance adopts it (see _on_wake_hit).
+        if self._wake_mode == "strict" and (
+            self._state is VoiceState.SPEAKING
+            or (self._state is VoiceState.THINKING and now >= self._steer_until)
+        ):
+            # Public-room posture: only the phrase interrupts a reply, or steers a working
+            # turn once its window shut; a hit later in this same utterance adopts it.
             self._metrics.count("gate_dropped_onsets")
             return
         await self._open_activity(self._ep.open_pcm() or b"")
@@ -341,7 +340,6 @@ class GatedUplink:
     async def _open_activity(self, pcm: bytes) -> None:
         self._cancel_park()
         self._hit_active_ms = None  # an adoption sets it after; a lost session left it
-        self._claim_until = 0.0  # spent on this utterance
         try:
             await self._inner.begin_activity()
         except asyncio.CancelledError:
@@ -390,11 +388,13 @@ class GatedUplink:
             # command — the local path publishes nothing either.
             self._metrics.count("gate_bare_summon")
             self._log.debug("bare summon: nothing after the phrase; window open")
-            self._claim_until = time.monotonic() + self._window_s  # see _on_wake_hit
             await self._inner.end_activity(commit=False)
             return
         if self._attention == "sentence":
             self._spent = True
+            self._steer_until = 0.0  # the turn spends the phrase's window
+        else:
+            self._steer_until = time.monotonic() + self._window_s
         await self._inner.end_activity(commit=True)
 
     async def _kill_reply(self) -> None:
@@ -449,8 +449,6 @@ class GatedUplink:
     async def _on_inner_event(self, event) -> None:
         if isinstance(event, StateHint):
             prev, self._state = self._state, event.state
-            if event.state in (VoiceState.SPEAKING, VoiceState.IDLE):
-                self._claim_until = 0.0
             if (
                 event.state in (VoiceState.THINKING, VoiceState.SPEAKING)
                 and prev in (VoiceState.IDLE, VoiceState.CAPTURING)
