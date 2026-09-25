@@ -1007,8 +1007,9 @@ def test_a_consumed_stop_abandons_the_pending_tool_work():
 
 def test_the_models_cancel_ends_the_wait_it_leaves():
     """No transcript consumed the stop: the model called cancel_nanobot, and both answers
-    come back abandoned, resuming nothing. The wait they held ends with the last one."""
-    async def _case():
+    come back abandoned, resuming nothing. The wait they held ends with the last one,
+    whichever of the two lands last."""
+    async def _case(receipt_first: bool):
         b, sent, _ = make_stop_backend(VoiceConfig())
         await _dispatched_wait(b)
         await b._handle_event({"type": "input_audio_buffer.speech_started"})
@@ -1021,16 +1022,21 @@ def test_the_models_cancel_ends_the_wait_it_leaves():
         await b._drain_task
         assert b._turn is VoiceState.THINKING
         sent.clear()
-        await b.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
+        answers = [("c1", AbandonedResult("(stopped by the user)")),
+                   ("c2", ReceiptResult("(stopped)"))]
+        if receipt_first:
+            answers.reverse()
+        await b.submit_tool_result(*answers[0])
         await asyncio.sleep(0.01)
-        assert b._turn is VoiceState.THINKING  # the cancel's own answer is still owed
-        await b.submit_tool_result("c2", ReceiptResult("(stopped)"))
+        assert b._turn is VoiceState.THINKING  # the other answer is still owed
+        await b.submit_tool_result(*answers[1])
         await b._drain_task
         assert b._turn is VoiceState.IDLE
         assert [p["type"] for p in sent] == ["conversation.item.create"] * 2
         await b.close()
 
-    asyncio.run(_case())
+    asyncio.run(_case(receipt_first=False))
+    asyncio.run(_case(receipt_first=True))
 
 
 def test_an_abandoned_answer_leaves_a_live_or_unborn_reply_its_state():
