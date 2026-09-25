@@ -7,8 +7,9 @@ from __future__ import annotations
 import asyncio
 import time
 
-from eval_harness import EvalConversation
+from eval_harness import _FRAME, EvalConversation
 
+from nanobot_channel_voice.backend import local as local_mod
 from nanobot_channel_voice.backend.base import VoiceState
 
 _REPLY = "The weather in tokyo is sunny today. Tomorrow will be cloudy all day."
@@ -643,6 +644,137 @@ def test_dead_stream_residue_never_glues_onto_a_final():
             await c.wait_state(VoiceState.IDLE)
             assert rec.requests  # the apology spoke
             assert not any("Partial" in t for t in rec.requests)
+
+    _run(_case())
+
+
+def _record_speech(backend) -> list[str]:
+    """The texts the backend synthesizes from here on, in order."""
+    said: list[str] = []
+    inner = backend._tts
+
+    class _Tts:
+        output_rate = inner.output_rate
+
+        async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
+            said.append(text)
+            return await inner.synthesize(text)
+
+        async def synthesize_pcm(self, text: str, *, voice: str | None = None) -> bytes:
+            said.append(text)
+            return await inner.synthesize_pcm(text)
+
+    backend._tts = _Tts()
+    return said
+
+
+async def _deliver_from_elsewhere(backend, text: str) -> None:
+    """What reaches this chat as a heartbeat report or another chat's message-tool send:
+    a final with no turn token."""
+    from nanobot.bus.events import OutboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.channel import VoiceChannel
+    from nanobot_channel_voice.config import VoiceConfig
+
+    channel = VoiceChannel(VoiceConfig(), MessageBus())
+    channel._backend = backend
+    await channel.send(OutboundMessage(
+        channel="voice", chat_id=channel.config.chat_id, content=text, metadata={},
+    ))
+
+
+def test_a_message_from_elsewhere_waits_for_the_live_turn(monkeypatch):
+    """Landing while the agent works, it was spoken as the turn's own reply: its drain
+    settled IDLE under the run and cancelled the deadman. It waits for the turn now."""
+    monkeypatch.setattr(local_mod, "_NOTICE_GRACE_S", 0.05)
+
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            said = _record_speech(b)
+            await c.user_says("check the build")
+            await _deliver_from_elsewhere(b, "Heartbeat report: the backup finished.")
+            await asyncio.sleep(0.3)
+            assert b._turn is VoiceState.THINKING
+            assert not b._cur_turn.timeout_task.done()
+            assert said == []
+
+            await b.on_delta("The build is green.")
+            await b.on_stream_end(resuming=False)
+            await _until(lambda: "Heartbeat" in " ".join(said) and b._turn is VoiceState.IDLE)
+            assert " ".join(said) == "The build is green. Heartbeat report: the backup finished."
+
+    _run(_case())
+
+
+def test_a_message_from_elsewhere_never_splits_a_reply(monkeypatch):
+    """Landing mid-reply, it flushed the chunker (the reply's buffered words were lost) and
+    queued itself between the reply's chunks."""
+    monkeypatch.setattr(local_mod, "_NOTICE_GRACE_S", 0.05)
+
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            said = _record_speech(b)
+            await c.user_says("how is the build doing")
+            await b.on_delta("The build finished at noon and every test passed. ")
+            await b.on_delta("The deploy then went out to staging")
+            await _deliver_from_elsewhere(b, "Heartbeat report: the backup finished.")
+            await b.on_delta(" without any errors at all.")
+            await b.on_stream_end(resuming=False)
+            await _until(lambda: "Heartbeat" in " ".join(said) and b._turn is VoiceState.IDLE)
+            assert " ".join(said) == (
+                "The build finished at noon and every test passed. The deploy then went out"
+                " to staging without any errors at all. Heartbeat report: the backup finished."
+            )
+
+    _run(_case())
+
+
+def test_a_message_from_elsewhere_waits_for_the_user_to_finish(monkeypatch):
+    """Nor does it start over someone mid-utterance: a reply flip there ducks or mutes them."""
+    monkeypatch.setattr(local_mod, "_NOTICE_GRACE_S", 0.05)
+
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            said = _record_speech(b)
+            c.vad.flag = True
+            for _ in range(10):
+                await b.push_audio(_FRAME)
+            assert b._turn is VoiceState.CAPTURING
+            await _deliver_from_elsewhere(b, "Dinner is ready.")
+            await asyncio.sleep(0.2)
+            assert said == []
+            c.vad.flag = False  # the user trails off: noise, no words
+            for _ in range(b._cfg.vad.hangover_ms // 20 + 2):
+                await b.push_audio(_FRAME)
+            await b._utt_queue.join()
+            await _until(lambda: bool(said) and b._turn is VoiceState.IDLE)
+            assert said == ["Dinner is ready."]
+
+    _run(_case())
+
+
+def test_a_waiting_message_leaves_room_to_answer_the_reply(monkeypatch):
+    """Nor does it take the floor the moment a reply ends: an answer to it starts within
+    the grace, and then that turn goes first."""
+    monkeypatch.setattr(local_mod, "_NOTICE_GRACE_S", 0.4)
+
+    async def _case():
+        async with EvalConversation() as c:
+            b = c.backend
+            said = _record_speech(b)
+            await c.user_says("what is left on my list")
+            await _deliver_from_elsewhere(b, "Dinner is ready.")
+            await b.on_delta("Two tasks are left. Shall I start the first one?")
+            await b.on_stream_end(resuming=False)
+            await c.wait_state(VoiceState.IDLE)
+            await asyncio.sleep(0.1)
+            await c.user_says("yes please")
+            assert c.texts()[-1] == "yes please"
+            assert "Dinner" not in " ".join(said)
 
     _run(_case())
 

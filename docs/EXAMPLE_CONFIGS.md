@@ -477,6 +477,7 @@ Drop-in tuning for any local-backend example above:
 - `bargeIn.mode: "pause"` halts playback during the confirm window instead of ducking to `duckDb`, resuming exactly where it stopped on a false alarm.
 - `bargeIn.stopPhrases` (defaults cover en/zh/ja): a bare "stop"/"别说了"/"やめて" kills the reply *silently* - consumed, never forwarded - while "stop, use Tokyo instead" still publishes as a normal interruption.
 - Many false barge-in candidates per minute? Usually `aec: "webrtc"` or `bargeIn.mode: "duck"`.
+- A heartbeat report, or a message another chat sends to voice, never lands inside a turn: it waits until nobody is talking and no reply is owed or playing, then plays after a short pause that leaves room to answer the reply that just ended.
 
 ### Open mic with Smart Turn
 

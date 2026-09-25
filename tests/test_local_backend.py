@@ -836,6 +836,7 @@ def test_agent_initiated_sends_mark_the_turn_proactive():
         from nanobot.bus.queue import MessageBus
 
         from nanobot_channel_voice.channel import VoiceChannel
+        from nanobot_channel_voice.streamid import TURN_META
 
         h = _build()
         channel = VoiceChannel(VoiceConfig(), MessageBus())
@@ -855,10 +856,81 @@ def test_agent_initiated_sends_mark_the_turn_proactive():
         h.backend._cur_turn.proactive = False
         await channel.send(OutboundMessage(
             channel="voice", chat_id=channel.config.chat_id, content="Plain reply.",
-            metadata={},
+            metadata={TURN_META: "t1"},
         ))
         assert spoken[-1] == "Plain reply."
         assert h.backend._cur_turn.proactive is False
+
+    _run(_t())
+
+
+def test_a_final_from_outside_this_chats_runs_is_announced():
+    """Core stamps every reply to a voice publish with its turn token, and a cron or
+    trigger turn with its trigger: a final with neither (a heartbeat report, another
+    chat's message-tool send) waits for a quiet moment instead of joining the live turn."""
+    async def _t():
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.bus.queue import MessageBus
+
+        from nanobot_channel_voice.channel import VoiceChannel
+        from nanobot_channel_voice.streamid import TURN_META
+
+        h = _build()
+        channel = VoiceChannel(VoiceConfig(), MessageBus())
+        channel._backend = h.backend
+        spoken: list[str] = []
+        announced: list[str] = []
+
+        async def _speak(text: str) -> None:
+            spoken.append(text)
+
+        async def _announce(text: str) -> None:
+            announced.append(text)
+
+        h.backend.speak_final = _speak  # type: ignore[method-assign]
+        h.backend.announce = _announce  # type: ignore[method-assign]
+        chat = channel.config.chat_id
+        for content, meta in (
+            ("Heartbeat report.", {}),
+            ("The answer.", {TURN_META: "t1"}),
+            ("Stretch now.", {"_cron_trigger": {"job_id": "x"}}),
+        ):
+            await channel.send(OutboundMessage(
+                channel="voice", chat_id=chat, content=content, metadata=meta,
+            ))
+        assert announced == ["Heartbeat report."]
+        assert spoken == ["The answer.", "Stretch now."]
+
+    _run(_t())
+
+
+def test_idle_is_not_quiet_while_the_user_holds_the_floor():
+    """An onset over a reply that then drained never flips CAPTURING: an open, queued or
+    decoding utterance keeps a waiting message waiting for its verdict."""
+    async def _t():
+        h = _build()
+        b = h.backend
+        spoken: list[str] = []
+
+        async def _speak(text: str) -> None:
+            spoken.append(text)
+
+        b.speak_final = _speak  # type: ignore[method-assign]
+        b._endpointer._in_speech = True
+        await b.announce("Dinner is ready.")
+        await asyncio.sleep(0.3)
+        assert spoken == []
+        b._endpointer._in_speech = False
+        b._utt_queue.put_nowait(_utt())
+        await asyncio.sleep(0.3)
+        assert spoken == []
+        b._utt_queue.get_nowait()
+        b._worker_decoding = True
+        await asyncio.sleep(0.3)
+        assert spoken == []
+        b._worker_decoding = False
+        await asyncio.sleep(0.3)
+        assert spoken == ["Dinner is ready."]
 
     _run(_t())
 

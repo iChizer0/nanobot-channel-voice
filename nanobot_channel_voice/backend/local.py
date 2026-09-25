@@ -150,6 +150,10 @@ _EARCON_MAX_FILE_B = 2_000_000  # refuse absurd files unread: ~10 s of 48 k ster
 # the engine voiced nothing: the clip is silence with a duration, not a quiet phrase.
 _CANNED_MIN_RMS = 0.005
 
+# A message from outside the chat's runs waits this long past a settle: an answer to what
+# just ended starts within it.
+_NOTICE_GRACE_S = 1.5
+
 
 def _swallow_result(task: asyncio.Task) -> None:
     """Retrieve an abandoned decode's outcome: no "exception was never retrieved"."""
@@ -955,6 +959,9 @@ class LocalBackend(TurnEventMixin):
         self._tts_overflow_warn = Throttle()
         self._tts_task: asyncio.Task | None = None
         self._drain_task: asyncio.Task | None = None
+        # Messages from outside the chat's runs, waiting for a quiet moment (see announce).
+        self._notices: deque[str] = deque()
+        self._notice_task: asyncio.Task | None = None
         # Per-char synth cost (ms) EMA for the JIT schedule; the worker's first chunk seeds it.
         self._synth_mpc: float | None = None
 
@@ -2134,6 +2141,7 @@ class LocalBackend(TurnEventMixin):
                 self._eager_task, self._utt_task, turn.prologue_task, turn.midturn_task,
                 turn.timeout_task, self._tts_task, self._drain_task, self._consult_task,
                 self._ack_task, self._fast_ack_task, self._earcon_task, self._attention_task,
+                self._notice_task,
             ) if t is not None
         ]
 
@@ -2158,6 +2166,7 @@ class LocalBackend(TurnEventMixin):
         self._cur_turn.midturn_task = self._cur_turn.timeout_task = None
         self._tts_task = self._drain_task = self._ack_task = None
         self._fast_ack_task = self._earcon_task = self._attention_task = None
+        self._notice_task = None
         # Pooled adapter resources (e.g. an httpx client); optional per adapter.
         aclose = getattr(self._tts, "aclose", None)
         if aclose is not None:
@@ -2707,6 +2716,7 @@ class LocalBackend(TurnEventMixin):
         settled = state is VoiceState.IDLE and self._turn in (
             VoiceState.SPEAKING, VoiceState.THINKING,
         )
+        idling = state is VoiceState.IDLE and self._turn is not VoiceState.IDLE
         if settled and self._canned_base is None:
             if (
                 self._wake_attention != "sentence"
@@ -2719,6 +2729,8 @@ class LocalBackend(TurnEventMixin):
         if settled:
             # AFTER the flip: a watcher spawned here must see IDLE, or it exits as if live.
             self._arm_attention_cue()
+        if idling:
+            self._schedule_notice(_NOTICE_GRACE_S)  # the quiet a waiting message needs
 
     def _reply_asked_question(self) -> bool:
         tail = self._reply_tail.rstrip().rstrip("\"'”’」』)]）】…")
@@ -3335,6 +3347,49 @@ class LocalBackend(TurnEventMixin):
         if tail:
             self._tts_enqueue(tail)
         self._schedule_drain()
+
+    async def announce(self, text: str) -> None:
+        """Speak a message from outside the chat's runs (a heartbeat report, another chat's
+        send) once nobody talks and no turn is live: inside one it would splice into the
+        reply, or settle the wait under the working run."""
+        if self._closing:
+            return
+        if not self._notices and self._quiet():
+            await self.speak_final(text)
+            return
+        self._notices.append(text)
+        self._metrics.count("notice_held")
+        self._schedule_notice(0.0)
+
+    def _quiet(self) -> bool:
+        return (
+            self._turn is VoiceState.IDLE
+            and not self._endpointer.in_speech
+            and self._utt_queue.empty()
+            and not self._worker_decoding
+        )
+
+    def _schedule_notice(self, grace: float) -> None:
+        if self._notices and not self._closing and (
+            self._notice_task is None or self._notice_task.done()
+        ):
+            self._notice_task = asyncio.create_task(self._flush_notice(grace))
+
+    async def _flush_notice(self, grace: float) -> None:
+        """One waiting message per quiet moment; its own settle schedules the next."""
+        try:
+            await asyncio.sleep(grace)
+            while self._notices and not self._closing:
+                if self._turn is not VoiceState.IDLE:
+                    return  # a turn or clip took the floor: its settle schedules us again
+                if self._quiet():
+                    await self.speak_final(self._notices.popleft())
+                    return
+                await asyncio.sleep(0.25)  # the user holds the floor
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a message must never wedge the session
+            self._log.warning("waiting message failed ({})", exc)
 
     # ---- TTS stage + drain --------------------------------------------------
 

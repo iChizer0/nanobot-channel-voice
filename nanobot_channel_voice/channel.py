@@ -1292,6 +1292,12 @@ class VoiceChannel(BaseChannel):
         text = (msg.content or "").strip()
         if not text:
             return
+        if turn is None and not _agent_initiated(meta):
+            # Core stamps every reply to a voice publish with its turn token, and a cron or
+            # trigger turn with its trigger: this comes from outside the chat's runs (a
+            # heartbeat report, another chat's send) and must not join a live turn.
+            await local.announce(text)
+            return
         if _agent_initiated(meta):
             local.note_proactive()
         await local.speak_final(text)

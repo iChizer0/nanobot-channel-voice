@@ -555,6 +555,7 @@ def test_foreign_chat_delivery_is_neither_spoken_nor_collected():
             def note_proactive(self): touched.append("proactive")
             def is_dead_turn(self, token): return False
             async def speak_final(self, text): spoken.append(text)
+            async def announce(self, text): spoken.append(text)
             async def on_delta(self, delta, stream_id=None): deltas.append(delta)
             async def on_stream_end(self, *, resuming, stream_id=None): touched.append("end")
 
