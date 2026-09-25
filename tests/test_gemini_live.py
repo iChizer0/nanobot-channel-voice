@@ -835,6 +835,65 @@ def test_a_call_alone_under_server_vad_waits_in_thinking(before):
     ], after=after)
 
 
+def test_the_models_cancel_ends_the_wait_it_leaves():
+    """A stop in the silent wait reaches the model alone (no transcript is matched here):
+    it calls cancel_nanobot, both answers come back abandoned, SILENT, and the wait they
+    held ends with the last one."""
+    cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
+
+    async def after(backend):
+        await backend._drain_task  # the filler played: THINKING for c1
+        await backend._handle_event(
+            {"toolCall": {"functionCalls": [{"id": "c2", "name": "cancel_nanobot", "args": {}}]}}
+        )
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        await backend.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
+        assert backend._turn is VoiceState.THINKING  # the cancel's own answer is owed
+        await backend.submit_tool_result("c2", AbandonedResult("(stopped)"))
+        assert backend._turn is VoiceState.IDLE
+
+    _, sent, _ = drive([
+        {"setupComplete": {}},
+        audio_msg(b"\x01"),
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}}]}},
+        {"serverContent": {"turnComplete": True}},
+    ], config=cfg, after=after)
+    schedules = [m["toolResponse"]["functionResponses"][0]["response"]["scheduling"]
+                 for m in sent if "toolResponse" in m]
+    assert schedules == ["SILENT", "SILENT"]
+
+
+def test_an_abandoned_answer_leaves_background_reasoning_thinking():
+    """Extended thinking reasons on after its call's turn: the call's abandoned answer ends
+    nothing the model still does."""
+    async def after(backend):
+        await backend._drain_task
+        await backend.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
+        assert backend._turn is VoiceState.THINKING
+
+    drive([
+        {"setupComplete": {}},
+        audio_msg(b"\x01", interactionStatus="IN_PROGRESS"),
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}},
+        {"serverContent": {"turnComplete": True, "interactionStatus": "IN_PROGRESS"}},
+    ], after=after)
+
+
+def test_an_abandoned_answer_under_a_streaming_reply_leaves_it_speaking():
+    async def after(backend):
+        await backend.submit_tool_result("c1", AbandonedResult("(replaced by a newer request)"))
+        await asyncio.sleep(0.05)
+        assert backend._turn is VoiceState.SPEAKING
+
+    drive([
+        {"setupComplete": {}},
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}},
+        audio_msg(b"\x01"),  # a reply streams, its turn not complete yet
+    ], after=after)
+
+
 def test_a_blip_during_a_tool_wait_stays_thinking():
     """The gate's discarded activity, and the model's unheard answer to it, both settle
     THINKING while a call still runs: IDLE would let the gate park the socket, losing

@@ -72,8 +72,8 @@ _DIRECT_RULES = (
 
 # Silence-is-the-ack, model-side half: enforcement is backend._consume_stop's
 # transcript-gated response.cancel, which needs input transcription and can lose the race
-# to a fast ack. Appended in EVERY mode; the second sentence is the only cover for a
-# stopped tool's answer where no transcript abandons the work.
+# to a fast ack. Appended in EVERY mode; the second sentence covers a stopped tool's answer
+# where no transcript abandons the work (supervisor mode also has cancel_nanobot).
 _STOP_RULE = (
     "If the user only tells you to stop, be quiet, or wait, do not answer — "
     "produce no speech at all. A request they stopped stays stopped: do not read out "
@@ -97,11 +97,12 @@ _SUPERVISOR_RULES = (
     "success or failure), THEN call "
     "the ask_nanobot tool with the user's request. When it returns, read the answer "
     "aloud naturally and concisely as if it were your own, never mention the tool "
-    "or that you delegated."
+    "or that you delegated. If the user tells you to stop or cancel a request that is "
+    "still being worked on, call cancel_nanobot and say nothing."
 )
 
-# Supervisor's only declared tool: persona + this schema is the whole realtime context,
-# MCP/skills/memory stay in nanobot.
+# Supervisor's delegation tool: persona + its schema and cancel_nanobot's are the whole
+# realtime context, MCP/skills/memory stay in nanobot.
 _SUPERVISOR_TOOL = ToolDef(
     name="ask_nanobot",
     description=(
@@ -131,10 +132,23 @@ _SUPERVISOR_TOOL = ToolDef(
     },
 )
 
+# The supervisor's stop, where no transcript can consume one (Gemini, or no input
+# transcription): ends the running and queued delegations as a consumed stop does.
+_CANCEL_TOOL = ToolDef(
+    name="cancel_nanobot",
+    description=(
+        "Stop the work ask_nanobot is still doing. Call it, saying nothing, when the user "
+        "tells you to stop, cancel, or forget a request that has not been answered yet. "
+        "A new request needs no cancel: a new ask_nanobot call replaces the running one."
+    ),
+    parameters={"type": "object", "properties": {}},
+)
+
 # The ask_nanobot result for work the user stopped, or a newer request replaced: satisfies
 # the function call, and resumes nothing (see AbandonedResult).
 _DELEGATION_STOPPED = AbandonedResult("(stopped by the user)")
 _DELEGATION_REPLACED = AbandonedResult("(replaced by a newer request)")
+_CANCELLED = AbandonedResult("(stopped)")  # cancel_nanobot's own result
 
 # Tags our own priority commands: core copies INBOUND metadata onto the command ack
 # ("Stopped 1 task(s)."), so _speakable can drop it — untagged, every barge-in speaks it.
@@ -829,8 +843,9 @@ class VoiceChannel(BaseChannel):
         ``supported`` is the profile's tool capability: a provider whose function-call flow
         isn't the OpenAI exchange (Qwen) stays persona-only even with the gateway wired.
         ``"direct"`` declares nanobot's N tools, each call a guarded ``execute_tool`` slice
-        the realtime model sequences; ``"supervisor"`` declares ONE (``ask_nanobot``)
-        delegating the whole request, so multi-step planning leaves the weak model."""
+        the realtime model sequences; ``"supervisor"`` declares ``ask_nanobot``, delegating
+        the whole request so multi-step planning leaves the weak model, and
+        ``cancel_nanobot`` to stop it."""
         gw = self._tool_gateway
         if gw is None:
             # No core passes one today. A toolMode the user SET is inert: say so, or a
@@ -859,7 +874,7 @@ class VoiceChannel(BaseChannel):
             )
             await self._warn_if_unified_session()
             # Not execute_tool: a delegated request is a whole turn, driven over the bus.
-            return [_SUPERVISOR_TOOL], self._delegate_to_nanobot
+            return [_SUPERVISOR_TOOL, _CANCEL_TOOL], self._supervisor_tool
 
         # Direct mode. The gateway derives the session key from channel/chat_id as the bus
         # does, so cloud tools share the voice session's working dir / memory.
@@ -871,6 +886,12 @@ class VoiceChannel(BaseChannel):
             )
 
         return tools, exec_tool
+
+    async def _supervisor_tool(self, name: str, args: str, turn: str) -> str:
+        if name == _CANCEL_TOOL.name:
+            await self._on_cloud_abandon()
+            return _CANCELLED
+        return await self._delegate_to_nanobot(name, args, turn)
 
     async def _delegate_to_nanobot(self, name: str, args: str, turn: str) -> str:
         """``ask_nanobot`` handler (supervisor mode): run a full nanobot turn over the bus
@@ -947,8 +968,9 @@ class VoiceChannel(BaseChannel):
                     self._pending_delegation = None
 
     async def _on_cloud_abandon(self) -> None:
-        """A consumed stop ended the pending tool work: a delegation in flight is /stop-ped
-        and answered as stopped, and one queued behind it gives up."""
+        """A stop (consumed from its transcript, or the model's cancel_nanobot) ended the
+        pending tool work: a delegation in flight is /stop-ped and answered as stopped, and
+        one queued behind it gives up."""
         self._cloud_stops += 1
         collector = self._pending_delegation
         if collector is None or collector.resolved:

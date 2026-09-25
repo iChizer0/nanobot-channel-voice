@@ -393,6 +393,7 @@ class RealtimeBackend(RealtimeTransport):
             return
         if abandoned:
             self._discard_response_tools(rid)  # the work was stopped or replaced
+            await self._release_wait()
             return
         pending = self._tools_pending.get(rid)
         if pending is not None:
@@ -910,6 +911,18 @@ class RealtimeBackend(RealtimeTransport):
             },
         })
         await self._ask_response()
+
+    async def _release_wait(self) -> None:
+        """Answers came back abandoned and nothing else is owed or live: a wait held for them
+        alone settles (the deadman is off, so nothing else would), and a filler still playing
+        drains IDLE, not THINKING."""
+        if (
+            self._answer_owed() or self._live_response() or self._continuation_unborn
+            or self._turn not in (VoiceState.THINKING, VoiceState.SPEAKING)
+        ):
+            return
+        self._metrics.turn_end()
+        self._start_drain()
 
     def _answer_owed(self) -> bool:
         """A dispatched call still runs, or an answer waits on the re-ask a response end

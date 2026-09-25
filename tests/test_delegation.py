@@ -347,6 +347,30 @@ def test_a_stop_stops_the_live_delegation_and_moots_the_queued_one():
     run(_case())
 
 
+def test_cancel_nanobot_stops_the_running_delegation_and_the_queued_one():
+    """Where no transcript consumes a stop (Gemini, no input transcription), the model's
+    cancel_nanobot does what a consumed stop does; its own answer resumes nothing."""
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        first = _ask(channel, "one")
+        await asyncio.sleep(0)
+        second = _ask(channel, "two")
+        await asyncio.sleep(0.01)
+        out = await channel._supervisor_tool("cancel_nanobot", "{}", "r2")
+        assert isinstance(out, AbandonedResult)
+        assert await first == "(stopped by the user)"
+        assert await second == "(stopped by the user)"
+        assert [t for t, _ in published] == ["one"] and stops == [True]
+        idle = await channel._supervisor_tool("cancel_nanobot", "{}", "r3")
+        assert isinstance(idle, AbandonedResult) and stops == [True]  # nothing to stop
+        third = asyncio.create_task(channel._supervisor_tool("ask_nanobot", _args("3"), "r4"))
+        await asyncio.sleep(0.01)
+        await _answer(channel, "three")
+        assert await third == "three"
+
+    run(_case())
+
+
 def test_a_later_turn_replaces_the_running_delegation_and_the_queued_one():
     """The user was heard again and the model asked anew: that request replaces everything
     asked before it, running (/stop-ped) or queued (never run)."""
@@ -602,8 +626,8 @@ def test_missing_tool_gateway_says_the_tool_mode_is_inert():
         channel._tool_gateway = object()
         warned.clear()
         tools, exec_tool = await channel._cloud_tools(True, "supervisor")
-        assert [t.name for t in tools] == ["ask_nanobot"]
-        assert exec_tool == channel._delegate_to_nanobot  # a fresh bound method each access
+        assert [t.name for t in tools] == ["ask_nanobot", "cancel_nanobot"]
+        assert exec_tool == channel._supervisor_tool  # a fresh bound method each access
         assert warned == []
 
     run(_case())

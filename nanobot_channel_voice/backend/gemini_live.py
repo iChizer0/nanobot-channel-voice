@@ -242,8 +242,11 @@ class GeminiLiveBackend(RealtimeTransport):
                 }],
             },
         })
-        if self._pending_calls or cut:
-            return  # siblings still running (their budget), or nothing is owed
+        if cut:
+            await self._release_wait()  # nothing is owed for it
+            return
+        if self._pending_calls:
+            return  # siblings still running (their budget)
         # The continuation is the model's; what follows is continuation latency.
         self._metrics.turn_continuation()
         self._arm_watchdog()
@@ -508,13 +511,20 @@ class GeminiLiveBackend(RealtimeTransport):
         # No answer can land (a late one drops here): the shell stops the work, a delegation
         # included, rather than let it run unheard.
         await self._emit(ToolsCancelled(frozenset(withdrawn)))
+        await self._release_wait()
+
+    async def _release_wait(self) -> None:
+        """No call is left to answer (withdrawn, or answered as abandoned): a wait held for
+        them alone settles (the deadman is off, so nothing else would), and a filler still
+        playing drains IDLE, not THINKING."""
         if self._pending_calls or self._in_progress or self._generating:
             return
         if self._turn is VoiceState.THINKING:
-            # The wait held THINKING for them with the deadman off: nothing else settles it.
+            self._metrics.turn_end()
             await self._set_turn(VoiceState.IDLE)
         elif self._turn is VoiceState.SPEAKING:
-            self._start_drain()  # the filler's drain would settle THINKING for nothing
+            self._metrics.turn_end()
+            self._start_drain()
 
     # ---- transport hooks ----------------------------------------------------
 

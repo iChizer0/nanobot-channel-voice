@@ -56,7 +56,7 @@ def test_persona_override_replaces_style_but_never_the_contract():
     assert out.startswith(mine)
     assert _DEFAULT_PERSONA not in out
     assert _SUPERVISOR_RULES in out
-    assert "ask_nanobot" in out
+    assert "ask_nanobot" in out and "cancel_nanobot" in out
 
 
 def test_direct_rules_survive_a_persona_override():

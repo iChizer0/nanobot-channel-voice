@@ -771,10 +771,10 @@ class RealtimeConfig(_VoiceBase):
     # A realtime model is small and non-reasoning, so it plans multi-step tool sequences badly.
     #   "direct"     = declare nanobot's tools to it; it plans and calls them itself. Fine for
     #                  light, single-step tool use.
-    #   "supervisor" = declare ONE tool (ask_nanobot): it owns the conversation but delegates
-    #                  all reasoning/tool work to nanobot's AgentLoop and speaks the finished
-    #                  answer. Robust multi-step use, costing a ~1-2s delegation the mandatory
-    #                  filler masks. Tool-capable providers only.
+    #   "supervisor" = declare ask_nanobot (and cancel_nanobot to stop it): it owns the
+    #                  conversation but delegates all reasoning/tool work to nanobot's AgentLoop
+    #                  and speaks the finished answer. Robust multi-step use, costing a ~1-2s
+    #                  delegation the mandatory filler masks. Tool-capable providers only.
     tool_mode: Literal["direct", "supervisor"] = "direct"
     # Who decides what audio goes up the socket. "server": every mic frame streams and the
     # provider's VAD finds the turns — billed as the provider bills listening (Gemini and the

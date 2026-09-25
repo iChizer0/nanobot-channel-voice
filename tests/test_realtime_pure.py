@@ -1003,6 +1003,82 @@ def test_a_consumed_stop_abandons_the_pending_tool_work():
     asyncio.run(_case())
 
 
+def test_the_models_cancel_ends_the_wait_it_leaves():
+    """No transcript consumed the stop: the model called cancel_nanobot, and both answers
+    come back abandoned, resuming nothing. The wait they held ends with the last one."""
+    async def _case():
+        b, sent, _ = make_stop_backend(VoiceConfig())
+        await _dispatched_wait(b)
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event(_created("r2"))
+        await b._handle_event({"type": "response.function_call_arguments.done", "response_id": "r2",
+                               "call_id": "c2", "name": "cancel_nanobot", "arguments": "{}"})
+        await b._handle_event({"type": "response.done",
+                               "response": {"id": "r2", "status": "completed"}})
+        await b._drain_task
+        assert b._turn is VoiceState.THINKING
+        sent.clear()
+        await b.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
+        await asyncio.sleep(0.01)
+        assert b._turn is VoiceState.THINKING  # the cancel's own answer is still owed
+        await b.submit_tool_result("c2", AbandonedResult("(stopped)"))
+        await b._drain_task
+        assert b._turn is VoiceState.IDLE
+        assert [p["type"] for p in sent] == ["conversation.item.create"] * 2
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_an_abandoned_answer_leaves_a_live_or_unborn_reply_its_state():
+    """A replaced request's answer lands while the newer one's reply is live, or its
+    continuation is asked for but not born: that reply owns the state, not a settle."""
+    async def _case():
+        b, sent, _ = make_stop_backend(VoiceConfig())
+        await _dispatched_wait(b)  # r1: the old request's call c1
+        await b._handle_event(_created("r2"))  # the user asked anew
+        await b.submit_tool_result("c1", AbandonedResult("(replaced by a newer request)"))
+        await asyncio.sleep(0.01)
+        assert b._turn is VoiceState.THINKING
+        await b._handle_event({"type": "response.function_call_arguments.done", "response_id": "r2",
+                               "call_id": "c2", "name": "ask_nanobot", "arguments": "{}"})
+        await b._handle_event({"type": "response.done",
+                               "response": {"id": "r2", "status": "completed"}})
+        await b._handle_event(_created("r3"))  # and anew again
+        await b._handle_event({"type": "response.function_call_arguments.done", "response_id": "r3",
+                               "call_id": "c3", "name": "ask_nanobot", "arguments": "{}"})
+        await b._handle_event({"type": "response.done",
+                               "response": {"id": "r3", "status": "completed"}})
+        await b.submit_tool_result("c3", "the answer")  # its continuation is asked for
+        assert b._continuation_unborn
+        await b.submit_tool_result("c2", AbandonedResult("(replaced by a newer request)"))
+        await asyncio.sleep(0.01)
+        assert b._turn is VoiceState.THINKING
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_an_abandoned_answer_before_the_users_reply_keeps_its_latency_sample():
+    """It lands after the user stopped speaking and before their reply exists: nothing to
+    settle, and the reply's TTFA is still measured from the end of their speech."""
+    async def _case():
+        b, _, _ = make_stop_backend(VoiceConfig())
+        await _dispatched_wait(b)
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
+        assert b._turn is VoiceState.CAPTURING
+        await b._handle_event(_created("r2"))
+        await b._handle_event({"type": "response.output_audio.delta", "response_id": "r2",
+                               "delta": base64.b64encode(b"\x00\x00").decode()})
+        assert b._metrics.snapshot()["latency_ms"]["ttfa_ms"]["n"] == 1
+        await b.close()
+
+    asyncio.run(_case())
+
+
 def test_a_refused_create_takes_its_kill_at_birth_with_it():
     """An onset marks the unborn continuation to die at birth; when the server refuses that
     create instead, the mark must not kill the next response born, the user's own."""
