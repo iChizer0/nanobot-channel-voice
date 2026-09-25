@@ -412,8 +412,8 @@ def test_an_answered_delegation_is_neither_replaced_nor_stopped():
 
 
 def test_a_swept_delegation_stops_its_turn():
-    """The shell cancels tool tasks at teardown: nobody will hear the answer, so the
-    nanobot turn is stopped like a timed-out one instead of burning tokens."""
+    """The shell cancels tool tasks at teardown, or when the provider withdraws the call:
+    nobody will hear the answer, so the nanobot turn is stopped like a timed-out one."""
     async def _case():
         channel, published, stops = _supervisor_channel()
         task = _ask(channel, "q")

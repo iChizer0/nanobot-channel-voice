@@ -938,7 +938,9 @@ class VoiceChannel(BaseChannel):
                 await self._publish_stop()  # still RUNNING: nobody will hear its answer
                 return "I couldn't finish that in time. Please try again."
             except asyncio.CancelledError:
-                await self._publish_stop()  # the shell swept the task (teardown): as above
+                # The shell swept the task (teardown, or the provider withdrew the call):
+                # as above.
+                await self._publish_stop()
                 raise
             finally:
                 if self._pending_delegation is collector:

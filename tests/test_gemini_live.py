@@ -19,6 +19,7 @@ from nanobot_channel_voice.backend.base import (
     StateHint,
     ToolCall,
     ToolDef,
+    ToolsCancelled,
     ToolStarted,
     TurnDone,
     UserSpeechStarted,
@@ -323,6 +324,29 @@ def test_cancelled_tool_result_is_dropped():
         {"toolCallCancellation": {"ids": ["c1"]}},
     ], after=after)
     assert sent == []
+
+
+def test_a_withdrawn_call_stops_its_work_and_ends_the_wait():
+    """The server withdraws the calls of a turn the user cut: no answer can land, so the
+    shell is told to stop their work, and a THINKING wait held only for them (no deadman
+    while a call runs) settles instead of holding forever."""
+    async def after(backend):
+        await backend._drain_task  # the filler played out: the wait holds THINKING
+        assert backend._turn is VoiceState.THINKING
+        await backend._handle_event({"toolCallCancellation": {"ids": ["c1"]}})
+        assert backend._turn is VoiceState.THINKING  # c2 still owes its answer
+        await backend._handle_event({"toolCallCancellation": {"ids": ["c2", "gone"]}})
+        assert backend._turn is VoiceState.IDLE
+
+    _, _, events = drive([
+        {"setupComplete": {}},
+        audio_msg(b"\x01"),
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}},
+                                        {"id": "c2", "name": "t", "args": {}}]}},
+        {"serverContent": {"turnComplete": True}},
+    ], after=after)
+    withdrawn = [e.call_ids for e in events if isinstance(e, ToolsCancelled)]
+    assert withdrawn == [frozenset({"c1"}), frozenset({"c2"})]
 
 
 def test_server_vad_interrupted_is_the_barge_in_onset():
@@ -858,6 +882,42 @@ class _HeldPlayback(PlaybackSink):
 
     async def open_stream(self, rate: int) -> PlaybackStream:
         return _HeldStream(self.released)
+
+
+def test_a_call_withdrawn_while_the_filler_plays_settles_idle():
+    """The filler's drain would settle THINKING for a call that is gone."""
+
+    async def _run():
+        playback = _HeldPlayback()
+        sink = AudioSink(playback, mode="stream")
+        await sink.start()
+        backend = gl.GeminiLiveBackend(VoiceConfig(backend="gemini"), sink=sink)
+
+        async def on_event(e):
+            if isinstance(e, OutputAudio):
+                sink.enqueue(e)
+
+        async def record(payload):
+            pass
+
+        backend._on_event = on_event
+        backend._send = record
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event(audio_msg(b"\x00" * 4800))
+        await backend._handle_event(
+            {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}}
+        )
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await asyncio.sleep(0.05)
+        assert backend._turn is VoiceState.SPEAKING  # the filler still plays
+        await backend._handle_event({"toolCallCancellation": {"ids": ["c1"]}})
+        playback.released.set()
+        await asyncio.sleep(0.05)
+        assert backend._turn is VoiceState.IDLE
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
 
 
 def test_a_continuation_under_the_fillers_drain_stays_speaking():

@@ -40,6 +40,7 @@ from .base import (
     OutputTranscript,
     ToolCall,
     ToolDef,
+    ToolsCancelled,
     ToolStarted,
     TurnDone,
     VoiceState,
@@ -344,7 +345,7 @@ class GeminiLiveBackend(RealtimeTransport):
         elif "toolCall" in msg:
             await self._on_tool_call(msg["toolCall"] or {}, _status_of(msg))
         elif "toolCallCancellation" in msg:
-            self._on_tool_cancel(msg["toolCallCancellation"] or {})
+            await self._on_tool_cancel(msg["toolCallCancellation"] or {})
         elif "sessionResumptionUpdate" in msg:
             upd = msg["sessionResumptionUpdate"] or {}
             if upd.get("resumable") and upd.get("newHandle"):
@@ -492,12 +493,24 @@ class GeminiLiveBackend(RealtimeTransport):
         if self._pending_calls:
             self._cancel_watchdog()  # the shell's tool task has its own budget
 
-    def _on_tool_cancel(self, cancel: dict) -> None:
-        # The shell's tool task runs on; its result then finds no pending call and drops.
+    async def _on_tool_cancel(self, cancel: dict) -> None:
         ids = {i for i in cancel.get("ids") or [] if isinstance(i, str)}
-        self._metrics.calls_abandoned(self._pending_calls.keys() & ids)
-        for cid in ids:
-            self._pending_calls.pop(cid, None)
+        withdrawn = self._pending_calls.keys() & ids
+        if not withdrawn:
+            return
+        self._metrics.calls_abandoned(withdrawn)
+        for cid in withdrawn:
+            del self._pending_calls[cid]
+        # No answer can land (a late one drops here): the shell stops the work, a delegation
+        # included, rather than let it run unheard.
+        await self._emit(ToolsCancelled(frozenset(withdrawn)))
+        if self._pending_calls or self._in_progress or self._generating:
+            return
+        if self._turn is VoiceState.THINKING:
+            # The wait held THINKING for them with the deadman off: nothing else settles it.
+            await self._set_turn(VoiceState.IDLE)
+        elif self._turn is VoiceState.SPEAKING:
+            self._start_drain()  # the filler's drain would settle THINKING for nothing
 
     # ---- transport hooks ----------------------------------------------------
 

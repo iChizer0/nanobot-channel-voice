@@ -141,6 +141,14 @@ class ToolsAbandoned:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolsCancelled:
+    """CLOUD ONLY. The provider withdrew these calls (Gemini, when the user cuts the turn
+    that issued them): no answer can land, so the shell stops their work."""
+
+    call_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class TurnDone:
     """The assistant turn is complete. Informational: the shell only logs it, each backend
     owns its drain-to-IDLE. Exactly once per completed turn: CLOUD suppresses it while any
@@ -158,7 +166,8 @@ class Error:
 
 VoiceEvent = (
     OutputAudio | StateHint | OutputTranscript | InputTranscript
-    | UserSpeechStarted | ToolStarted | ToolCall | ToolsAbandoned | TurnDone | Error
+    | UserSpeechStarted | ToolStarted | ToolCall | ToolsAbandoned | ToolsCancelled
+    | TurnDone | Error
 )
 
 OnEvent = Callable[[VoiceEvent], Awaitable[None]]

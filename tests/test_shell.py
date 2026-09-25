@@ -20,6 +20,7 @@ from nanobot_channel_voice.backend.base import (
     StateHint,
     ToolCall,
     ToolsAbandoned,
+    ToolsCancelled,
     TurnDone,
     VoiceState,
 )
@@ -149,7 +150,7 @@ def test_events_after_teardown_are_dropped():
     shell, _, _ = _shell()
     shell._stopped = True
     _run(shell._on_event(ToolCall(call_id="c1", name="x", arguments="{}")))
-    assert shell._tool_tasks == set()
+    assert not shell._tool_tasks
     _run(shell._on_event(StateHint(VoiceState.SPEAKING)))
     assert shell.state is VoiceState.IDLE
 
@@ -220,6 +221,32 @@ def test_abandoned_tools_reach_the_channel():
 
     _run(_case())
     assert abandoned == [True]
+
+
+def test_a_withdrawn_call_stops_its_work_and_its_sibling_answers():
+    """The provider withdrew one call: its task is cancelled (a delegation /stops its
+    turn on the way out) and submits nothing; the other call still answers."""
+    release = asyncio.Event()
+
+    async def exec_tool(name, args, turn):
+        await release.wait()
+        return f"{name} done"
+
+    async def _case():
+        shell, backend, _ = _shell(exec_tool=exec_tool)
+        await shell._on_event(ToolCall(call_id="a", name="a", arguments="{}"))
+        await shell._on_event(ToolCall(call_id="b", name="b", arguments="{}"))
+        await asyncio.sleep(0)
+        await shell._on_event(ToolsCancelled(frozenset({"a", "gone"})))
+        release.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return shell, backend
+
+    shell, backend = _run(_case())
+    assert [c[1] for c in backend.calls if c[0] == "result"] == [("b", "b done")]
+    assert shell._metrics.counters.get("tool_cancelled") == 1
+    assert not shell._tool_tasks
 
 
 def test_missing_tool_seam_answers_the_model_instead_of_hanging():

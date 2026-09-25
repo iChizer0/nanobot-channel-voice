@@ -35,6 +35,7 @@ from .backend.base import (
     ToolCall,
     ToolDef,
     ToolsAbandoned,
+    ToolsCancelled,
     ToolStarted,
     TurnDone,
     UserSpeechStarted,
@@ -108,8 +109,9 @@ class VoiceShell:
         self._stop_task: asyncio.Task | None = None
         self._capture_task: asyncio.Task | None = None
         self._fatal_task: asyncio.Task | None = None
-        # Referenced so they aren't GC'd mid-flight and can be cancelled on stop.
-        self._tool_tasks: set[asyncio.Task] = set()
+        # task -> call_id: referenced so they aren't GC'd mid-flight, and cancellable on stop
+        # or when the provider withdraws their call.
+        self._tool_tasks: dict[asyncio.Task, str] = {}
         self._log = logger.bind(component="voice")
 
     # ---- lifecycle ----------------------------------------------------------
@@ -274,6 +276,11 @@ class VoiceShell:
         elif isinstance(event, ToolsAbandoned):
             if self._on_abandon is not None:
                 await self._on_abandon()
+        elif isinstance(event, ToolsCancelled):
+            self._log.info("tool call(s) withdrawn by the provider: stopping their work")
+            for task, call_id in list(self._tool_tasks.items()):
+                if call_id in event.call_ids:
+                    task.cancel()  # a delegation /stops its nanobot turn on the way out
         elif isinstance(event, OutputTranscript):
             pass  # observational; nothing here consumes assistant text
         elif isinstance(event, InputTranscript):
@@ -321,8 +328,8 @@ class VoiceShell:
         the backend's tool state machine keys on ``call_id`` and tolerates any order."""
         self._metrics.call_spawned(ev.call_id)
         task = asyncio.create_task(self._on_tool_call(ev))
-        self._tool_tasks.add(task)
-        task.add_done_callback(self._tool_tasks.discard)
+        self._tool_tasks[task] = ev.call_id
+        task.add_done_callback(lambda t: self._tool_tasks.pop(t, None))
 
     async def _on_tool_call(self, ev: ToolCall) -> None:
         # Cloud only. Route through nanobot's ToolRegistry (security parity); no seam =>
