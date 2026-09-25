@@ -1991,6 +1991,32 @@ def test_notices_waiting_out_an_outage_keep_only_the_newest():
     asyncio.run(_run())
 
 
+def test_a_notice_that_fails_to_go_out_yields_to_a_refilled_queue():
+    """A failed send puts the notice back first, as the oldest; but the bus kept delivering
+    while the send hung, and past the cap the oldest goes: this one, counted, not the
+    newest arrival."""
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        backend._ready.set()
+
+        async def hung_send(text: str) -> None:
+            for i in range(NOTICE_BACKLOG):
+                await backend.announce(f"Late {i}.")
+            raise RuntimeError("socket closed")
+
+        backend._voice_notice = hung_send
+        await backend.announce("First.")
+        await _settle()
+        assert list(backend._notices) == [f"Late {i}." for i in range(NOTICE_BACKLOG)]
+        assert backend._metrics.counters.get("notice_dropped") == 1
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
 def test_a_notice_talked_over_while_it_is_sent_dies_at_birth():
     async def _run():
         sink = AudioSink(NullPlayback(), mode="stream")

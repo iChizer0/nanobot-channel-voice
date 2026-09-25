@@ -292,7 +292,10 @@ class RealtimeTransport(TurnEventMixin):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self._notices.appendleft(text)
+            if len(self._notices) < self._notices.maxlen:
+                self._notices.appendleft(text)
+            else:
+                self._metrics.count("notice_dropped")  # refilled meanwhile: it is the oldest
             self._log.warning("could not voice a notice ({}); it waits", exc)
             return
         self._metrics.count("notice_voiced")
