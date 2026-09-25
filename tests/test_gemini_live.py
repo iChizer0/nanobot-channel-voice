@@ -955,6 +955,48 @@ def test_a_notice_is_a_client_turn_and_the_next_waits_for_its_answer():
     asyncio.run(_run())
 
 
+def test_a_notice_answered_with_nothing_still_ends_its_turn():
+    """A notice is a turn from its send (THINKING), so a settle follows even when the model
+    says nothing: that settle is what re-arms a gated uplink's park."""
+
+    async def _run():
+        backend, sent, events = make_backend()
+        await backend._handle_event({"setupComplete": {}})
+        await backend.announce("Dinner is ready.")
+        await backend._notice_task
+        assert _notices(sent) == ["[notice] Dinner is ready."]
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        assert hints(events) == [VoiceState.THINKING, VoiceState.IDLE]
+        await backend.close()
+
+    asyncio.run(_run())
+
+
+def test_an_abandoned_answer_leaves_a_notice_on_its_way_its_wait():
+    """The last call is answered as abandoned while a notice's answer is still to come: the
+    wait is the notice's now, and settles when its turn ends, not before its audio."""
+    cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
+
+    async def _run():
+        backend, _, events = make_backend(cfg)
+        ev = backend._handle_event
+        await ev({"setupComplete": {}})
+        await ev({"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}}]}})
+        await ev({"serverContent": {"turnComplete": True}})
+        await backend.announce("Dinner is ready.")
+        await backend._notice_task
+        await backend.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
+        assert backend._turn is VoiceState.THINKING
+        await ev(audio_msg(b"\x01"))
+        await ev({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        assert hints(events) == [VoiceState.THINKING, VoiceState.SPEAKING, VoiceState.IDLE]
+        await backend.close()
+
+    asyncio.run(_run())
+
+
 def test_a_notice_waits_out_background_reasoning():
     async def _run():
         backend, sent, _ = make_backend()

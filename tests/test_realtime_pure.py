@@ -1787,6 +1787,43 @@ def test_a_notice_is_voiced_once_the_session_is_quiet():
     asyncio.run(_run())
 
 
+def test_a_notice_whose_request_fails_still_ends_its_turn():
+    """A create refused with an error (a rate limit) is ended by the deadman alone: THINKING
+    from the send, the notice still ends in a settle, which re-arms a gated uplink's park."""
+
+    async def _run():
+        cfg = VoiceConfig.model_validate({"realtime": {"turnTimeoutS": 0.05}})
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend = rt.RealtimeBackend(cfg, sink=sink, profile=PROFILES["openai"])
+        sent: list[dict] = []
+        events: list = []
+
+        async def record(payload):
+            sent.append(payload)
+
+        async def on_event(e):
+            events.append(e)
+
+        backend._send = record
+        backend._on_event = on_event
+        await backend._handle_event({"type": "session.updated"})
+        await backend.announce("Dinner is ready.")
+        await backend._notice_task
+        assert _notice_frames(sent) == ["[notice] Dinner is ready."]
+        await backend._handle_event({"type": "error", "error": {
+            "code": "rate_limit_exceeded", "message": "slow down"}})
+        for _ in range(80):
+            await asyncio.sleep(0.01)
+            if backend._watchdog_task.done():
+                break
+        assert hints(events) == [VoiceState.THINKING, VoiceState.IDLE]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
 def test_a_notice_waits_for_a_reply_the_user_is_talking_under():
     """Server VAD: a reply born while the user speaks settles IDLE under their speech when it
     ends; the notice still waits for them to finish."""

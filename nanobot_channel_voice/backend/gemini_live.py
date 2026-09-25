@@ -516,8 +516,8 @@ class GeminiLiveBackend(RealtimeTransport):
     async def _release_wait(self) -> None:
         """No call is left to answer (withdrawn, or answered as abandoned): a wait held for
         them alone settles (the deadman is off, so nothing else would), and a filler still
-        playing drains IDLE, not THINKING."""
-        if self._pending_calls or self._in_progress or self._generating:
+        playing drains IDLE, not THINKING. A notice on its way owns the wait until its turn ends."""
+        if self._pending_calls or self._in_progress or self._generating or self._notice_turn:
             return
         if self._turn is VoiceState.THINKING:
             self._metrics.turn_end()
@@ -546,6 +546,10 @@ class GeminiLiveBackend(RealtimeTransport):
             "turns": [{"role": "user", "parts": [{"text": f"{NOTICE_MARK} {text}"}]}],
             "turnComplete": True,
         }})
+        if self._turn is VoiceState.IDLE:
+            # A turn from here on, answered aloud or not: the settle ending it is what
+            # re-arms a gated uplink's park.
+            await self._set_turn(VoiceState.THINKING)
         self._arm_watchdog()
 
     async def _watchdog_recover(self) -> str | None:

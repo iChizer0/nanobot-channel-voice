@@ -923,6 +923,10 @@ class RealtimeBackend(RealtimeTransport):
             },
         })
         await self._ask_response()
+        if self._turn is VoiceState.IDLE:
+            # A turn from here on, even if its create is refused (the deadman then ends it):
+            # the settle ending it is what re-arms a gated uplink's park.
+            await self._set_turn(VoiceState.THINKING)
 
     async def _release_wait(self) -> None:
         """Answers came back abandoned and nothing else is owed or live: a wait held for them
