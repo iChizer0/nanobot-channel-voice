@@ -390,6 +390,9 @@ class GeminiLiveBackend(RealtimeTransport):
         if not self._generating:
             self._generating = True
             self._metrics.turn_thinking()
+            # A turn's first audio owns the state: the last turn's drain (a filler before a
+            # fast tool's continuation) would settle it THINKING/IDLE mid-reply.
+            self._cancel_drain()
         if self._turn is not VoiceState.SPEAKING:
             await self._set_turn(VoiceState.SPEAKING)
         self._progress_t = time.monotonic()  # feed the deadman: the turn is alive

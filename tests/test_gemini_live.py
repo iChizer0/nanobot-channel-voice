@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 
+from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend import gemini_live as gl
 from nanobot_channel_voice.backend.audio_sink import AudioSink
@@ -756,3 +757,70 @@ def test_a_blip_during_a_tool_wait_stays_thinking():
         {"serverContent": {"turnComplete": True}},
     ], config=cfg, after=after)
     assert VoiceState.IDLE not in hints(events)
+
+
+class _HeldStream(PlaybackStream):
+    def __init__(self, released: asyncio.Event) -> None:
+        self._released = released
+
+    async def write(self, pcm: bytes) -> None:
+        await asyncio.sleep(0)
+
+    async def drain(self) -> None:
+        await self._released.wait()
+
+    async def kill(self) -> None:
+        self._released.set()
+
+
+class _HeldPlayback(PlaybackSink):
+    """The device drain returns only when the test releases it."""
+
+    def __init__(self) -> None:
+        self.released = asyncio.Event()
+
+    async def play_wav(self, wav_bytes: bytes) -> bool:
+        return True
+
+    async def abort(self) -> None:
+        pass
+
+    async def open_stream(self, rate: int) -> PlaybackStream:
+        return _HeldStream(self.released)
+
+
+def test_a_continuation_under_the_fillers_drain_stays_speaking():
+    """A fast tool's continuation starts while the filler still plays: the filler's drain
+    must not settle THINKING under it, which reopens a half-duplex mic on the reply."""
+
+    async def _run():
+        playback = _HeldPlayback()
+        sink = AudioSink(playback, mode="stream")
+        await sink.start()
+        backend = gl.GeminiLiveBackend(VoiceConfig(backend="gemini"), sink=sink)
+
+        async def on_event(e):
+            if isinstance(e, OutputAudio):
+                sink.enqueue(e)
+
+        async def record(payload):
+            pass
+
+        backend._on_event = on_event
+        backend._send = record
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event(audio_msg(b"\x00" * 4800))
+        await backend._handle_event(
+            {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}}
+        )
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await asyncio.sleep(0.05)
+        await backend.submit_tool_result("c1", "{}")
+        await backend._handle_event(audio_msg(b"\x00" * 4800))
+        playback.released.set()  # the filler's stream finishes playing
+        await asyncio.sleep(0.05)
+        assert backend._turn is VoiceState.SPEAKING
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
