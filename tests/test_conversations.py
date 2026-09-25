@@ -525,6 +525,22 @@ def test_silent_tool_boundaries_do_not_hold_the_filler_off():
     _run(_case())
 
 
+def test_the_captured_earcon_does_not_end_the_filler_script():
+    """The ding plays over the wait's first beat when that comes early: the beat is
+    skipped and the script runs on, where the watch used to exit with the turn's fillers."""
+    async def _case():
+        async with EvalConversation(
+            prologue={"enabled": True, "afterMs": 50, "intervalMs": 1000},
+            earcons={"captured": True},
+        ) as c:
+            await c.user_says("run the whole pipeline")
+            await asyncio.sleep(1.4)  # no reply yet: only the fillers speak
+            assert c.counter("earcon_captured") == 1
+            assert c.counter("prologue_filler") >= 1
+
+    _run(_case())
+
+
 def test_quiet_notice_speaks_while_the_core_is_busy():
     """The audible clock, not the core clock: a tool chain pushes last_activity with
     every progress event, so the old single-clock deadman could never speak during

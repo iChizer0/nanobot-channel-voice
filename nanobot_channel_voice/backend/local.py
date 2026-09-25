@@ -4078,7 +4078,8 @@ class LocalBackend(TurnEventMixin):
             step = start_step
             while (
                 not self._closing
-                and self._turn is VoiceState.THINKING
+                # The base: a clip on a beat (the captured earcon) skips it, never ends the script.
+                and self._base_turn() is VoiceState.THINKING
                 and epoch == self._sink.epoch
             ):
                 if await self._play_filler(epoch, step):
