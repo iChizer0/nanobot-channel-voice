@@ -1902,6 +1902,33 @@ def test_a_second_notice_waits_for_the_first_ones_reply():
     asyncio.run(_run())
 
 
+def test_a_second_notice_in_a_tool_wait_waits_for_the_first_ones_reply():
+    """A tool wait is THINKING whether a notice went out or not, so only its unborn reply
+    keeps a second notice from asking for a second response before the first is born."""
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _tool_wait_backend(sink)
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await _tool_wait(ev)
+        await backend._drain_task
+        await backend.announce("Reminder: check the oven.")
+        await _settle()
+        await backend.announce("Dinner is ready.")
+        await _settle()
+        assert _notice_frames(sent) == ["[notice] Reminder: check the oven."]
+        await ev({"type": "response.created", "response": {"id": "r2"}})
+        await ev({"type": "response.done", "response": {"id": "r2", "status": "completed"}})
+        await backend._drain_task
+        await _settle()
+        assert _notice_frames(sent)[-1] == "[notice] Dinner is ready."
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
 def test_a_notice_goes_out_during_a_tool_wait():
     async def _run():
         sink = AudioSink(NullPlayback(), mode="stream")
