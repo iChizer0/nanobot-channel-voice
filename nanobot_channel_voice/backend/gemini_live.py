@@ -436,6 +436,10 @@ class GeminiLiveBackend(RealtimeTransport):
                 self._cancel_watchdog()  # the shell's tool task has its own budget
             else:
                 self._arm_watchdog()  # background reasoning: settled silently if quiet
+            if self._turn in (VoiceState.IDLE, VoiceState.CAPTURING) and not self._user_speaking:
+                # Answered with no audio at all: the hold's drain only settles a reply that
+                # played, so the whole wait would show IDLE (server VAD) or CAPTURING.
+                await self._set_turn(VoiceState.THINKING)
             self._start_hold_thinking()
             return
         self._in_progress = False

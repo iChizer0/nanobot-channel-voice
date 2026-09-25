@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 
+import pytest
+
 from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend import gemini_live as gl
@@ -773,6 +775,64 @@ def test_calls_carry_the_model_turn_that_issued_them():
     turns = {e.call_id: e.turn for e in events if isinstance(e, ToolCall)}
     assert turns["a"] == turns["b"] == turns["c"]
     assert len({turns["c"], turns["d"], turns["e"]}) == 3
+
+
+def test_a_turn_answered_by_a_call_alone_waits_in_thinking():
+    """No filler, just the call: the hold's drain defers to an onset that is over, so the
+    whole wait would show CAPTURING until the deadman, which then counts it unanswered."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def after(backend):
+        backend._ready.set()
+        await backend.begin_activity()
+        await backend.end_activity()
+        await backend._handle_event(
+            {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}}
+        )
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+        assert backend._watchdog_task.done()  # the shell's tool task has its own budget
+
+    drive([{"setupComplete": {}}], config=cfg, after=after)
+
+
+def test_a_call_alone_under_an_open_activity_leaves_it_capturing():
+    """The user's next activity is already open when the call-only turn completes: that
+    onset owns the state."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def after(backend):
+        backend._ready.set()
+        await backend.begin_activity()
+        await backend.end_activity()
+        await backend._handle_event(
+            {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}}
+        )
+        await backend.begin_activity()  # the user speaks again
+        await backend._handle_event({"serverContent": {"turnComplete": True}})
+        await backend._drain_task
+        assert backend._turn is VoiceState.CAPTURING
+
+    drive([{"setupComplete": {}}], config=cfg, after=after)
+
+
+@pytest.mark.parametrize("before", [
+    [],  # server VAD shows no onset: the turn starts from IDLE
+    [audio_msg(b"\x01"), {"serverContent": {"interrupted": True}},
+     {"serverContent": {"turnComplete": True}}],  # after cutting a reply: CAPTURING
+])
+def test_a_call_alone_under_server_vad_waits_in_thinking(before):
+    async def after(backend):
+        await backend._drain_task
+        assert backend._turn is VoiceState.THINKING
+
+    drive([
+        {"setupComplete": {}},
+        *before,
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "t", "args": {}}]}},
+        {"serverContent": {"turnComplete": True}},
+    ], after=after)
 
 
 def test_a_blip_during_a_tool_wait_stays_thinking():
