@@ -22,6 +22,7 @@ from nanobot_channel_voice.backend.base import (
     Error,
     InputTranscript,
     OutputAudio,
+    ReceiptResult,
     StateHint,
     ToolCall,
     ToolDef,
@@ -1022,7 +1023,7 @@ def test_the_models_cancel_ends_the_wait_it_leaves():
         await b.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
         await asyncio.sleep(0.01)
         assert b._turn is VoiceState.THINKING  # the cancel's own answer is still owed
-        await b.submit_tool_result("c2", AbandonedResult("(stopped)"))
+        await b.submit_tool_result("c2", ReceiptResult("(stopped)"))
         await b._drain_task
         assert b._turn is VoiceState.IDLE
         assert [p["type"] for p in sent] == ["conversation.item.create"] * 2
@@ -1055,6 +1056,57 @@ def test_an_abandoned_answer_leaves_a_live_or_unborn_reply_its_state():
         await b.submit_tool_result("c2", AbandonedResult("(replaced by a newer request)"))
         await asyncio.sleep(0.01)
         assert b._turn is VoiceState.THINKING
+        await b.close()
+
+    asyncio.run(_case())
+
+
+@pytest.mark.parametrize("cancel_answered_first", [True, False])
+def test_a_request_asked_with_the_cancel_still_continues_its_turn(cancel_answered_first):
+    """"Check London instead, forget Paris": one response calls ask_nanobot and
+    cancel_nanobot. The cancel's answer is abandoned, London's is not: the response resumes
+    once both are in, in either order."""
+    async def _case():
+        b, sent, _ = make_stop_backend(VoiceConfig())
+        await _dispatched_wait(b)  # r1: Paris
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event(_created("r2"))
+        for cid, name in (("c2", "ask_nanobot"), ("c3", "cancel_nanobot")):
+            await b._handle_event({"type": "response.function_call_arguments.done",
+                                   "response_id": "r2", "call_id": cid, "name": name,
+                                   "arguments": "{}"})
+        await b._handle_event({"type": "response.done",
+                               "response": {"id": "r2", "status": "completed"}})
+        sent.clear()
+        await b.submit_tool_result("c1", AbandonedResult("(replaced by a newer request)"))
+        answers = [("c3", ReceiptResult("(stopped)")), ("c2", "Rain in London.")]
+        if not cancel_answered_first:
+            answers.reverse()
+        for cid, output in answers:
+            await b.submit_tool_result(cid, output)
+        assert [p["type"] for p in sent] == ["conversation.item.create"] * 3 + ["response.create"]
+        await b.close()
+
+    asyncio.run(_case())
+
+
+def test_a_stop_after_one_answer_leaves_the_turn_quiet():
+    """Two calls of one response: one answered, then the other stopped. The stop ends the
+    response's turn, answer included, so nothing is asked for."""
+    async def _case():
+        b, sent, _ = make_stop_backend(VoiceConfig())
+        await b._handle_event(_created("r1"))
+        for cid in ("c1", "c2"):
+            await b._handle_event({"type": "response.function_call_arguments.done",
+                                   "response_id": "r1", "call_id": cid, "name": "ask_nanobot",
+                                   "arguments": "{}"})
+        await b._handle_event({"type": "response.done",
+                               "response": {"id": "r1", "status": "completed"}})
+        sent.clear()
+        await b.submit_tool_result("c1", "Paris is sunny.")
+        await b.submit_tool_result("c2", AbandonedResult("(stopped by the user)"))
+        assert [p["type"] for p in sent] == ["conversation.item.create"] * 2
         await b.close()
 
     asyncio.run(_case())

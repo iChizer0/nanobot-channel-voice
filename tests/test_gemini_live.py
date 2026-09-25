@@ -18,6 +18,7 @@ from nanobot_channel_voice.backend.base import (
     ManualTurnBackend,
     OutputAudio,
     OutputTranscript,
+    ReceiptResult,
     StateHint,
     ToolCall,
     ToolDef,
@@ -851,7 +852,7 @@ def test_the_models_cancel_ends_the_wait_it_leaves():
         assert backend._turn is VoiceState.THINKING
         await backend.submit_tool_result("c1", AbandonedResult("(stopped by the user)"))
         assert backend._turn is VoiceState.THINKING  # the cancel's own answer is owed
-        await backend.submit_tool_result("c2", AbandonedResult("(stopped)"))
+        await backend.submit_tool_result("c2", ReceiptResult("(stopped)"))
         assert backend._turn is VoiceState.IDLE
 
     _, sent, _ = drive([

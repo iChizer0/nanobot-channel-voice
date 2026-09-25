@@ -26,7 +26,13 @@ from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
 from nanobot_channel_voice.backend import gemini_live
 from nanobot_channel_voice.backend.audio_sink import AudioSink
-from nanobot_channel_voice.backend.base import NOTICE_MARK, AbandonedResult, ToolDef, VoiceState
+from nanobot_channel_voice.backend.base import (
+    NOTICE_MARK,
+    AbandonedResult,
+    ReceiptResult,
+    ToolDef,
+    VoiceState,
+)
 from nanobot_channel_voice.backend.common import loggable_text
 from nanobot_channel_voice.backend.gated import GatedUplink
 from nanobot_channel_voice.backend.gemini_live import GeminiLiveBackend, resolve_gemini_key
@@ -148,7 +154,7 @@ _CANCEL_TOOL = ToolDef(
 # the function call, and resumes nothing (see AbandonedResult).
 _DELEGATION_STOPPED = AbandonedResult("(stopped by the user)")
 _DELEGATION_REPLACED = AbandonedResult("(replaced by a newer request)")
-_CANCELLED = AbandonedResult("(stopped)")  # cancel_nanobot's own result
+_CANCELLED = ReceiptResult("(stopped)")  # cancel_nanobot's own result
 
 # Tags our own priority commands: core copies INBOUND metadata onto the command ack
 # ("Stopped 1 task(s)."), so _speakable can drop it — untagged, every barge-in speaks it.
@@ -889,7 +895,10 @@ class VoiceChannel(BaseChannel):
 
     async def _supervisor_tool(self, name: str, args: str, turn: str) -> str:
         if name == _CANCEL_TOOL.name:
-            await self._on_cloud_abandon()
+            # A request of the cancel's own turn stands ("cancel that and ask X"): asked
+            # first, it already replaced the older work; asked after, it is newer than the stop.
+            if not turn or turn != self._asked_turn:
+                await self._on_cloud_abandon()
             return _CANCELLED
         return await self._delegate_to_nanobot(name, args, turn)
 

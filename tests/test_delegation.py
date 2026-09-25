@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import json
 
-from nanobot_channel_voice.backend.base import AbandonedResult
+import pytest
+
+from nanobot_channel_voice.backend.base import AbandonedResult, ReceiptResult
 from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel, _ReplyCollector
 from nanobot_channel_voice.metrics import VoiceMetrics
 
@@ -357,16 +359,52 @@ def test_cancel_nanobot_stops_the_running_delegation_and_the_queued_one():
         second = _ask(channel, "two")
         await asyncio.sleep(0.01)
         out = await channel._supervisor_tool("cancel_nanobot", "{}", "r2")
-        assert isinstance(out, AbandonedResult)
+        assert isinstance(out, ReceiptResult)
         assert await first == "(stopped by the user)"
         assert await second == "(stopped by the user)"
         assert [t for t, _ in published] == ["one"] and stops == [True]
         idle = await channel._supervisor_tool("cancel_nanobot", "{}", "r3")
-        assert isinstance(idle, AbandonedResult) and stops == [True]  # nothing to stop
+        assert isinstance(idle, ReceiptResult) and stops == [True]  # nothing to stop
         third = asyncio.create_task(channel._supervisor_tool("ask_nanobot", _args("3"), "r4"))
         await asyncio.sleep(0.01)
         await _answer(channel, "three")
         assert await third == "three"
+
+    run(_case())
+
+
+@pytest.mark.parametrize("cancel_first", [False, True])
+def test_a_cancel_called_with_a_new_request_ends_only_the_older_work(cancel_first):
+    """"Check London instead, forget Paris": one model turn may call cancel_nanobot and a new
+    ask_nanobot, in either order. The cancel ends the older request, never its turn's own."""
+    async def _case():
+        channel, published, stops = _supervisor_channel()
+        paris = _ask(channel, "Paris")
+        await asyncio.sleep(0.01)
+        calls = [("ask_nanobot", _args("London")), ("cancel_nanobot", "{}")]
+        if cancel_first:
+            calls.reverse()
+        tasks = {name: asyncio.create_task(channel._supervisor_tool(name, args, "r2"))
+                 for name, args in calls}
+        await asyncio.sleep(0.01)
+        assert isinstance(await paris, AbandonedResult)
+        assert isinstance(await tasks["cancel_nanobot"], ReceiptResult)
+        assert [t for t, _ in published] == ["Paris", "London"] and stops == [True]
+        await _answer(channel, "Rain in London.")
+        assert await tasks["ask_nanobot"] == "Rain in London."
+
+    run(_case())
+
+
+def test_a_cancel_that_names_no_turn_stops_everything():
+    """A call without a model turn cannot tell its own turn's request apart: the cancel then
+    stops all pending work, as a consumed stop does."""
+    async def _case():
+        channel, _, stops = _supervisor_channel()
+        first = _ask(channel, "one", "")
+        await asyncio.sleep(0.01)
+        await channel._supervisor_tool("cancel_nanobot", "{}", "")
+        assert await first == "(stopped by the user)" and stops == [True]
 
     run(_case())
 

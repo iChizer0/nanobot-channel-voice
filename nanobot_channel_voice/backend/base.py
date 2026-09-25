@@ -134,6 +134,13 @@ class AbandonedResult(str):
     __slots__ = ()
 
 
+class ReceiptResult(AbandonedResult):
+    """A stop tool's own answer (cancel_nanobot): it asks for no reply either, but a real
+    answer to a call beside it ("cancel that, ask X") still resumes the turn."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True, slots=True)
 class ToolsAbandoned:
     """CLOUD ONLY. A consumed stop ended the work pending tool calls serve: the channel

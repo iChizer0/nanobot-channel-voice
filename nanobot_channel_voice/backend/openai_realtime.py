@@ -42,6 +42,7 @@ from .base import (
     InputTranscript,
     OutputAudio,
     OutputTranscript,
+    ReceiptResult,
     ToolCall,
     ToolDef,
     ToolsAbandoned,
@@ -205,6 +206,9 @@ class RealtimeBackend(RealtimeTransport):
         self._cancelled_responses: dict[str, None] = {}
         self._response_done: set[str] = set()
         self._response_had_tools: dict[str, bool] = {}
+        # Responses with a real answer in: a stop's receipt beside one ("cancel that, ask
+        # X") still lets the response resume; a receipt alone resumes nothing.
+        self._response_resumes: set[str] = set()
         self._tools_pending: dict[str, set[str]] = {}
         self._call_to_response: dict[str, str] = {}
         self._fn_names: dict[str, str] = {}
@@ -374,6 +378,7 @@ class RealtimeBackend(RealtimeTransport):
             self._log.debug("dropping tool result for unknown call_id {} (session lost)", call_id)
             return
         abandoned = isinstance(output, AbandonedResult)
+        receipt = isinstance(output, ReceiptResult)
         output = self._clamp_tool_output(output)
         payload = {
             "type": "conversation.item.create",
@@ -391,7 +396,7 @@ class RealtimeBackend(RealtimeTransport):
         self._log.debug("submit_tool_result call_id={} -> rid={}", call_id, rid)
         if rid is None:
             return
-        if abandoned:
+        if abandoned and not receipt:
             self._discard_response_tools(rid)  # the work was stopped or replaced
             await self._release_wait()
             return
@@ -399,6 +404,12 @@ class RealtimeBackend(RealtimeTransport):
         if pending is not None:
             pending.discard(call_id)
             self._log.debug("tools pending for rid={}: {}", rid, pending)
+        if not receipt:
+            self._response_resumes.add(rid)
+        elif not pending and rid not in self._response_resumes:
+            self._discard_response_tools(rid)  # a stop's receipt alone: nothing to say
+            await self._release_wait()
+            return
         await self._maybe_respond(rid)
 
     # ---- ManualTurnBackend wire (gated uplink) ------------------------------
@@ -877,6 +888,7 @@ class RealtimeBackend(RealtimeTransport):
         self._tools_pending.pop(rid, None)
         self._response_done.discard(rid)
         self._response_had_tools.pop(rid, None)
+        self._response_resumes.discard(rid)
 
     def _live_response(self) -> bool:
         rid = self._active_response_id
@@ -958,6 +970,7 @@ class RealtimeBackend(RealtimeTransport):
             self._fn_args.pop(cid, None)
         self._response_had_tools.pop(rid, None)
         self._response_done.discard(rid)
+        self._response_resumes.discard(rid)
 
     async def _on_error(self, evt: dict) -> None:
         err = evt.get("error") or {}
