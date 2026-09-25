@@ -442,10 +442,11 @@ class GeminiLiveBackend(RealtimeTransport):
         self._metrics.turn_end()
         if not self._pending_calls:
             await self._emit(TurnDone())
-        if self._manual and self._turn is VoiceState.CAPTURING and not self._user_speaking:
-            # Manual turns leave CAPTURING only at the first audio: nothing spoken
-            # (proactive audio declined) and no activity open, the drain's CAPTURING
-            # guard would hold the state until the deadman.
+        if self._turn is VoiceState.CAPTURING and not self._user_speaking:
+            # CAPTURING is left only at the first audio: nothing was spoken (proactive audio
+            # declined; under server VAD an interruption answered with silence, as a pure
+            # stop is) and no activity is open, so the drain's guard would hold it until
+            # the deadman.
             await self._set_turn(VoiceState.IDLE)
             return
         self._start_drain()

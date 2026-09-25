@@ -568,6 +568,21 @@ def test_server_vad_interrupted_turn_completion_does_not_end_the_turn():
     assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING]
 
 
+def test_server_vad_interruption_answered_with_silence_settles_idle():
+    """A pure stop over a reply: the cut turn's completion is swallowed, and the model's
+    answer to the stop is silence. Its completion ends the onset's CAPTURING at once."""
+    backend, _, events = drive([
+        {"setupComplete": {}},
+        audio_msg(b"\x01"),
+        {"serverContent": {"interrupted": True}},
+        {"serverContent": {"turnComplete": True}},  # the cut turn's end
+        {"serverContent": {"turnComplete": True}},  # the silent answer
+    ])
+    assert hints(events) == [VoiceState.SPEAKING, VoiceState.CAPTURING, VoiceState.IDLE]
+    assert not any(isinstance(e, Error) for e in events)
+    assert "turn_unanswered" not in backend.metrics.snapshot()["counters"]
+
+
 def test_deadman_waits_for_sibling_tool_calls():
     async def after(backend):
         await backend.submit_tool_result("c1", "{}")
