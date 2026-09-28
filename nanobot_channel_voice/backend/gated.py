@@ -23,7 +23,7 @@ import time
 from loguru import logger
 
 from nanobot_channel_voice.aio import cancel_and_wait, cancel_task
-from nanobot_channel_voice.audio.pcm import resample_pcm
+from nanobot_channel_voice.audio.pcm import ding_pcm, dong_pcm, resample_pcm
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.vad import Endpointer, resolve_preroll_ms
@@ -36,11 +36,13 @@ from .base import (
     Instructions,
     ManualTurnBackend,
     OnEvent,
+    OutputAudio,
     OutputTranscript,
     StateHint,
     ToolDef,
     VoiceState,
 )
+from .cues import cue_pcm
 
 # Own reply said the phrase: veto acoustic hits for this long past the transcript delta,
 # plus whatever the sink still had queued then (the words play that much later).
@@ -69,6 +71,7 @@ class GatedUplink:
         capture_rate: int,
         uplink_rate: int,
         open_mic: bool,
+        output_rate: int = 24000,  # the cue rate: every supported provider streams 24 kHz
         metrics: VoiceMetrics | None = None,
     ):
         for name in ("begin_activity", "end_activity", "park"):
@@ -136,10 +139,33 @@ class GatedUplink:
         self._phrase = WakePhrase(list(wake.phrases) + list(wake.aliases))
         self._phrase_echo_until = 0.0
         self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
-        if self._mode == "wake" and wake.ack.enabled:
+        # Cues (earcons.*): what the user hears of a gate the provider never sees. The
+        # receipt plays at a commit and at a summon; the attention cue when the wake window
+        # closes unused. Enqueued straight on the sink at the provider's output rate.
+        cues = config.earcons
+        self._cue_rate = output_rate
+        self._receipt = (
+            cue_pcm(cues.path, ding_pcm, output_rate, gain_db=cues.gain_db)[0]
+            if cues.captured else None
+        )
+        self._lapse_cue = None
+        if cues.attention and self._mode == "wake":
+            self._lapse_cue = cue_pcm(
+                cues.attention_path, dong_pcm, output_rate, gain_db=cues.gain_db
+            )[0]
+        elif cues.attention:
+            self._log.info("voice: earcons.attention marks the wake window closing; "
+                           "uplink='vad' has none, cue disabled")
+        self._lapse_task: asyncio.Task | None = None
+        # Without echo cancellation the mic hears a cue: onsets until its end (plus the
+        # playback hangover) are the cue, not the user. The canceller removes it (the sink
+        # feeds its reference), as it does the reply.
+        self._cue_until = 0.0
+        self._cue_guard_s = None if open_mic else config.playback_hangover_ms / 1000.0
+        if self._mode == "wake" and self._receipt is None:
             self._log.info(
-                "voice: wake.ack is spoken by the local TTS, which a cloud session has "
-                "none of: a summon gets no audible receipt"
+                "voice: a cloud summon gets no audible receipt (wake.ack needs the local "
+                "TTS); enable earcons.captured for one"
             )
 
         self._state = VoiceState.IDLE
@@ -249,9 +275,9 @@ class GatedUplink:
 
     async def close(self) -> None:
         self._closing = True
-        for task in (self._consult_task, self._park_task):
+        for task in (self._consult_task, self._park_task, self._lapse_task):
             await cancel_and_wait(task)
-        self._consult_task = self._park_task = None
+        self._consult_task = self._park_task = self._lapse_task = None
         await self._inner.close()
         for engine in (self._vad, self._wake, self._turn):
             release = getattr(engine, "release", None)
@@ -322,9 +348,18 @@ class GatedUplink:
             # A bare summon over the audible reply: kill it and listen (the local
             # _wake_kill). While the agent works the query survives, as locally.
             await self._kill_reply()
+        # No receipt here: the command that follows would land inside its echo guard.
+        self._arm_lapse()
         return False
 
     async def _on_onset(self, now: float) -> None:
+        if now < self._cue_until:
+            # Our own cue: forget the utterance it opened, so a real onset after it is
+            # fresh rather than merged into a phantom that never uploaded.
+            self._metrics.count("gate_cue_onsets")
+            with self._hop_lock:
+                self._ep.reset()
+            return
         if not self._window_open(now):
             self._metrics.count("gate_dropped_onsets")  # a later hit may still adopt it
             return
@@ -390,6 +425,8 @@ class GatedUplink:
             self._metrics.count("gate_bare_summon")
             self._log.debug("bare summon: nothing after the phrase; window open")
             await self._inner.end_activity(commit=False)
+            self._play_cue(self._receipt, "earcon_captured")
+            self._arm_lapse()
             return
         if self._attention == "sentence":
             self._spent = True
@@ -397,6 +434,7 @@ class GatedUplink:
         else:
             self._steer_until = time.monotonic() + self._window_s
         await self._inner.end_activity(commit=True)
+        self._play_cue(self._receipt, "earcon_captured")  # once it went
 
     async def _kill_reply(self) -> None:
         """Cancel the live reply and settle with the window open (THINKING while a tool
@@ -486,7 +524,41 @@ class GatedUplink:
                 self._window_until = now  # the summoned sentence was answered
             else:
                 self._window_until = now + self._window_s
+            self._arm_lapse()
         self._schedule_park()
+
+    # ---- cues ----------------------------------------------------------------
+
+    def _play_cue(self, pcm: bytes | None, metric: str) -> None:
+        if pcm is None or self._closing or self._ep.in_speech:
+            return  # never over the user
+        self._metrics.count(metric)
+        self._sink.enqueue(OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._cue_rate))
+        if self._cue_guard_s is not None:
+            self._cue_until = (
+                time.monotonic() + self._sink.backlog_ms() / 1000.0 + self._cue_guard_s
+            )
+
+    def _arm_lapse(self) -> None:
+        """(Re)watch the attention window: a sleeping watcher holds a stale deadline."""
+        if self._lapse_cue is None or self._closing:
+            return
+        cancel_task(self._lapse_task)
+        self._lapse_task = asyncio.create_task(self._lapse_watch())
+
+    async def _lapse_watch(self) -> None:
+        """One attention cue per window that closes unused. An engaged turn holds the
+        window open (inf) until its IDLE, which re-arms the watch."""
+        while not self._closing:
+            delay = self._window_until - time.monotonic()
+            if delay == math.inf:
+                return
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+            if not self._active:
+                self._play_cue(self._lapse_cue, "earcon_attention")
+            return
 
     def _schedule_park(self) -> None:
         self._cancel_park()

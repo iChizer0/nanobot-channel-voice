@@ -94,18 +94,23 @@ def test_sections_follow_the_backend():
     assert notes({"tts": {"enabled": False}}) == {"interruptions": "Not in use until Speak replies is on.", "waiting": "Not in use until Speak replies is on."}
     # a cloud provider: the served STT is advanced outright, the detectors until the gate runs them
     cloud = {"backend": "openai"}
-    assert _section_ids(cloud) == ["general", "provider", "audio", "stt", "vad", "wake", "access"]
+    assert _section_ids(cloud) == ["general", "provider", "audio", "stt", "vad", "wake", "cues", "access"]
     assert in_use(cloud) == ["general", "provider"]
     assert notes(cloud) == {
         "stt": "The provider transcribes for itself. Serve transcription runs an engine on this device for other clients.",
         "vad": "Not in use until Send audio is On speech or After wake word.",
         "wake": "Not in use until Send audio is After wake word.",
+        "cues": "Not in use until Send audio is On speech or After wake word.",
     }
     gated = {"backend": "openai", "realtime": {"uplink": "vad"}, "vad": {"engine": "silero"}}
-    assert in_use(gated) == ["general", "provider"]  # Listening is Advanced-only, in use or not
+    # Listening is Advanced-only, in use or not; the gate plays the cues
+    assert in_use(gated) == ["general", "provider", "cues"]
     assert set(notes(gated)) == {"stt", "wake"}
+    # the attention cue marks the wake window, which only the wake uplink has
+    assert [f["key"] for f in _sections(gated)["cues"]] == ["earcons.captured", "earcons.gainDb"]
     woken = {**gated, "realtime": {"uplink": "wake"}, "wake": {"mode": "gate", "engine": "openwakeword", "phrases": ["hey"]}}
-    assert in_use(woken) == ["general", "provider", "wake"]
+    assert in_use(woken) == ["general", "provider", "wake", "cues"]
+    assert "earcons.attention" in [f["key"] for f in _sections(woken)["cues"]]
     fields = _fields(gated)
     assert "vad.silero.weights" in fields
     # the gate endpoints with the same three: its detector, the silence that ends the

@@ -948,8 +948,9 @@ class OpenWakeWordConfig(OnDeviceRuntime):
 
 
 class EarconsConfig(_VoiceBase):
-    """Non-verbal cues (local backend only): synthesized struck two-note tones, ~¼ s — no
-    asset, no TTS call, no language. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
+    """Non-verbal cues: synthesized struck two-note tones, ~¼ s — no asset, no TTS call, no
+    language. Local backend, and a cloud backend under a gated uplink (``realtime.uplink``
+    vad/wake), where ``captured`` plays at every sent utterance and bare summon. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
     (the publish), ~1-3 s before any spoken feedback. ``attention`` (falling E6→A5) plays when
     the wake attention window closes — at the deadline lapse under ``attention="conversation"``,
     at the reply's settle when the window is already spent (``"sentence"``, or ``windowS=0``);

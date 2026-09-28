@@ -347,12 +347,7 @@ def build_form(cfg: VoiceConfig, store: Store | None = None) -> dict[str, Any]:
         sections.append(section("waiting", "Waiting", _waiting_paths(cfg), note=spoken))
         sections.append(section("vad", "Listening", _listening_paths(cfg)))
         sections.append(section("wake", "Wake word", _wake_paths(cfg) + _wake_extras(cfg, local=True)))
-        cues = ["earcons.captured", "earcons.attention", "earcons.gainDb"]
-        if cfg.earcons.captured:
-            cues.append("earcons.path")
-        if cfg.earcons.attention:
-            cues.append("earcons.attentionPath")
-        sections.append(section("cues", "Cues", cues))
+        sections.append(section("cues", "Cues", _cue_paths(cfg, attention=True)))
     else:
         provider = ["realtime.apiKey", "realtime.model"]
         if cfg.backend == "azure" or cfg.realtime.base_url:
@@ -391,8 +386,23 @@ def build_form(cfg: VoiceConfig, store: Store | None = None) -> dict[str, Any]:
             "wake", "Wake word", _wake_paths(cfg) + _wake_extras(cfg, local=False),
             note=None if cfg.realtime.uplink == "wake" else _NOTE_WAKE_GATE,
         ))
+        # The gate plays them: the receipt at every sent utterance, the attention cue when
+        # the wake window closes.
+        sections.append(section(
+            "cues", "Cues", _cue_paths(cfg, attention=cfg.realtime.uplink == "wake"),
+            note=None if gated else _NOTE_GATE,
+        ))
     sections.append(section("access", "Access", ["allowFrom", "logTranscripts"]))
     return {"sections": sections}
+
+
+def _cue_paths(cfg: VoiceConfig, *, attention: bool) -> list[str]:
+    paths = ["earcons.captured"] + (["earcons.attention"] if attention else []) + ["earcons.gainDb"]
+    if cfg.earcons.captured:
+        paths.append("earcons.path")
+    if attention and cfg.earcons.attention:
+        paths.append("earcons.attentionPath")
+    return paths
 
 
 def lenient_config(values: dict[str, Any]) -> VoiceConfig:

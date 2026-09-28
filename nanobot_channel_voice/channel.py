@@ -815,6 +815,7 @@ class VoiceChannel(BaseChannel):
             self._backend = await self._build_gate(
                 inner, audio_sink, aec_stage, capture_rate=capture_rate,
                 uplink_rate=input_rate, open_mic=open_mic,
+                output_rate=profile.output_rate if profile else gemini_live.OUTPUT_RATE,
             )
         tools, exec_tool = await self._cloud_tools(supported, rt.tool_mode)
         shell = VoiceShell(
@@ -862,7 +863,7 @@ class VoiceChannel(BaseChannel):
 
     async def _build_gate(
         self, inner, audio_sink: AudioSink, aec_stage, *,
-        capture_rate: int, uplink_rate: int, open_mic: bool,
+        capture_rate: int, uplink_rate: int, open_mic: bool, output_rate: int,
     ) -> GatedUplink:
         rt = self.config.realtime
         frame_ms = self.config.audio.frame_ms
@@ -895,7 +896,7 @@ class VoiceChannel(BaseChannel):
             return GatedUplink(
                 inner, config=self.config, sink=audio_sink, vad=vad,
                 turn_analyzer=turn_analyzer, wake_detector=wake_detector, aec=aec_stage,
-                capture_rate=capture_rate, uplink_rate=uplink_rate,
+                capture_rate=capture_rate, uplink_rate=uplink_rate, output_rate=output_rate,
                 open_mic=open_mic, metrics=self._metrics,
             )
         except BaseException:

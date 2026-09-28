@@ -812,3 +812,138 @@ def test_a_hit_under_an_open_activity_keeps_the_engaged_window():
         await gate.close()
 
     asyncio.run(_run())
+
+
+# ---- cues -------------------------------------------------------------------
+
+
+def _queued(gate) -> int:
+    return gate._sink._queue.qsize()
+
+
+def test_the_receipt_plays_at_a_commit_and_its_echo_opens_nothing():
+    async def _run():
+        # A committed utterance, then "speech" at once: the cue heard by the mic.
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6 + [True] * 3)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        assert inner.calls[-1] == ("end", True)
+        assert _queued(gate) == 1
+        inner.calls.clear()
+        await feed(gate, 3, start=14)
+        assert inner.kinds() == []
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["earcon_captured"] == 1 and counters["gate_cue_onsets"] == 1
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_an_onset_after_the_cue_is_the_user():
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6 + [True] * 3)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        gate._cue_until = 0.0  # the cue and its hangover have passed
+        inner.calls.clear()
+        await feed(gate, 3, start=14)
+        assert inner.kinds()[0] == "begin"
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_echo_cancellation_needs_no_cue_guard():
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6 + [True] * 3)
+        gate, inner, _, on_event = build(vad=vad, open_mic=True, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        inner.calls.clear()
+        await feed(gate, 3, start=14)
+        assert inner.kinds()[0] == "begin"
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_cues_are_off_unless_enabled():
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        assert inner.calls[-1] == ("end", True)
+        assert _queued(gate) == 0
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_bare_summon_gets_the_receipt():
+    async def _run():
+        vad = ScriptVad([True] * 5 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}, back_bytes=FRAME),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+            earcons={"captured": True},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 10)
+        assert inner.calls[-1] == ("end", False)
+        assert gate._metrics.snapshot()["counters"]["earcon_captured"] == 1
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_the_attention_cue_marks_a_window_closing_unused():
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({1}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 0.05},
+            earcons={"attention": True},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 9)  # hit + sentence: engaged, the window holds
+        assert inner.calls[-1] == ("end", True)
+        await asyncio.sleep(0.1)
+        assert "earcon_attention" not in gate._metrics.snapshot()["counters"]
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await inner.emit(StateHint(VoiceState.IDLE))  # re-armed for windowS
+        await asyncio.sleep(0.1)
+        assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1
+        await asyncio.sleep(0.1)
+        assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1  # once
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_spent_sentence_window_cues_at_the_settle():
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({1}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15,
+                  "attention": "sentence"},
+            earcons={"attention": True},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 9)
+        await inner.emit(StateHint(VoiceState.THINKING))
+        await inner.emit(OutputTranscript("It is sunny."))
+        await inner.emit(StateHint(VoiceState.IDLE))
+        await asyncio.sleep(0.02)
+        assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_vad_uplink_has_no_attention_cue():
+    gate, *_ = build(vad=ScriptVad([]), earcons={"attention": True})
+    assert gate._lapse_cue is None

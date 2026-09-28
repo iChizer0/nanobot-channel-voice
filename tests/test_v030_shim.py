@@ -164,9 +164,9 @@ def test_setup_validator_reports_plugin_schema_errors():
     fields = {f["key"]: f for s in payload["form"]["sections"] for f in s["fields"]}
     assert fields["wake.openwakeword.threshold"]["value"] == 0.5  # the refused leaf at its default, the rest kept
     ids, _ = shape({"enabled": True, "legacyKey": 1, "importJson": {"backend": "openai"}})
-    assert ids == ["general", "provider", "audio", "stt", "vad", "wake", "access"]  # an old config's stray key, backend switched
+    assert ids == ["general", "provider", "audio", "stt", "vad", "wake", "cues", "access"]  # an old config's stray key, backend switched
     ids, _ = shape({"stt": {"whisper": {"bogus": 1}}, "importJson": {"backend": "gemini", "realtime": {"uplink": "vad"}}})
-    assert ids == ["general", "provider", "audio", "stt", "vad", "wake", "access"]  # cross-field refusal: Listening is there to fix it
+    assert ids == ["general", "provider", "audio", "stt", "vad", "wake", "cues", "access"]  # cross-field refusal: Listening is there to fix it
     assert "provider" in shape({"backend": "openai", "importJson": "{not json"})[0]  # an unusable paste: the saved shape
 
 

@@ -34,7 +34,6 @@ from nanobot_channel_voice.aio import (
 from nanobot_channel_voice.audio.pcm import (
     ding_pcm,
     dong_pcm,
-    fade_tail_pcm,
     pcm_ms,
     pcm_peak,
     pcm_rms,
@@ -65,6 +64,7 @@ from nanobot_channel_voice.wake.phrase import FuzzyWake, WakePhrase
 from .audio_sink import AudioSink, scale_pcm, trim_lead_silence, trim_tail_silence
 from .base import NOTICE_BACKLOG, OnEvent, OutputAudio, ToolDef, VoiceState
 from .common import TurnEventMixin, loggable_text
+from .cues import cue_pcm
 
 TranscribeFn = Callable[[bytes], Awaitable[str]]
 # (text, turn_token, notes); notes ride the context bridge keyed by the token, keeping the
@@ -141,10 +141,6 @@ _FAST_ACK_WINDOW_S = 0.8
 # At-close ack shape gate: a bare summon (phrase + lead fillers) stays under this; wake+command
 # runs longer and must wait for its reply instead of a spurious ack.
 _CLOSE_ACK_MAX_ACTIVE_MS = 1300
-
-# Past this a cue is a jingle: it gates the half-duplex mic and delays what queues behind it.
-_EARCON_MAX_MS = 600
-_EARCON_MAX_FILE_B = 2_000_000  # refuse absurd files unread: ~10 s of 48 k stereo already
 
 # Audibility floor for a canned clip. The quietest real ack measured 0.018 rms, so below this
 # the engine voiced nothing: the clip is silence with a duration, not a quiet phrase.
@@ -3690,45 +3686,11 @@ class LocalBackend(TurnEventMixin):
         self._canned_ack = False
 
     def _build_earcon(self, path: str | None, synth) -> bytes | None:
-        """One cue, shaped once at init. A custom WAV wins; an unusable file degrades loudly to
-        ``synth``'s built-in. Edge-trim runs BEFORE the length cap (a padded export must not
-        spend the budget on silence while the cut eats the sound); a real cut fades."""
-        rate = self._tts.output_rate if self._pcm_out else 16000
-        pcm = b""
-        if path:
-            try:
-                size = Path(path).stat().st_size
-                if size > _EARCON_MAX_FILE_B:
-                    raise ValueError(f"{size / 1e6:.1f} MB; a cue asset should be tiny")
-                src, src_rate = wav_pcm(Path(path).read_bytes())
-                if not src:
-                    raise ValueError("not a readable S16 WAV")
-                if self._pcm_out:
-                    src = resample_pcm(src, src_rate, rate)
-                else:
-                    rate = src_rate  # blob playback follows the header: no resample
-                src = trim_lead_silence(src, rate, cap_ms=20.0)
-                src = trim_tail_silence(src, rate, cap_ms=120.0)
-                cap = int(rate * _EARCON_MAX_MS / 1000) * 2
-                if len(src) > cap:
-                    logger.warning(
-                        "voice: earcon '{}' is {:.0f} ms; truncating to {} ms "
-                        "(a cue must stay short)",
-                        path, pcm_ms(len(src), rate), _EARCON_MAX_MS,
-                    )
-                    src = fade_tail_pcm(src[:cap], rate)
-                pcm = src
-            except Exception as exc:  # noqa: BLE001 - degrade loudly, never mute
-                logger.warning(
-                    "voice: earcon file '{}' unusable ({}); using the built-in",
-                    path, exc,
-                )
-                rate = self._tts.output_rate if self._pcm_out else 16000
-                pcm = b""
-        if not pcm:
-            pcm = synth(rate)
-        if self._cfg.earcons.gain_db:
-            pcm = scale_pcm(pcm, 10.0 ** (self._cfg.earcons.gain_db / 20.0))
+        """One cue, shaped once at init (see :func:`cue_pcm`)."""
+        pcm, rate = cue_pcm(
+            path, synth, self._tts.output_rate if self._pcm_out else 16000,
+            keep_file_rate=not self._pcm_out, gain_db=self._cfg.earcons.gain_db,
+        )
         audio = pcm if self._pcm_out else pcm_to_wav_bytes(pcm, rate)
         return self._prep_canned(audio)
 
