@@ -177,7 +177,9 @@ def _transient(exc: BaseException) -> bool:
         exc = exc.reason
     if ssl is not None and isinstance(exc, ssl.SSLCertVerificationError):
         return False  # a wrong clock or an intercepting proxy: the next attempt meets the same
-    return isinstance(exc, (OSError, http.client.HTTPException))
+    # A broken exchange (a chunked body cut short, a dropped status line), not a request
+    # http.client refuses to send (a malformed URL).
+    return isinstance(exc, (OSError, http.client.IncompleteRead, http.client.BadStatusLine))
 
 
 def _pause(seconds: float, should_stop: Callable[[], bool] | None, stopped: str) -> None:
@@ -224,7 +226,7 @@ def _download(
                 if not chunk:
                     # http.client ends a Content-Length body cut short with b"", not an error.
                     left = getattr(resp, "length", None)
-                    return http.client.IncompleteRead(b"", left) if left else None
+                    return ConnectionError(f"the connection closed {left} bytes short") if left else None
                 if should_stop is not None and should_stop():
                     raise WeightsError(stopped)
                 out.write(chunk)

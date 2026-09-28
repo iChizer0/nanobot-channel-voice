@@ -343,7 +343,8 @@ def test_a_download_cut_short_resumes_where_it_broke_off(store, flaky):
     assert (d / "model.onnx").read_bytes() == flaky.blob
     assert flaky.seen == [None, f"bytes={len(flaky.blob) // 2}-"]
     assert seen == sorted(seen) and seen[-1] == len(flaky.blob)
-    assert any("retrying" in line for line in lines)
+    short = len(flaky.blob) - len(flaky.blob) // 2
+    assert f"  model.onnx: the connection closed {short} bytes short; retrying in 0s" in lines
 
 
 def test_a_server_that_ignores_the_range_sends_the_file_again(store, flaky):
@@ -409,7 +410,9 @@ def test_transient_failures_are_the_networks_and_the_hubs():
     assert not w._transient(urllib.error.HTTPError("u", 404, "gone", {}, None))
     assert w._transient(urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")))
     assert w._transient(TimeoutError("timed out")) and w._transient(http.client.IncompleteRead(b"", 5))
+    assert w._transient(http.client.RemoteDisconnected("closed without a response"))
     assert not w._transient(urllib.error.URLError("unknown url type: ftp"))
+    assert not w._transient(http.client.InvalidURL("nonnumeric port: 'x'"))
     # a clock before the certificate (a first boot without an RTC) meets the same refusal again
     assert not w._transient(urllib.error.URLError(ssl.SSLCertVerificationError("certificate is not yet valid")))
 
