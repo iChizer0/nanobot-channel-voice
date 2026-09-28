@@ -34,6 +34,7 @@ the store (:data:`INDEX_CACHE`) so the WebUI form can offer keys offline.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import http.client
 import importlib
@@ -42,13 +43,20 @@ import json
 import os
 import re
 import shutil
+import socket
 import tarfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
+
+try:
+    import ssl
+except ImportError:  # a Python built without it reads file:// indexes only
+    ssl = None  # type: ignore[assignment]
 
 MANIFEST = ".manifest.json"
 INDEX_CACHE = ".index.json"
@@ -100,6 +108,142 @@ def store_dir(key: str, root: Path | None = None) -> Path:
     return (root or store_root()).joinpath(*validate_key(key).split("/"))
 
 
+# ---- network ----------------------------------------------------------------
+
+_CONNECT_TIMEOUT_S = 10.0  # per address: a dead IPv6 route must not cost the read timeout
+_READ_TIMEOUT_S = 60.0
+# A download tries again after these pauses when the network or the hub failed it. An
+# index is read once: its callers show the error and have their own Retry.
+_RETRY_PAUSES_S = (1.0, 4.0)
+_RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _connect(address: tuple[str, int], timeout: Any, source_address: Any = None) -> socket.socket:
+    """``socket.create_connection`` failing with every address's error, where its own raises
+    the last: a kernel without IPv6 answers EAFNOSUPPORT after IPv4 failed for its reason."""
+    capped = min(timeout, _CONNECT_TIMEOUT_S) if isinstance(timeout, (int, float)) else timeout
+    try:
+        sock = socket.create_connection(address, capped, source_address, all_errors=True)
+    except ExceptionGroup as group:
+        reasons = dict.fromkeys(str(exc) for exc in group.exceptions)
+        raise OSError(f"cannot connect to {address[0]}: {'; '.join(reasons)}") from None
+    if capped != timeout:
+        sock.settimeout(timeout)
+    return sock
+
+
+class _AllErrors:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect
+
+
+class _HTTPConnection(_AllErrors, http.client.HTTPConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def do_open(self, http_class: Any, req: Any, **kwargs: Any) -> Any:
+        return super().do_open(_HTTPConnection, req, **kwargs)
+
+
+_HANDLERS: list[type] = [_HTTPHandler]
+if ssl is not None:
+
+    class _HTTPSConnection(_AllErrors, http.client.HTTPSConnection):
+        pass
+
+    class _HTTPSHandler(urllib.request.HTTPSHandler):
+        def do_open(self, http_class: Any, req: Any, **kwargs: Any) -> Any:
+            return super().do_open(_HTTPSConnection, req, **kwargs)
+
+    _HANDLERS.append(_HTTPSHandler)
+
+
+def _urlopen(url: str, timeout: float, offset: int = 0) -> Any:
+    """``urlopen`` through :func:`_connect` (env proxies as usual); ``offset`` asks for the
+    rest of a file from that byte on."""
+    request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-"} if offset else {})
+    return urllib.request.build_opener(*_HANDLERS).open(request, timeout=timeout)
+
+
+def _transient(exc: BaseException) -> bool:
+    """A failure of the network or the hub, not of the request: another attempt may pass."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRY_STATUS
+    if isinstance(exc, urllib.error.URLError):
+        if not isinstance(exc.reason, OSError):  # e.g. an unknown url type
+            return False
+        exc = exc.reason
+    if ssl is not None and isinstance(exc, ssl.SSLCertVerificationError):
+        return False  # a wrong clock or an intercepting proxy: the next attempt meets the same
+    return isinstance(exc, (OSError, http.client.HTTPException))
+
+
+def _pause(seconds: float, should_stop: Callable[[], bool] | None, stopped: str) -> None:
+    deadline = time.monotonic() + seconds
+    while (left := deadline - time.monotonic()) > 0:
+        if should_stop is not None and should_stop():
+            raise WeightsError(stopped)
+        time.sleep(min(left, 0.25))
+
+
+def _download(
+    url: str,
+    out: BinaryIO,
+    *,
+    name: str,
+    stopped: str,
+    log: Callable[[str], None],
+    progress: Callable[[int], None] | None,
+    should_stop: Callable[[], bool] | None,
+) -> tuple[str, int]:
+    """Stream ``url`` into ``out``: (sha256, bytes). A transient failure goes again after a
+    pause, from where it broke off when the server honours ``Range``, else from the start;
+    a failed write is not the network's and raises at once. ``progress`` never steps back."""
+    digester, total, shown = hashlib.sha256(), 0, 0
+
+    def attempt() -> BaseException | None:
+        nonlocal digester, total, shown
+        try:
+            resp = _urlopen(url, _READ_TIMEOUT_S, total) if total else _urlopen(url, _READ_TIMEOUT_S)
+        except urllib.error.HTTPError as exc:
+            return None if exc.code == 416 and total else exc  # nothing past what it holds: the pin decides
+        except (OSError, http.client.HTTPException) as exc:
+            return exc
+        with resp:
+            if total and getattr(resp, "status", None) != 206:  # sent whole again
+                out.seek(0)
+                out.truncate()
+                digester, total = hashlib.sha256(), 0
+            while True:
+                try:
+                    chunk = resp.read(_CHUNK)
+                except (OSError, http.client.HTTPException) as exc:
+                    return exc
+                if not chunk:
+                    # http.client ends a Content-Length body cut short with b"", not an error.
+                    left = getattr(resp, "length", None)
+                    return http.client.IncompleteRead(b"", left) if left else None
+                if should_stop is not None and should_stop():
+                    raise WeightsError(stopped)
+                out.write(chunk)
+                digester.update(chunk)
+                total += len(chunk)
+                if progress is not None and total > shown:
+                    shown = total
+                    progress(total)
+
+    pauses = iter(_RETRY_PAUSES_S)
+    while (failure := attempt()) is not None:
+        pause = next(pauses, None)
+        if pause is None or not _transient(failure):
+            raise failure
+        log(f"  {name}: {failure}; retrying in {pause:.0f}s")
+        _pause(pause, should_stop, stopped)
+    return digester.hexdigest(), total
+
+
 # ---- index ------------------------------------------------------------------
 
 
@@ -139,7 +283,7 @@ def _index_base(source: str) -> str:
 def _read_source(source: str, timeout: float) -> dict[str, Any]:
     split = urllib.parse.urlsplit(source)
     if split.scheme in ("http", "https"):
-        with urllib.request.urlopen(source, timeout=timeout) as resp:  # noqa: S310 - user-given index URL
+        with _urlopen(source, timeout) as resp:
             # urllib follows a redirect from https down to http: the index must still arrive
             # authenticated.
             try:
@@ -457,7 +601,8 @@ def fetch(
     or packed when this Python lacks its codec (a later fetch unpacks it in place).
     ``managed_by`` tags a key this call installs (a re-check or an update keeps the tag), so
     automatic cleanup removes only its own keys; ``progress(name, bytes)`` runs per chunk;
-    ``should_stop`` is polled between chunks and aborts with :class:`WeightsError`."""
+    ``should_stop`` is polled between chunks and aborts with :class:`WeightsError`. A
+    download the network breaks goes again, twice, resuming where the server allows."""
     d = store_dir(key, root)
     # nested keys would let the stale-file sweep rmtree the inner installation
     for other in installed(root):
@@ -546,24 +691,18 @@ def fetch(
                         f"'{key}' {name}: remote files must pin a sha256 in the index"
                     )
                 scratch.append(part)
-                digester = hashlib.sha256()
-                total = 0
                 try:
-                    with urllib.request.urlopen(url, timeout=60) as resp, part.open("wb") as out:  # noqa: S310
-                        while chunk := resp.read(_CHUNK):
-                            if should_stop is not None and should_stop():
-                                raise WeightsError(f"'{key}' {name}: download cancelled")
-                            digester.update(chunk)
-                            out.write(chunk)
-                            total += len(chunk)
-                            if progress is not None:
-                                progress(name, total)
+                    with part.open("wb") as out:
+                        digest, total = _download(
+                            url, out, name=name, stopped=f"'{key}' {name}: download cancelled",
+                            log=log, should_stop=should_stop,
+                            progress=None if progress is None else functools.partial(progress, name),
+                        )
                         out.flush()
                         os.fsync(out.fileno())  # durable before the manifest vouches for it
                 # A truncated chunked body raises IncompleteRead: HTTPException, NOT OSError.
                 except (OSError, http.client.HTTPException) as exc:
                     raise WeightsError(f"'{key}' {name}: download failed: {exc}") from None
-                digest = digester.hexdigest()
                 if digest != want:
                     raise WeightsError(
                         f"'{key}' {name}: sha256 mismatch after download "

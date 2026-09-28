@@ -1,19 +1,25 @@
 """Weight store: index merge, fetch (http + file://), prune, path resolution, CLI.
 
-Everything runs against a tmp store via $NANOBOT_VOICE_MODELS_DIR; http
-downloads are faked at urllib so no test touches the network.
+Everything runs against a tmp store via $NANOBOT_VOICE_MODELS_DIR; http downloads are
+faked at ``weights._urlopen`` or served from 127.0.0.1, so no test touches the network.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import http.client
 import io
 import json
 import os
+import socket
+import ssl
 import sys
 import tarfile
 import threading
-import urllib.request
+import time
+import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -146,7 +152,7 @@ def test_a_redirect_does_not_downgrade_an_index(monkeypatch):
     class Landed(io.BytesIO):
         url = "http://mirror.lan/weights-index.json"  # where urlopen's answer came from
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: Landed(b'{"models": {}}'))
+    monkeypatch.setattr(w, "_urlopen", lambda *_a, **_k: Landed(b'{"models": {}}'))
     named = "https://hub.example/weights-index.json"
     with pytest.raises(w.WeightsError, match=f"'{named}': it redirects to {Landed.url}, and an index must be https"):
         w.load_index([named])
@@ -261,7 +267,7 @@ def test_fetch_http_streams_verifies_and_is_idempotent(store, monkeypatch):
         calls.append(url)
         return io.BytesIO(blob)  # IOBase is already a context manager
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(w, "_urlopen", fake_urlopen)
     entry = {
         "files": {"model.onnx": {"url": "https://example.test/model.onnx",
                                  "sha256": hashlib.sha256(blob).hexdigest()}}
@@ -276,7 +282,7 @@ def test_fetch_http_streams_verifies_and_is_idempotent(store, monkeypatch):
 
 
 def test_fetch_http_bad_checksum_never_lands(store, monkeypatch):
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(b"tampered"))
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0: io.BytesIO(b"tampered"))
     entry = {"files": {"model.onnx": {"url": "https://x.test/m", "sha256": "0" * 64}}}
     with pytest.raises(w.WeightsError, match="refusing to install"):
         w.fetch("vad/firered/onnx", entry)
@@ -284,11 +290,186 @@ def test_fetch_http_bad_checksum_never_lands(store, monkeypatch):
     assert not (d / "model.onnx").exists() and not list(d.glob(".partial-*"))
 
 
+class _Flaky(BaseHTTPRequestHandler):
+    """Serves ``server.blob`` honouring ``Range``, each request taking the next step of
+    ``server.script``: "cut" (half the body, then close), "whole" (ignores the Range),
+    "overlong" (declares a byte more than it sends), a status code, else a clean answer."""
+
+    def do_GET(self):  # noqa: N802 - http.server API
+        asked = self.headers.get("Range")
+        self.server.seen.append(asked)
+        step = self.server.script.pop(0) if self.server.script else "ok"
+        blob = self.server.blob
+        start = int(asked.removeprefix("bytes=").rstrip("-")) if asked and step != "whole" else 0
+        if isinstance(step, int) or start >= len(blob):
+            self.send_error(step if isinstance(step, int) else 416)
+            return
+        body = blob[start:]
+        self.send_response(206 if start else 200)
+        if start:
+            self.send_header("Content-Range", f"bytes {start}-{len(blob) - 1}/{len(blob)}")
+        self.send_header("Content-Length", str(len(body) + (step == "overlong")))
+        self.end_headers()
+        self.wfile.write(body[: len(body) // 2] if step == "cut" else body)
+
+    def log_message(self, *_args):
+        pass
+
+
+@pytest.fixture()
+def flaky(monkeypatch):
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setattr(w, "_RETRY_PAUSES_S", (0.0, 0.0))
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Flaky)
+    httpd.blob, httpd.script, httpd.seen = os.urandom(3 << 20), [], []
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    httpd.url = f"http://127.0.0.1:{httpd.server_port}/model.onnx"
+    yield httpd
+    httpd.shutdown()
+
+
+def _flaky_entry(server):
+    pin = {"url": server.url, "sha256": hashlib.sha256(server.blob).hexdigest(), "size": len(server.blob)}
+    return {"files": {"model.onnx": pin}}
+
+
+def test_a_download_cut_short_resumes_where_it_broke_off(store, flaky):
+    """http.client ends a Content-Length body cut short with b"", no error: the fetch
+    notices, asks for the rest by Range, and the bar never steps back."""
+    flaky.script = ["cut"]
+    lines, seen = [], []
+    d = w.fetch("vad/silero/onnx", _flaky_entry(flaky), log=lines.append,
+                progress=lambda _name, n: seen.append(n))
+    assert (d / "model.onnx").read_bytes() == flaky.blob
+    assert flaky.seen == [None, f"bytes={len(flaky.blob) // 2}-"]
+    assert seen == sorted(seen) and seen[-1] == len(flaky.blob)
+    assert any("retrying" in line for line in lines)
+
+
+def test_a_server_that_ignores_the_range_sends_the_file_again(store, flaky):
+    flaky.script = ["cut", "whole"]
+    seen = []
+    d = w.fetch("vad/silero/onnx", _flaky_entry(flaky), progress=lambda _name, n: seen.append(n))
+    assert (d / "model.onnx").read_bytes() == flaky.blob
+    assert seen == sorted(seen) and seen[-1] == len(flaky.blob)
+
+
+def test_a_body_that_came_whole_before_the_break_is_settled_by_its_pin(store, flaky):
+    """A Range past the end answers 416: everything is already there, the sha256 decides."""
+    flaky.script = ["overlong"]
+    d = w.fetch("vad/silero/onnx", _flaky_entry(flaky))
+    assert (d / "model.onnx").read_bytes() == flaky.blob
+    assert flaky.seen == [None, f"bytes={len(flaky.blob)}-"]
+
+
+def test_a_hub_failure_goes_again_and_a_refusal_does_not(store, flaky):
+    entry = _flaky_entry(flaky)
+    flaky.script = [503, 502]
+    w.fetch("vad/silero/onnx", entry)
+    assert len(flaky.seen) == 3
+    flaky.seen.clear()
+    flaky.script = [404]
+    with pytest.raises(w.WeightsError, match="download failed: HTTP Error 404"):
+        w.fetch("vad/silero/onnx", entry, force=True)
+    assert len(flaky.seen) == 1
+    flaky.seen.clear()
+    flaky.script = [503, 503, 503]
+    with pytest.raises(w.WeightsError, match="HTTP Error 503"):
+        w.fetch("vad/silero/onnx", entry, force=True)
+    assert len(flaky.seen) == 3
+    assert (w.store_dir("vad/silero/onnx") / "model.onnx").read_bytes() == flaky.blob  # kept
+
+
+def test_a_cancel_lands_during_a_retry_pause(store, flaky, monkeypatch):
+    monkeypatch.setattr(w, "_RETRY_PAUSES_S", (30.0,))
+    flaky.script = [503]
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    started = time.monotonic()
+    with pytest.raises(w.WeightsError, match="download cancelled"):
+        w.fetch("vad/silero/onnx", _flaky_entry(flaky), should_stop=stop.is_set)
+    assert time.monotonic() - started < 5
+
+
+def test_a_failed_write_is_not_the_networks_and_is_not_tried_again(monkeypatch):
+    calls = []
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0, offset=0: calls.append(offset) or io.BytesIO(b"x" * 10))
+
+    class Full(io.BytesIO):
+        def write(self, _data):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.raises(OSError, match="No space left"):
+        w._download("https://x.test/m", Full(), name="m", stopped="stop", log=print, progress=None, should_stop=None)
+    assert calls == [0]
+
+
+def test_transient_failures_are_the_networks_and_the_hubs():
+    assert w._transient(urllib.error.HTTPError("u", 503, "busy", {}, None))
+    assert not w._transient(urllib.error.HTTPError("u", 404, "gone", {}, None))
+    assert w._transient(urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")))
+    assert w._transient(TimeoutError("timed out")) and w._transient(http.client.IncompleteRead(b"", 5))
+    assert not w._transient(urllib.error.URLError("unknown url type: ftp"))
+    # a clock before the certificate (a first boot without an RTC) meets the same refusal again
+    assert not w._transient(urllib.error.URLError(ssl.SSLCertVerificationError("certificate is not yet valid")))
+
+
+def test_the_connect_cap_bounds_the_handshake_not_the_reads(monkeypatch):
+    seen = {}
+
+    class Sock:
+        def settimeout(self, value):
+            seen["read"] = value
+
+    def create_connection(address, timeout, source_address=None, *, all_errors=False):
+        seen.update(connect=timeout, all_errors=all_errors)
+        return Sock()
+
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    w._connect(("hub.test", 443), 60.0)
+    assert seen == {"connect": w._CONNECT_TIMEOUT_S, "all_errors": True, "read": 60.0}
+    seen.clear()
+    w._connect(("hub.test", 443), 5.0)
+    assert seen == {"connect": 5.0, "all_errors": True}
+
+
+def test_a_failed_connect_names_every_address_it_tried(flaky, monkeypatch):
+    """socket.create_connection raises the LAST address's error, so a kernel without IPv6
+    reported EAFNOSUPPORT for a host whose IPv4 attempt had failed for its own reason."""
+    real = socket.socket
+
+    class NoIPv6(real):
+        def __init__(self, family=-1, *args, **kwargs):
+            if family == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+            super().__init__(family, *args, **kwargs)
+
+    probe = real()
+    probe.bind(("127.0.0.1", 0))
+    dead = probe.getsockname()[1]
+    probe.close()
+    v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 443, 0, 0))
+
+    def v4(port):
+        return (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+
+    url = f"http://hub.test:{flaky.server_port}/model.onnx"
+    monkeypatch.setattr(socket, "socket", NoIPv6)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: [v6, v4(flaky.server_port)])
+    with w._urlopen(url, 5) as resp:  # the kernel refuses IPv6, IPv4 answers
+        assert resp.read() == flaky.blob
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: [v4(dead), v6])
+    with pytest.raises(OSError) as caught:
+        w._urlopen(url, 5)
+    assert "Connection refused" in str(caught.value)
+    assert "Address family not supported" in str(caught.value)
+
+
 def test_an_update_that_fails_leaves_the_installed_revision_whole(store, monkeypatch):
     """Nothing moves in until every file verifies: a later file failing (a bad pin, a
     cancel) leaves the installed revision intact, never half new."""
     served = {}
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(served[url]))
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0: io.BytesIO(served[url]))
 
     def revision(tag, meta_pin=None):
         blobs = {"encoder.rknn": b"encoder " + tag, "meta.json": b"meta " + tag}
@@ -362,7 +543,7 @@ def test_a_partial_left_under_this_pid_is_never_written_through(store, monkeypat
     the download replaces it rather than writing into its target."""
     src = _src(tmp_path, "model.onnx", b"the user's own copy")
     blob = b"remote-model-bytes"
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(blob))
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0: io.BytesIO(blob))
     d = w.store_dir("vad/firered/onnx")
     d.mkdir(parents=True)
     (d / f".partial-{os.getpid()}-model.onnx").symlink_to(src)
@@ -411,7 +592,7 @@ def test_an_extract_archive_lands_as_the_directory_it_unpacks_to(store, monkeypa
     """The directory stays, the archive does not: a refetch downloads nothing, a new
     revision replaces the directory whole, and a local archive unpacks rather than links."""
     served, calls = {}, []
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
     key = "tts/m/rknn.rv1126b"
     v1 = _packed(served, _tar({"espeak-ng-data": None, "espeak-ng-data/phondata": b"v1", "espeak-ng-data/voices/!v/adam": b"a"}))
     d = w.fetch(key, v1)
@@ -447,7 +628,7 @@ def test_an_archive_must_make_one_directory_of_files(store, monkeypatch):
     """A member beside the directory, one escaping it, or a link fails the key and leaves
     nothing; so does extract on a name that is no tar archive."""
     served = {}
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: io.BytesIO(served[url]))
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0: io.BytesIO(served[url]))
     for members in (
         {"espeak-ng-data/a": b"x", "tokens.txt": b"beside"},
         {"espeak-ng-data/../../escaped": b"x"},
@@ -466,7 +647,7 @@ def test_a_python_without_the_codec_installs_the_archive_packed(store, monkeypat
     without downloading, and only then does the key read as stale."""
     served, calls = {}, []
     entry = _packed(served, _tar({"espeak-ng-data/phondata": b"v1"}))
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0: calls.append(url) or io.BytesIO(served[url]))
     monkeypatch.setitem(sys.modules, "bz2", None)
     lines = []
     d = w.fetch("tts/m/onnx", entry, log=lines.append)
