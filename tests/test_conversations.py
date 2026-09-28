@@ -853,11 +853,12 @@ def test_waiting_messages_keep_only_the_newest():
     _run(_case())
 
 
-def test_transcription_gap_warning_is_only_for_the_delegating_provider():
-    """A failed on-device build also leaves the adapter None, and it has already logged
-    its own warning; naming 'nanobot' there contradicts the user's config."""
+def test_transcription_gap_warning_names_the_path_that_delegates(monkeypatch):
+    """A failed on-device build delegates too, so it is deaf the same way; the line names the
+    engine that did not load rather than a 'nanobot' the config never chose."""
     from nanobot.bus.queue import MessageBus
 
+    from nanobot_channel_voice import channel as channel_mod
     from nanobot_channel_voice.channel import VoiceChannel
     from nanobot_channel_voice.config import VoiceConfig
 
@@ -866,10 +867,19 @@ def test_transcription_gap_warning_is_only_for_the_delegating_provider():
     class _Log:
         def warning(self, msg, *a): warned.append(msg.format(*a))
 
-    channel = VoiceChannel(
-        VoiceConfig.model_validate({"stt": {"provider": "whisper"}}), MessageBus(),
-    )
-    channel.logger = _Log()  # type: ignore[assignment]
-    channel._stt = None  # the on-device build failed
-    channel._warn_if_transcription_unconfigured()
+    monkeypatch.setattr(channel_mod, "transcription_gap", lambda: "its provider has no API key")
+    for provider in ("nanobot", "whisper"):
+        channel = VoiceChannel(VoiceConfig.model_validate({"stt": {"provider": provider}}), MessageBus())
+        channel.logger = _Log()  # type: ignore[assignment]
+        channel._stt = None  # delegated: by choice, or the on-device build failed
+        _run(channel._warn_if_transcription_unconfigured())
+    assert warned[0].startswith("voice: stt.provider='nanobot' delegates every utterance")
+    assert warned[1].startswith("voice: stt.provider='whisper' did not load, so nanobot's transcription stands in")
+    assert all("its provider has no API key" in line and "hear NOTHING" in line for line in warned)
+    warned.clear()
+    channel._stt = object()  # loaded: core transcription is off the path
+    _run(channel._warn_if_transcription_unconfigured())
+    monkeypatch.setattr(channel_mod, "transcription_gap", lambda: None)
+    channel._stt = None
+    _run(channel._warn_if_transcription_unconfigured())
     assert warned == []

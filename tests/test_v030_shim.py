@@ -253,13 +253,15 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     from nanobot.channels.contracts import ChannelValidationContext
 
     import nanobot_channel_voice.config as voice_config
+    import nanobot_channel_voice.tts.system as system_tts
 
     manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
     ctx = ChannelValidationContext()
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env")  # silence the key nudges
-    # The pipeline row reads the LIVE install's transcription config; pin it so the
-    # rows below describe the section under test, not this machine.
+    # The pipeline row reads the LIVE install's transcription config and PATH; pin both so
+    # the rows below describe the section under test, not this machine.
     monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
+    monkeypatch.setattr(system_tts, "system_voice", lambda *_a: ("espeak", "/usr/bin/espeak-ng"))
 
     # local: no schema pass row (the identity line names the backend), the pipeline
     # check the resolved engine trio, the devices row the PCMs; options read by label,
@@ -326,17 +328,28 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
         "Internal delegates to nanobot's transcription, but there is no API key, so every "
         "utterance would be heard as silence."
     )
-    # an on-device engine takes core transcription off the path, so no such row
-    section = {"stt": {"provider": "sensevoice"}}
-    assert "silence" not in _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]
+    # an on-device engine that loads takes core transcription off the path; one that falls
+    # back puts Internal on it, which hears nothing either
+    paths = ("encoderPath", "decoderPath", "vocabPath", "melFiltersPath")
+    loads = {"stt": {"provider": "whisper", "whisper": {p: f"/m/{p}" for p in paths}}}
+    assert "silence" not in _check_ids(manifest._validate(loads, ctx))["pipeline"]["message"]
+    assert _check_ids(manifest._validate({"stt": {"provider": "sensevoice"}}, ctx))["pipeline"]["message"] == (
+        "SenseVoice has no model, pick one under Speech-to-text. Until then Internal transcribes. "
+        "Internal delegates to nanobot's transcription, but there is no API key, so every "
+        "utterance would be heard as silence."
+    )
     monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
 
     # unfetched weights keys warn as one sentence, with Apply as the remedy when the
-    # cached index lists every one of them (the Models section says what Apply moves)
+    # cached index lists every one of them (the Models section says what Apply moves); with
+    # no index cached yet (a first sync that failed), once the panel has loaded one
     monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(tmp_path / "empty-store"))
     section = {"vad": {"engine": "firered", "firered": {"weights": "vad/firered/onnx"}}}
     message = _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]
-    assert message == "The FireRed model is not fetched yet. Until then Energy listens."
+    assert message == (
+        "The FireRed model is not fetched yet, Apply downloads it once the model index has "
+        "loaded. Until then Energy listens."
+    )
     import json as _json
 
     from nanobot_channel_voice import weights as w
@@ -614,13 +627,22 @@ def test_setup_validator_stays_within_the_rendered_check_budget(monkeypatch):
     branch must fit or later checks silently vanish."""
     from nanobot.channels.contracts import ChannelValidationContext
 
+    from nanobot_channel_voice import running
+    from nanobot_channel_voice.config import VoiceConfig
+
     manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
     ctx = ChannelValidationContext()
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    local_worst = manifest._validate(
-        {"vad": {"engine": "firered"}, "realtime": {"model": "m"}, "importJson": "{}"}, ctx
-    )
+    # every local row at once: a fallback, a live channel that started without its (keyless)
+    # voice, a cloud setting Local ignores, the key nudge, and the devices row
+    local = {"vad": {"engine": "firered"}, "realtime": {"model": "m"}, "importJson": "{}"}
+    started = running.Started(VoiceConfig.model_validate(local), {"tts": None})
+    monkeypatch.setattr(running, "_current", (object(), started))
+    local_worst = manifest._validate(local, ctx)
+    assert [c["id"] for c in local_worst["checks"]] == [
+        "pipeline", "running", "realtime_unused", "tts_key", "audio_devices",
+    ]
     # every cloud row at once: no key, no endpoint, an open mic without a canceller, a
     # wake gate without its head, a local-only block, and the devices row
     cloud = {
@@ -687,3 +709,123 @@ def test_pipeline_row_names_a_turn_model_that_is_never_consulted():
     # not said of a model that would not load: it is not consulted for the louder reason
     unloadable = {"enabled": True, "vad": {"hangoverMs": 240, "turn": {"engine": "smartturn", "consultMs": 240}}}
     assert "never consulted" not in _check_ids(manifest._validate(unloadable, ctx))["pipeline"]["message"]
+
+
+def _install(tmp_path, key, *names):
+    """A fetched key in the test's store, each file linked from a source of its own."""
+    from nanobot_channel_voice import weights as w
+
+    src = tmp_path / "src" / key.replace("/", "_")
+    src.mkdir(parents=True)
+    for name in names:
+        (src / name).write_bytes(b"x")
+    w.fetch(key, {"files": {name: {"url": (src / name).as_uri()} for name in names}})
+
+
+_WHISPER = "stt/whisper/base/onnx"
+_WHISPER_FILES = ("encoder.onnx", "decoder.onnx", "vocab.json", "mel_filters.npz")
+
+
+def test_pipeline_row_names_a_system_voice_that_cannot_speak(monkeypatch):
+    """Without espeak-ng the System voice returns nothing, picked or standing in: a reply
+    nobody hears, which no row showed."""
+    from nanobot.channels.contracts import ChannelValidationContext
+
+    import nanobot_channel_voice.config as voice_config
+    import nanobot_channel_voice.tts.system as system_tts
+
+    manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
+    ctx = ChannelValidationContext()
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
+    monkeypatch.setattr(system_tts, "system_voice", lambda *_a: None)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    silent = "System needs espeak-ng, which is not installed, so replies would be silent."
+    for section in (
+        {"tts": {"provider": "system"}},
+        {"tts": {"provider": "matcha"}},  # no model: System stands in
+        {"enabled": True},  # OpenAI without a key: System stands in
+    ):
+        pipeline = _check_ids(manifest._validate(section, ctx))["pipeline"]
+        assert pipeline["status"] == "warn" and pipeline["message"].endswith(silent), section
+    for section in ({"tts": {"provider": "system", "enabled": False}}, {"tts": {"apiKey": "sk-x"}}):
+        assert _check_ids(manifest._validate(section, ctx))["pipeline"]["status"] == "pass", section
+    monkeypatch.setattr(system_tts, "system_voice", lambda *_a: ("espeak", "/usr/bin/espeak-ng"))
+    assert _check_ids(manifest._validate({"tts": {"provider": "system"}}, ctx))["pipeline"]["status"] == "pass"
+
+
+def test_running_row_tells_what_the_live_channel_started_without(monkeypatch, tmp_path):
+    """The pipeline row weighs the config against the store; the channel runs what loaded
+    at its start. A model fetched since, or one that failed to load, gets a row of its own
+    and the panel's restart; one the pipeline row already names as missing gets neither."""
+    from nanobot.channels.contracts import ChannelValidationContext
+
+    import nanobot_channel_voice.config as voice_config
+    import nanobot_channel_voice.tts.system as system_tts
+    from nanobot_channel_voice import running
+    from nanobot_channel_voice import weights as w
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.engines import Fallback
+
+    manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
+    ctx = ChannelValidationContext()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
+    monkeypatch.setattr(system_tts, "system_voice", lambda *_a: ("espeak", "/usr/bin/espeak-ng"))
+    restart = "Apply and restart" if manifest._WEBUI else "Turning the channel off and on"
+    section = {"stt": {"provider": "whisper", "whisper": {"weights": _WHISPER}}}
+
+    def started(fell_back, config=section):
+        record = running.Started(VoiceConfig.model_validate(config), fell_back)
+        monkeypatch.setattr(running, "_current", (object(), record))
+
+    started({"stt": Fallback(key=_WHISPER)})
+    out = manifest._validate(section, ctx)  # still missing: the pipeline row speaks for both
+    assert "running" not in _check_ids(out) and "restart" not in out
+    _install(tmp_path, _WHISPER, *_WHISPER_FILES)  # fetched since, by the CLI
+    out = manifest._validate(section, ctx)
+    assert _check_ids(out)["pipeline"]["status"] == "pass"
+    live = _check_ids(out)["running"]
+    assert (live["label"], live["status"]) == ("Running channel", "warn")
+    assert live["message"] == (
+        "It started without Whisper, so Internal transcribes instead. The Whisper model is "
+        f"in place now. {restart} loads it."
+    )
+    assert out["restart"] is True
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: "its provider has no API key")
+    assert _check_ids(manifest._validate(section, ctx))["running"]["message"].endswith(
+        "Internal delegates to nanobot's transcription, but its provider has no API key, so "
+        "every utterance is heard as silence."
+    )
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
+
+    started({"stt": None})  # its files were there and it did not load: a restart retries
+    assert _check_ids(manifest._validate(section, ctx))["running"]["message"].endswith(
+        f"Whisper did not load, the gateway log says why. {restart} tries again."
+    )
+
+    # a pending edit picked another engine: this row keeps the live one, nothing to restart
+    w.prune(_WHISPER)
+    started({"stt": Fallback(key=_WHISPER)})
+    out = manifest._validate({"stt": {"provider": "sensevoice"}}, ctx)
+    assert _check_ids(out)["running"]["message"] == "It started without Whisper, so Internal transcribes instead."
+    assert "restart" not in out
+
+    # a keyless OpenAI voice falls back again on any restart; its own row says why
+    monkeypatch.delenv("OPENAI_API_KEY")
+    started({"tts": None}, config={})
+    out = manifest._validate({}, ctx)
+    assert _check_ids(out)["running"]["message"] == "It started without OpenAI, so System speaks instead."
+    assert "tts_key" in _check_ids(out) and "restart" not in out
+
+
+def test_a_late_withdraw_leaves_the_restarted_channels_record():
+    from nanobot_channel_voice import running
+
+    old, new = object(), object()
+    running.publish(old, running.Started(None, {}))
+    record = running.Started(None, {"vad": None})
+    running.publish(new, record)
+    running.withdraw(old)  # the stopped instance's teardown, after the restart
+    assert running.current() is record
+    running.withdraw(new)
+    assert running.current() is None

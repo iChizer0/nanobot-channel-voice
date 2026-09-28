@@ -52,8 +52,15 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
     backend = choice_label("backend", cfg.backend)
     rt = cfg.realtime
     store = Store.read(cfg.device)
+    restart = False
     if cfg.backend == "local":
-        checks.append(_pipeline_check(cfg, check, store))
+        from nanobot_channel_voice.running import preflights
+
+        why = preflights(cfg)
+        checks.append(_pipeline_check(cfg, check, store, why))
+        live, restart = _running_check(cfg, check, why)
+        if live is not None:
+            checks.append(live)
         # What the section SET, not what the schema holds: no hand-kept field list to drift.
         if "realtime" in _touched(cfg):
             checks.append(
@@ -64,13 +71,7 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
                 )
             )
         # "skipped", not "fail": the channel starts keyless (local/system TTS need none).
-        # Both OpenAI dialects run _build_openai, which raises without a key or a base URL.
-        if (
-            cfg.tts.enabled
-            and cfg.tts.provider in ("openai", "openai_compat")
-            and not resolve_openai_key(cfg.tts.api_key)
-            and not cfg.tts.api_base
-        ):
+        if _keyless_openai(cfg):
             checks.append(
                 check(
                     "tts_key", "Text-to-speech key", "skipped",
@@ -194,6 +195,8 @@ def _validate(values: dict[str, Any], _context: ChannelValidationContext) -> dic
     )
     payload = status_from_checks("voice", checks, [], identity=_identity(cfg))
     payload["form"] = build_form(cfg, store)
+    if restart:
+        payload["restart"] = True  # the panel offers Apply and restart with nothing to apply
     return payload
 
 
@@ -268,54 +271,47 @@ def _schema_detail(exc: Exception) -> str:
     return ". ".join(parts)[:300]
 
 
-def _pipeline_check(cfg: Any, check: Any, store: Any) -> dict[str, Any]:
-    """One row for the resolved local engines: "pass" names the trio, "warn" says which
-    selected engine would fall back at start, why, and what stands in until then. The
-    remedy is the panel's own: Apply for a model the index lists, the section's Model
-    row for a block without one, the pip extra for a missing module."""
-    from nanobot_channel_voice import stt, tts, vad, wake
-    from nanobot_channel_voice.config import transcription_gap
-    from nanobot_channel_voice.engines import preflight
+def _slots(cfg: Any) -> dict[str, tuple[str, str, str | None]]:
+    """Per slot of the local pipeline: its engine as the panel labels it, the section that
+    picks it, and what stands in when it does not load (None: the channel does not start)."""
     from nanobot_channel_voice.webui_form import choice_label
 
-    # (engine, its section as the panel shows it, what stands in, why it would) per slot;
-    # a stand-in of None is a slot the channel does not start without.
     listening = "Listening in Advanced"
-    stt_slot = (
-        choice_label("stt.provider", cfg.stt.provider), "Speech-to-text",
-        # Serving borrows this engine, and _start_stt_server raises where the pipeline
-        # alone would have fallen back to Internal.
-        None if cfg.stt.serve.enabled else "Internal transcribes",
-        preflight(cfg.stt, cfg.stt.provider, stt.ENGINES, prefix="stt."),
+    return {
+        "vad": (choice_label("vad.engine", cfg.vad.engine), listening, "Energy listens"),
+        "turn": (choice_label("vad.turn.engine", cfg.vad.turn.engine), listening, "turns end on silence alone"),
+        # Serving borrows this engine, and _start_stt_server raises where the pipeline alone
+        # would have fallen back to Internal.
+        "stt": (
+            choice_label("stt.provider", cfg.stt.provider), "Speech-to-text",
+            None if cfg.stt.serve.enabled else "Internal transcribes",
+        ),
+        "tts": (choice_label("tts.provider", cfg.tts.provider), "Text-to-speech", "System speaks"),
+        "wake": (choice_label("wake.engine", cfg.wake.engine), "Wake word", "Transcript matches the wake word"),
+    }
+
+
+def _keyless_openai(cfg: Any) -> bool:
+    """Both OpenAI dialects run _build_openai, which raises without a key or a base URL: the
+    channel starts, and the System voice speaks."""
+    from nanobot_channel_voice.config import resolve_openai_key
+
+    return bool(
+        cfg.tts.enabled
+        and cfg.tts.provider in ("openai", "openai_compat")
+        and not resolve_openai_key(cfg.tts.api_key)
+        and not cfg.tts.api_base
     )
-    turn_slot = (
-        choice_label("vad.turn.engine", cfg.vad.turn.engine), listening,
-        "turns end on silence alone",
-        preflight(cfg.vad, cfg.vad.turn.engine, vad.TURN_ENGINES, prefix="vad.", block="turn"),
-    )
-    slots = [
-        (
-            choice_label("vad.engine", cfg.vad.engine), listening, "Energy listens",
-            preflight(cfg.vad, cfg.vad.engine, vad.ENGINES, prefix="vad."),
-        ),
-        turn_slot,
-        stt_slot,
-        (
-            choice_label("tts.provider", cfg.tts.provider), "Text-to-speech", "System speaks",
-            preflight(cfg.tts, cfg.tts.provider, tts.ENGINES, prefix="tts.")
-            if cfg.tts.enabled
-            else None,
-        ),
-        (
-            choice_label("wake.engine", cfg.wake.engine), "Wake word",
-            "Transcript matches the wake word",
-            preflight(cfg.wake, cfg.wake.engine, wake.ENGINES, prefix="wake.")
-            if cfg.wake.mode != "off"
-            else None,
-        ),
-    ]
-    degraded = [slot for slot in slots if slot[3] is not None]
-    sentences = _why_sentences([(engine, section, why) for engine, section, _, why in degraded], store)
+
+
+def _pipeline_check(cfg: Any, check: Any, store: Any, why: dict[str, Any]) -> dict[str, Any]:
+    """One row for the resolved local engines: "pass" names the trio, "warn" says which
+    selected engine would fall back at start (``why``: the section's preflights), why, and
+    what stands in until then. The remedy is the panel's own: Apply for a model the index
+    lists, the section's Model row for a block without one, the pip extra for a module."""
+    slots = _slots(cfg)
+    degraded = [(*slots[slot], fallback) for slot, fallback in why.items() if fallback is not None]
+    sentences = _why_sentences([(engine, section, fb) for engine, section, _, fb in degraded], store)
     if stand_ins := [stand_in for _, _, stand_in, _ in degraded if stand_in]:
         sentences.append(f"Until then {_join(stand_ins)}.")
     fatal = [engine for engine, _, stand_in, _ in degraded if not stand_in]
@@ -325,18 +321,77 @@ def _pipeline_check(cfg: Any, check: Any, store: Any) -> dict[str, Any]:
         )
     # The turn slot's other fallback, the one preflight cannot see. Not said of a model
     # that would not load either: it is not consulted for the louder reason.
-    if turn_slot[3] is None and (idle := _turn_idle(cfg)) is not None:
+    if why.get("turn") is None and (idle := _turn_idle(cfg)) is not None:
         sentences.append(idle)
-    # Delegated STT with nothing behind it decodes every utterance to "", which the
-    # pipeline cannot tell from silence: the channel would start and hear nothing.
-    if cfg.stt.provider == "nanobot" and (gap := transcription_gap()) is not None:
-        sentences.append(
-            f"Internal delegates to nanobot's transcription, but {gap}, so every utterance "
-            "would be heard as silence."
-        )
+    sentences += _silent_stand_ins(
+        delegated=cfg.stt.provider == "nanobot" or (why.get("stt") is not None and not cfg.stt.serve.enabled),
+        system=cfg.tts.enabled
+        and (cfg.tts.provider == "system" or why.get("tts") is not None or _keyless_openai(cfg)),
+        now=False,
+    )
     if sentences:
         return check("pipeline", "Local pipeline", "skipped" if fatal else "warn", " ".join(sentences))
     return check("pipeline", "Local pipeline", "pass", f"{', '.join(_engines(cfg))}.")
+
+
+def _silent_stand_ins(*, delegated: bool, system: bool, now: bool) -> list[str]:
+    """What leaves the channel deaf or mute while it looks fine: nanobot's transcription with
+    nothing behind it (every utterance decodes to "", the pipeline's silence), and the
+    System voice without espeak-ng."""
+    from nanobot_channel_voice.config import transcription_gap
+    from nanobot_channel_voice.tts.system import system_voice
+
+    sentences = []
+    if delegated and (gap := transcription_gap()) is not None:
+        sentences.append(
+            f"Internal delegates to nanobot's transcription, but {gap}, so every utterance "
+            f"{'is' if now else 'would be'} heard as silence."
+        )
+    if system and system_voice() is None:
+        sentences.append(
+            "System needs espeak-ng, which is not installed, so replies "
+            f"{'are' if now else 'would be'} silent."
+        )
+    return sentences
+
+
+def _running_check(cfg: Any, check: Any, why: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
+    """The live channel against the pipeline row: a row when it started without an engine
+    that row does not name as missing (fetched since, failed to load, or edited away), and
+    whether a restart would load one."""
+    from nanobot_channel_voice.running import current, preflights
+
+    started = current()
+    if started is None:
+        return None, False
+    live = started.config
+    slots, named = _slots(live), _slots(cfg)
+    missing = [
+        slot for slot in started.fell_back
+        if why.get(slot) is None or named[slot][0] != slots[slot][0]
+    ]
+    if not missing:
+        return None, False
+    now = preflights(live)
+    # Keyless, an OpenAI voice falls back again: its own row says so, a restart does not help.
+    ready = [s for s in missing if now.get(s) is None and not (s == "tts" and _keyless_openai(live))]
+    landed = [slots[s][0] for s in ready if started.fell_back[s] is not None]
+    failed = [slots[s][0] for s in ready if started.fell_back[s] is None]
+    engines = _join([slots[s][0] for s in missing])
+    stand_ins = [slots[s][2] for s in missing if slots[s][2]]
+    sentences = [f"It started without {engines}, so {_join(stand_ins)} instead." if stand_ins
+                 else f"It started without {engines}."]
+    if landed:
+        one = len(landed) == 1
+        sentences.append(f"The {_join(landed)} model{'' if one else 's'} {'is' if one else 'are'} in place now.")
+    if failed:
+        sentences.append(f"{_join(failed)} did not load, the gateway log says why.")
+    if ready:
+        restart = "Apply and restart" if _WEBUI else "Turning the channel off and on"
+        does = "tries again" if failed else f"loads {'it' if len(ready) == 1 else 'them'}"
+        sentences.append(f"{restart} {does}.")
+    sentences += _silent_stand_ins(delegated="stt" in missing, system="tts" in missing, now=True)
+    return check("running", "Running channel", "warn", " ".join(sentences)), bool(ready)
 
 
 def _why_sentences(degraded: list[tuple[str, str, Any]], store: Any) -> list[str]:
@@ -353,7 +408,9 @@ def _why_sentences(degraded: list[tuple[str, str, Any]], store: Any) -> list[str
         # remedy says so: the row would otherwise promise a download the button refuses.
         noticed = [engine for engine, key in unfetched if (index.get(key) or {}).get("accept")]
         remedy = "."
-        if listed:
+        if store.index is None:  # the panel loads it on open
+            remedy = f", Apply downloads {'it' if one else 'them'} once the model index has loaded."
+        elif listed:
             remedy = f", Apply downloads {'it' if one else 'them'}"
             if noticed and one:
                 remedy += " once its notice under Models is accepted"

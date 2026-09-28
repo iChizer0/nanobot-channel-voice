@@ -21,6 +21,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.runtime_context import RuntimeContextBlock
 
+from nanobot_channel_voice import running
 from nanobot_channel_voice.aio import cancel_and_wait
 from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
@@ -510,6 +511,7 @@ class VoiceChannel(BaseChannel):
         shell: VoiceShell | None = None
         server = None
         started = False
+        missed: dict[str, Any] = {}
         try:
             kind = backend_kind(self.config.backend)
             if kind in ("openai_dialect", "gemini"):
@@ -520,9 +522,9 @@ class VoiceChannel(BaseChannel):
                 # gateway (every other channel, cron, the WebUI) for the whole build.
                 # Nothing here binds to a loop — Queue/Event bind lazily on first use.
                 self._stt = await self._load(make_stt, self.config.stt)
-                self._warn_if_transcription_unconfigured()
+                await self._warn_if_transcription_unconfigured()
                 await self._warn_if_unified_session()
-                shell, backend, tts, blocks = await self._load(self._build_local)
+                shell, backend, tts, blocks, missed = await self._load(self._build_local)
                 instructions, tools = "", []
                 if self._running:  # a cancelled start() must not register a dead bridge
                     self._backend, self._tts_adapter, self._voice_context = backend, tts, blocks
@@ -548,6 +550,8 @@ class VoiceChannel(BaseChannel):
             if not self._running:
                 return  # stop() raced the bind: the handle was not published yet
             started = True
+            if kind == "local":
+                running.publish(self, running.Started(self.config, missed))
         finally:
             if not started:
                 # Raised or raced: a never-started backend must not stay registered (speak_final
@@ -574,9 +578,10 @@ class VoiceChannel(BaseChannel):
         await self._stop_event.wait()
         self.logger.info("voice channel stopped")
 
-    def _build_local(self) -> tuple[VoiceShell, LocalBackend, TtsAdapter | None, list]:
+    def _build_local(self) -> tuple[VoiceShell, LocalBackend, TtsAdapter | None, list, dict[str, Any]]:
         """Pure: the thread may outlive a cancelled start(), so it touches neither this
-        instance nor the global context bridge; start() publishes on the loop."""
+        instance nor the global context bridge; start() publishes on the loop. The last
+        item: the slots that started without their engine (``running.fell_back``)."""
         # The adapter's window, not config: a whisper export may override chunkLength.
         window = None if self._stt is None else self._stt.max_decode_ms
         if window is not None and self.config.vad.max_utterance_ms > window:
@@ -676,7 +681,10 @@ class VoiceChannel(BaseChannel):
             metrics=self._metrics,
             tracer=self._tracer,
         )
-        return shell, backend, tts, blocks
+        missed = running.fell_back(
+            self.config, vad=vad, turn=turn_analyzer, stt=self._stt, tts=tts, wake=wake_detector,
+        )
+        return shell, backend, tts, blocks, missed
 
     def _announce_context(self) -> None:
         if tool_created():
@@ -1122,18 +1130,30 @@ class VoiceChannel(BaseChannel):
                     ),
                 )
 
-    def _warn_if_transcription_unconfigured(self) -> None:
-        """``stt.provider="nanobot"`` with nothing behind it is a deaf channel that still
-        reports healthy: every utterance decodes to ``""`` and is dropped as silence."""
-        if self._stt is not None or self.config.stt.provider != "nanobot":
-            return  # on-device: loaded, or its own build warning already named the gap
-        gap = transcription_gap()
-        if gap is not None:
+    async def _warn_if_transcription_unconfigured(self) -> None:
+        """Delegated STT with nothing behind it is a deaf channel that still reports
+        healthy: every utterance decodes to ``""`` and is dropped as silence. Delegated =
+        ``nanobot``, or an on-device engine that did not load. Off the loop: the check
+        parses the whole config."""
+        if self._stt is not None:
+            return
+        gap = await asyncio.to_thread(transcription_gap)
+        if gap is None:
+            return
+        provider = self.config.stt.provider
+        if provider == "nanobot":
             self.logger.warning(
                 "voice: stt.provider='nanobot' delegates every utterance to nanobot's "
                 "transcription, but {} — the channel will start and hear NOTHING. Configure "
                 "it, or set stt.provider to an on-device engine.",
                 gap,
+            )
+        else:
+            self.logger.warning(
+                "voice: stt.provider='{}' did not load, so nanobot's transcription stands in, "
+                "but {} — the channel will start and hear NOTHING. Fix the engine (its own "
+                "warning says why), or configure nanobot's transcription.",
+                provider, gap,
             )
 
     async def _warn_if_unified_session(self) -> None:
@@ -1159,6 +1179,7 @@ class VoiceChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+        running.withdraw(self)
         self._drop_bridge()
         await cancel_and_wait(self._metrics_task)
         self._metrics_task = None

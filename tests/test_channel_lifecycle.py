@@ -121,7 +121,7 @@ def test_stop_landing_during_the_stt_load_still_releases_it(monkeypatch):
         may_finish.clear()
         ch = _channel(section, monkeypatch, make_stt)
         shell = _StubShell()
-        ch._build_local = lambda: (shell, None, None, [])  # type: ignore[method-assign]
+        ch._build_local = lambda: (shell, None, None, [], {})  # type: ignore[method-assign]
 
         async def build_cloud(kind):
             return shell, "", []
@@ -158,7 +158,7 @@ def test_a_start_cancelled_mid_load_frees_the_adapter_that_lands_late(monkeypatc
         may_finish.clear()
         ch = _channel(section, monkeypatch, make_stt)
         shell = _StubShell()
-        ch._build_local = lambda: (shell, None, None, [])  # type: ignore[method-assign]
+        ch._build_local = lambda: (shell, None, None, [], {})  # type: ignore[method-assign]
 
         async def build_cloud(kind):
             return shell, "", []
@@ -335,3 +335,27 @@ def test_start_failures_reach_the_webui_in_the_channels_own_words(monkeypatch):
     assert ch.start_error_message(OSError("address in use")) == "address in use"
     assert ch.start_error_message(RuntimeError("")) is None
     assert ch.start_error_message(AttributeError("'NoneType' has no attribute 'x'")) is None
+
+
+def test_a_local_start_publishes_what_it_started_without(monkeypatch):
+    """The WebUI validator compares it with the config to tell the live channel's state;
+    a stop withdraws it."""
+    from nanobot_channel_voice import running
+
+    ch = _channel(
+        {"tts": {"enabled": False}, "vad": {"engine": "silero"}, "stt": {"provider": "whisper"}},
+        monkeypatch, lambda cfg: None,  # the on-device build fell back
+    )
+
+    async def run():
+        task = await _start_until(ch, lambda: running.current() is not None)
+        published = running.current()
+        await ch.stop()
+        await task
+        return published
+
+    published = _run(run())
+    assert published is not None and published.config is ch.config
+    assert list(published.fell_back) == ["vad", "stt"]
+    assert published.fell_back["vad"].unset == ("vad.silero.modelPath",)
+    assert running.current() is None

@@ -54,34 +54,32 @@ async def _communicate(proc: asyncio.subprocess.Process, *, timeout: float) -> t
         raise
 
 
+def system_voice(espeak: str = "espeak-ng") -> tuple[str, str] | None:
+    """(kind, absolute path) of the binary the System voice runs: espeak-ng, else ``say`` on
+    macOS. None when neither is on PATH: every reply is then silent."""
+    if path := shutil.which(espeak):
+        return "espeak", path
+    if sys.platform == "darwin" and (path := shutil.which("say")):
+        return "say", path
+    return None
+
+
 class SystemTtsAdapter(TtsAdapter):
     def __init__(self, *, language: str | None = None, espeak_path: str = "espeak-ng"):
         self._language = language
         self.spoken_language = language  # espeak voice only; `say` keeps the host default
-        self._espeak = espeak_path
-        self._resolved: tuple[str | None, str | None] | None = None
         self._log = logger.bind(component="tts-system")
-
-    def _resolve(self) -> tuple[str | None, str | None]:
-        """(kind, absolute path) of the available binary, resolved once: ``shutil.which``
-        stats every PATH entry and this runs on the loop per speakable chunk. The negative
-        result is cached too, so installing espeak-ng mid-session needs a restart."""
-        if self._resolved is None:
-            path = shutil.which(self._espeak)
-            if path:
-                self._resolved = ("espeak", path)
-            elif sys.platform == "darwin" and (path := shutil.which("say")):
-                self._resolved = ("say", path)
-            else:
-                self._resolved = (None, None)
-                self._log.warning("no system TTS (espeak-ng/say) available")
-        return self._resolved
+        # At build, off the loop (which() stats every PATH entry), so a missing voice is said
+        # at start rather than at the first silent reply; installing one needs a restart.
+        self._voice = system_voice(espeak_path)
+        if self._voice is None:
+            self._log.warning("voice: the System voice needs espeak-ng on PATH; without it replies are silent")
 
     async def synthesize(self, text: str, *, voice: str | None = None) -> bytes:
         text = text.strip()
         if not text:
             return b""
-        kind, exe = self._resolve()
+        kind, exe = self._voice or (None, None)
         if kind == "espeak" and exe:
             return await self._espeak_ng(exe, text, voice)
         if kind == "say" and exe:
