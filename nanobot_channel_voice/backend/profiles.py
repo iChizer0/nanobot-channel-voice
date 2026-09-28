@@ -69,7 +69,7 @@ class RealtimeProfile:
     # prefix wins; realtime.voice still overrides the result.
     model_voice_overrides: dict[str, str] = field(default_factory=dict)
     # Per-model capability overrides, matched the same way (qwen3 is persona-only,
-    # qwen3.5 has tools).
+    # qwen3.5/qwen3.8 have tools).
     model_capability_overrides: dict[str, dict[str, bool | int]] = field(default_factory=dict)
     # Vendor-required session keys outside the common schema, merged into the beta session.
     session_extras: dict = field(default_factory=dict)
@@ -190,22 +190,23 @@ PROFILES: dict[str, RealtimeProfile] = {
         key="qwen",
         dialect="beta",
         default_base_url="wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-        default_model="qwen3-omni-flash-realtime",
-        default_voice="Chelsie",  # valid for qwen3-omni-flash-realtime
+        default_model="qwen3.8-omni-flash-realtime",
+        default_voice="Tina",  # the documented default of qwen3.5 and qwen3.8
         model_voice_overrides={
-            # qwen3.5-omni-flash-realtime drops Chelsie; its documented default is Tina.
-            "qwen3.5-omni-flash-realtime": "Tina",
+            # The older generations have no Tina (qwen3.5 dropped their Chelsie).
+            "qwen3-omni-": "Chelsie",
+            "qwen-omni-": "Chelsie",
         },
+        # qwen3.5 (flash and plus) and qwen3.8 add tool calling and require an explicit
+        # response.create after the function_call_output to produce the final answer.
+        # Big outputs push the realtime context over its limit; the server truncates.
         model_capability_overrides={
-            # qwen3.5 adds tool calling and requires an explicit response.create after
-            # the function_call_output to produce the final answer.
-            "qwen3.5-omni-flash-realtime": {
+            prefix: {
                 "supports_tools": True,
                 "needs_response_create_after_tools": True,
-                # Big outputs push the realtime context over its limit; the server
-                # truncates.
                 "max_tool_output_chars": 8000,
-            },
+            }
+            for prefix in ("qwen3.5-omni-", "qwen3.8-omni-")
         },
         input_rate=16000,   # DashScope Qwen-Omni takes 16k in, streams 24k out
         output_rate=24000,
@@ -215,8 +216,7 @@ PROFILES: dict[str, RealtimeProfile] = {
         # NB: no OpenAI-Beta header — Qwen-*ASR*-Realtime needs it and shares the
         # /api-ws/v1/realtime path, but Omni documents Authorization as its only header.
         interrupt="cancel",
-        # The default model is PERSONA-ONLY: the base must stay False or it gets tools it
-        # can't drive (qwen3.5 re-enables via the override above).
+        # Off unless a model above opts in: qwen3-omni cannot drive tools.
         supports_tools=False,
         needs_response_create_after_tools=True,
         flatten_tool_schema=True,  # Qwen-Omni rejects nullable-union types + combinators

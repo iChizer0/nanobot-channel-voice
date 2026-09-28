@@ -762,7 +762,7 @@ class RealtimeConfig(_VoiceBase):
     model: str | None = None
     base_url: str | None = None           # ``?model=`` appended at connect (GA/beta)
     api_key: str | None = None            # falls back to OPENAI_API_KEY
-    voice: str | None = None              # provider voice (e.g. OpenAI cedar/marin, Qwen Chelsie)
+    voice: str | None = None              # provider voice (e.g. OpenAI cedar/marin, Qwen Tina)
     # Replaces the built-in persona (style/identity) ONLY: the resolved toolMode's tool rules
     # (filler preamble, supervisor's ask_nanobot contract) are appended by the channel and
     # cannot be overridden — they are the wire contract. Say nothing about tools here.

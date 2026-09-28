@@ -53,18 +53,25 @@ def test_auth_header_shapes():
 
 def test_qwen_capabilities_gate_tools_per_model_generation():
     p = PROFILES["qwen"]
-    base = p.capabilities_for(p.default_model)
-    assert base["supports_tools"] is False  # qwen3 generation is persona-only
-    new = p.capabilities_for("qwen3.5-omni-flash-realtime")
-    assert new["supports_tools"] is True
-    assert new["max_tool_output_chars"] == 8000
+    old = p.capabilities_for("qwen3-omni-flash-realtime")
+    assert old["supports_tools"] is False  # qwen3 generation is persona-only
+    assert p.default_model == "qwen3.8-omni-flash-realtime"
+    for model in (
+        "qwen3.5-omni-flash-realtime",
+        "qwen3.5-omni-plus-realtime",
+        "qwen3.8-omni-flash-realtime",
+    ):
+        new = p.capabilities_for(model)
+        assert new["supports_tools"] is True, model
+        assert new["max_tool_output_chars"] == 8000
 
 
 def test_longest_prefix_wins_for_voice_overrides():
     p = PROFILES["qwen"]
     assert p.default_voice_for("qwen3-omni-flash-realtime") == "Chelsie"
     assert p.default_voice_for("qwen3.5-omni-flash-realtime") == "Tina"
-    assert p.default_voice_for(None) == "Chelsie"
+    assert p.default_voice_for("qwen3.8-omni-flash-realtime") == "Tina"
+    assert p.default_voice_for(None) == "Tina"
 
 
 def test_beta_profiles_carry_vendor_format_strings():
