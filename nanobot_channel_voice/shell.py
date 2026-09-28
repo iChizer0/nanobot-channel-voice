@@ -29,6 +29,7 @@ from .backend.audio_sink import AudioSink
 from .backend.base import (
     Error,
     InputTranscript,
+    Instructions,
     OutputAudio,
     OutputTranscript,
     StateHint,
@@ -117,7 +118,7 @@ class VoiceShell:
     # ---- lifecycle ----------------------------------------------------------
 
     async def start(
-        self, *, instructions: str | None = None, tools: list[ToolDef] | None = None
+        self, *, instructions: Instructions = None, tools: list[ToolDef] | None = None
     ) -> None:
         self._running = True
         await self._capture.start()

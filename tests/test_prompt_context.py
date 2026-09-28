@@ -10,6 +10,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.runtime_context import normalize_runtime_context_blocks
 
 from nanobot_channel_voice.channel import (
+    _AGENT_CONTEXT_HEAD,
     _DEFAULT_PERSONA,
     _DIRECT_RULES,
     _NOTICE_RULE,
@@ -63,6 +64,63 @@ def test_direct_rules_survive_a_persona_override():
     out = _cloud_instructions("Speak like a pirate.", supervisor=False, has_tools=True)
     assert _DIRECT_RULES in out
     assert _SUPERVISOR_RULES not in out
+
+
+def test_agent_context_and_clock_sit_between_persona_and_rules():
+    out = _cloud_instructions(
+        None, supervisor=False, has_tools=True,
+        agent_context="# Memory\n\nAda's cat is Turing.\n", clock="[time at connect: X]",
+    )
+    assert out == "\n\n".join((
+        _DEFAULT_PERSONA, "[time at connect: X]", _AGENT_CONTEXT_HEAD,
+        "# Memory\n\nAda's cat is Turing.", _DIRECT_RULES, _STOP_RULE, _NOTICE_RULE,
+    ))
+    # A blank context adds no heading.
+    assert _AGENT_CONTEXT_HEAD not in _cloud_instructions(
+        None, supervisor=False, has_tools=True, agent_context="  \n"
+    )
+
+
+class _FakeGateway:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    async def get_agent_context(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        if self.fail:
+            raise RuntimeError("gateway down")
+        return "# Memory\n\nAda's cat is Turing."
+
+
+def _instructions(gateway, *, supervisor: bool, has_tools: bool) -> str:
+    channel = VoiceChannel(VoiceConfig(), MessageBus(), tool_gateway=gateway)
+    return asyncio.run(channel._instructions_source(supervisor, has_tools)())
+
+
+def test_cloud_instructions_carry_the_agent_context_and_a_clock():
+    gateway = _FakeGateway()
+    out = _instructions(gateway, supervisor=False, has_tools=True)
+    assert _AGENT_CONTEXT_HEAD in out and "Ada's cat is Turing." in out
+    assert re.search(r"\[time at connect: \d{4}-\d{2}-\d{2} \(\w+day\) \d{2}:\d{2}", out)
+    assert gateway.calls == [{"channel": "voice", "chat_id": "voice:local", "include_skills": True}]
+
+
+def test_only_a_direct_session_with_tools_gets_the_skills_index():
+    # Supervisor reaches skills through ask_nanobot; a tool-less model cannot read them.
+    for supervisor, has_tools in ((True, True), (False, False)):
+        gateway = _FakeGateway()
+        _instructions(gateway, supervisor=supervisor, has_tools=has_tools)
+        assert gateway.calls[0]["include_skills"] is False
+
+
+def test_a_failing_or_missing_gateway_keeps_persona_and_rules():
+    for gateway in (_FakeGateway(fail=True), None):
+        out = _instructions(gateway, supervisor=False, has_tools=False)
+        assert out.startswith(_DEFAULT_PERSONA)
+        assert _AGENT_CONTEXT_HEAD not in out
+        assert "[time at connect: " in out
+        assert out.endswith(f"{_STOP_RULE}\n\n{_NOTICE_RULE}")
 
 
 # ---- local speakability context ---------------------------------------------

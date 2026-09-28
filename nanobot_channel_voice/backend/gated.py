@@ -33,6 +33,7 @@ from nanobot_channel_voice.wake.phrase import WakePhrase
 
 from .audio_sink import AudioSink
 from .base import (
+    Instructions,
     ManualTurnBackend,
     OnEvent,
     OutputTranscript,
@@ -162,7 +163,7 @@ class GatedUplink:
     # ---- VoiceBackend -------------------------------------------------------
 
     async def start(
-        self, *, instructions: str | None, tools: list[ToolDef], on_event: OnEvent
+        self, *, instructions: Instructions, tools: list[ToolDef], on_event: OnEvent
     ) -> None:
         self._on_event = on_event
         await self._inner.start(

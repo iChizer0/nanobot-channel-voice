@@ -181,6 +181,9 @@ VoiceEvent = (
 )
 
 OnEvent = Callable[[VoiceEvent], Awaitable[None]]
+# A cloud session's instructions: fixed text, or a source resolved again at every connect
+# so a reconnected session carries fresh context.
+Instructions = str | Callable[[], Awaitable[str]] | None
 
 
 @runtime_checkable
@@ -194,7 +197,7 @@ class VoiceBackend(Protocol):
     pace_output_audio: bool
 
     async def start(
-        self, *, instructions: str | None, tools: list[ToolDef], on_event: OnEvent
+        self, *, instructions: Instructions, tools: list[ToolDef], on_event: OnEvent
     ) -> None:
         """Begin a session and spawn the backend's tasks. ``local`` ignores ``instructions``
         / ``tools`` (nanobot owns persona + tools); ``cloud`` sends ``session.update``, then

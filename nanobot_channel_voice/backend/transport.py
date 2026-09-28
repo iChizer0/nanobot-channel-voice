@@ -33,7 +33,15 @@ from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.metrics import VoiceMetrics
 
 from .audio_sink import AudioSink
-from .base import NOTICE_BACKLOG, Error, OnEvent, ToolDef, UserSpeechStarted, VoiceState
+from .base import (
+    NOTICE_BACKLOG,
+    Error,
+    Instructions,
+    OnEvent,
+    ToolDef,
+    UserSpeechStarted,
+    VoiceState,
+)
 from .common import TurnEventMixin
 
 _SEND_Q_MAX = 64  # ~1.3s of 20ms frames; drop-oldest past this
@@ -113,6 +121,7 @@ class RealtimeTransport(TurnEventMixin):
         self._parked = False
         self._on_event: OnEvent | None = None
         self._instructions: str | None = None
+        self._instructions_source: Instructions = None  # resolved at every connect
         self._tools: list[ToolDef] = []
 
         self._ws = None
@@ -153,6 +162,10 @@ class RealtimeTransport(TurnEventMixin):
     def _hello_payload(self) -> dict:
         """The first frame after connect (session.update / setup)."""
         raise NotImplementedError
+
+    def _keeps_instructions(self) -> bool:
+        """This connect resumes a session that keeps the instructions it started with."""
+        return False
 
     def _audio_frame(self, pcm: bytes) -> dict:
         """The wire frame carrying one captured chunk."""
@@ -198,10 +211,13 @@ class RealtimeTransport(TurnEventMixin):
         return self._metrics
 
     async def start(
-        self, *, instructions: str | None, tools: list[ToolDef], on_event: OnEvent
+        self, *, instructions: Instructions, tools: list[ToolDef], on_event: OnEvent
     ) -> None:
         self._on_event = on_event
-        self._instructions = instructions
+        if callable(instructions):
+            self._instructions_source, self._instructions = instructions, None
+        else:
+            self._instructions_source, self._instructions = None, instructions
         self._tools = tools or []
         self._closing = False
         self._rx_task = asyncio.create_task(self._rx_loop())
@@ -507,6 +523,13 @@ class RealtimeTransport(TurnEventMixin):
 
     async def _connect_and_run(self) -> None:
         connect = _load_connect()
+        if self._instructions_source is not None and (
+            self._instructions is None or not self._keeps_instructions()
+        ):
+            try:
+                self._instructions = await self._instructions_source()
+            except Exception:  # noqa: BLE001 - the last instructions beat none
+                self._log.exception("could not refresh the session instructions")
         try:
             url, headers = self._connect_args()
             hello = self._hello_payload()

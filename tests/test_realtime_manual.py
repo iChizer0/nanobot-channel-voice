@@ -819,3 +819,50 @@ def test_a_connect_that_cannot_be_prepared_is_fatal_not_laddered(monkeypatch):
 
 def _never_connect(*_args, **_kwargs):
     raise AssertionError("the hello must be built before the socket opens")
+
+
+class _ClosingSocket:
+    """A socket the server closes straight after the hello: every connect is one hello."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+def test_an_instructions_source_is_resolved_again_at_every_connect(monkeypatch):
+    """A reconnected session carries fresh context; a source that fails keeps the last."""
+    monkeypatch.setattr(transport, "_BACKOFF", (0.0, 0.0, 0.0))
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+
+    async def _run():
+        backend, sent, _ = make_backend()
+        versions = iter(["v1", RuntimeError("gateway down"), "v3"])
+
+        async def source() -> str:
+            value = next(versions, "v3")
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        monkeypatch.setattr(
+            transport, "_load_connect", lambda: lambda *_a, **_k: _ClosingSocket()
+        )
+        await backend.start(instructions=source, tools=[], on_event=backend._on_event)
+        for _ in range(100):
+            hellos = [p for p in sent if p.get("type") == "session.update"]
+            if len(hellos) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        await backend.close()
+        seen = [p["session"]["instructions"] for p in hellos[:3]]
+        assert seen == ["v1", "v1", "v3"]
+
+    run(_run())

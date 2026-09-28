@@ -30,6 +30,7 @@ from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
     NOTICE_MARK,
     AbandonedResult,
+    Instructions,
     ReceiptResult,
     ToolDef,
     VoiceState,
@@ -50,6 +51,7 @@ from nanobot_channel_voice.config import (
 from nanobot_channel_voice.context_tool import (
     VoiceContextBridge,
     register_bridge,
+    time_note,
     tool_created,
     unregister_bridge,
 )
@@ -75,6 +77,14 @@ _DIRECT_RULES = (
     "implying success or failure), then call it with no further speech. Skip the "
     "filler when you expect the answer immediately. The reply that delivers the "
     "answer is pure answer: never open it with wait phrases or progress narration."
+)
+
+# Heads nanobot's workspace, profile files, memory and (direct mode) skills index: the
+# realtime model runs without nanobot's system prompt, so this is all it knows of the agent.
+# Written for text, so the voice rules around it win.
+_AGENT_CONTEXT_HEAD = (
+    "You speak for the agent below: its workspace, profile, memory and skills are "
+    "yours. Where it asks for formatting, the voice rules win."
 )
 
 # Silence-is-the-ack, model-side half: enforcement is backend._consume_stop's
@@ -194,13 +204,26 @@ def _agent_initiated(metadata: dict[str, Any] | None) -> bool:
     return bool(meta.get("_cron_trigger") or meta.get("_local_trigger"))
 
 
-def _cloud_instructions(persona: str | None, *, supervisor: bool, has_tools: bool) -> str:
-    """The realtime session's instructions: persona (taste) then the mode's tool rules
-    (contract). ONE derivation, so a ``realtime.persona`` override restyles the voice but
-    never deletes the delegation contract or the filler preamble."""
+def _cloud_instructions(
+    persona: str | None,
+    *,
+    supervisor: bool,
+    has_tools: bool,
+    agent_context: str | None = None,
+    clock: str | None = None,
+) -> str:
+    """The realtime session's instructions: persona (taste), the clock, the agent's own
+    context, then the mode's tool rules (contract). ONE derivation, so a
+    ``realtime.persona`` override restyles the voice but never deletes the delegation
+    contract or the filler preamble."""
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
+    context = (
+        f"{_AGENT_CONTEXT_HEAD}\n\n{agent_context.strip()}"
+        if agent_context and agent_context.strip() else ""
+    )
     return "\n\n".join(
-        part for part in (persona or _DEFAULT_PERSONA, rules, _STOP_RULE, _NOTICE_RULE)
+        part
+        for part in (persona or _DEFAULT_PERSONA, clock, context, rules, _STOP_RULE, _NOTICE_RULE)
         if part
     )
 
@@ -709,7 +732,7 @@ class VoiceChannel(BaseChannel):
                 "the model; reinstall the plugin so the gateway sees its entry points"
             )
 
-    async def _build_cloud(self, kind: str) -> tuple[VoiceShell, str, list]:
+    async def _build_cloud(self, kind: str) -> tuple[VoiceShell, Instructions, list]:
         rt = self.config.realtime
         # Fail fast on STATIC config errors before any device is claimed: left to the
         # backend they raise in the rx task, where the reconnect ladder reads them as
@@ -810,10 +833,32 @@ class VoiceChannel(BaseChannel):
         # Supervisor rules only when the delegated tool is wired; direct rules only when
         # there are tools whose round-trip needs masking.
         supervisor = rt.tool_mode == "supervisor" and exec_tool is not None
-        instructions = _cloud_instructions(
-            rt.persona, supervisor=supervisor, has_tools=bool(tools)
-        )
-        return shell, instructions, tools
+        return shell, self._instructions_source(supervisor, bool(tools)), tools
+
+    def _instructions_source(self, supervisor: bool, has_tools: bool) -> Instructions:
+        """The cloud session's instructions, resolved at every connect so a reconnected
+        session reads fresh memory, skills and time."""
+        gw = self._tool_gateway
+
+        async def instructions() -> str:
+            context = None
+            if gw is not None:
+                try:
+                    context = await gw.get_agent_context(
+                        channel=self.name, chat_id=self.config.chat_id,
+                        # The skills index only helps a model holding read_file.
+                        include_skills=has_tools and not supervisor,
+                    )
+                except Exception:  # noqa: BLE001 - persona and rules still hold
+                    self.logger.exception("voice: could not read the agent context")
+            text = _cloud_instructions(
+                self.config.realtime.persona, supervisor=supervisor, has_tools=has_tools,
+                agent_context=context, clock=time_note("time at connect"),
+            )
+            self.logger.debug("voice: session instructions are {} chars", len(text))
+            return text
+
+        return instructions
 
     async def _build_gate(
         self, inner, audio_sink: AudioSink, aec_stage, *,
@@ -871,7 +916,7 @@ class VoiceChannel(BaseChannel):
         ``cancel_nanobot`` to stop it."""
         gw = self._tool_gateway
         if gw is None:
-            # No core passes one today. A toolMode the user SET is inert: say so, or a
+            # Official core passes none. A toolMode the user SET is inert: say so, or a
             # supervisor session looks like a plain chatbot that forgot how to delegate.
             level = (
                 "warning" if "tool_mode" in self.config.realtime.model_fields_set else "info"

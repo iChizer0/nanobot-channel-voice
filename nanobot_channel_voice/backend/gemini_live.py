@@ -278,7 +278,8 @@ class GeminiLiveBackend(RealtimeTransport):
         sep = "&" if "?" in base else "?"
         return f"{base}{sep}key={self._api_key()}", {}
 
-    def _hello_payload(self) -> dict:
+    def _live_handle(self) -> str | None:
+        """The resumption handle, dropped once expired."""
         if (
             self._resume_handle
             and self._handle_since
@@ -286,6 +287,14 @@ class GeminiLiveBackend(RealtimeTransport):
         ):
             self._log.info("gemini: resumption handle expired; starting a fresh session")
             self._resume_handle = None
+        return self._resume_handle
+
+    def _keeps_instructions(self) -> bool:
+        # Whether a resumed session takes a changed systemInstruction is undocumented.
+        return self._live_handle() is not None
+
+    def _hello_payload(self) -> dict:
+        self._live_handle()
         model = self._model if self._model.startswith("models/") else f"models/{self._model}"
         generation: dict = {
             "responseModalities": ["AUDIO"],

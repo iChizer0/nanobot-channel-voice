@@ -1145,3 +1145,58 @@ def test_a_continuation_under_the_fillers_drain_stays_speaking():
         await sink.stop()
 
     asyncio.run(_run())
+
+
+def test_a_resumed_session_keeps_the_instructions_it_started_with(monkeypatch):
+    """Whether a resumed setup may change systemInstruction is undocumented: the refresh
+    waits for a fresh session (no handle, or an expired one)."""
+    from nanobot_channel_voice.backend import transport
+
+    class _ClosingSocket:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    monkeypatch.setattr(transport, "_BACKOFF", (0.0, 0.0, 0.0))
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+
+    async def _run():
+        backend, sent, _ = make_backend()
+        versions = iter(["v1", "v2", "v3"])
+
+        async def source() -> str:
+            return next(versions)
+
+        opened = 0
+
+        def connect(*_a, **_k):
+            nonlocal opened
+            opened += 1
+            if opened == 1:  # the first session hands out a handle
+                backend._resume_handle, backend._handle_since = "h", gl.time.monotonic()
+            elif opened == 2:  # ... which expires before the third connect
+                monkeypatch.setattr(gl, "_RESUME_HANDLE_S", -1.0)
+            return _ClosingSocket()
+
+        monkeypatch.setattr(transport, "_load_connect", lambda: connect)
+        await backend.start(instructions=source, tools=[], on_event=backend._on_event)
+        for _ in range(100):
+            setups = [p["setup"] for p in sent if "setup" in p]
+            if len(setups) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        await backend.close()
+        texts = [s["systemInstruction"]["parts"][0]["text"] for s in setups[:3]]
+        assert texts == ["v1", "v1", "v2"]  # resumed keeps v1; the fresh session reads again
+        assert "handle" in setups[1]["sessionResumption"]
+        assert setups[2]["sessionResumption"] == {}
+
+    asyncio.run(_run())

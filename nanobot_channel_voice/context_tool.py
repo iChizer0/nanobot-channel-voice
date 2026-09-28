@@ -25,13 +25,13 @@ from nanobot_channel_voice.streamid import TURN_META
 _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 
-def _time_note() -> str:
+def time_note(label: str = "time now") -> str:
     """The model's only clock: core injects no date or time anywhere (0.3.0), and
     without one the model invents a placeholder. Computed at resolve time, so a cron turn
     reads the fire-time clock, not its creation-time one."""
     now = datetime.now().astimezone()
     offset = now.strftime("%z")
-    return (f"[time now: {now:%Y-%m-%d} ({_WEEKDAYS[now.weekday()]}) {now:%H:%M}, "
+    return (f"[{label}: {now:%Y-%m-%d} ({_WEEKDAYS[now.weekday()]}) {now:%H:%M}, "
             f"UTC{offset[:3]}:{offset[3:]}]")
 
 
@@ -62,7 +62,7 @@ class VoiceContextBridge:
         token = metadata.get(TURN_META)
         notes = self._notes.pop(token, ()) if isinstance(token, str) else ()
         turn_block = RuntimeContextBlock(
-            source="voice", content="\n".join((_time_note(), *notes))
+            source="voice", content="\n".join((time_note(), *notes))
         )
         return [*self.blocks, turn_block]
 
