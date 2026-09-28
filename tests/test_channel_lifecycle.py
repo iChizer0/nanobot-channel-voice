@@ -359,3 +359,34 @@ def test_a_local_start_publishes_what_it_started_without(monkeypatch):
     assert list(published.fell_back) == ["vad", "stt"]
     assert published.fell_back["vad"].unset == ("vad.silero.modelPath",)
     assert running.current() is None
+
+
+def test_core_sees_the_channel_running_once_its_pipeline_is_up(monkeypatch):
+    """Core's status reads is_running: "starting" through the model loads (the WebUI checks
+    the setup again when it turns "running", once the fallbacks are published)."""
+    from nanobot_channel_voice import running
+
+    loading, may_finish = threading.Event(), threading.Event()
+
+    def make_stt(cfg):
+        loading.set()
+        may_finish.wait(5)
+        return _FakeStt()
+
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, make_stt)
+
+    async def run():
+        task = await _start_until(ch, loading.is_set)
+        seen = [ch.is_running]
+        may_finish.set()
+        for _ in range(500):
+            if ch.is_running or task.done():
+                break
+            await asyncio.sleep(0.01)
+        seen += [ch.is_running, running.current() is not None]
+        await ch.stop()
+        seen.append(ch.is_running)
+        await task
+        return seen
+
+    assert _run(run()) == [False, True, True, False]

@@ -879,6 +879,11 @@ def test_transcription_gap_warning_names_the_path_that_delegates(monkeypatch):
     warned.clear()
     channel._stt = object()  # loaded: core transcription is off the path
     _run(channel._warn_if_transcription_unconfigured())
+    served = VoiceChannel(
+        VoiceConfig.model_validate({"stt": {"provider": "whisper", "serve": {"enabled": True}}}), MessageBus(),
+    )
+    served.logger = _Log()  # type: ignore[assignment]
+    _run(served._warn_if_transcription_unconfigured())  # serving refuses to start instead
     monkeypatch.setattr(channel_mod, "transcription_gap", lambda: None)
     channel._stt = None
     _run(channel._warn_if_transcription_unconfigured())

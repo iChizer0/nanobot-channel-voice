@@ -231,7 +231,8 @@ def test_setup_validator_nudges_by_form_label(monkeypatch):
 
     # an open mic on the cloud path needs a real canceller (start() refuses otherwise):
     # the row names the two rows that fix it, both advanced, and any of the start-time
-    # outs silences it
+    # outs silences it (the WebRTC one with its binding, pinned installed here)
+    monkeypatch.setattr(manifest, "find_spec", lambda _name: object())
     out = manifest._validate({"backend": "openai", "realtime": {"bargeIn": "aec"}}, ctx)
     assert _check_ids(out)["realtime_aec"]["message"] == (
         "Open mic barge-in needs echo cancellation. Under Provider in Advanced, set Echo "
@@ -634,10 +635,14 @@ def test_setup_validator_stays_within_the_rendered_check_budget(monkeypatch):
     ctx = ChannelValidationContext()
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    # every local row at once: a fallback, a live channel that started without its (keyless)
-    # voice, a cloud setting Local ignores, the key nudge, and the devices row
-    local = {"vad": {"engine": "firered"}, "realtime": {"model": "m"}, "importJson": "{}"}
-    started = running.Started(VoiceConfig.model_validate(local), {"tts": None})
+    # every local row at once: a fallback, a live channel that started without an engine that
+    # loads now, a cloud setting Local ignores, the key nudge, and the devices row
+    paths = ("encoderPath", "decoderPath", "vocabPath", "melFiltersPath")
+    local = {
+        "vad": {"engine": "firered"}, "realtime": {"model": "m"}, "importJson": "{}",
+        "stt": {"provider": "whisper", "whisper": {p: f"/m/{p}" for p in paths}},
+    }
+    started = running.Started(VoiceConfig.model_validate(local), {"stt": None})
     monkeypatch.setattr(running, "_current", (object(), started))
     local_worst = manifest._validate(local, ctx)
     assert [c["id"] for c in local_worst["checks"]] == [
@@ -803,6 +808,14 @@ def test_running_row_tells_what_the_live_channel_started_without(monkeypatch, tm
         f"Whisper did not load, the gateway log says why. {restart} tries again."
     )
 
+    # a restart runs the section as it stands, not as the channel started: another model of
+    # the same engine that is in place is what it loads
+    other = "stt/whisper/small/onnx"
+    started({"stt": Fallback(key=other)}, config={"stt": {"provider": "whisper", "whisper": {"weights": other}}})
+    out = manifest._validate(section, ctx)
+    assert _check_ids(out)["running"]["message"].endswith(f"The Whisper model is in place now. {restart} loads it.")
+    assert out["restart"] is True
+
     # a pending edit picked another engine: this row keeps the live one, nothing to restart
     w.prune(_WHISPER)
     started({"stt": Fallback(key=_WHISPER)})
@@ -810,12 +823,17 @@ def test_running_row_tells_what_the_live_channel_started_without(monkeypatch, tm
     assert _check_ids(out)["running"]["message"] == "It started without Whisper, so Internal transcribes instead."
     assert "restart" not in out
 
-    # a keyless OpenAI voice falls back again on any restart; its own row says why
+    # the keyless OpenAI voice has its own row; a key in the section makes the restart worth it
     monkeypatch.delenv("OPENAI_API_KEY")
     started({"tts": None}, config={})
     out = manifest._validate({}, ctx)
-    assert _check_ids(out)["running"]["message"] == "It started without OpenAI, so System speaks instead."
-    assert "tts_key" in _check_ids(out) and "restart" not in out
+    assert "running" not in _check_ids(out) and "tts_key" in _check_ids(out)
+    out = manifest._validate({"tts": {"apiKey": "sk-x"}}, ctx)
+    assert _check_ids(out)["running"]["message"] == (
+        "It started without OpenAI, so System speaks instead. OpenAI did not load, the gateway "
+        f"log says why. {restart} tries again."
+    )
+    assert out["restart"] is True
 
 
 def test_a_late_withdraw_leaves_the_restarted_channels_record():

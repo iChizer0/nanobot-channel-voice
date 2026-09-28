@@ -356,25 +356,25 @@ def _silent_stand_ins(*, delegated: bool, system: bool, now: bool) -> list[str]:
 
 
 def _running_check(cfg: Any, check: Any, why: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
-    """The live channel against the pipeline row: a row when it started without an engine
-    that row does not name as missing (fetched since, failed to load, or edited away), and
-    whether a restart would load one."""
-    from nanobot_channel_voice.running import current, preflights
+    """The live channel against the rows above: a row for an engine it started without that
+    they do not name as missing (fetched since, failed to load, or edited away), and whether
+    a restart, which runs the section as it stands, would load one."""
+    from nanobot_channel_voice.running import current
 
     started = current()
     if started is None:
         return None, False
-    live = started.config
-    slots, named = _slots(live), _slots(cfg)
+    slots, named = _slots(started.config), _slots(cfg)
+    same = {s for s in started.fell_back if named[s][0] == slots[s][0]}
+    # The rows above speak for a slot they name missing under the same engine, and the
+    # keyless OpenAI voice has a row of its own.
     missing = [
-        slot for slot in started.fell_back
-        if why.get(slot) is None or named[slot][0] != slots[slot][0]
+        s for s in started.fell_back
+        if s not in same or (why.get(s) is None and not (s == "tts" and _keyless_openai(cfg)))
     ]
     if not missing:
         return None, False
-    now = preflights(live)
-    # Keyless, an OpenAI voice falls back again: its own row says so, a restart does not help.
-    ready = [s for s in missing if now.get(s) is None and not (s == "tts" and _keyless_openai(live))]
+    ready = [s for s in missing if s in same and s in why]  # the section runs it, and it loads
     landed = [slots[s][0] for s in ready if started.fell_back[s] is not None]
     failed = [slots[s][0] for s in ready if started.fell_back[s] is None]
     engines = _join([slots[s][0] for s in missing])

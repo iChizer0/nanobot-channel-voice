@@ -447,6 +447,7 @@ class VoiceChannel(BaseChannel):
         self._shell: VoiceShell | None = None
         self._backend: LocalBackend | RealtimeBackend | GeminiLiveBackend | GatedUplink | None = None
         self._stop_event: asyncio.Event | None = None
+        self._up = False  # start() has built the pipeline (is_running)
         self._stt: SttAdapter | None = None
         self._stt_server = None             # stt.serve: local /v1/audio/transcriptions
         self._tts_adapter = None            # local mode only; kept for warmup
@@ -479,6 +480,12 @@ class VoiceChannel(BaseChannel):
 
     # ---- lifecycle ----------------------------------------------------------
 
+    @property
+    def is_running(self) -> bool:
+        """Once start() has built the pipeline: core shows "starting" through the model loads,
+        and the WebUI checks the setup again when it turns "running"."""
+        return self._running and self._up
+
     def start_error_message(self, error: Exception) -> str | None:
         """The WebUI's "Failed" box: core shows this text, else "Check gateway logs".
         start() words its own refusals for the operator (a missing key or extra, weights,
@@ -490,6 +497,7 @@ class VoiceChannel(BaseChannel):
 
     async def start(self) -> None:
         self._running = True
+        self._up = False
         self._stop_event = asyncio.Event()
         if self.config.import_json:
             # A WebUI paste pending in config.json: expand it into real section keys and
@@ -552,6 +560,7 @@ class VoiceChannel(BaseChannel):
             started = True
             if kind == "local":
                 running.publish(self, running.Started(self.config, missed))
+            self._up = True
         finally:
             if not started:
                 # Raised or raced: a never-started backend must not stay registered (speak_final
@@ -1135,8 +1144,8 @@ class VoiceChannel(BaseChannel):
         healthy: every utterance decodes to ``""`` and is dropped as silence. Delegated =
         ``nanobot``, or an on-device engine that did not load. Off the loop: the check
         parses the whole config."""
-        if self._stt is not None:
-            return
+        if self._stt is not None or self.config.stt.serve.enabled:
+            return  # serving refuses to start without its engine: nothing delegates
         gap = await asyncio.to_thread(transcription_gap)
         if gap is None:
             return
