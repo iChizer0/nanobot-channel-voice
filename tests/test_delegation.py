@@ -672,6 +672,29 @@ def test_missing_tool_gateway_says_the_tool_mode_is_inert():
     run(_case())
 
 
+def test_direct_mode_leaves_out_the_context_bridge_tool():
+    """voice_context carries local turns' runtime context and does nothing when called;
+    a realtime model gets nanobot's context in its instructions instead."""
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    class _Gateway:
+        async def get_tool_definitions(self):
+            return [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in ("read_file", "voice_context", "web_search")
+            ]
+
+    async def _case():
+        cfg = VoiceConfig.model_validate({"backend": "openai", "realtime": {"apiKey": "k"}})
+        ch = VoiceChannel(cfg, MessageBus(), tool_gateway=_Gateway())
+        tools, _ = await ch._cloud_tools(True, "direct")
+        assert [t.name for t in tools] == ["read_file", "web_search"]
+
+    run(_case())
+
+
 def test_supervisor_mode_warns_under_a_unified_session(monkeypatch):
     """A delegated request is a bus turn too: in one shared session it can be folded into
     another channel's turn, whose reply the delegation never collects. Direct mode runs

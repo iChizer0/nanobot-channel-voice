@@ -21,6 +21,9 @@ from nanobot.runtime_context import RuntimeContextBlock
 
 from nanobot_channel_voice.streamid import TURN_META
 
+# The bridge's tool name: every channel's model sees it, a realtime one need not.
+CONTEXT_TOOL_NAME = "voice_context"
+
 # English weekday names regardless of the process locale (%A localizes).
 _WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
@@ -116,7 +119,7 @@ class VoiceContextTool(Tool):
 
     @property
     def name(self) -> str:
-        return "voice_context"
+        return CONTEXT_TOOL_NAME
 
     @property
     def description(self) -> str:

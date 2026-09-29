@@ -49,6 +49,7 @@ from nanobot_channel_voice.config import (
     unified_session,
 )
 from nanobot_channel_voice.context_tool import (
+    CONTEXT_TOOL_NAME,
     VoiceContextBridge,
     register_bridge,
     time_note,
@@ -946,8 +947,10 @@ class VoiceChannel(BaseChannel):
             return [_SUPERVISOR_TOOL, _CANCEL_TOOL], self._supervisor_tool
 
         # Direct mode. The gateway derives the session key from channel/chat_id as the bus
-        # does, so cloud tools share the voice session's working dir / memory.
+        # does, so cloud tools share the voice session's working dir / memory. The context
+        # bridge stays registered for local turns; a realtime model has no use for it.
         tools = [ToolDef.from_nanobot_schema(s) for s in await gw.get_tool_definitions()]
+        tools = [t for t in tools if t.name != CONTEXT_TOOL_NAME]
 
         async def exec_tool(name: str, args: str, turn: str):
             return await gw.execute_tool(
