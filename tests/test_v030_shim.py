@@ -43,12 +43,13 @@ def test_runtime_shim_reexports_the_channel():
     assert VoiceChannel.name == "voice"  # load_channel_class checks this match
 
 
-def test_connect_shim_reexports_the_sync_connector():
+def test_connect_shim_hands_core_the_store_the_channel_uses():
     mod = _load("voice_shim_connect", _SHIM / "connect.py")
-    from nanobot_channel_voice.webui_sync import VoiceSyncStore
+    from nanobot_channel_voice.webui_sync import store
 
-    assert mod.VoiceSyncStore is VoiceSyncStore
-    assert callable(getattr(VoiceSyncStore(), "handle"))  # load_connector's one check
+    assert mod.store is store
+    assert store() is store()  # core's factory and every channel's keeper share one writer
+    assert callable(getattr(store(), "handle"))  # load_connector's one check
 
 
 def test_manifest_logo_is_an_inline_image_where_core_can_show_one():
@@ -344,6 +345,7 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
     # unfetched weights keys warn as one sentence, with Apply as the remedy when the
     # cached index lists every one of them (the Models section says what Apply moves); with
     # no index cached yet (a first sync that failed), once the panel has loaded one
+    monkeypatch.setattr(manifest, "_WEBUI", {"webui": manifest._PANEL})
     monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(tmp_path / "empty-store"))
     section = {"vad": {"engine": "firered", "firered": {"weights": "vad/firered/onnx"}}}
     message = _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]
@@ -384,6 +386,25 @@ def test_setup_validator_is_backend_aware(monkeypatch, tmp_path):
         "The Matcha model is not fetched yet, Apply downloads it once its notice under Models "
         "is accepted. Until then System speaks."
     )
+    # a notice the section accepts holds nothing
+    accepting = {**one, "models": {"acceptNotices": ["tts/matcha/en/onnx"]}}
+    assert _check_ids(manifest._validate(accepting, ctx))["pipeline"]["message"] == (
+        "The Matcha model is not fetched yet, Apply downloads it. Until then System speaks."
+    )
+    # core's generic pane has no Apply: the channel fetches on its own, the notice waits
+    # for the config, and without autoFetch the CLI is the remedy
+    monkeypatch.setattr(manifest, "_WEBUI", {})
+    assert _check_ids(manifest._validate(one, ctx))["pipeline"]["message"] == (
+        "The Matcha model is not fetched yet, the channel fetches it once `models.acceptNotices` "
+        "accepts its license notice. Until then System speaks."
+    )
+    assert _check_ids(manifest._validate(accepting, ctx))["pipeline"]["message"] == (
+        "The Matcha model is not fetched yet, the channel fetches it on its own. Until then System speaks."
+    )
+    assert _check_ids(manifest._validate({**accepting, "models": {"autoFetch": False}}, ctx))["pipeline"][
+        "message"
+    ] == "The Matcha model is not fetched yet, `nanobot-voice sync` fetches it. Until then System speaks."
+    monkeypatch.setattr(manifest, "_WEBUI", {"webui": manifest._PANEL})
     section["tts"]["matcha"]["weights"] = "tts/matcha/mine/onnx"  # one of them unlisted: no Apply
     assert _check_ids(manifest._validate(section, ctx))["pipeline"]["message"].startswith(
         "The FireRed and Matcha models are not fetched yet. Until then"
@@ -508,7 +529,13 @@ def test_setup_validator_gate_row_mirrors_the_cloud_start(monkeypatch, tmp_path)
     entry = {"files": {"m.onnx": {"url": "https://x/m", "sha256": "0" * 64, "size": 1}}}
     cache.write_text(json.dumps({"models": {"vad/silero/v6/onnx": entry}}))
     listed = {"engine": "silero", "silero": {"weights": "vad/silero/v6/onnx"}}
+    monkeypatch.setattr(manifest, "_WEBUI", {"webui": manifest._PANEL})
+    # the start waits for a model the channel fetches on its own
     assert gate({**cloud, "realtime": {"uplink": "vad"}, "vad": listed})["message"] == (
+        "The Silero model is not fetched yet, Apply downloads it. The channel starts once it lands."
+    )
+    manual = {**cloud, "realtime": {"uplink": "vad"}, "vad": listed, "models": {"autoFetch": False}}
+    assert gate(manual)["message"] == (
         "The Silero model is not fetched yet, Apply downloads it. The channel does not start without it."
     )
     row = gate({**cloud, "realtime": {"uplink": "vad"}, "vad": {**silero, "turn": {"engine": "smartturn"}}})
@@ -847,3 +874,81 @@ def test_a_late_withdraw_leaves_the_restarted_channels_record():
     assert running.current() is record
     running.withdraw(new)
     assert running.current() is None
+
+
+class _StatusKeeper:
+    """What the validator asks of the channel's keeper: its status, nothing else."""
+
+    def __init__(self, status):
+        self._status = status
+
+    def status(self):
+        return self._status
+
+
+def test_the_pipeline_row_follows_the_channels_own_fetch(monkeypatch, tmp_path):
+    from nanobot.channels.contracts import ChannelValidationContext
+
+    from nanobot_channel_voice.keeper import Status
+    from nanobot_channel_voice.webui_sync import store
+
+    manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
+    ctx = ChannelValidationContext()
+    monkeypatch.setenv("NANOBOT_VOICE_MODELS_DIR", str(tmp_path / "store"))
+    monkeypatch.setattr(manifest, "_WEBUI", {"webui": manifest._PANEL})
+    section = {"vad": {"engine": "silero", "silero": {"weights": "vad/silero/v6/onnx"}}}
+
+    def row():
+        return _check_ids(manifest._validate(section, ctx))["pipeline"]["message"]
+
+    store().attach(_StatusKeeper(Status(state="fetching", keys=("vad/silero/v6/onnx",))))
+    assert row().startswith(
+        "The Silero model is downloading, and the channel loads it once it lands."
+    )
+    store().attach(_StatusKeeper(Status(
+        state="waiting", keys=("vad/silero/v6/onnx",), error="cannot connect to the hub",
+    )))
+    assert row().startswith(
+        "The Silero model could not be fetched (cannot connect to the hub), the channel "
+        "tries again on its own, Apply fetches it now."
+    )
+    monkeypatch.setattr(manifest, "_WEBUI", {})
+    waiting = row()
+    assert "tries again on its own." in waiting and "Apply" not in waiting
+    store().attach(_StatusKeeper(Status(
+        state="stopped", keys=("vad/silero/v6/onnx",), error="sha256 mismatch after download",
+    )))
+    assert row().startswith(
+        "The Silero model could not be fetched (sha256 mismatch after download), "
+        "`nanobot-voice sync` fetches it."
+    )
+
+
+def test_the_running_row_defers_to_the_channels_own_reload(monkeypatch, tmp_path):
+    from nanobot.channels.contracts import ChannelValidationContext
+
+    import nanobot_channel_voice.config as voice_config
+    from nanobot_channel_voice import running
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.engines import Fallback
+    from nanobot_channel_voice.keeper import Status
+    from nanobot_channel_voice.webui_sync import store
+
+    manifest = _load("voice_shim_manifest", _SHIM / "manifest.py")
+    ctx = ChannelValidationContext()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    monkeypatch.setattr(manifest, "_WEBUI", {"webui": manifest._PANEL})
+    monkeypatch.setattr(voice_config, "transcription_gap", lambda: None)
+    section = {"stt": {"provider": "whisper", "whisper": {"weights": _WHISPER}}}
+    record = running.Started(VoiceConfig.model_validate(section), {"stt": Fallback(key=_WHISPER)})
+    monkeypatch.setattr(running, "_current", (object(), record))
+    _install(tmp_path, _WHISPER, *_WHISPER_FILES)  # landed since, by the channel itself
+    store().attach(_StatusKeeper(Status(reload=True)))
+    out = manifest._validate(section, ctx)
+    assert _check_ids(out)["running"]["message"].endswith(
+        "The Whisper model is in place now. The channel loads it at its next quiet moment."
+    )
+    store().attach(_StatusKeeper(Status(reload=False)))  # loaded: back to the restart offer
+    assert _check_ids(manifest._validate(section, ctx))["running"]["message"].endswith(
+        "The Whisper model is in place now. Apply and restart loads it."
+    )

@@ -3326,6 +3326,11 @@ class LocalBackend(TurnEventMixin):
             and not self._worker_decoding
         )
 
+    @property
+    def at_rest(self) -> bool:
+        """Quiet, no message waiting to be spoken, no wake window open."""
+        return self._quiet() and not self._notices and time.monotonic() >= self._wake_until
+
     def _schedule_notice(self, grace: float) -> None:
         if self._notices and not self._closing and (
             self._notice_task is None or self._notice_task.done()

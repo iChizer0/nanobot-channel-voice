@@ -38,6 +38,17 @@ _COPY: dict[str, tuple[str, str | None]] = {
     ),
     "device": ("Device", None),  # help follows the index, see _device_help
     "index": ("Model index", None),  # help follows the cached index, see _index_help
+    "models.autoFetch": (
+        "Download models",
+        "When it starts, the channel downloads the models its setup runs and lacks, tries a "
+        "failed download again, and reloads once they land. A model with a license notice "
+        "waits for it to be accepted.",
+    ),
+    "models.acceptNotices": (
+        "Accepted notices",
+        "Model keys whose license notice you accept, such as `tts/mms/en/rknn.rv1126b`: the "
+        "channel downloads them on its own, and Apply asks for no tick.",
+    ),
     "allowFrom": ("Allowed senders", "Sender ids the channel answers, `*` for any. The microphone's sender id is `local`."),
     "audio.captureDevice": ("Microphone", "An ALSA device name such as `default` or `plughw:1,0`."),
     "audio.playbackDevice": ("Speaker", "An ALSA device name such as `default` or `plughw:1,0`."),
@@ -234,7 +245,8 @@ _UNITS = {
 # sets once, the internals the identity and pipeline rows already summarise, the tuning
 # numbers and the phrase lists. A set value stays in force while its row is hidden.
 _ADVANCED = frozenset({
-    "device", "index", "audio.captureDevice", "audio.playbackDevice", "aec", "tts.audioFormat",
+    "device", "index", "models.autoFetch", "models.acceptNotices",
+    "audio.captureDevice", "audio.playbackDevice", "aec", "tts.audioFormat",
     "bargeIn.mode", "realtime.bargeIn",
     "vad.engine", "vad.firered.weights", "vad.silero.weights", "vad.hangoverMs",
     "vad.turn.engine", "vad.turn.weights",
@@ -315,7 +327,7 @@ def build_form(cfg: VoiceConfig, store: Store | None = None) -> dict[str, Any]:
             out["note"] = note
         return out
 
-    sections = [section("general", "General", ["backend", "device", "index"])]
+    sections = [section("general", "General", ["backend", "device", "index", "models.autoFetch", "models.acceptNotices"])]
     if not _on_device(cfg):
         for field in sections[0]["fields"][1:]:
             field["help"] += _ON_DEVICE_UNUSED

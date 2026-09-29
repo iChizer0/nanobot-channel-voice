@@ -36,6 +36,8 @@ class _FakeStt:
 
 
 class _StubShell:
+    busy = False
+
     def __init__(self) -> None:
         self.starts = 0
         self.stops = 0
@@ -390,3 +392,284 @@ def test_core_sees_the_channel_running_once_its_pipeline_is_up(monkeypatch):
         return seen
 
     assert _run(run()) == [False, True, True, False]
+
+
+# ---- models that land after the start (models.autoFetch) ---------------------------
+
+
+class _FakeKeeper:
+    """What start() asks of a ModelKeeper, driven by the test: ``landed`` wakes a rebuild,
+    ``release`` ends the wait for the models the start cannot do without."""
+
+    def __init__(self, _cfg=None) -> None:
+        self.landed = asyncio.Event()
+        self.release = asyncio.Event()
+        self.why: str | None = None
+        self.started = self.closed = self.loads = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    async def close(self) -> None:
+        self.closed += 1
+
+    def loaded(self) -> None:
+        self.loads += 1
+
+    async def until(self, ready, keys) -> str | None:
+        await self.release.wait()
+        return self.why
+
+
+def _keepers(monkeypatch) -> list[_FakeKeeper]:
+    from nanobot_channel_voice import channel as channel_mod
+
+    made: list[_FakeKeeper] = []
+    monkeypatch.setattr(channel_mod, "ModelKeeper", lambda cfg: made.append(k := _FakeKeeper()) or k)
+    monkeypatch.setattr(channel_mod, "_REST_S", 0.05)
+    monkeypatch.setattr(channel_mod, "_REST_POLL_S", 0.01)
+    return made
+
+
+async def _until(condition, timeout_s: float = 5.0) -> None:
+    for _ in range(int(timeout_s / 0.01)):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met")
+
+
+def test_models_that_land_rebuild_the_pipeline_in_place_once_at_rest(monkeypatch):
+    from nanobot_channel_voice import running
+
+    made = _keepers(monkeypatch)
+    builds: list[_FakeStt] = []
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, lambda cfg: builds.append(_FakeStt()) or builds[-1])
+
+    async def run():
+        task = await _start_until(ch, lambda: ch.is_running)
+        first, keeper = ch._shell, made[0]
+        keeper.landed.set()
+        await _until(lambda: len(builds) == 2 and ch.is_running)
+        assert ch._shell is not first and running.current() is not None
+        await asyncio.sleep(0.1)
+        assert len(builds) == 2  # one landing, one rebuild
+        await ch.stop()
+        await task
+        return keeper
+
+    keeper = _run(run())
+    assert (keeper.started, keeper.loads, keeper.closed) == (1, 2, 1)
+    assert [stt.released for stt in builds] == [1, 1]  # the first stack went before the second
+
+
+def test_a_rebuild_waits_out_an_exchange_and_an_apply(monkeypatch):
+    from nanobot_channel_voice.webui_sync import VoiceSyncStore
+
+    made = _keepers(monkeypatch)
+    applying = {"on": True}
+    monkeypatch.setattr(VoiceSyncStore, "applying", lambda self: applying["on"])
+    builds: list[int] = []
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, lambda cfg: builds.append(1) or _FakeStt())
+
+    async def run():
+        task = await _start_until(ch, lambda: ch.is_running)
+        ch._shell._state = VoiceState.SPEAKING
+        made[0].landed.set()
+        await asyncio.sleep(0.2)
+        assert len(builds) == 1  # mid-reply
+        ch._shell._state = VoiceState.IDLE
+        await asyncio.sleep(0.2)
+        assert len(builds) == 1  # core restarts the channel after an Apply
+        applying["on"] = False
+        await _until(lambda: len(builds) == 2 and ch.is_running)
+        await ch.stop()
+        await task
+
+    _run(run())
+
+
+def test_a_stop_while_waiting_for_rest_rebuilds_nothing(monkeypatch):
+    from nanobot_channel_voice import running
+
+    made = _keepers(monkeypatch)
+    builds: list[int] = []
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, lambda cfg: builds.append(1) or _FakeStt())
+
+    async def run():
+        task = await _start_until(ch, lambda: ch.is_running)
+        ch._shell._state = VoiceState.THINKING
+        made[0].landed.set()
+        await asyncio.sleep(0.1)
+        await ch.stop()
+        await asyncio.wait_for(task, 5)
+
+    _run(run())
+    assert builds == [1] and made[0].closed == 1
+    assert ch._shell is None and running.current() is None and not ch.is_running
+
+
+def test_a_message_landing_mid_rebuild_is_spoken_after_it(monkeypatch):
+    """A rebuild has no pipeline for seconds of model loads: a reminder that lands then is
+    spoken by the rebuilt one, and a dead turn's straggler is not."""
+    from nanobot.bus.events import OutboundMessage
+
+    from nanobot_channel_voice.streamid import TURN_META
+
+    made = _keepers(monkeypatch)
+    gate = threading.Event()
+    gate.set()
+    builds: list[int] = []
+
+    def make_stt(cfg):
+        builds.append(1)
+        gate.wait(5)
+        return _FakeStt()
+
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, make_stt)
+    announced: list[str] = []
+
+    async def announce(self, text):
+        announced.append(text)
+
+    from nanobot_channel_voice.backend.local import LocalBackend
+
+    monkeypatch.setattr(LocalBackend, "announce", announce)
+
+    async def run():
+        task = await _start_until(ch, lambda: ch.is_running)
+        gate.clear()  # the rebuild blocks inside its model load
+        made[0].landed.set()
+        await _until(lambda: len(builds) == 2 and ch._backend is None)
+        await ch.send(OutboundMessage(channel="voice", chat_id=ch.config.chat_id, content="Reminder: stretch"))
+        await ch.send(OutboundMessage(
+            channel="voice", chat_id=ch.config.chat_id, content="late",
+            metadata={TURN_META: "t-dead"},
+        ))
+        assert announced == []
+        gate.set()
+        await _until(lambda: ch.is_running)
+        await ch.stop()
+        await task
+
+    _run(run())
+    assert announced == ["Reminder: stretch"]
+
+
+def test_a_waiting_backend_message_defers_the_rebuild(monkeypatch):
+    """A queued notice dies with its backend, so the rebuild waits until it was spoken."""
+    made = _keepers(monkeypatch)
+    builds: list[int] = []
+    ch = _channel({"tts": {"enabled": False}}, monkeypatch, lambda cfg: builds.append(1) or _FakeStt())
+
+    async def run():
+        task = await _start_until(ch, lambda: ch.is_running)
+        ch._backend._notices.append("waiting")
+        made[0].landed.set()
+        await asyncio.sleep(0.3)
+        assert len(builds) == 1
+        ch._backend._notices.clear()
+        await _until(lambda: len(builds) == 2 and ch.is_running)
+        await ch.stop()
+        await task
+
+    _run(run())
+
+
+def test_the_start_waits_for_the_models_it_cannot_do_without(monkeypatch):
+    """Served speech-to-text has no stand-in: core reads Starting while its model is fetched."""
+    made = _keepers(monkeypatch)
+    section = {**_CLOUD_SERVE, "stt": {**_CLOUD_SERVE["stt"], "whisper": {"weights": "stt/whisper/base/onnx"}}}
+    ch = _channel(section, monkeypatch, lambda cfg: _FakeStt())
+    shell = _StubShell()
+
+    async def build_cloud(kind):
+        return shell, "", []
+
+    ch._build_cloud = build_cloud  # type: ignore[method-assign]
+
+    async def run():
+        task = asyncio.create_task(ch.start())
+        await _until(lambda: bool(made))
+        await asyncio.sleep(0.1)
+        assert not ch.is_running and not task.done() and shell.starts == 0
+        made[0].release.set()
+        await _until(lambda: ch.is_running)
+        await ch.stop()
+        await task
+
+    _run(run())
+    assert shell.starts == 1
+
+
+def test_a_start_whose_models_will_not_come_says_why(monkeypatch):
+    made = _keepers(monkeypatch)
+    section = {**_CLOUD_SERVE, "stt": {**_CLOUD_SERVE["stt"], "whisper": {"weights": "stt/whisper/base/onnx"}}}
+    ch = _channel(section, monkeypatch, lambda cfg: _FakeStt())
+
+    async def run():
+        task = asyncio.create_task(ch.start())
+        await _until(lambda: bool(made))
+        made[0].why = "the model index does not list stt/whisper/base/onnx"
+        made[0].release.set()
+        with pytest.raises(RuntimeError) as refused:
+            await task
+        return str(refused.value)
+
+    assert _run(run()) == (
+        "the channel does not start without stt/whisper/base/onnx: the model index does not "
+        "list stt/whisper/base/onnx"
+    )
+    assert made[0].closed == 1
+
+
+def test_without_auto_fetch_the_channel_keeps_no_models(monkeypatch):
+    made = _keepers(monkeypatch)
+    ch = _channel({"tts": {"enabled": False}, "models": {"autoFetch": False}}, monkeypatch, lambda cfg: _FakeStt())
+
+    async def run():
+        task = await _start_until(ch, lambda: ch.is_running)
+        await ch.stop()
+        await task
+
+    _run(run())
+    assert made == []
+
+
+def test_a_model_the_channel_fetches_itself_is_in_the_rebuilt_pipeline(store, tmp_path, monkeypatch):
+    """The real keeper, from a file index: the landing, the rebuild, the model in use."""
+    import hashlib
+    import json
+    import time
+
+    from nanobot_channel_voice import channel as channel_mod
+    from nanobot_channel_voice import running
+    from nanobot_channel_voice import weights as w
+
+    monkeypatch.setattr(channel_mod, "_REST_S", 0.05)
+    monkeypatch.setattr(channel_mod, "_REST_POLL_S", 0.01)
+    blob = tmp_path / "model.onnx"
+    blob.write_bytes(b"not a real model")
+    entry = {"files": {"model.onnx": {"url": blob.as_uri(), "sha256": hashlib.sha256(blob.read_bytes()).hexdigest()}}}
+    store.mkdir(parents=True)
+    (store / w.INDEX_CACHE).write_text(json.dumps({
+        "fetched_unix": int(time.time()), "sources": list(w.DEFAULT_INDEX_SOURCES),
+        "models": {"vad/silero/v6/onnx": entry},
+    }))
+    builds: list[int] = []
+    ch = _channel(
+        {"tts": {"enabled": False}, "vad": {"engine": "silero", "silero": {"weights": "vad/silero/v6/onnx"}}},
+        monkeypatch, lambda cfg: builds.append(1) or _FakeStt(),
+    )
+
+    async def run():
+        task = await _start_until(ch, lambda: len(builds) == 2 and ch.is_running)
+        published = running.current()
+        await ch.stop()
+        await task
+        return published
+
+    published = _run(run())
+    assert "vad/silero/v6/onnx" in w.installed(store) and len(builds) == 2
+    # the rebuild resolved the landed files (this blob does not load, so Energy stands in)
+    assert published.fell_back["vad"] is None

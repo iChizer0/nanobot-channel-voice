@@ -14,7 +14,7 @@ import re
 import urllib.parse
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from loguru import logger
 from nanobot.config.schema import Base
@@ -1098,6 +1098,30 @@ class WakeConfig(_VoiceBase):
         return self
 
 
+class ModelsConfig(_VoiceBase):
+    """The channel keeps its own models: at start it fetches in the background what its
+    setup runs and the store lacks (never updating or removing one), rebuilds its pipeline
+    at the next quiet moment once they land, and retries a failure a later attempt may
+    pass. The CLI and the WebUI's Apply fetch the same way on request."""
+
+    auto_fetch: bool = True
+    # Weights keys whose license notice (the index's ``accept``) the operator accepts: fetched
+    # unattended, and neither the WebUI's Apply nor ``nanobot-voice sync`` asks again.
+    accept_notices: list[str] = Field(default_factory=list)
+    # Seconds before each retry, the last repeating; [] = no timed retry.
+    retry_s: list[Annotated[float, Field(gt=0)]] = Field(default_factory=lambda: [60.0, 300.0, 900.0])
+
+    @field_validator("accept_notices")
+    @classmethod
+    def _notices_name_keys(cls, value: list[str]) -> list[str]:
+        for key in value:
+            try:
+                w.validate_key(key)
+            except w.WeightsError as exc:
+                raise ValueError(str(exc)) from None
+        return value
+
+
 class VoiceConfig(_VoiceBase):
     """Top-level ``channels.voice`` config.
 
@@ -1123,6 +1147,7 @@ class VoiceConfig(_VoiceBase):
     # per model; empty is no index. The WebUI's Model pills and Apply read it, and so does
     # ``nanobot-voice`` without ``--index``.
     index: list[str] = Field(default_factory=lambda: list(w.DEFAULT_INDEX_SOURCES))
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     allow_from: list[str] = Field(default_factory=lambda: ["*"])  # BaseChannel allow-list
     streaming: bool = True  # core `supports_streaming`: send_delta() speaks the reply as it streams
     # Core's per-channel overrides of channels.sendProgress/sendToolHints/showReasoning,

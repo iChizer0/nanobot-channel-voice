@@ -41,7 +41,9 @@ def _confirm(prompt: str, yes: bool, why: str) -> None:
         raise w.WeightsError("aborted")
 
 
-def _fetch_one(key: str, entry: dict[str, Any], *, force: bool, yes: bool, root: Path) -> None:
+def _fetch_one(
+    key: str, entry: dict[str, Any], *, force: bool, yes: bool, root: Path, accepted: bool = False,
+) -> None:
     line = key
     if entry.get("license"):
         line += f"  [{entry['license']}]"
@@ -53,19 +55,24 @@ def _fetch_one(key: str, entry: dict[str, Any], *, force: bool, yes: bool, root:
         print(f"  DEPRECATED: renamed to {new}, name that instead" if new else "  DEPRECATED")
     if entry.get("accept"):  # e.g. a non-commercial license notice
         print(f"  NOTICE: {entry['accept']}")
-        _confirm("  Accept and download?", yes, f"'{key}' requires accepting its notice")
+        if accepted:
+            print("  accepted by channels.voice.models.acceptNotices")
+        else:
+            _confirm("  Accept and download?", yes, f"'{key}' requires accepting its notice")
     d = w.fetch(key, entry, force=force, root=root, log=print)
     print(f"  -> {d}")
 
 
 def _fetch_all(
     keys: list[str], index: dict[str, Any], *, force: bool, yes: bool, root: Path,
+    accepted: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
-    """Fetch every key, returning the failures by key: one failure never stops the rest."""
+    """Fetch every key, returning the failures by key: one failure never stops the rest.
+    ``accepted``: keys whose notice the config accepts."""
     failed: dict[str, str] = {}
     for key in keys:
         try:
-            _fetch_one(key, index[key], force=force, yes=yes, root=root)
+            _fetch_one(key, index[key], force=force, yes=yes, root=root, accepted=key in accepted)
         except (w.WeightsError, OSError) as exc:
             failed[key] = str(exc)
     return failed
@@ -128,10 +135,11 @@ def _configured_index(path: Path, *, required: bool) -> list[str]:
 
 
 def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
-    from nanobot_channel_voice.sync import plan_sync, voice_section
+    from nanobot_channel_voice.sync import accepted_notices, plan_sync, voice_section
 
     path = _config_path(args)
-    plan = plan_sync(voice_section(path), index, root, managed_by=None, prune=args.prune)
+    section = voice_section(path)
+    plan = plan_sync(section, index, root, managed_by=None, prune=args.prune)
     for key in plan.wanted:
         w.validate_key(key)
     if not plan.wanted:
@@ -151,7 +159,9 @@ def _sync(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     unindexed = "not in the index (set the right channels.voice.index, or pass --index)"
     failed = dict.fromkeys(plan.unknown, unindexed)
     listed = [k for k in plan.wanted if k in index]
-    failed |= _fetch_all(listed, index, force=args.force, yes=args.yes, root=root)
+    failed |= _fetch_all(
+        listed, index, force=args.force, yes=args.yes, root=root, accepted=accepted_notices(section),
+    )
     _report(plan.wanted, failed, skipped)
     if failed:
         unpruned = ", nothing pruned" if args.prune and plan.prune else ""

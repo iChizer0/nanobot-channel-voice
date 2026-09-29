@@ -8,6 +8,7 @@ final messages (see :func:`_speakable`)."""
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import threading
@@ -22,12 +23,14 @@ from nanobot.channels.base import BaseChannel
 from nanobot.runtime_context import RuntimeContextBlock
 
 from nanobot_channel_voice import running
+from nanobot_channel_voice import weights as w
 from nanobot_channel_voice.aio import cancel_and_wait
 from nanobot_channel_voice.audio import make_audio
 from nanobot_channel_voice.audio.pcm import pcm_ms, wav_duration_ms
 from nanobot_channel_voice.backend import gemini_live
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
+    NOTICE_BACKLOG,
     NOTICE_MARK,
     AbandonedResult,
     Instructions,
@@ -57,15 +60,18 @@ from nanobot_channel_voice.context_tool import (
     unregister_bridge,
 )
 from nanobot_channel_voice.history import SpokenHistory
+from nanobot_channel_voice.keeper import ModelKeeper
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
 from nanobot_channel_voice.streamid import TURN_META, base_of, unique_token
 from nanobot_channel_voice.stt import SttAdapter, make_stt, transcribe_chunked, write_temp_wav
+from nanobot_channel_voice.sync import fatal_ready, fatal_weights_keys
 from nanobot_channel_voice.telemetry import VoiceTracer
 from nanobot_channel_voice.tts import TtsAdapter, make_tts
 from nanobot_channel_voice.tts.base import CALIBRATION_TEXT, startup_text
 from nanobot_channel_voice.vad import EnergyVad, make_turn_analyzer, make_vad
 from nanobot_channel_voice.wake import make_wake_detector
+from nanobot_channel_voice.webui_sync import store
 
 _DEFAULT_PERSONA = (
     "You are a helpful, concise voice assistant. Keep replies short and conversational."
@@ -433,6 +439,10 @@ def _collect(collector: _ReplyCollector, delta: str, *, stream_end: bool, resumi
 # (two model stacks resident at once exhaust the NPU / RAM).
 _LOAD_LOCK = threading.Lock()
 
+# A rebuild for landed models waits until the channel has rested this long, checked this often.
+_REST_S = 1.0
+_REST_POLL_S = 0.25
+
 
 class _Load:
     __slots__ = ("cancelled",)
@@ -484,6 +494,10 @@ class VoiceChannel(BaseChannel):
         self._backend: LocalBackend | RealtimeBackend | GeminiLiveBackend | GatedUplink | None = None
         self._stop_event: asyncio.Event | None = None
         self._up = False  # start() has built the pipeline (is_running)
+        self._keeper: ModelKeeper | None = None  # models.autoFetch
+        # Speakable messages from outside a turn that land while a rebuild has no pipeline
+        # (see send): spoken once the rebuilt one is up, in order.
+        self._rebuild_held: list[str] | None = None
         self._stt: SttAdapter | None = None
         self._stt_server = None             # stt.serve: local /v1/audio/transcriptions
         self._tts_adapter = None            # local mode only; kept for warmup
@@ -554,6 +568,46 @@ class VoiceChannel(BaseChannel):
                         "voice config import: merged {} top-level keys into channels.voice "
                         "and removed importJson from config.json", imported,
                     )
+        keeper = self._keeper = ModelKeeper(self.config) if self.config.models.auto_fetch else None
+        try:
+            if keeper is not None:
+                keeper.start()
+                await self._models_to_start(keeper)
+            # Models that land later rebuild the pipeline in place, with this same config.
+            while self._running and await self._bring_up() and await self._landed_at_rest(keeper):
+                self.logger.info("voice: rebuilding the pipeline with the models that landed")
+                self._rebuild_held = []
+                await self._take_down()
+                self._metrics = VoiceMetrics()  # one per session
+        except BaseException:
+            if keeper is not None:
+                with suppress(Exception):
+                    await keeper.close()
+            raise
+        if self._stop_event.is_set():
+            self.logger.info("voice channel stopped")
+
+    async def _models_to_start(self, keeper: ModelKeeper) -> None:
+        """Hold the start (core reads Starting) until the store holds what the channel does
+        not start without; RuntimeError when those will not come."""
+        ready = functools.partial(fatal_ready, self.config, w.store_root())
+        if await asyncio.to_thread(ready):
+            return
+        keys = sorted(fatal_weights_keys(self.config))
+        self.logger.info("voice: waiting for {} before starting", ", ".join(keys) or "the wake word models")
+        stop = asyncio.create_task(self._stop_event.wait())  # type: ignore[union-attr]
+        until = asyncio.create_task(keeper.until(ready, keys))
+        try:
+            await asyncio.wait({stop, until}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+            until.cancel()
+        if until.done() and not until.cancelled() and (why := until.result()) is not None:
+            raise RuntimeError(f"the channel does not start without {', '.join(keys) or 'its wake word models'}: {why}")
+
+    async def _bring_up(self) -> bool:
+        """Build and start the pipeline: True once up, False when stop() raced it. A refusal
+        raises, leaving nothing running."""
         shell: VoiceShell | None = None
         server = None
         started = False
@@ -580,7 +634,7 @@ class VoiceChannel(BaseChannel):
                 # Refuse loudly: falling through to local would run the wrong brain.
                 raise RuntimeError(f"voice backend kind '{kind}' is not implemented")
             if not self._running:
-                return  # stop() raced the build
+                return False  # stop() raced the build
             self.logger.info(
                 "voice channel starting (backend={}, capture={}, playback={})",
                 self.config.backend,
@@ -588,16 +642,18 @@ class VoiceChannel(BaseChannel):
             )
             await shell.start(instructions=instructions, tools=tools)
             if not self._running:
-                return  # stop() landed mid-start, before _shell was published
+                return False  # stop() landed mid-start, before _shell was published
             self._shell = shell
             # A serve endpoint that cannot bind refuses loudly (WebUI dictation would be
             # silently broken) and takes the shell down.
             server = await self._start_stt_server()
             if not self._running:
-                return  # stop() raced the bind: the handle was not published yet
+                return False  # stop() raced the bind: the handle was not published yet
             started = True
             if kind == "local":
                 running.publish(self, running.Started(self.config, missed))
+            if self._keeper is not None:
+                self._keeper.loaded()
             self._up = True
         finally:
             if not started:
@@ -622,8 +678,50 @@ class VoiceChannel(BaseChannel):
             self._metrics_task = asyncio.create_task(
                 self._metrics_reporter(self.config.debug.metrics_interval_s)
             )
-        await self._stop_event.wait()
-        self.logger.info("voice channel stopped")
+        held, self._rebuild_held = self._rebuild_held, None
+        for text in held or ():
+            await self._announce(text)  # what landed while the rebuild had no pipeline
+        return True
+
+    async def _landed_at_rest(self, keeper: ModelKeeper | None) -> bool:
+        """Until stop() (False), or until models landed and the channel is at rest (True).
+        Not while an Apply runs: core restarts the channel after it."""
+        stop = asyncio.create_task(self._stop_event.wait())  # type: ignore[union-attr]
+        try:
+            if keeper is None:
+                await stop
+                return False
+            landed = asyncio.create_task(keeper.landed.wait())
+            try:
+                await asyncio.wait({stop, landed}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                landed.cancel()
+            if stop.done():
+                return False
+            keeper.landed.clear()
+            self.logger.info("voice: new models are in place; the pipeline reloads at the next quiet moment")
+            since: float | None = None
+            while not stop.done():
+                if self._at_rest() and not store().applying():
+                    since = since if since is not None else time.monotonic()
+                    if time.monotonic() - since >= _REST_S:
+                        return True
+                else:
+                    since = None
+                await asyncio.wait({stop}, timeout=_REST_POLL_S)
+            return False
+        finally:
+            stop.cancel()
+
+    def _at_rest(self) -> bool:
+        """Nothing a rebuild would cut: no turn, speech, decode, tool call, delegation or
+        waiting message, on the shell or inside the backend."""
+        shell = self._shell
+        if shell is None or shell.state is not VoiceState.IDLE or shell.busy:
+            return False
+        if (pending := self._pending_delegation) is not None and not pending.resolved:
+            return False
+        return getattr(self._backend, "at_rest", True)
 
     def _build_local(self) -> tuple[VoiceShell, LocalBackend, TtsAdapter | None, list, dict[str, Any]]:
         """Pure: the thread may outlive a cancelled start(), so it touches neither this
@@ -1257,25 +1355,34 @@ class VoiceChannel(BaseChannel):
 
     async def stop(self) -> None:
         self._running = False
+        self._rebuild_held = None  # a message held for a rebuild dies with the channel
+        if (keeper := self._keeper) is not None:
+            await keeper.close()
+        await self._take_down()
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    async def _take_down(self) -> None:
+        """The pipeline down: stop()'s teardown, and a rebuild's first half. Each handle is
+        taken before its await, so a stop() racing a rebuild tears nothing down twice."""
+        self._up = False
         running.withdraw(self)
         self._drop_bridge()
-        await cancel_and_wait(self._metrics_task)
-        self._metrics_task = None
-        await cancel_and_wait(self._warmup_task)
-        self._warmup_task = None
-        if self._stt_server is not None:
+        metrics_task, self._metrics_task = self._metrics_task, None
+        await cancel_and_wait(metrics_task)
+        warmup_task, self._warmup_task = self._warmup_task, None
+        await cancel_and_wait(warmup_task)
+        if (server := self._stt_server) is not None:
             # Before the shell: no new serve-side decode may outlive the teardown below.
-            with suppress(Exception):
-                await self._stt_server.stop()
             self._stt_server = None
-        if self._shell is not None:
-            await self._shell.stop()
+            with suppress(Exception):
+                await server.stop()
+        if (shell := self._shell) is not None:
             self._shell = None
+            await shell.stop()
             self._backend = None
         # Last, so no decode can be running against it. The backend freed TTS/VAD.
         self._release_stt()
-        if self._stop_event is not None:
-            self._stop_event.set()
 
     @staticmethod
     async def _load(fn, *args):
@@ -1376,6 +1483,15 @@ class VoiceChannel(BaseChannel):
         if local is None:
             if self.config.backend != "local":
                 await self._cloud_send(msg, meta)
+                return
+            # The local pipeline is down (a rebuild, a stop). A message from outside a
+            # turn (a reminder, another chat's send) still deserves a voice: _announce
+            # holds it for a rebuilt pipeline. A turn-stamped final is a dead turn's
+            # straggler here, since a rebuild starts only at rest.
+            if _speakable(msg) and (meta.get(TURN_META) is None or _agent_initiated(meta)):
+                text = (msg.content or "").strip()
+                if text:
+                    await self._announce(text)
             return
         # ANY traffic for our chat proves the core is alive on this session: feed the
         # deadman BEFORE filtering, so it measures a silent core, not a long tool run.
@@ -1438,6 +1554,14 @@ class VoiceChannel(BaseChannel):
             await self._announce(notice.reply)
 
     async def _announce(self, text: str) -> None:
+        if (held := self._rebuild_held) is not None:
+            # A rebuild has no pipeline to speak through: spoken once the rebuilt one is
+            # up, in order. Covers the streamed cloud paths too (_take_notice).
+            if len(held) < NOTICE_BACKLOG:
+                held.append(text)
+            else:
+                self._metrics.count("notice_dropped")
+            return
         announce = getattr(self._backend, "announce", None)
         shown = loggable_text(text, self.config.log_transcripts)
         if announce is None:

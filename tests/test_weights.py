@@ -12,6 +12,7 @@ import http.client
 import io
 import json
 import os
+import pathlib
 import socket
 import ssl
 import sys
@@ -401,8 +402,43 @@ def test_a_failed_write_is_not_the_networks_and_is_not_tried_again(monkeypatch):
             raise OSError(errno.ENOSPC, "No space left on device")
 
     with pytest.raises(OSError, match="No space left"):
-        w._download("https://x.test/m", Full(), name="m", stopped="stop", log=print, progress=None, should_stop=None)
+        w._download("https://x.test/m", Full(), name="m", label="m", log=print, progress=None, should_stop=None)
     assert calls == [0]
+
+
+def test_a_failure_says_whether_a_later_attempt_may_pass(store, flaky, monkeypatch):
+    monkeypatch.setattr(w, "_RETRY_PAUSES_S", ())
+    flaky.script = [503]
+    with pytest.raises(w.WeightsError, match="download failed") as busy:
+        w.fetch("vad/silero/onnx", _flaky_entry(flaky))
+    assert busy.value.transient
+    flaky.script = [404]
+    with pytest.raises(w.WeightsError, match="download failed") as gone:
+        w.fetch("vad/silero/onnx", _flaky_entry(flaky))
+    assert not gone.value.transient
+    # the in-run retry skips a certificate refusal; minutes on, NTP may have set the clock
+    refused = urllib.error.URLError(ssl.SSLCertVerificationError("certificate is not yet valid"))
+    assert not w._transient(refused) and w._recoverable(refused)
+    monkeypatch.setattr(w, "_urlopen", lambda *_a, **_k: (_ for _ in ()).throw(urllib.error.URLError(OSError("down"))))
+    with pytest.raises(w.WeightsError, match="cannot read weights index") as offline:
+        w.load_index(["https://x.test/index.json"])
+    assert offline.value.transient
+
+
+def test_a_local_write_failure_is_no_network_failure(store, monkeypatch):
+    monkeypatch.setattr(w, "_urlopen", lambda url, timeout=0, offset=0: io.BytesIO(b"x" * 10))
+    real_open = pathlib.Path.open
+
+    def full(self, mode="r", *a, **k):
+        if "w" in mode and self.name.startswith(".partial-"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_open(self, mode, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "open", full)
+    entry = {"files": {"model.onnx": {"url": "https://x.test/m", "sha256": "0" * 64}}}
+    with pytest.raises(w.WeightsError, match="cannot write the download") as exc:
+        w.fetch("vad/silero/onnx", entry)
+    assert not exc.value.transient
 
 
 def test_transient_failures_are_the_networks_and_the_hubs():
@@ -1187,6 +1223,21 @@ def test_cli_sync_fetches_the_operator_baseline_beneath_the_section(store, tmp_p
     monkeypatch.setenv("NANOBOT_VOICE_DEFAULTS", str(tmp_path / "gone.json"))
     assert cli_main(["--index", index, "sync", "--config", cfg]) == 2
     assert "NANOBOT_VOICE_DEFAULTS: cannot read" in capsys.readouterr().err
+
+
+def test_cli_sync_takes_the_notices_the_config_accepts(store, tmp_path, capsys):
+    src = _src(tmp_path, "encoder.onnx")
+    noticed = _entry_for(src, accept="CC-BY-NC 4.0: non-commercial use only.")
+    index = _write_index(tmp_path, {"tts/mms-eng/onnx": noticed, "tts/mms-deu/onnx": noticed})
+    section = {"tts": {"provider": "mms", "mms": {"weights": "tts/mms-eng/onnx"}}}
+    cfg = _write_config(tmp_path, section)
+    assert cli_main(["--index", index, "sync", "--config", cfg]) == 2  # off a tty, unaccepted
+    assert "--yes" in capsys.readouterr().out + capsys.readouterr().err
+    cfg = _write_config(tmp_path, {**section, "models": {"acceptNotices": ["tts/mms-eng/onnx"]}})
+    assert cli_main(["--index", index, "sync", "--config", cfg]) == 0
+    assert "accepted by channels.voice.models.acceptNotices" in capsys.readouterr().out
+    # an explicit fetch names its key itself: it still asks
+    assert cli_main(["--index", index, "fetch", "tts/mms-eng/onnx", "--force"]) == 2
 
 
 def test_cli_sync_names_configured_keys_missing_from_the_index(store, tmp_path, capsys):

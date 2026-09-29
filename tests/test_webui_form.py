@@ -436,7 +436,9 @@ def test_the_model_index_row_says_where_downloads_come_from():
         )
         form = build_form(VoiceConfig.model_validate(section), store)
         general = next(s for s in form["sections"] if s["id"] == "general")
-        assert [f["key"] for f in general["fields"]] == ["backend", "device", "index"]
+        assert [f["key"] for f in general["fields"]] == [
+            "backend", "device", "index", "models.autoFetch", "models.acceptNotices",
+        ]
         return general["fields"][2]
 
     built_in = row({}, w.DEFAULT_INDEX_SOURCES, "https://huggingface.co/o/r/resolve/main/e.onnx")
@@ -456,3 +458,11 @@ def test_the_model_index_row_says_where_downloads_come_from():
     cloud = row({"backend": "openai", "index": [mirror]}, [mirror], "https://hf-mirror.com/e.onnx")
     assert cloud["advanced"] is True
     assert cloud["help"].endswith("Not in use until an on-device detector or a served engine runs.")
+
+
+def test_how_the_channel_keeps_its_models_is_a_row_under_advanced(store):
+    form = build_form(VoiceConfig.model_validate({"models": {"acceptNotices": ["tts/mms/en/onnx"]}}))
+    fields = {f["key"]: f for s in form["sections"] for f in s["fields"]}
+    auto, accepted = fields["models.autoFetch"], fields["models.acceptNotices"]
+    assert (auto["kind"], auto["label"], auto["value"], auto["advanced"]) == ("bool", "Download models", True, True)
+    assert (accepted["kind"], accepted["value"], accepted["advanced"]) == ("list", ["tts/mms/en/onnx"], True)

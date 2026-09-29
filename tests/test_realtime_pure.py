@@ -160,6 +160,19 @@ async def publish_stream(sink: AudioSink, ms: int = 1000, rate: int = 24000) -> 
     await sink.wait_idle()
 
 
+def test_at_rest_only_idle_with_nothing_queued_or_owed():
+    backend, _events = make_backend()
+    assert backend.at_rest
+    backend._notices.append("a reminder waits")
+    assert not backend.at_rest  # a rebuild would drop it
+    backend._notices.clear()
+    backend._user_speaking = True
+    assert not backend.at_rest
+    backend._user_speaking = False
+    backend._turn = VoiceState.THINKING
+    assert not backend.at_rest
+
+
 def hints(events) -> list[VoiceState]:
     return [e.state for e in events if isinstance(e, StateHint)]
 

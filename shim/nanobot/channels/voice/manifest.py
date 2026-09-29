@@ -311,13 +311,16 @@ def _pipeline_check(cfg: Any, check: Any, store: Any, why: dict[str, Any]) -> di
     lists, the section's Model row for a block without one, the pip extra for a module."""
     slots = _slots(cfg)
     degraded = [(*slots[slot], fallback) for slot, fallback in why.items() if fallback is not None]
-    sentences = _why_sentences([(engine, section, fb) for engine, section, _, fb in degraded], store)
+    sentences = _why_sentences([(engine, section, fb) for engine, section, _, fb in degraded], store, cfg)
     if stand_ins := [stand_in for _, _, stand_in, _ in degraded if stand_in]:
         sentences.append(f"Until then {_join(stand_ins)}.")
-    fatal = [engine for engine, _, stand_in, _ in degraded if not stand_in]
+    fatal = [(engine, fb) for engine, _, stand_in, fb in degraded if not stand_in]
     if fatal:
+        engines = _join([engine for engine, _ in fatal])
         sentences.append(
-            f"Serve transcription is on, so the channel does not start without {_join(fatal)}."
+            f"Serve transcription is on, so the channel starts once the {engines} model lands."
+            if _waits(fatal, store, cfg)
+            else f"Serve transcription is on, so the channel does not start without {engines}."
         )
     # The turn slot's other fallback, the one preflight cannot see. Not said of a model
     # that would not load either: it is not consulted for the louder reason.
@@ -360,6 +363,7 @@ def _running_check(cfg: Any, check: Any, why: dict[str, Any]) -> tuple[dict[str,
     they do not name as missing (fetched since, failed to load, or edited away), and whether
     a restart, which runs the section as it stands, would load one."""
     from nanobot_channel_voice.running import current
+    from nanobot_channel_voice.webui_sync import own_fetch
 
     started = current()
     if started is None:
@@ -386,7 +390,9 @@ def _running_check(cfg: Any, check: Any, why: dict[str, Any]) -> tuple[dict[str,
         sentences.append(f"The {_join(landed)} model{'' if one else 's'} {'is' if one else 'are'} in place now.")
     if failed:
         sentences.append(f"{_join(failed)} did not load, the gateway log says why.")
-    if ready:
+    if landed and not failed and (fetch := own_fetch()) is not None and fetch.reload:
+        sentences.append(f"The channel loads {'it' if len(landed) == 1 else 'them'} at its next quiet moment.")
+    elif ready:
         restart = "Apply and restart" if _WEBUI else "Turning the channel off and on"
         does = "tries again" if failed else f"loads {'it' if len(ready) == 1 else 'them'}"
         sentences.append(f"{restart} {does}.")
@@ -394,37 +400,13 @@ def _running_check(cfg: Any, check: Any, why: dict[str, Any]) -> tuple[dict[str,
     return check("running", "Running channel", "warn", " ".join(sentences)), bool(ready)
 
 
-def _why_sentences(degraded: list[tuple[str, str, Any]], store: Any) -> list[str]:
-    """Why each (engine, its section, ``Fallback``) would not load, as the panel's own
-    remedies: Apply for a model the index lists, the section's Model row for a block
-    without one, the pip extra for a missing module."""
+def _why_sentences(degraded: list[tuple[str, str, Any]], store: Any, cfg: Any) -> list[str]:
+    """Why each (engine, its section, ``Fallback``) would not load, as the remedies the setup
+    has: the channel's own fetch, Apply for a model the index lists, the section's Model row
+    for a block without one, the pip extra for a missing module."""
     sentences = []
-    unfetched = [(engine, why.key) for engine, _, why in degraded if why.key]
-    if unfetched:
-        one = len(unfetched) == 1
-        index = store.index or {}
-        listed = all(key in index for _, key in unfetched)
-        # A notice in the index holds Apply until it is accepted under Models, so the
-        # remedy says so: the row would otherwise promise a download the button refuses.
-        noticed = [engine for engine, key in unfetched if (index.get(key) or {}).get("accept")]
-        remedy = "."
-        if store.index is None:  # the panel loads it on open
-            remedy = f", Apply downloads {'it' if one else 'them'} once the model index has loaded."
-        elif listed:
-            remedy = f", Apply downloads {'it' if one else 'them'}"
-            if noticed and one:
-                remedy += " once its notice under Models is accepted"
-            elif noticed:
-                plural = len(noticed) > 1
-                remedy += (
-                    f" once the {_join(noticed)} notice{'s' if plural else ''} under Models "
-                    f"{'are' if plural else 'is'} accepted"
-                )
-            remedy += "."
-        sentences.append(
-            f"The {_join([engine for engine, _ in unfetched])} model{'' if one else 's'} "
-            f"{'is' if one else 'are'} not fetched yet{remedy}"
-        )
+    if unfetched := [(engine, why.key) for engine, _, why in degraded if why.key]:
+        sentences.append(_unfetched(unfetched, store, cfg))
     for engine, section, why in degraded:
         if why.unset:
             sentences.append(f"{engine} has no model, pick one under {section}.")
@@ -438,6 +420,74 @@ def _why_sentences(degraded: list[tuple[str, str, Any]], store: Any) -> list[str
         elif why.error:
             sentences.append(f"{engine} cannot load its model ({why.error}).")
     return sentences
+
+
+def _unfetched(unfetched: list[tuple[str, str]], store: Any, cfg: Any) -> str:
+    """The models the store lacks, (engine, key) each: where the running channel's own fetch
+    has them, else what brings them, a license notice first."""
+    from nanobot_channel_voice.webui_sync import own_fetch
+
+    one = len(unfetched) == 1
+    subject = f"The {_join([engine for engine, _ in unfetched])} model{'' if one else 's'}"
+    it = "it" if one else "them"
+    keys = {key for _, key in unfetched}
+    status = own_fetch()
+    # No byte count: the row refreshes on state changes, and a frozen number would sit
+    # beside the Models section's live one.
+    if status is not None and status.state == "fetching" and keys <= set(status.keys):
+        return (
+            f"{subject} {'is' if one else 'are'} downloading, and the channel loads "
+            f"{it} once {'it lands' if one else 'they land'}."
+        )
+    if status is not None and status.state == "waiting" and keys & set(status.keys):
+        now = f", Apply fetches {it} now" if _WEBUI else ""
+        return f"{subject} could not be fetched ({status.error}), the channel tries again on its own{now}."
+    failed = status is not None and status.state == "stopped" and status.error and keys & set(status.keys)
+    state = f"could not be fetched ({status.error})" if failed else f"{'is' if one else 'are'} not fetched yet"
+    index = store.index or {}
+    # A notice in the index holds the fetch until it is accepted, so the remedy says so:
+    # the row would otherwise promise a download that does not come.
+    noticed = [engine for engine, key in unfetched if key in _held(index, cfg)]
+    if _WEBUI:
+        if store.index is None:  # the panel loads it on open
+            return f"{subject} {state}, Apply downloads {it} once the model index has loaded."
+        if not all(key in index for key in keys):
+            return f"{subject} {state}."
+        remedy = f", Apply downloads {it}"
+        if noticed and one:
+            remedy += " once its notice under Models is accepted"
+        elif noticed:
+            plural = len(noticed) > 1
+            remedy += (
+                f" once the {_join(noticed)} notice{'s' if plural else ''} under Models "
+                f"{'are' if plural else 'is'} accepted"
+            )
+        return f"{subject} {state}{remedy}."
+    if not cfg.models.auto_fetch or failed:
+        return f"{subject} {state}, `nanobot-voice sync` fetches {it}."
+    if noticed:
+        whose = "its" if one else f"the {_join(noticed)}"
+        return (
+            f"{subject} {state}, the channel fetches {it} once `models.acceptNotices` accepts "
+            f"{whose} license notice{'' if len(noticed) == 1 else 's'}."
+        )
+    return f"{subject} {state}, the channel fetches {it} on its own."
+
+
+def _held(index: dict[str, Any], cfg: Any) -> set[str]:
+    """Keys whose license notice nobody has accepted in the section."""
+    accepted = set(cfg.models.accept_notices)
+    return {key for key, entry in index.items() if entry.get("accept") and key not in accepted}
+
+
+def _waits(fatal: list[tuple[str, Any]], store: Any, cfg: Any) -> bool:
+    """Whether the start waits for these models, (engine, ``Fallback``) each, rather than
+    refusing: the channel fetches them on its own, and nothing holds them."""
+    keys = {why.key for _, why in fatal}
+    if not cfg.models.auto_fetch or None in keys:
+        return False
+    index = store.index
+    return index is None or (keys <= set(index) and not keys & _held(index, cfg))
 
 
 def _turn_idle(cfg: Any) -> str | None:
@@ -494,9 +544,14 @@ def _gate_check(cfg: Any, check: Any, store: Any) -> dict[str, Any] | None:
     idle = _turn_idle(cfg) if gated and turn[2] is None else None
     if not degraded and idle is None:
         return None
-    sentences = _why_sentences(degraded, store)
+    sentences = _why_sentences(degraded, store, cfg)
     if fatal:
-        sentences.append(f"The channel does not start without {'it' if len(fatal) == 1 else 'them'}.")
+        one = len(fatal) == 1
+        sentences.append(
+            f"The channel starts once {'it lands' if one else 'they land'}."
+            if _waits([(engine, why) for engine, _, why in fatal], store, cfg)
+            else f"The channel does not start without {'it' if one else 'them'}."
+        )
     if turn[2] is not None:
         sentences.append("Until then turns end on silence alone.")
     if idle is not None:
@@ -578,7 +633,7 @@ PLUGIN = ChannelPlugin(
     runtime="nanobot.channels.voice.runtime:VoiceChannel",
     # The panel's Apply: core's start/poll/cancel routes, fetching the models the section
     # names before core (re)starts the channel.
-    connector="nanobot.channels.voice.connect:VoiceSyncStore",
+    connector="nanobot.channels.voice.connect:store",  # the one the channel shares
     setup=SETUP_SPEC,
     # Read by core's ensure_enabled_channel_dependencies: a no-op here (the manifest
     # only exists once the dist is installed), declared so a copy still names it.

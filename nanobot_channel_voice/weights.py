@@ -27,9 +27,9 @@ symlinked in place, verified when the index pins one.
 File names inside an entry are the resolution contract: an engine block setting
 ``weights: <key>`` gets its unset ``*_path`` fields filled by stem + any extension
 (``encoder_path`` -> ``encoder.<ext>``); explicit paths always win. The network is used
-only by the CLI and the WebUI's sync flow (``webui_sync``), never at channel start:
-:func:`apply_weights` touches only the local store. The last loaded index is cached in
-the store (:data:`INDEX_CACHE`) so the WebUI form can offer keys offline.
+by the CLI and by the sync flow (``webui_sync``: the WebUI's Apply and the channel's own
+background fetch); :func:`apply_weights` touches only the local store. The last loaded
+index is cached in the store (:data:`INDEX_CACHE`) so the WebUI form can offer keys offline.
 """
 
 from __future__ import annotations
@@ -72,7 +72,12 @@ _CHUNK = 1 << 20
 
 
 class WeightsError(RuntimeError):
-    """Actionable store/index failure; the message is user-facing."""
+    """Actionable store/index failure; the message is user-facing. ``transient``: a later
+    attempt may pass (the network, the hub, a clock not yet set)."""
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 class NotFetchedError(WeightsError):
@@ -182,6 +187,13 @@ def _transient(exc: BaseException) -> bool:
     return isinstance(exc, (OSError, http.client.IncompleteRead, http.client.BadStatusLine))
 
 
+def _recoverable(exc: BaseException) -> bool:
+    """A failure an attempt minutes later may not meet: a transient one, or a certificate a
+    clock not yet set refuses (a first boot without an RTC, before NTP)."""
+    reason = exc.reason if type(exc) is urllib.error.URLError else exc
+    return _transient(exc) or (ssl is not None and isinstance(reason, ssl.SSLCertVerificationError))
+
+
 def _pause(seconds: float, should_stop: Callable[[], bool] | None, stopped: str) -> None:
     deadline = time.monotonic() + seconds
     while (left := deadline - time.monotonic()) > 0:
@@ -195,14 +207,16 @@ def _download(
     out: BinaryIO,
     *,
     name: str,
-    stopped: str,
+    label: str,
     log: Callable[[str], None],
     progress: Callable[[int], None] | None,
     should_stop: Callable[[], bool] | None,
 ) -> tuple[str, int]:
     """Stream ``url`` into ``out``: (sha256, bytes). A transient failure goes again after a
     pause, from where it broke off when the server honours ``Range``, else from the start;
-    a failed write is not the network's and raises at once. ``progress`` never steps back."""
+    the last one raises ``WeightsError`` saying whether it was transient. A failed write is
+    not the network's and raises at once. ``progress`` never steps back."""
+    stopped = f"{label}: download cancelled"
     digester, total, shown = hashlib.sha256(), 0, 0
 
     def attempt() -> BaseException | None:
@@ -240,7 +254,7 @@ def _download(
     while (failure := attempt()) is not None:
         pause = next(pauses, None)
         if pause is None or not _transient(failure):
-            raise failure
+            raise WeightsError(f"{label}: download failed: {failure}", transient=_recoverable(failure))
         log(f"  {name}: {failure}; retrying in {pause:.0f}s")
         _pause(pause, should_stop, stopped)
     return digester.hexdigest(), total
@@ -352,7 +366,9 @@ def load_index(sources: Sequence[str], *, timeout: float = 30.0) -> dict[str, di
         try:
             data = _read_source(source, timeout)
         except (OSError, ValueError, http.client.HTTPException) as exc:
-            raise WeightsError(f"cannot read weights index '{source}': {exc}") from None
+            raise WeightsError(
+                f"cannot read weights index '{source}': {exc}", transient=_recoverable(exc)
+            ) from None
         entries = data.get("models")
         if entries is None:
             entries = {}
@@ -696,15 +712,13 @@ def fetch(
                 try:
                     with part.open("wb") as out:
                         digest, total = _download(
-                            url, out, name=name, stopped=f"'{key}' {name}: download cancelled",
-                            log=log, should_stop=should_stop,
+                            url, out, name=name, label=f"'{key}' {name}", log=log, should_stop=should_stop,
                             progress=None if progress is None else functools.partial(progress, name),
                         )
                         out.flush()
                         os.fsync(out.fileno())  # durable before the manifest vouches for it
-                # A truncated chunked body raises IncompleteRead: HTTPException, NOT OSError.
-                except (OSError, http.client.HTTPException) as exc:
-                    raise WeightsError(f"'{key}' {name}: download failed: {exc}") from None
+                except OSError as exc:  # the network's failures arrive as WeightsError
+                    raise WeightsError(f"'{key}' {name}: cannot write the download: {exc}") from None
                 if digest != want:
                     raise WeightsError(
                         f"'{key}' {name}: sha256 mismatch after download "

@@ -1,18 +1,19 @@
 """Bring the weights store in line with the config: what to fetch, what to remove, then do it.
 
-Shared by ``nanobot-voice sync`` and the WebUI's Apply flow. The plan is pure (index +
-store + the section), so a caller can show it before running; the run reports progress
-per chunk and stops between chunks when asked. A wanted key the store holds otherwise
-than the index pins is fetched again, its changed files only. Automatic cleanup removes
-only keys a ``managed_by`` tag says the same flow installed: a hand-fetched model is the
-user's.
+Shared by ``nanobot-voice sync``, the WebUI's Apply and the channel's background fetch. The
+plan is pure (index + store + the section), so a caller can show it before running; the run
+reports progress per chunk and stops between chunks when asked. A wanted key the store
+holds otherwise than the index pins is fetched again, its changed files only. Automatic
+cleanup removes only keys a ``managed_by`` tag says the same flow installed: a hand-fetched
+model is the user's.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,13 @@ def _resolved(section: dict[str, Any]) -> Any | None:
         return None
 
 
+def accepted_notices(section: dict[str, Any]) -> frozenset[str]:
+    """The keys whose notice the section's ``models.acceptNotices`` accepts; none when the
+    schema refuses the section."""
+    cfg = _resolved(section)
+    return frozenset(cfg.models.accept_notices) if cfg is not None else frozenset()
+
+
 def used_weights_keys(cfg: Any) -> set[str]:
     """The ``weights`` keys the section's resolved setup runs: the selected engines' blocks
     (a bilingual voice's ``secondary`` too), the wake head under a mode on, and under a
@@ -65,6 +73,45 @@ def used_weights_keys(cfg: Any) -> set[str]:
     if _wake_listens(cfg):
         blocks.append(cfg.wake.openwakeword)
     return {block.weights for block in blocks if getattr(block, "weights", None)}
+
+
+def complete(cfg: Any, root: Path) -> bool:
+    """Whether the store holds every model the setup runs, read from the store alone."""
+    return _holds(cfg, root, used_weights_keys(cfg), wake=_wake_listens(cfg))
+
+
+def fatal_ready(cfg: Any, root: Path) -> bool:
+    """Whether the store holds what :func:`fatal_weights_keys` names."""
+    return _holds(cfg, root, fatal_weights_keys(cfg), wake=cfg.backend != "local" and _wake_listens(cfg))
+
+
+def _holds(cfg: Any, root: Path, keys: set[str], *, wake: bool) -> bool:
+    """``keys`` installed, and under ``wake`` some backbone build for the head."""
+    have = w.installed(root)
+    if not keys <= set(have):
+        return False
+    oww = cfg.wake.openwakeword
+    if wake and not oww.embedding_path and (oww.weights or oww.model_path):
+        return w.backbone_key(oww.resolved_target, oww.weights, root) in have
+    return True
+
+
+def fatal_weights_keys(cfg: Any) -> set[str]:
+    """The ``weights`` keys the channel does not start without (the others degrade): a cloud
+    gate's detectors, and the model behind served speech-to-text. The wake head's backbone
+    is as fatal as the head."""
+    blocks: list[Any] = []
+    if cfg.backend != "local" and cfg.realtime.uplink != "server":
+        blocks.append(getattr(cfg.vad, cfg.vad.engine, None))
+        if cfg.realtime.uplink == "wake":
+            blocks.append(cfg.wake.openwakeword)
+    if cfg.stt.serve.enabled:
+        blocks.append(getattr(cfg.stt, cfg.stt.provider, None))
+    return {block.weights for block in blocks if getattr(block, "weights", None)}
+
+
+def is_backbone(key: str) -> bool:
+    return key.startswith(f"{w.WAKE_PREFIX}{w.BACKBONE_STEM}/")
 
 
 def _wake_listens(cfg: Any) -> bool:
@@ -148,6 +195,30 @@ def plan_sync(
     a section is resolved: one the schema refuses plans every key it names, backbone excluded."""
     cfg = _resolved(section)
     named = used_weights_keys(cfg) if used_only and cfg is not None else config_weights_keys(section)
+    return _plan(cfg, named, index, root, managed_by=managed_by, prune=prune, updates=updates)
+
+
+def plan_missing(
+    cfg: Any, index: dict[str, dict[str, Any]], root: Path, *, accepted: Collection[str] = (),
+) -> tuple[SyncPlan, list[str]]:
+    """What a run nobody watches fetches for the setup ``cfg`` runs: the keys the store
+    lacks, nothing updated or removed, and none whose notice ``accepted`` does not list
+    (returned beside the plan), nor the backbone of a head that will not be there."""
+    plan = _plan(cfg, used_weights_keys(cfg), index, root, managed_by=None, prune=False, updates=False)
+    held = [k for k in plan.notices if k not in accepted]
+    fetch = [k for k in plan.fetch if k not in held]
+    head = cfg.wake.openwakeword.weights
+    if head and head not in fetch and (head in plan.fetch or head in plan.unknown):
+        fetch = [k for k in fetch if not is_backbone(k)]
+    return dataclasses.replace(
+        plan, fetch=fetch, notices={k: n for k, n in plan.notices.items() if k in fetch},
+    ), held
+
+
+def _plan(
+    cfg: Any, named: set[str], index: dict[str, dict[str, Any]], root: Path, *,
+    managed_by: str | None, prune: bool, updates: bool,
+) -> SyncPlan:
     backbone = backbone_wanted(cfg, index) if cfg is not None else None
     wanted = sorted(named | ({backbone} if backbone else set()))
     have = w.installed(root)
@@ -220,6 +291,7 @@ def run_sync(
 
     done = fetched = 0
     failed: dict[str, str] = {}
+    lasting: set[str] = set()  # failed keys a later attempt would meet again
     for key in plan.fetch:
         check_stop()
         log(key)
@@ -234,15 +306,18 @@ def run_sync(
             if should_stop is not None and should_stop():
                 raise  # a cancel ends the run, with fetch's own message
             failed[key] = str(exc)
+            if not getattr(exc, "transient", False):
+                lasting.add(key)
         # A download can overrun the declared size (a stale index, none declared): never step back.
         step = max(plan.sizes[key], sum(files.values()))
         done += step
         fetched += 0 if key in failed else step
-    if any(key not in plan.update for key in failed):
+    if installs := [key for key in failed if key not in plan.update]:
         landed = len(plan.fetch) - len(failed)
         raise w.WeightsError(
             "; ".join(failed.values())
-            + (f" ({landed} of {len(plan.fetch)} fetched)" if landed else "")
+            + (f" ({landed} of {len(plan.fetch)} fetched)" if landed else ""),
+            transient=not lasting.intersection(installs),
         )
     check_stop()
     freed = 0

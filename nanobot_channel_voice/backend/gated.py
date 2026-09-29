@@ -253,6 +253,11 @@ class GatedUplink:
     def voices_notices(self) -> bool:
         return self._inner.voices_notices
 
+    @property
+    def at_rest(self) -> bool:
+        """Idle on both sides of the gate: no open activity here, nothing waiting inside."""
+        return self._state is VoiceState.IDLE and not self._active and self._inner.at_rest
+
     async def announce(self, text: str) -> None:
         # The inner resumes a parked socket for it; the IDLE after its reply re-arms the park.
         self._cancel_park()

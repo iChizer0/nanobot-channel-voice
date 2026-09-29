@@ -33,15 +33,21 @@ def used_weights_keys(section):
 
 class _Blobs(BaseHTTPRequestHandler):
     """Serves ``/<name>`` from ``server.blobs`` in 64 KiB chunks, slowly when asked, so a
-    poll mid-download sees a partial byte count and a cancel lands between chunks."""
+    poll mid-download sees a partial byte count and a cancel lands between chunks. Each
+    GET is counted in ``server.gets``; ``server.fail[name]`` answers its codes first."""
 
     def do_GET(self):  # noqa: N802 - http.server API
-        if (target := self.server.redirects.get(self.path.lstrip("/"))) is not None:
+        name = self.path.lstrip("/")
+        self.server.gets.append(name)
+        if codes := self.server.fail.get(name):
+            self.send_error(codes.pop(0))
+            return
+        if (target := self.server.redirects.get(name)) is not None:
             self.send_response(307)
             self.send_header("Location", target)
             self.end_headers()
             return
-        blob = self.server.blobs.get(self.path.lstrip("/"))
+        blob = self.server.blobs.get(name)
         if blob is None:
             self.send_error(404)
             return
@@ -63,6 +69,8 @@ def server():
     httpd.blobs = {}
     httpd.redirects = {}
     httpd.delay = 0.0
+    httpd.gets = []
+    httpd.fail = {}
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     httpd.base = f"http://127.0.0.1:{httpd.server_port}"
@@ -498,9 +506,11 @@ def test_connector_settles_a_run_nobody_watched_and_admits_one_apply_at_a_time(s
 
         task = connector._session.task  # the panel is gone; the gateway finishes the run
         await task
+        assert connector.applying()  # its restart is still core's to make: no rebuild meanwhile
         # the panel reopens: its plan request answers with the run's result, once
         settled = await connector.handle("start", {"plan": ["true"], "refresh": ["true"]})
         assert settled["status"] == "succeeded" and settled["session_id"] == started[0]["session_id"]
+        assert not connector.applying()
         planned = await connector.handle("start", {"plan": ["true"]})
         assert planned["status"] == "planned" and planned["plan"]["fetch"] == []
 
@@ -1135,3 +1145,325 @@ def test_picking_a_gate_also_picks_its_detector(store):
         VoiceConfig.model_validate({**cloud, "realtime": {"uplink": "vad"}})
     section = {**cloud, "realtime": {"uplink": "vad"}, "vad": {"engine": "silero", "silero": {"weights": picked["vad.silero.weights"]}}}
     assert used_weights_keys(section) == {"vad/silero/v6/onnx"}  # validates, and Apply fetches it
+
+
+# ---- the channel's own fetch -----------------------------------------------------
+
+
+def _keeper(section):
+    from nanobot_channel_voice.keeper import ModelKeeper
+
+    return ModelKeeper(VoiceConfig.model_validate(section))
+
+
+async def _settle(keeper, attempts=1, timeout_s=10.0):
+    for _ in range(int(timeout_s / 0.01)):
+        if keeper._settled >= attempts:
+            return keeper.status()
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"the keeper settled {keeper._settled} of {attempts} attempts")
+
+
+_SILERO = {"engine": "silero", "silero": {"weights": "vad/silero/v6/onnx"}}
+_MMS = {"provider": "mms", "mms": {"weights": "tts/mms/en/onnx"}}
+_WHISPER = {"provider": "whisper", "whisper": {"weights": "stt/whisper/base/onnx"}}
+
+
+def test_the_channel_fetches_what_its_setup_lacks_never_an_update_nor_under_a_notice(store, server):
+    index = _index(server, **{
+        "vad/silero/v6/onnx": ("silero-model.onnx", b"s" * 20),
+        "tts/mms/en/onnx": ("mms-decoder.onnx", b"m" * 10),
+        "stt/whisper/base/onnx": ("whisper-encoder.onnx", b"w" * 30),
+    })
+    index["tts/mms/en/onnx"]["accept"] = "non-commercial use only"
+    w.fetch("stt/whisper/base/onnx", index["stt/whisper/base/onnx"], root=store)
+    republished = _index(server, **{"stt/whisper/base/onnx": ("whisper2-encoder.onnx", b"W" * 30)})
+    _cache(store, {**index, **republished})
+    section = {"vad": _SILERO, "stt": _WHISPER, "tts": _MMS}
+
+    async def scenario():
+        keeper = _keeper(section)
+        keeper.start()
+        status = await _settle(keeper)
+        assert keeper.landed.is_set() and status.reload
+        assert (status.state, status.held, status.unknown) == ("idle", ("tts/mms/en/onnx",), ())
+        await keeper.close()
+        # the operator's acceptance lets it through
+        keeper = _keeper({**section, "models": {"acceptNotices": ["tts/mms/en/onnx"]}})
+        keeper.start()
+        assert (await _settle(keeper)).held == ()
+        await keeper.close()
+
+    _run(scenario())
+    assert set(w.installed(store)) == {"stt/whisper/base/onnx", "tts/mms/en/onnx", "vad/silero/v6/onnx"}
+    assert w.managed_by("vad/silero/v6/onnx", store) == MANAGED_BY  # an Apply may prune it later
+    assert "whisper2-encoder.onnx" not in server.gets  # the installed model stays as it is
+
+
+def test_a_complete_store_touches_no_index(store, monkeypatch):
+    from nanobot_channel_voice.webui_sync import VoiceSyncStore
+
+    async def no_index(*_a, **_k):
+        raise AssertionError("read the index")
+
+    monkeypatch.setattr(VoiceSyncStore, "index_for", no_index)
+
+    async def scenario():
+        keeper = _keeper({"vad": {"engine": "silero", "silero": {"modelPath": "/v.onnx"}}})
+        keeper.start()
+        assert (await _settle(keeper)).state == "idle"
+        await keeper.close()
+
+    _run(scenario())
+
+
+def test_a_failure_the_network_may_outgrow_is_tried_again_the_last_pause_repeating(store, server, monkeypatch):
+    monkeypatch.setattr(w, "_RETRY_PAUSES_S", ())  # the in-run retry: this test is the schedule's
+    index = _cache(store, _index(server, **{"vad/silero/v6/onnx": ("silero-model.onnx", b"s" * 20)}))
+    server.fail["silero-model.onnx"] = [503, 503, 503]
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO, "models": {"retryS": [0.01, 0.05]}})
+        keeper.start()
+        status = await _settle(keeper)
+        assert status.state == "waiting" and "503" in status.error
+        assert status.keys == ("vad/silero/v6/onnx",) and status.retry_unix > time.time() - 1
+        status = await _settle(keeper, 4)
+        assert status.state == "idle" and keeper.landed.is_set()
+        await keeper.close()
+
+    _run(scenario())
+    assert server.gets.count("silero-model.onnx") == 4
+    assert "vad/silero/v6/onnx" in w.installed(store) and index
+
+
+def test_a_failure_no_retry_passes_stops_the_fetch(store, server, monkeypatch):
+    index = _index(server, **{"vad/silero/v6/onnx": ("silero-model.onnx", b"s" * 20)})
+    index["vad/silero/v6/onnx"]["files"]["model.onnx"]["sha256"] = "0" * 64  # an index older than the file
+    _cache(store, index)
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO, "models": {"retryS": [0.01]}})
+        keeper.start()
+        status = await _settle(keeper)
+        assert status.state == "stopped" and "sha256 mismatch" in status.error
+        await asyncio.sleep(0.1)
+        assert keeper._settled == 1
+        await keeper.close()
+
+    _run(scenario())
+    assert server.gets == ["silero-model.onnx"]
+
+
+def test_an_index_reload_plans_a_waiting_fetch_again_its_own_reload_does_not(store, server, tmp_path, monkeypatch):
+    """A reload the attempt itself made must not wake the keeper, or a failing download would
+    loop at the speed of the network."""
+    from nanobot_channel_voice.webui_sync import store as sync_store
+
+    monkeypatch.setattr(w, "_RETRY_PAUSES_S", ())
+    index = _index(server, **{"vad/silero/v6/onnx": ("silero-model.onnx", b"s" * 20)})
+    _cache(store, index, fetched_unix=1)  # old: the attempt reloads it, through the store
+    reloads = []
+    monkeypatch.setattr(
+        w, "refresh_index", lambda sources, root, timeout: reloads.append(1) or _cache(root, index, sources=sources),
+    )
+    _write_config(tmp_path, monkeypatch, {"vad": _SILERO})
+    server.fail["silero-model.onnx"] = [503]
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO, "models": {"retryS": [30]}})
+        keeper.start()
+        assert (await _settle(keeper)).state == "waiting"
+        await asyncio.sleep(0.1)
+        assert keeper._settled == 1 and len(reloads) == 1
+        sync_store()._start_reload()  # the panel opens: the index answers again
+        status = await _settle(keeper, 2)
+        assert status.state == "idle" and keeper.landed.is_set()
+        await keeper.close()
+
+    _run(scenario())
+    assert server.gets.count("silero-model.onnx") == 2
+
+
+def test_the_channels_own_run_is_shown_to_the_panel_never_handed_over_as_succeeded(store, tmp_path, monkeypatch, server):
+    from nanobot_channel_voice.webui_sync import store as sync_store
+
+    _cache(store, _index(server, **{"vad/silero/v6/onnx": ("silero-model.onnx", b"s" * (4 << 20))}))
+    _write_config(tmp_path, monkeypatch, {"vad": _SILERO})
+    server.delay = 0.02
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO})
+        keeper.start()
+        connector = sync_store()
+        for _ in range(500):
+            planned = await connector.handle("start", {"plan": ["true"]})
+            if (planned.get("background") or {}).get("progress", {}).get("done_bytes"):
+                break
+            await asyncio.sleep(0.01)
+        # a plan, not a run to follow: the form stays editable
+        assert planned["status"] == "planned" and planned["session_id"] == ""
+        background = planned["background"]
+        assert background["state"] == "fetching" and background["keys"] == ["vad/silero/v6/onnx"]
+        assert background["session_id"] == connector._auto.id
+        assert background["progress"]["key"] == "vad/silero/v6/onnx"
+        with pytest.raises(ChannelConnectError, match="no such voice sync session"):
+            await connector.handle("poll", {"session_id": [background["session_id"]]})
+        await _settle(keeper)
+        # landed, and said so until the pipeline has loaded it (a rebuild is too quick for
+        # the status poll to see)
+        after = await connector.handle("start", {"plan": ["true"]})
+        assert after["status"] == "planned" and after["plan"]["fetch"] == []
+        assert after["background"]["state"] == "reloading"
+        keeper.loaded()
+        assert (await connector.handle("start", {"plan": ["true"]}))["background"] is None
+        await keeper.close()
+
+    _run(scenario())
+
+
+def test_an_apply_waits_behind_the_channels_run_and_fetches_no_byte_twice(store, tmp_path, monkeypatch, server):
+    from nanobot_channel_voice.webui_sync import store as sync_store
+
+    _cache(store, _index(server, **{
+        "vad/silero/v6/onnx": ("silero-model.onnx", b"s" * (4 << 20)),
+        "stt/whisper/base/onnx": ("whisper-encoder.onnx", b"w" * 100),
+    }))
+    # the channel runs Silero; the section has since gained Whisper
+    _write_config(tmp_path, monkeypatch, {"vad": _SILERO, "stt": _WHISPER})
+    server.delay = 0.02
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO})
+        keeper.start()
+        connector = sync_store()
+        while connector._auto is None or not connector._auto.at[2]:
+            await asyncio.sleep(0.01)
+        started = await connector.handle("start", {})
+        assert started["status"] == "pending"
+        assert started["progress"]["key"] == "vad/silero/v6/onnx"  # the bytes on the wire are that run's
+        done = await _drive(connector, started["session_id"])
+        assert done["status"] == "succeeded" and done["message"] == "Models fetched 2 (4 MB)."
+        assert keeper.status().state == "idle" and keeper.landed.is_set()
+        await keeper.close()
+
+    _run(scenario())
+    assert server.gets.count("silero-model.onnx") == 1 and server.gets.count("whisper-encoder.onnx") == 1
+    assert set(w.installed(store)) == {"stt/whisper/base/onnx", "vad/silero/v6/onnx"}
+
+
+def test_an_apply_whose_setup_drops_the_download_stops_it(store, tmp_path, monkeypatch, server):
+    from nanobot_channel_voice.webui_sync import store as sync_store
+
+    _cache(store, _index(server, **{
+        "vad/silero/v6/onnx": ("silero-model.onnx", b"s" * (4 << 20)),
+        "vad/firered/streaming/onnx": ("firered-model.onnx", b"f" * 100),
+    }))
+    _write_config(tmp_path, monkeypatch, {"vad": {"engine": "firered", "firered": {"weights": "vad/firered/streaming/onnx"}}})
+    server.delay = 0.02
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO})
+        keeper.start()
+        connector = sync_store()
+        while connector._auto is None or not connector._auto.at[2]:
+            await asyncio.sleep(0.01)
+        started = await connector.handle("start", {})
+        done = await _drive(connector, started["session_id"])
+        assert done["status"] == "succeeded" and done["message"] == "Models fetched 1 (0 MB)."
+        status = keeper.status()
+        assert (status.state, status.error) == ("stopped", None)  # until the Apply's restart
+        keeper.poke()
+        await asyncio.sleep(0.05)
+        assert keeper.status().state == "stopped"
+        await keeper.close()
+
+    _run(scenario())
+    assert set(w.installed(store)) == {"vad/firered/streaming/onnx"}
+    assert not list(store.rglob(".partial-*"))
+
+
+def test_cancelling_the_channels_run_stops_it_until_the_channel_restarts(store, server):
+    from nanobot_channel_voice.webui_sync import store as sync_store
+
+    _cache(store, _index(server, **{"vad/silero/v6/onnx": ("silero-model.onnx", b"s" * (4 << 20))}))
+    server.delay = 0.02
+
+    async def scenario():
+        keeper = _keeper({"vad": _SILERO, "models": {"retryS": [0.01]}})
+        keeper.start()
+        connector = sync_store()
+        while connector._auto is None or not connector._auto.at[2]:
+            await asyncio.sleep(0.01)
+        cancelled = await connector.handle("cancel", {"session_id": [connector._auto.id]})
+        assert cancelled["status"] == "cancelled"
+        await _settle(keeper)
+        await asyncio.sleep(0.1)
+        assert keeper.status().state == "stopped" and keeper._settled == 1
+        assert connector.background() == {"state": "stopped", "keys": ["vad/silero/v6/onnx"], "error": None, "retry_unix": None}
+        await keeper.close()
+
+    _run(scenario())
+    assert w.installed(store) == {}
+
+
+def test_a_notice_the_config_accepts_needs_no_tick(store, tmp_path, monkeypatch, server):
+    index = _index(server, **{"tts/mms/en/onnx": ("mms-decoder.onnx", b"m" * 10)})
+    index["tts/mms/en/onnx"]["accept"] = "non-commercial use only"
+    _cache(store, index)
+    _write_config(tmp_path, monkeypatch, {"tts": _MMS, "models": {"acceptNotices": ["tts/mms/en/onnx"]}})
+    connector = VoiceSyncStore()
+
+    async def scenario():
+        planned = await connector.handle("start", {"plan": ["true"]})
+        item = planned["plan"]["fetch"][0]
+        assert item["notice"] == "non-commercial use only" and item["accepted"] is True
+        started = await connector.handle("start", {})
+        assert (await _drive(connector, started["session_id"]))["status"] == "succeeded"
+
+    _run(scenario())
+
+
+def test_the_channels_index_is_the_panels_cache_or_its_own(store, tmp_path, monkeypatch):
+    from nanobot_channel_voice.webui_sync import store as sync_store
+
+    mine = ["https://mirror.test/index.json"]
+    reads = []
+    monkeypatch.setattr(w, "refresh_index", lambda sources, root, timeout: reads.append(("reload", sources)) or _cache(root, {}, sources=sources))
+    monkeypatch.setattr(w, "load_index", lambda sources, timeout: reads.append(("load", sources)) or {})
+    _write_config(tmp_path, monkeypatch, {})
+
+    async def scenario():
+        connector = sync_store()
+        _cache(store, {}, sources=list(w.DEFAULT_INDEX_SOURCES))
+        assert await connector.index_for(list(w.DEFAULT_INDEX_SOURCES)) == {} and reads == []  # young
+        _cache(store, {}, sources=list(w.DEFAULT_INDEX_SOURCES), fetched_unix=1)
+        await connector.index_for(list(w.DEFAULT_INDEX_SOURCES))
+        assert reads == [("reload", list(w.DEFAULT_INDEX_SOURCES))]  # the section's: the panel's cache
+        await connector.index_for(mine)  # another index than the section names: never cached
+        assert reads[-1] == ("load", mine) and w.cached_index(store)[2] == list(w.DEFAULT_INDEX_SOURCES)
+
+    _run(scenario())
+
+
+def test_a_start_that_waits_hears_its_model_land_or_why_it_will_not(store, server):
+    index = _index(server, **{
+        "stt/whisper/base/onnx": ("whisper-encoder.onnx", b"w" * 10),
+        "tts/mms/en/onnx": ("mms-decoder.onnx", b"m" * 10),
+    })
+    index["tts/mms/en/onnx"]["accept"] = "non-commercial use only"
+    _cache(store, index)
+
+    async def scenario():
+        keeper = _keeper({"stt": _WHISPER})
+        keeper.start()
+        ready = lambda: "stt/whisper/base/onnx" in w.installed(store)  # noqa: E731
+        assert await asyncio.wait_for(keeper.until(ready, ["stt/whisper/base/onnx"]), 5) is None
+        await keeper.close()
+        keeper = _keeper({"tts": _MMS})
+        keeper.start()
+        why = await asyncio.wait_for(keeper.until(lambda: False, ["tts/mms/en/onnx"]), 5)
+        assert why.startswith("the license notice of tts/mms/en/onnx is not accepted")
+        await keeper.close()
+
+    _run(scenario())

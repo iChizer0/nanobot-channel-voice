@@ -169,6 +169,11 @@ class VoiceShell:
     def state(self) -> VoiceState:
         return self._state
 
+    @property
+    def busy(self) -> bool:
+        """A tool call is in flight."""
+        return bool(self._tool_tasks)
+
     # ---- capture pump -------------------------------------------------------
 
     async def _capture_loop(self) -> None:

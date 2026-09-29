@@ -280,6 +280,17 @@ class RealtimeTransport(TurnEventMixin):
         """The model takes a text turn, so ``announce`` can voice a notice."""
         return True
 
+    @property
+    def at_rest(self) -> bool:
+        """Nothing a teardown would cut or lose: no turn or speech, no waiting notice, no
+        tool call owing its answer."""
+        return (
+            self._turn is VoiceState.IDLE
+            and not self._user_speaking
+            and not self._notices
+            and not self._waiting_on_tools()
+        )
+
     async def announce(self, text: str) -> None:
         """Have the model voice a message the agent sent on its own (a reminder, a report,
         a message from another channel) once the session is quiet; a parked socket is
