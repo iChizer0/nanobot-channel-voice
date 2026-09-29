@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from nanobot_channel_voice.backend.base import AbandonedResult, ReceiptResult
+from nanobot_channel_voice.backend.base import AbandonedResult, DelegatedResult, ReceiptResult
 from nanobot_channel_voice.channel import _DELEGATION_META, VoiceChannel, _ReplyCollector
 from nanobot_channel_voice.metrics import VoiceMetrics
 
@@ -369,6 +369,7 @@ def test_cancel_nanobot_stops_the_running_delegation_and_the_queued_one():
         await asyncio.sleep(0.01)
         await _answer(channel, "three")
         assert await third == "three"
+        assert isinstance(await third, DelegatedResult)  # the answer Gemini voices at once
 
     run(_case())
 
@@ -392,6 +393,8 @@ def test_a_cancel_called_with_a_new_request_ends_only_the_older_work(cancel_firs
         assert [t for t, _ in published] == ["Paris", "London"] and stops == [True]
         await _answer(channel, "Rain in London.")
         assert await tasks["ask_nanobot"] == "Rain in London."
+        # the replaced request's answer stays abandoned through the handler
+        assert not isinstance(await paris, DelegatedResult)
 
     run(_case())
 
@@ -668,6 +671,157 @@ def test_supervisor_mode_needs_no_tool_gateway():
 
         # A model that cannot drive tools stays persona-only in either mode.
         assert await channel({})._cloud_tools(False, "supervisor") == ([], None)
+
+    run(_case())
+
+
+class _ReadGateway:
+    """A tool gateway holding reads and writes; records what it executes."""
+
+    _MY = {"type": "object", "required": ["action"], "properties": {
+        "action": {"type": "string", "enum": ["check", "set"]},
+        "key": {"type": "string"}, "value": {"description": "New value (for set)."}}}
+
+    def __init__(self) -> None:
+        self.ran: list[tuple] = []
+
+    async def get_tool_definitions(self):
+        names = ("read_file", "write_file", "exec", "list_dir", "find_files", "my",
+                 "list_exec_sessions", "web_search")
+        return [{"type": "function", "function": {
+            "name": name, "description": f"core {name}",
+            "parameters": self._MY if name == "my" else {"type": "object", "properties": {}},
+        }} for name in names]
+
+    async def execute_tool(self, name, args, *, channel, chat_id):
+        self.ran.append((name, args, channel, chat_id))
+        return f"{name} ran"
+
+    async def get_agent_context(self, *, channel, chat_id, include_skills=True):
+        return f"agent context (skills={include_skills})"
+
+
+def test_supervisor_mode_reads_for_itself_through_the_gateway():
+    """With a gateway, supervisor mode also holds the agent's read-only tools for checking
+    on nanobot's work, run directly: no write, no shell, no web lookup, and ``my`` as its
+    check alone. Everything else is still a delegation."""
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    async def _case():
+        cfg = VoiceConfig.model_validate(
+            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+        )
+        gw = _ReadGateway()
+        ch = VoiceChannel(cfg, MessageBus(), tool_gateway=gw)
+        tools, exec_tool = await ch._cloud_tools(True, "supervisor")
+        assert [t.name for t in tools] == [
+            "ask_nanobot", "cancel_nanobot", "read_file", "list_dir", "find_files", "my",
+            "list_exec_sessions",
+        ]
+        my = tools[5]
+        assert my.parameters["properties"]["action"]["enum"] == ["check"]
+        assert "value" not in my.parameters["properties"]
+        assert "set" not in my.parameters["properties"]["key"].get("description", "")
+        assert my.parameters["required"] == ["action"] and "read-only" in my.description
+        assert gw._MY["properties"]["action"]["enum"] == ["check", "set"]  # a copy narrowed
+
+        assert await exec_tool("read_file", '{"path": "notes.md"}', "r1") == "read_file ran"
+        assert gw.ran == [("read_file", '{"path": "notes.md"}', "voice", cfg.chat_id)]
+        refused = await exec_tool("my", '{"action": "set", "key": "model", "value": "x"}', "r1")
+        assert refused.startswith("Error:") and refused.is_error and len(gw.ran) == 1
+        assert await exec_tool("my", '{"action": "check", "key": "subagents"}', "r1") == "my ran"
+        assert gw.ran[-1][1] == '{"action": "check", "key": "subagents"}'
+        assert await exec_tool("list_dir", '{"path": "."}', "r1") == "list_dir ran"
+
+    run(_case())
+
+
+@pytest.mark.parametrize("args, runs", [
+    # core unwraps a lone "arguments" field, as an object or as JSON text
+    ('{"arguments": {"action": "set", "key": "model_preset", "value": "x"}}', None),
+    ('{"arguments": "{\\"action\\": \\"set\\", \\"key\\": \\"model\\"}"}', None),
+    ('{"arguments": {"action": "check", "key": "subagents"}}',
+     '{"action": "check", "key": "subagents"}'),
+    # whatever else rides along, only a check is sent: a second wrapper, a stray value
+    ('{"arguments": {"arguments": {"action": "set", "key": "model"}}}', '{"action": "check"}'),
+    ('{"action": "check", "key": "model", "value": "x"}', '{"action": "check", "key": "model"}'),
+    ('{"action": "inspect"}', '{"action": "check"}'),
+    ("not json", '{"action": "check"}'),
+])
+def test_supervisor_my_is_rebuilt_as_a_check(args, runs):
+    """``my`` is built, not filtered: core accepts a call wrapped in one ``arguments`` field,
+    so reading the top level alone would let a set through where tools.my.allowSet is on."""
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    async def _case():
+        cfg = VoiceConfig.model_validate(
+            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+        )
+        gw = _ReadGateway()
+        ch = VoiceChannel(cfg, MessageBus(), tool_gateway=gw)
+        out = await ch._supervisor_tool("my", args, "r1")
+        if runs is None:
+            assert out.is_error and gw.ran == []
+        else:
+            assert [(name, sent) for name, sent, *_ in gw.ran] == [("my", runs)]
+
+    run(_case())
+
+
+@pytest.mark.parametrize("name", ["write_file", "exec", "apply_patch"])
+def test_a_supervisor_never_runs_a_tool_it_does_not_hold(name):
+    """A name outside the reads is a delegation, never a gateway call: a hallucinated write
+    or shell carries no request, so it is asked again rather than run."""
+    async def _case():
+        channel, published, _ = _supervisor_channel()
+        gw = channel._tool_gateway = _ReadGateway()
+        out = await channel._supervisor_tool(name, '{"path": "x", "content": "y"}', "r1")
+        assert out.startswith("I didn't catch") and gw.ran == [] and published == []
+
+    run(_case())
+
+
+def test_supervisor_instructions_name_the_reads_only_when_it_holds_them():
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.channel import _INSPECT_RULE, _SUPERVISOR_RULES
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.history import SpokenHistory
+
+    async def _case():
+        cfg = VoiceConfig.model_validate(
+            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+        )
+        ch = VoiceChannel(cfg, MessageBus(), tool_gateway=_ReadGateway())
+        text = await ch._instructions_source(True, True, SpokenHistory(), inspects=True)(True)
+        assert f"{_SUPERVISOR_RULES} {_INSPECT_RULE}" in text
+        assert "skills=False" in text  # a delegating model reads no skill itself
+        plain = await ch._instructions_source(True, True, SpokenHistory())(True)
+        assert _SUPERVISOR_RULES in plain and _INSPECT_RULE not in plain
+
+    run(_case())
+
+
+def test_a_supervisor_whose_gateway_cannot_list_tools_still_delegates():
+    from nanobot.bus.queue import MessageBus
+
+    from nanobot_channel_voice.config import VoiceConfig
+
+    class _Broken(_ReadGateway):
+        async def get_tool_definitions(self):
+            raise RuntimeError("mcp connect failed")
+
+    async def _case():
+        cfg = VoiceConfig.model_validate(
+            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+        )
+        ch = VoiceChannel(cfg, MessageBus(), tool_gateway=_Broken())
+        tools, _ = await ch._cloud_tools(True, "supervisor")
+        assert [t.name for t in tools] == ["ask_nanobot", "cancel_nanobot"]
 
     run(_case())
 

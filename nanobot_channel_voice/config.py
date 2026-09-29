@@ -776,7 +776,8 @@ class RealtimeConfig(_VoiceBase):
     #                  and speaks the finished answer. Robust multi-step use, costing a ~1-2s
     #                  delegation the mandatory filler masks. Tool-capable providers only.
     # Supervisor runs over the bus on any core; direct needs the core's tool gateway (the
-    # official core passes none, so it is persona-only there).
+    # official core passes none, so it is persona-only there). With the gateway, supervisor
+    # also reads for itself: files, and nanobot's state (background subagents, commands).
     tool_mode: Literal["direct", "supervisor"] = "direct"
     # Who decides what audio goes up the socket. "server": every mic frame streams and the
     # provider's VAD finds the turns — billed as the provider bills listening (Gemini and the

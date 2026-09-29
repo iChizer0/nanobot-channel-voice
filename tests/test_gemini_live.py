@@ -13,6 +13,7 @@ from nanobot_channel_voice.backend import gemini_live as gl
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
     AbandonedResult,
+    DelegatedResult,
     Error,
     InputTranscript,
     ManualTurnBackend,
@@ -305,17 +306,22 @@ def test_tool_call_round_trip_is_non_blocking_and_auto_continues():
     assert hints(events)[-1] is VoiceState.IDLE
 
 
-def test_supervisor_results_interrupt():
+def test_a_delegated_answer_interrupts_and_a_read_waits_for_the_filler():
+    """The delegated answer is the reply the user waits for; a read supervisor mode makes
+    itself (read_file) can wait for whatever the model is still saying."""
     cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
 
     async def after(backend):
-        await backend.submit_tool_result("c1", "plain text answer")
+        await backend.submit_tool_result("c1", DelegatedResult("plain text answer"))
+        await backend.submit_tool_result("c2", "file contents")
 
     _, sent, _ = drive([
-        {"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}}]}},
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}},
+                                        {"id": "c2", "name": "read_file", "args": {}}]}},
     ], config=cfg, after=after)
-    resp = sent[0]["toolResponse"]["functionResponses"][0]["response"]
-    assert resp == {"result": "plain text answer", "scheduling": "INTERRUPT"}
+    responses = [m["toolResponse"]["functionResponses"][0]["response"] for m in sent]
+    assert responses == [{"result": "plain text answer", "scheduling": "INTERRUPT"},
+                         {"result": "file contents", "scheduling": "WHEN_IDLE"}]
 
 
 def test_cancelled_tool_result_is_dropped():
@@ -728,7 +734,7 @@ def test_schema_infers_object_for_an_implicit_object_property():
 
 def test_a_talked_over_call_still_answers_once_the_user_is_done():
     """An onset no longer cuts a pending call: its answer lands WHEN_IDLE while the user
-    holds the floor (a manual activity open), on the configured schedule otherwise. Only
+    holds the floor (a manual activity open), at once otherwise. Only
     an AbandonedResult (stopped or replaced) joins the context SILENT, arming no deadman."""
     cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"},
                       realtime={"uplink": "vad", "toolMode": "supervisor"})
@@ -737,9 +743,9 @@ def test_a_talked_over_call_still_answers_once_the_user_is_done():
         backend._ready.set()
         await backend.begin_activity()
         await backend.barge_in(0)
-        await backend.submit_tool_result("c1", "answer one")
+        await backend.submit_tool_result("c1", DelegatedResult("answer one"))
         await backend.end_activity()
-        await backend.submit_tool_result("c2", "answer two")
+        await backend.submit_tool_result("c2", DelegatedResult("answer two"))
         armed = backend._watchdog_task
         await backend.submit_tool_result("c3", AbandonedResult("(stopped by the user)"))
         assert backend._watchdog_task is armed  # no deadman for an answer nobody awaits
@@ -990,9 +996,9 @@ def test_a_supervisor_answer_waits_for_a_notice_being_voiced():
         await backend.announce("Your meeting starts in five minutes.")
         await backend._notice_task
         await ev(audio_msg(b"\x01"))  # the notice is being read out
-        await backend.submit_tool_result("c1", "It is sunny.")
+        await backend.submit_tool_result("c1", DelegatedResult("It is sunny."))
         await ev({"serverContent": {"turnComplete": True}})
-        await backend.submit_tool_result("c2", "It is windy.")
+        await backend.submit_tool_result("c2", DelegatedResult("It is windy."))
         schedules = [m["toolResponse"]["functionResponses"][0]["response"]["scheduling"]
                      for m in sent if "toolResponse" in m]
         assert schedules == ["WHEN_IDLE", "INTERRUPT"]

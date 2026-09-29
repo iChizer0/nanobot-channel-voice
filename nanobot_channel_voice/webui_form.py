@@ -206,7 +206,7 @@ _COPY: dict[str, tuple[str, str | None]] = {
         "Tools",
         "Supervisor runs them through nanobot and speaks the finished answer, on any "
         "nanobot. Direct lets the provider call them itself, and needs a nanobot that hands "
-        "its tools to channels.",
+        "its tools to channels, which also lets Supervisor read files and task state itself.",
     ),
 }
 # Option labels, per path: the same value reads differently in different fields

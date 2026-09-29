@@ -194,6 +194,27 @@ def test_tool_exception_is_reported_back_to_the_model():
     assert "nope" in output
 
 
+def test_exec_latency_is_bucketed_by_how_the_call_runs():
+    """A supervisor session's delegation is its own bucket; a read the realtime model makes
+    through the gateway meanwhile is a direct call, and must not blur the delegation's."""
+    async def exec_tool(name, args, turn):
+        return "ok"
+
+    async def _case():
+        shell, _, _ = _shell(exec_tool=exec_tool, tool_mode="supervisor",
+                             direct_tools=frozenset({"read_file"}))
+        for call_id, name in (("c1", "ask_nanobot"), ("c2", "read_file"), ("c3", "made_up")):
+            shell._metrics.call_seen(call_id, name)
+            await shell._on_event(ToolCall(call_id=call_id, name=name, arguments="{}"))
+        while shell.busy:
+            await asyncio.sleep(0)
+        return shell._metrics.snapshot()["latency_ms"]
+
+    latency = _run(_case())
+    assert latency["tool_exec_ms.supervisor"]["n"] == 2  # a made-up name is delegated too
+    assert latency["tool_exec_ms.direct"]["n"] == 1
+
+
 def test_the_seam_gets_the_turn_that_issued_the_call():
     seen: list[str] = []
 

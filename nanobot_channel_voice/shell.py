@@ -72,14 +72,17 @@ class VoiceShell:
         on_abandon: AbandonFn | None = None,
         on_fatal: FatalFn | None = None,
         tool_mode: str = "direct",
+        direct_tools: frozenset[str] = frozenset(),
         metrics: VoiceMetrics | None = None,
         tracer: VoiceTracer | None = None,
         history: SpokenHistory | None = None,
     ):
         # Cloud only: what was said, for a session that replaces a lost one.
         self.history = history
-        # Label only; execution latency is bucketed by it (direct vs supervisor).
+        # Label only: execution latency is bucketed by how a call runs, so a supervisor
+        # session's reads (``direct_tools``, run by the gateway) stay out of its delegations.
         self._tool_mode = tool_mode
+        self._direct_tools = direct_tools
         self._metrics = metrics if metrics is not None else VoiceMetrics()
         # A disabled/absent tracer yields no-op spans, so no branching at call sites.
         self._tracer = tracer if tracer is not None else VoiceTracer(config.telemetry)
@@ -360,6 +363,7 @@ class VoiceShell:
         # an error string the model can recover from. ToolRegistry NEVER raises for a tool
         # failure: ToolResult.error(...) is a str subclass, so `is_error` is the signal.
         outcome = "ok"
+        mode = "direct" if ev.name in self._direct_tools else self._tool_mode
         with self._tracer.tool_span(ev.name, ev.call_id, ev.arguments) as span:
             if self._exec_tool is None:
                 outcome = "no_seam"
@@ -372,11 +376,9 @@ class VoiceShell:
                     output = result if isinstance(result, str) else json.dumps(result)
                 except asyncio.CancelledError:
                     # Teardown: drop the call rather than submit a bogus result.
-                    self._metrics.call_finished(
-                        ev.call_id, outcome="cancelled", mode=self._tool_mode
-                    )
+                    self._metrics.call_finished(ev.call_id, outcome="cancelled", mode=mode)
                     self._tracer.tool_outcome(
-                        span, outcome="cancelled", mode=self._tool_mode,
+                        span, outcome="cancelled", mode=mode,
                         stale=False, result=None,
                     )
                     raise
@@ -388,9 +390,9 @@ class VoiceShell:
             # Barged in while this ran? Visibility only: the backend's stale guard is
             # what keeps the result from reviving a dead turn.
             stale = self._metrics.call_stale(ev.call_id, self._sink.epoch)
-            self._metrics.call_finished(ev.call_id, outcome=outcome, mode=self._tool_mode)
+            self._metrics.call_finished(ev.call_id, outcome=outcome, mode=mode)
             self._tracer.tool_outcome(
-                span, outcome=outcome, mode=self._tool_mode, stale=stale, result=output,
+                span, outcome=outcome, mode=mode, stale=stale, result=output,
             )
         if outcome != "ok":
             self._log.info("tool {} -> {}", ev.name, outcome)

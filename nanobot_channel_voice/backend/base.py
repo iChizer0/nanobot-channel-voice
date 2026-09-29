@@ -148,6 +148,13 @@ class ReceiptResult(AbandonedResult):
     __slots__ = ()
 
 
+class DelegatedResult(str):
+    """A delegated request's answer (ask_nanobot): the reply the user is waiting for, so it
+    goes out at once. A plain tool result may wait for the model's filler to finish."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True, slots=True)
 class ToolsAbandoned:
     """CLOUD ONLY. A consumed stop ended the work pending tool calls serve: the channel

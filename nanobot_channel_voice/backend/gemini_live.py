@@ -35,6 +35,7 @@ from .audio_sink import AudioSink
 from .base import (
     NOTICE_MARK,
     AbandonedResult,
+    DelegatedResult,
     InputTranscript,
     OutputAudio,
     OutputTranscript,
@@ -153,11 +154,6 @@ class GeminiLiveBackend(RealtimeTransport):
                 "voice: realtime.thinkingLevel='{}' is ignored for {}: only the "
                 "extended-thinking models take one", level, self._model,
             )
-        # The delegated answer IS the reply the user waits for; a direct tool's result
-        # can wait for the filler to finish.
-        self._scheduling = (
-            "INTERRUPT" if config.realtime.tool_mode == "supervisor" else "WHEN_IDLE"
-        )
         self._log_transcripts = config.log_transcripts
         self._resume_handle: str | None = None
         # The handle's clock: its receipt, then the session's termination (what the
@@ -223,12 +219,14 @@ class GeminiLiveBackend(RealtimeTransport):
             return
         name = self._pending_calls.pop(call_id)
         cut = isinstance(output, AbandonedResult)  # stopped or replaced: resumes nothing
-        # An answer landing while the user holds the floor, or a notice is being voiced,
-        # waits for them to finish (INTERRUPT would cut the notice off).
+        # The delegated answer IS the reply the user waits for; a tool's result can wait for
+        # the filler to finish, as any answer landing while the user holds the floor, or a
+        # notice is being voiced, waits for them (INTERRUPT would cut the notice off).
+        busy = self._user_speaking or self._notice_turn
         scheduling = (
             "SILENT" if cut
-            else "WHEN_IDLE" if self._user_speaking or self._notice_turn
-            else self._scheduling
+            else "INTERRUPT" if isinstance(output, DelegatedResult) and not busy
+            else "WHEN_IDLE"
         )
         try:
             result = json.loads(output)  # a JSON tool result rides as structure

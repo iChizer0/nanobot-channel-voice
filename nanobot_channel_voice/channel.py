@@ -33,6 +33,7 @@ from nanobot_channel_voice.backend.base import (
     NOTICE_BACKLOG,
     NOTICE_MARK,
     AbandonedResult,
+    DelegatedResult,
     Instructions,
     ReceiptResult,
     ToolDef,
@@ -141,8 +142,26 @@ _SUPERVISOR_RULES = (
     "still being worked on, call cancel_nanobot and say nothing."
 )
 
-# Supervisor's delegation tool: persona + its schema and cancel_nanobot's are the whole
-# realtime context, MCP/skills/memory stay in nanobot.
+# Supervisor mode with a tool gateway: the agent's read-only tools the realtime model calls
+# itself, to check on nanobot's work without a delegation's round-trip (files it wrote,
+# its background subagents and exec sessions). ``my`` is offered as its check alone.
+_INSPECT_TOOLS = frozenset({"read_file", "list_dir", "find_files", "my", "list_exec_sessions"})
+_INSPECT_RULE = (
+    "Checking on nanobot's work is not delegated: to read a file it wrote, see what a "
+    "folder holds, or whether its background tasks and commands have finished, call your "
+    "read-only tools yourself and say what you find, with no filler first (they answer at "
+    "once). Anything that changes something, or needs more than a read or two, still goes "
+    "to ask_nanobot."
+)
+_MY_CHECK = (
+    "Check nanobot's own runtime state, read-only: with no key an overview of its model "
+    "and settings; key 'subagents' for the background tasks it is running and how far "
+    "they got."
+)
+_MY_KEY = "Dot-path to drill into, such as 'subagents' or 'model'. Omit for the overview."
+
+# Supervisor's delegation tool: the work goes to nanobot through it, and MCP and the skills
+# stay there.
 _SUPERVISOR_TOOL = ToolDef(
     name="ask_nanobot",
     description=(
@@ -183,6 +202,52 @@ _CANCEL_TOOL = ToolDef(
     ),
     parameters={"type": "object", "properties": {}},
 )
+
+
+class _Refusal(str):
+    """A call the channel refuses: the model hears why, and it counts as a tool error."""
+
+    __slots__ = ()
+    is_error = True
+
+
+def _json_object(value: Any) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value) if value.strip() else {}
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _my_check(args: str) -> str | None:
+    """A ``my`` call rebuilt as its check (the key kept), or None when it asks for another
+    action. Built, not filtered: core also takes a call wrapped in one ``arguments`` field."""
+    params = _json_object(args)
+    if set(params) == {"arguments"}:
+        params = _json_object(params["arguments"])
+    if (params.get("action") or "check") not in ("check", "inspect"):
+        return None
+    check = {"action": "check"}
+    key = params.get("key")
+    if isinstance(key, str) and key:
+        check["key"] = key
+    return json.dumps(check)
+
+
+def _check_only(tool: ToolDef) -> ToolDef | None:
+    """``my`` as a state query: its check alone, nanobot changing its own settings when a
+    request asks it to. None once the schema lost the shape this narrows."""
+    props = tool.parameters.get("properties") or {}
+    action = props.get("action") or {}
+    if "check" not in (action.get("enum") or ()):
+        return None
+    kept = {name: spec for name, spec in props.items() if name != "value"}
+    kept["action"] = {**action, "enum": ["check"]}
+    if isinstance(kept.get("key"), dict):
+        kept["key"] = {**kept["key"], "description": _MY_KEY}
+    return ToolDef(tool.name, _MY_CHECK, {**tool.parameters, "properties": kept})
+
 
 # The ask_nanobot result for work the user stopped, or a newer request replaced: satisfies
 # the function call, and resumes nothing (see AbandonedResult).
@@ -232,6 +297,7 @@ def _cloud_instructions(
     *,
     supervisor: bool,
     has_tools: bool,
+    inspects: bool = False,
     agent_context: str | None = None,
     clock: str | None = None,
     history: str | None = None,
@@ -239,8 +305,11 @@ def _cloud_instructions(
     """The realtime session's instructions: persona (taste), the clock, the agent's own
     context, what was said before a lost session, then the mode's tool rules (contract).
     ONE derivation, so a ``realtime.persona`` override restyles the voice but never
-    deletes the delegation contract or the filler preamble."""
+    deletes the delegation contract or the filler preamble. ``inspects``: supervisor mode
+    also holds the agent's read-only tools."""
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
+    if supervisor and inspects:
+        rules = f"{rules} {_INSPECT_RULE}"
     context = (
         f"{_AGENT_CONTEXT_HEAD}\n\n{agent_context.strip()}"
         if agent_context and agent_context.strip() else ""
@@ -950,6 +1019,7 @@ class VoiceChannel(BaseChannel):
             on_abandon=self._on_cloud_abandon,  # a consumed stop ends a delegation
             on_fatal=self.stop,
             tool_mode=rt.tool_mode,
+            direct_tools=_INSPECT_TOOLS,
             metrics=self._metrics,
             tracer=self._tracer,
             history=history,
@@ -957,10 +1027,11 @@ class VoiceChannel(BaseChannel):
         # Supervisor rules only when the delegated tool is wired; direct rules only when
         # there are tools whose round-trip needs masking.
         supervisor = rt.tool_mode == "supervisor" and exec_tool is not None
-        return shell, self._instructions_source(supervisor, bool(tools), history), tools
+        inspects = supervisor and any(t.name in _INSPECT_TOOLS for t in tools)
+        return shell, self._instructions_source(supervisor, bool(tools), history, inspects), tools
 
     def _instructions_source(
-        self, supervisor: bool, has_tools: bool, history: SpokenHistory,
+        self, supervisor: bool, has_tools: bool, history: SpokenHistory, inspects: bool = False,
     ) -> Instructions:
         """The cloud session's instructions, resolved at every connect so a reconnected
         session reads fresh memory, skills and time, and a fresh one (the provider lost
@@ -980,7 +1051,7 @@ class VoiceChannel(BaseChannel):
                     self.logger.exception("voice: could not read the agent context")
             text = _cloud_instructions(
                 self.config.realtime.persona, supervisor=supervisor, has_tools=has_tools,
-                agent_context=context, clock=time_note("time at connect"),
+                inspects=inspects, agent_context=context, clock=time_note("time at connect"),
                 history=history.render() if fresh else None,
             )
             self.logger.debug("voice: session instructions are {} chars", len(text))
@@ -1056,7 +1127,8 @@ class VoiceChannel(BaseChannel):
             )
             await self._warn_if_unified_session()
             # Not execute_tool: a delegated request is a whole turn, driven over the bus.
-            return [_SUPERVISOR_TOOL, _CANCEL_TOOL], self._supervisor_tool
+            reads = await self._inspect_tools()
+            return [_SUPERVISOR_TOOL, _CANCEL_TOOL, *reads], self._supervisor_tool
 
         gw = self._tool_gateway
         if gw is None:
@@ -1085,14 +1157,51 @@ class VoiceChannel(BaseChannel):
 
         return tools, exec_tool
 
-    async def _supervisor_tool(self, name: str, args: str, turn: str) -> str:
+    async def _inspect_tools(self) -> list[ToolDef]:
+        """Supervisor mode's own reads: the agent's _INSPECT_TOOLS, through the gateway
+        as in direct mode. None without one: every check is then a delegation."""
+        gw = self._tool_gateway
+        if gw is None:
+            self.logger.info(
+                "voice: supervisor mode reads files and nanobot's state itself only through a "
+                "tool gateway, which this nanobot build does not pass; ask_nanobot does them"
+            )
+            return []
+        try:
+            schemas = await gw.get_tool_definitions()
+        except Exception:  # noqa: BLE001 - the delegation still works without them
+            self.logger.exception(
+                "voice: could not list the agent's tools; ask_nanobot does every read"
+            )
+            return []
+        tools = [ToolDef.from_nanobot_schema(s) for s in schemas]
+        tools = [_check_only(t) if t.name == "my" else t for t in tools if t.name in _INSPECT_TOOLS]
+        return [t for t in tools if t is not None]
+
+    async def _supervisor_tool(self, name: str, args: str, turn: str) -> Any:
         if name == _CANCEL_TOOL.name:
             # A request of the cancel's own turn stands ("cancel that and ask X"): asked
             # first, it already replaced the older work; asked after, it is newer than the stop.
             if not turn or turn != self._asked_turn:
                 await self._on_cloud_abandon()
             return _CANCELLED
-        return await self._delegate_to_nanobot(name, args, turn)
+        if name in _INSPECT_TOOLS and self._tool_gateway is not None:
+            return await self._inspect(name, args)
+        answer = await self._delegate_to_nanobot(name, args, turn)
+        return answer if isinstance(answer, AbandonedResult) else DelegatedResult(answer)
+
+    async def _inspect(self, name: str, args: str) -> Any:
+        """One of supervisor mode's reads, executed as direct mode executes a call."""
+        if name == "my":
+            args = _my_check(args)
+            if args is None:
+                return _Refusal(
+                    "Error: only a check is available here; ask_nanobot changes nanobot's "
+                    "settings."
+                )
+        return await self._tool_gateway.execute_tool(
+            name, args, channel=self.name, chat_id=self.config.chat_id,
+        )
 
     async def _delegate_to_nanobot(self, name: str, args: str, turn: str) -> str:
         """``ask_nanobot`` handler (supervisor mode): run a full nanobot turn over the bus
