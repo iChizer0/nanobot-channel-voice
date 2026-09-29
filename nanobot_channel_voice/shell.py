@@ -59,6 +59,23 @@ FatalFn = Callable[[], Awaitable[None]]
 __all__ = ["VoiceShell", "VoiceState"]  # VoiceState re-exported beside its mirror
 
 
+def _tool_output(result: Any) -> str:
+    """A tool result as the text a realtime model takes. Content blocks (core's read_file
+    returns an image as one) keep their text; anything else becomes a note, never its
+    base64, which the model cannot see and the provider may refuse at that size."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list) and result and all(
+        isinstance(block, dict) and "type" in block for block in result
+    ):
+        return "\n".join(
+            str(block.get("text", "")) if block["type"] == "text"
+            else f"[{block['type']} not shown: a voice session takes text only]"
+            for block in result
+        )
+    return json.dumps(result)
+
+
 class VoiceShell:
     def __init__(
         self,
@@ -373,7 +390,7 @@ class VoiceShell:
                     result = await self._exec_tool(ev.name, ev.arguments, ev.turn)
                     if getattr(result, "is_error", False):
                         outcome = "error"
-                    output = result if isinstance(result, str) else json.dumps(result)
+                    output = _tool_output(result)
                 except asyncio.CancelledError:
                     # Teardown: drop the call rather than submit a bogus result.
                     self._metrics.call_finished(ev.call_id, outcome="cancelled", mode=mode)

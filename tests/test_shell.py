@@ -215,6 +215,30 @@ def test_exec_latency_is_bucketed_by_how_the_call_runs():
     assert latency["tool_exec_ms.direct"]["n"] == 1
 
 
+def test_an_image_result_reaches_the_model_as_text_not_base64():
+    """Core's read_file returns an image as content blocks: a realtime model takes text
+    only, so it hears the label and a note, never megabytes of base64."""
+    blocks = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 4096},
+         "_meta": {"path": "photo.png"}},
+        {"type": "text", "text": "(Image file: photo.png)"},
+    ]
+
+    async def exec_tool(name, args, turn):
+        return blocks
+
+    async def _case():
+        shell, backend, _ = _shell(exec_tool=exec_tool)
+        await shell._on_tool_call(ToolCall(call_id="c1", name="read_file", arguments="{}"))
+        return [c[1] for c in backend.calls if c[0] == "result"]
+
+    [(call_id, output)] = _run(_case())
+    assert call_id == "c1" and "base64" not in output and len(output) < 200
+    assert output.splitlines() == [
+        "[image_url not shown: a voice session takes text only]", "(Image file: photo.png)",
+    ]
+
+
 def test_the_seam_gets_the_turn_that_issued_the_call():
     seen: list[str] = []
 
