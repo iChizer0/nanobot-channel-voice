@@ -1563,6 +1563,29 @@ def test_the_attention_cue_marks_a_window_closing_unused():
     asyncio.run(_run())
 
 
+def test_the_attention_cue_closes_a_summon_nobody_follows():
+    """The wake word, then nothing: windowS after the listening cue ends, the window closes
+    with the attention cue, and nothing went up."""
+    async def _run():
+        vad = ScriptVad([True] * 5 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}, back_bytes=FRAME),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 0.2},
+            earcons={"attention": True},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 10)
+        assert gate._metrics.snapshot()["counters"]["earcon_listening"] == 1
+        await asyncio.sleep(0.1)  # the listening cue still sounds
+        assert "earcon_attention" not in gate._metrics.snapshot()["counters"]
+        await asyncio.sleep(0.6)
+        assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1
+        assert inner.calls == []
+        await gate.close()
+
+    asyncio.run(_run())
+
+
 def test_a_spent_sentence_window_cues_at_the_settle():
     async def _run():
         vad = ScriptVad([True] * 4 + [False] * 5)
