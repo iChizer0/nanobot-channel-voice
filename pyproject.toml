@@ -61,8 +61,9 @@ rknn = [
 aec = ["livekit>=1.0"]
 # e2e speech-to-speech over the OpenAI Realtime API dialects (backend="openai"/...),
 # cloud-only and lazily imported. >=13 for the websockets.asyncio client: a 12.x
-# install fails the import with a misleading "install the extra" hint.
-realtime = ["websockets>=13"]
+# install fails the import with a misleading "install the extra" hint. Pillow turns a
+# tool's picture into the JPEG frame Qwen-Omni takes.
+realtime = ["websockets>=13", "pillow>=10"]
 # OpenTelemetry export of tool-call outcomes (telemetry.enabled); voice latency
 # stays in-process in VoiceMetrics. API only — TracerProvider/exporter wiring is
 # the host app's job, so this never fights its configuration — and lazily imported.

@@ -156,6 +156,26 @@ class DelegatedResult(str):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolImage:
+    """An image a tool returned (read_file on a picture), for a model that can see it."""
+
+    mime: str
+    data: bytes
+
+
+class ImageResult(str):
+    """A tool result with images: the text answers the call, and the backend shows the
+    model the images with it, as its provider takes them (only ``image_types`` get here)."""
+
+    images: tuple[ToolImage, ...]
+
+    def __new__(cls, text: str, images: tuple[ToolImage, ...]) -> ImageResult:
+        result = super().__new__(cls, text)
+        result.images = images
+        return result
+
+
+@dataclass(frozen=True, slots=True)
 class ToolsAbandoned:
     """CLOUD ONLY. A consumed stop ended the work pending tool calls serve: the channel
     stops a delegation in flight. Talking during the wait alone never abandons it."""

@@ -283,6 +283,11 @@ class RealtimeTransport(TurnEventMixin):
         return True
 
     @property
+    def image_types(self) -> frozenset[str]:
+        """The image MIME types the model is shown with a tool's result (an ``ImageResult``)."""
+        return frozenset()
+
+    @property
     def at_rest(self) -> bool:
         """Nothing a teardown would cut or lose: no turn or speech, no waiting notice, no
         tool call owing its answer."""

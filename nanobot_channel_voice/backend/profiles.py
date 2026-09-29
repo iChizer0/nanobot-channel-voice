@@ -27,6 +27,13 @@ Dialect = Literal["ga", "beta"]
 #                The server keeps what it streamed: no playback-aligned memory here.
 InterruptKind = Literal["truncate", "cancel"]
 
+# How the model is shown an image a tool returned (a call's output is text only):
+#   "message" = GA: a user message with input_image parts, after the output.
+#   "frame"   = Qwen-Omni: JPEG video frames, which ride a user audio turn the client commits
+#               (manual turns only: under server VAD the server commits).
+#   ""        = not at all: the image stays a note in the output.
+ImageInput = Literal["", "message", "frame"]
+
 # What a ``channels.voice.backend`` value selects; the channel dispatches on this.
 BackendKind = Literal["local", "openai_dialect", "gemini"]
 
@@ -65,6 +72,7 @@ class RealtimeProfile:
     # Max chars in one function_call_output: the whole output enters the model context, so
     # large payloads (base64 images) blow the window. 0 = unlimited (provider enforces).
     max_tool_output_chars: int = 0
+    image_input: ImageInput = ""
     # Per-model voice overrides: keys match by startswith on the resolved model, longest
     # prefix wins; realtime.voice still overrides the result.
     model_voice_overrides: dict[str, str] = field(default_factory=dict)
@@ -148,6 +156,7 @@ PROFILES: dict[str, RealtimeProfile] = {
         default_voice="alloy",
         input_rate=24000,
         output_rate=24000,
+        image_input="message",  # gpt-realtime and later
     ),
     # xAI Grok Voice: $0.08 per audio minute flat (+$0.004 per text item), so only the
     # gated uplink's park saves anything. Transcripts (inputTranscriptionModel
@@ -181,6 +190,7 @@ PROFILES: dict[str, RealtimeProfile] = {
         output_rate=24000,
         auth_header="api-key",
         bearer_prefix="",
+        image_input="message",  # gpt-realtime and later
     ),
     # ---- beta dialect (flat input_audio_format, response.audio.delta) -------
     # Alibaba DashScope. Outside mainland China use the -intl endpoint (workspace-scoped
@@ -220,6 +230,7 @@ PROFILES: dict[str, RealtimeProfile] = {
         supports_tools=False,
         needs_response_create_after_tools=True,
         flatten_tool_schema=True,  # Qwen-Omni rejects nullable-union types + combinators
+        image_input="frame",
         # Its conversation.item.create documents tool results only (no user text item).
         supports_text_input=False,
     ),

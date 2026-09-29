@@ -957,3 +957,208 @@ def test_a_resumption_window_closing_during_the_source_await_keeps_the_decision(
         await backend.close()
 
     run(_run())
+
+
+# ---- a tool's picture on Qwen: frames of a user audio turn ------------------
+
+
+def _png(size=(1600, 1200)) -> bytes:
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.effect_noise(size, 64).convert("RGB").save(out, "PNG")  # noise: no easy squeeze
+    return out.getvalue()
+
+
+def _picture_result():
+    from nanobot_channel_voice.backend.base import ImageResult, ToolImage
+
+    return ImageResult("(Image file: a.png)", (ToolImage("image/png", _png()),))
+
+
+def _frame_of(payload: dict) -> bytes:
+    assert payload["type"] == "input_image_buffer.append"
+    return base64.b64decode(payload["image"])
+
+
+def test_a_tools_picture_reaches_qwen_as_a_frame_turn_before_the_answer_is_asked():
+    """Qwen takes pictures only as JPEG frames of a user audio turn: held until the answer
+    is asked for (the read beat its response's end here), then silence, the frame, the
+    commit, and the create. The frame fits the vendor's 256 KB base64 limit."""
+    from nanobot_channel_voice.backend.openai_realtime import _FRAME_BYTES, _FRAME_SIDE
+
+    async def _run():
+        backend, sent, _ = make_backend("qwen")
+        assert backend.image_types == frozenset({"image/png", "image/jpeg"})
+        backend._ready.set()
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.function_call_arguments.done",
+                                     "response_id": "r1", "call_id": "c1",
+                                     "name": "read_file", "arguments": "{}"})
+        await backend.submit_tool_result("c1", _picture_result())
+        assert [p["type"] for p in sent] == ["conversation.item.create"]
+        assert sent[0]["item"]["output"] == "(Image file: a.png)"
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r1", "status": "completed"}})
+        assert [p["type"] for p in sent[1:]] == [
+            "input_audio_buffer.append", "input_image_buffer.append",
+            "input_audio_buffer.commit", "response.create",
+        ]
+        assert set(base64.b64decode(sent[1]["audio"])) == {0}
+        frame = _frame_of(sent[2])
+        assert frame[:2] == b"\xff\xd8" and len(frame) <= _FRAME_BYTES
+        assert len(base64.b64encode(frame)) <= 256 * 1024
+        from io import BytesIO
+
+        from PIL import Image
+
+        assert max(Image.open(BytesIO(frame)).size) <= _FRAME_SIDE
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_picture_landing_while_the_user_speaks_rides_their_turn():
+    async def _run():
+        backend, sent, _ = make_backend("qwen")
+        backend._ready.set()
+        await _dispatched_wait(backend)
+        await backend.begin_activity()
+        sent.clear()
+        await backend.submit_tool_result("c1", _picture_result())
+        await backend.end_activity()
+        assert [p["type"] for p in sent] == [
+            "conversation.item.create", "input_image_buffer.append",
+            "input_audio_buffer.commit", "response.create",
+        ]
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_picture_qwen_cannot_be_shown_is_a_note_and_no_frame_turn():
+    from nanobot_channel_voice.backend.base import ImageResult, ToolImage
+
+    async def _run():
+        backend, sent, _ = make_backend("qwen")
+        backend._ready.set()
+        await _dispatched_wait(backend)
+        broken = ImageResult("(Image file: a.png)", (ToolImage("image/png", b"not a png"),))
+        await backend.submit_tool_result("c1", broken)
+        assert [p["type"] for p in sent] == ["conversation.item.create", "response.create"]
+        assert sent[0]["item"]["output"] == "(Image file: a.png)\n[an image could not be shown]"
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_picture_outlives_its_filler_being_talked_over_and_rides_the_users_turn():
+    """Talking over the filler cancels its response, not the read already answered: as the
+    read's output, its picture goes to the response the user's own turn asks for."""
+
+    async def _run():
+        backend, sent, _ = make_shell_backend("qwen")
+        backend._ready.set()
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.function_call_arguments.done",
+                                     "response_id": "r1", "call_id": "c1",
+                                     "name": "read_file", "arguments": "{}"})
+        await backend.submit_tool_result("c1", _picture_result())
+        await backend.begin_activity()
+        assert sent[-1] == {"type": "response.cancel"}
+        await backend._handle_event({"type": "response.done",
+                                     "response": {"id": "r1", "status": "cancelled"}})
+        sent.clear()
+        await backend.end_activity()
+        assert [p["type"] for p in sent] == [
+            "input_image_buffer.append", "input_audio_buffer.commit", "response.create",
+        ]
+        await backend.close()
+
+    run(_run())
+
+
+async def _read_and_ask(backend) -> None:
+    """One response calling read_file (c1) and ask_nanobot (c2), then its end."""
+    ev = backend._handle_event
+    await ev({"type": "response.created", "response": {"id": "r1"}})
+    for cid, name in (("c1", "read_file"), ("c2", "ask_nanobot")):
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": cid, "name": name, "arguments": "{}"})
+    await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+
+
+@pytest.mark.parametrize("how", ["replaced", "stopped", "stopped after"])
+def test_a_picture_whose_work_ended_never_rides_a_later_turn(how):
+    """Its sibling delegation was replaced, or a stop ended the work, before or after the
+    read answered: either way no answer is asked for it, and the user's next, unrelated
+    turn must not carry it."""
+    from nanobot_channel_voice.backend.base import AbandonedResult
+
+    async def _run():
+        backend, sent, _ = make_backend("qwen")
+        backend._ready.set()
+        await _read_and_ask(backend)
+        if how == "replaced":
+            await backend.submit_tool_result("c1", _picture_result())
+            await backend.submit_tool_result("c2", AbandonedResult("(replaced)"))
+        elif how == "stopped":
+            await backend._consume_stop("stop")
+            await backend.submit_tool_result("c1", _picture_result())
+        else:
+            await backend.submit_tool_result("c1", _picture_result())
+            await backend._consume_stop("stop")
+        await backend.begin_activity()
+        sent.clear()
+        await backend.end_activity()
+        assert [p["type"] for p in sent] == ["input_audio_buffer.commit", "response.create"]
+        await backend.close()
+
+    run(_run())
+
+
+def test_an_onset_during_the_frame_turn_leaves_the_commit_to_the_user():
+    """Speech began while the frames were going up: committing now would split it, so their
+    own commit carries the frames with it."""
+    async def _run():
+        backend, sent, _ = make_backend("qwen")
+        backend._ready.set()
+        record = backend._send
+
+        async def send(payload):
+            await record(payload)
+            if payload["type"] == "input_image_buffer.append":
+                backend._user_speaking = True  # the gate's onset lands mid-send
+
+        backend._send = send
+        await _dispatched_wait(backend)
+        await backend.submit_tool_result("c1", _picture_result())
+        assert [p["type"] for p in sent[1:]] == [
+            "input_audio_buffer.append", "input_image_buffer.append", "response.create",
+        ]
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_frame_keeps_a_photo_upright_and_transparency_white():
+    import io
+
+    from PIL import Image
+
+    from nanobot_channel_voice.backend.base import ToolImage
+    from nanobot_channel_voice.backend.openai_realtime import _jpeg_frame
+
+    out = io.BytesIO()
+    Image.new("RGBA", (40, 20), (0, 0, 0, 0)).save(out, "PNG")  # clear, black underneath
+    frame = Image.open(io.BytesIO(_jpeg_frame(ToolImage("image/png", out.getvalue()))))
+    assert frame.convert("L").getextrema()[0] > 200
+    photo = Image.new("RGB", (40, 20), "red")
+    exif = photo.getexif()
+    exif[0x0112] = 6  # stored sideways: the camera says rotate 90
+    out = io.BytesIO()
+    photo.save(out, "JPEG", exif=exif)
+    frame = Image.open(io.BytesIO(_jpeg_frame(ToolImage("image/jpeg", out.getvalue()))))
+    assert frame.size == (20, 40)

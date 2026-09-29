@@ -12,6 +12,7 @@ event, so those paths stay dormant.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -30,6 +31,7 @@ from nanobot_channel_voice.telemetry import VoiceTracer
 from .backend.audio_sink import AudioSink
 from .backend.base import (
     Error,
+    ImageResult,
     InputTranscript,
     Instructions,
     OutputAudio,
@@ -37,6 +39,7 @@ from .backend.base import (
     StateHint,
     ToolCall,
     ToolDef,
+    ToolImage,
     ToolsAbandoned,
     ToolsCancelled,
     ToolStarted,
@@ -59,20 +62,44 @@ FatalFn = Callable[[], Awaitable[None]]
 __all__ = ["VoiceShell", "VoiceState"]  # VoiceState re-exported beside its mirror
 
 
-def _tool_output(result: Any) -> str:
+def _image_of(block: dict, types: frozenset[str]) -> ToolImage | None:
+    """The picture in core's ``image_url`` block (a base64 data URL) when the model takes
+    its type, else None."""
+    url = block.get("image_url")
+    url = url.get("url") if isinstance(url, dict) else url
+    if block["type"] != "image_url" or not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    head, _, data = url[len("data:"):].partition(",")
+    mime, _, encoding = head.partition(";")
+    if encoding != "base64" or mime not in types:
+        return None
+    try:
+        return ToolImage(mime, base64.b64decode(data, validate=True))
+    except (ValueError, TypeError):
+        return None
+
+
+def _tool_output(result: Any, *, image_types: frozenset[str] = frozenset()) -> str:
     """A tool result as the text a realtime model takes. Content blocks (core's read_file
-    returns an image as one) keep their text; anything else becomes a note, never its
-    base64, which the model cannot see and the provider may refuse at that size."""
+    returns an image as one) keep their text; an image of a type the model takes rides
+    along, and anything else becomes a note, never its base64, which the model cannot
+    see and the provider may refuse at that size."""
     if isinstance(result, str):
         return result
     if isinstance(result, list) and result and all(
         isinstance(block, dict) and "type" in block for block in result
     ):
-        return "\n".join(
-            str(block.get("text", "")) if block["type"] == "text"
-            else f"[{block['type']} not shown: a voice session takes text only]"
-            for block in result
-        )
+        parts: list[str] = []
+        images: list[ToolImage] = []
+        for block in result:
+            if block["type"] == "text":
+                parts.append(str(block.get("text", "")))
+            elif image_types and (image := _image_of(block, image_types)) is not None:
+                images.append(image)
+            else:
+                parts.append(f"[{block['type']} not shown: a voice session takes text only]")
+        text = "\n".join(parts)
+        return ImageResult(text, tuple(images)) if images else text
     return json.dumps(result)
 
 
@@ -108,6 +135,8 @@ class VoiceShell:
         self._backend = backend
         # getattr: absent (older stubs) means local-shaped, where parking is safe.
         self._pace_audio = getattr(backend, "pace_output_audio", True)
+        # The image types the model is shown with a tool's result; others become notes.
+        self._image_types = frozenset(getattr(backend, "image_types", ()))
         # Half-duplex wake tap: a backend exposing push_gated_audio still hears gated
         # frames (wake detector only), so the wake word can barge in. Absent on cloud.
         self._gated_push = getattr(backend, "push_gated_audio", None)
@@ -390,7 +419,7 @@ class VoiceShell:
                     result = await self._exec_tool(ev.name, ev.arguments, ev.turn)
                     if getattr(result, "is_error", False):
                         outcome = "error"
-                    output = _tool_output(result)
+                    output = _tool_output(result, image_types=self._image_types)
                 except asyncio.CancelledError:
                     # Teardown: drop the call rather than submit a bogus result.
                     self._metrics.call_finished(ev.call_id, outcome="cancelled", mode=mode)

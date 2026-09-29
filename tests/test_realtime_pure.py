@@ -21,12 +21,14 @@ from nanobot_channel_voice.backend.base import (
     NOTICE_BACKLOG,
     AbandonedResult,
     Error,
+    ImageResult,
     InputTranscript,
     OutputAudio,
     ReceiptResult,
     StateHint,
     ToolCall,
     ToolDef,
+    ToolImage,
     ToolsAbandoned,
     ToolStarted,
     TurnDone,
@@ -1592,6 +1594,86 @@ def test_a_continuation_announced_under_its_filler_is_still_truncated_when_cut()
         await sink.stop()
 
     asyncio.run(_run())
+
+
+async def _read_image_call(backend, output) -> list[dict]:
+    """A direct-mode read_file call, answered after its response ended, with ``output``."""
+    sent: list[dict] = []
+
+    async def record(payload):
+        sent.append(payload)
+
+    backend._send = record
+    ev = backend._handle_event
+    await ev({"type": "session.updated"})
+    await ev({"type": "response.created", "response": {"id": "r1"}})
+    await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+              "call_id": "c1", "name": "read_file", "arguments": "{}"})
+    await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+    await backend.submit_tool_result("c1", output)
+    await backend.close()
+    return sent
+
+
+def test_a_tools_image_follows_its_output_as_a_labelled_user_message():
+    """A call's output is text only: the picture a read returned rides a user message right
+    behind it, before the continuation is asked for, labelled as the tool's."""
+    backend, _ = make_backend()
+    assert backend.image_types == frozenset({"image/png", "image/jpeg"})
+    image = ToolImage("image/png", b"\x89PNG")
+    sent = asyncio.run(_read_image_call(backend, ImageResult("(Image file: a.png)", (image,))))
+    assert [p["type"] for p in sent] == ["conversation.item.create"] * 2 + ["response.create"]
+    assert sent[0]["item"] == {
+        "type": "function_call_output", "call_id": "c1", "output": "(Image file: a.png)",
+    }
+    message = sent[1]["item"]
+    assert message["type"] == "message" and message["role"] == "user"
+    assert message["content"][0]["type"] == "input_text"
+    assert message["content"][1:] == [
+        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw=="},
+    ]
+
+
+def test_a_session_lost_during_the_output_send_gets_no_image():
+    """The reconnect finished while the output went out: the image message would land in a
+    session that never had the call."""
+    backend, _ = make_backend()
+    image = ToolImage("image/png", b"\x89PNG")
+
+    async def _run():
+        sent: list[dict] = []
+
+        async def send(payload):
+            sent.append(payload)
+            if payload.get("item", {}).get("type") == "function_call_output":
+                backend._reset_turn_state(reason="session_lost")
+
+        ev = backend._handle_event
+        await ev({"type": "session.updated"})
+        await ev({"type": "response.created", "response": {"id": "r1"}})
+        await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+                  "call_id": "c1", "name": "read_file", "arguments": "{}"})
+        backend._send = send
+        await backend.submit_tool_result("c1", ImageResult("(Image file: a.png)", (image,)))
+        await backend.close()
+        return sent
+
+    assert [p["item"]["type"] for p in asyncio.run(_run())] == ["function_call_output"]
+
+
+def test_which_profiles_show_a_tools_image():
+    """GA takes it as a user message; Qwen only as frames of a turn the client commits, so
+    not under server VAD."""
+    sink = AudioSink(NullPlayback(), mode="stream")
+
+    def takes(config):
+        return {
+            key for key, profile in PROFILES.items()
+            if rt.RealtimeBackend(config, sink=sink, profile=profile).image_types
+        }
+
+    assert takes(VoiceConfig()) == {"openai", "azure"}
+    assert takes(VoiceConfig(realtime={"uplink": "vad"})) == {"openai", "azure", "qwen"}
 
 
 async def _tool_wait(ev, rid: str = "r1", cid: str = "c1") -> None:

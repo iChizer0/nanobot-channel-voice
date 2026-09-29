@@ -293,6 +293,10 @@ class GatedUplink:
         return self._inner.voices_notices
 
     @property
+    def image_types(self) -> frozenset[str]:
+        return self._inner.image_types
+
+    @property
     def at_rest(self) -> bool:
         """Idle on both sides of the gate: no open activity here, nothing waiting inside."""
         return self._state is VoiceState.IDLE and not self._active and self._inner.at_rest

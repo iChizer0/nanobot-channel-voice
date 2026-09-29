@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import io
 import json
 import time
 from contextlib import suppress
@@ -59,6 +60,13 @@ from .transport import RealtimeTransport, _load_connect  # noqa: F401 - re-expor
 # creates the response answering it; new user speech ends the window.
 _STOP_GRACE_S = 3.0
 _STOP_SUPPRESS_S = 2.0
+# The image types a tool's picture is shown in; others stay a note.
+_IMAGE_TYPES = frozenset({"image/png", "image/jpeg"})
+# Heads a tool's images: they ride a user message, since a call's output is text only.
+_IMAGE_LABEL = "(The image the tool call above returned, not something the user sent.)"
+# Qwen's frame limits: JPEG, up to 1080p, 256 KB once base64'd (it asks for < 190 KB raw).
+_FRAME_SIDE = 1280
+_FRAME_BYTES = 190_000
 # Forget a resumable conversation this long BEFORE the vendor drops its history: what a
 # server does with a stale ?conversation_id= is undocumented, and a refused connect
 # would walk the reconnect ladder to fatal.
@@ -119,6 +127,43 @@ def _normalize_schema(schema: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _jpeg_frame(image) -> bytes | None:
+    """A picture as a frame Qwen takes, shrunk until it fits; None when Pillow cannot read
+    it."""
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(image.data)) as picture:
+            rgba = ImageOps.exif_transpose(picture).convert("RGBA")  # a phone photo upright
+    except Exception:  # noqa: BLE001 - no Pillow, or bytes it cannot decode
+        return None
+    rgb = Image.new("RGB", rgba.size, "white")
+    rgb.paste(rgba, mask=rgba.getchannel("A"))  # transparency on white, not black
+    for side, quality in ((_FRAME_SIDE, 85), (_FRAME_SIDE, 60), (960, 60), (640, 50)):
+        frame = rgb.copy()
+        frame.thumbnail((side, side))
+        out = io.BytesIO()
+        frame.save(out, "JPEG", quality=quality)
+        if out.tell() <= _FRAME_BYTES:
+            return out.getvalue()
+    return None
+
+
+def _image_message(images) -> dict:
+    """A tool's images as the user message the GA dialect takes them in, labelled as the
+    tool's so the model does not answer them as the user's."""
+    parts = [
+        {"type": "input_image",
+         "image_url": f"data:{image.mime};base64,{base64.b64encode(image.data).decode('ascii')}"}
+        for image in images
+    ]
+    return {
+        "type": "conversation.item.create",
+        "item": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": _IMAGE_LABEL}, *parts]},
+    }
 
 
 def _tool_to_wire(tool: ToolDef, *, flatten: bool = False) -> dict:
@@ -220,6 +265,8 @@ class RealtimeBackend(RealtimeTransport):
         # Manual turns: a commit landing between a response.create and its
         # response.created is refused (already active); re-ask once that response ends.
         self._retry_create = False
+        # A tool's pictures as Qwen frames, shown when the answer is asked for (_show_frames).
+        self._frames: list[bytes] = []
         # A tool continuation asked for but not born (no response.created yet): a barge-in
         # has no id to cancel, so it marks the newborn. Unbounded, unlike the stop window.
         self._continuation_unborn = False
@@ -341,6 +388,7 @@ class RealtimeBackend(RealtimeTransport):
         # The stop also ends the work pending tool calls serve: their answers resume nothing
         # (nor may a deferred re-ask), and the channel stops a delegation in flight.
         self._retry_create = False
+        self._frames.clear()
         waited = [r for r, cids in self._tools_pending.items() if cids]
         for waited_rid in waited:
             self._discard_response_tools(waited_rid)
@@ -372,6 +420,14 @@ class RealtimeBackend(RealtimeTransport):
         return output[:keep] + "\n" + marker
 
     async def submit_tool_result(self, call_id: str, output: str) -> None:
+        images = getattr(output, "images", ())
+        frames: list[bytes] = []
+        if images and self._profile.image_input == "frame":
+            # Off the loop, and before any bookkeeping: the session may change meanwhile.
+            made = [await asyncio.to_thread(_jpeg_frame, image) for image in images]
+            frames = [frame for frame in made if frame is not None]
+            if len(frames) < len(images):
+                output = f"{output}\n[an image could not be shown]"
         # Always satisfy the pending call; only trigger a new response if the turn lives.
         if call_id not in self._session_calls:
             # The issuing session is gone (reconnect); this one would reject the call_id.
@@ -386,7 +442,16 @@ class RealtimeBackend(RealtimeTransport):
         }
         # call_id/size only: serializing the payload would double every result's JSON cost.
         self._log.debug("submit_tool_result call_id={} ({} chars)", call_id, len(output))
+        # Its pictures only where an answer is still owed: a call whose work was stopped or
+        # replaced shows nothing, then or on a later turn.
+        shown = not abandoned and call_id in self._call_to_response
         await self._send(payload)
+        if call_id not in self._session_calls:
+            return  # lost during the send: the next session never had this call
+        if shown:
+            self._frames.extend(frames)  # before the call stops pending: see _maybe_respond
+            if images and self._profile.image_input == "message":
+                await self._send(_image_message(images))
         # Answered exactly once: drop the bookkeeping, incl. the duplicate-submit guard.
         self._session_calls.discard(call_id)
         self._dispatched.discard(call_id)
@@ -397,7 +462,8 @@ class RealtimeBackend(RealtimeTransport):
         if rid is None:
             return
         if abandoned and not receipt:
-            self._discard_response_tools(rid)  # the work was stopped or replaced
+            self._frames.clear()  # the work was stopped or replaced, what it read with it
+            self._discard_response_tools(rid)
             await self._release_wait()
             return
         pending = self._tools_pending.get(rid)
@@ -417,6 +483,7 @@ class RealtimeBackend(RealtimeTransport):
     async def _activity_end_wire(self, *, commit: bool) -> None:
         if commit:
             self._retry_create = False  # this create answers the whole buffer
+            await self._show_frames(own_turn=False)
             await self._send({"type": "input_audio_buffer.commit"})
             await self._send({"type": "response.create"})
             return
@@ -429,6 +496,7 @@ class RealtimeBackend(RealtimeTransport):
             # What was owed an answer (committed audio, a tool's output) waited on this
             # activity, and no done will re-ask now: ask here.
             self._retry_create = False
+            await self._show_frames()
             await self._send({"type": "response.create"})
 
     # ---- wire ---------------------------------------------------------------
@@ -901,8 +969,24 @@ class RealtimeBackend(RealtimeTransport):
         the frame, so an onset during the send still kills it at birth; the deadman covers
         the create -> response.created gap, where a lost create would wedge the session."""
         self._continuation_unborn = True
+        await self._show_frames()
         await self._send({"type": "response.create"})
         self._arm_watchdog()
+
+    async def _show_frames(self, *, own_turn: bool = True) -> None:
+        """Qwen shows the model a picture only as a frame of a user audio turn: the frames
+        ride the user's turn being committed, else one of their own, where a moment of
+        silence goes first (frames need audio before them) and the commit after."""
+        frames, self._frames = self._frames, []
+        if not frames:
+            return
+        if own_turn:
+            await self._send(self._audio_frame(bytes(self._profile.input_rate // 5)))  # 100 ms
+        for frame in frames:
+            await self._send({"type": "input_image_buffer.append",
+                              "image": base64.b64encode(frame).decode("ascii")})
+        if own_turn and not self._user_speaking:  # an onset meanwhile: its turn carries them
+            await self._send({"type": "input_audio_buffer.commit"})
 
     def _cleanup_response(self, rid: str) -> None:
         self._tools_pending.pop(rid, None)
@@ -920,6 +1004,12 @@ class RealtimeBackend(RealtimeTransport):
     @property
     def voices_notices(self) -> bool:
         return self._profile.supports_text_input
+
+    @property
+    def image_types(self) -> frozenset[str]:
+        kind = self._profile.image_input
+        # A frame turn is the client's to commit: none under server VAD.
+        return _IMAGE_TYPES if kind == "message" or (kind == "frame" and self._manual) else frozenset()
 
     def _notice_quiet(self) -> bool:
         return (

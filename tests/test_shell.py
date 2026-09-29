@@ -14,11 +14,13 @@ from nanobot_channel_voice.audio.base import CaptureSource
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
+    ImageResult,
     InputTranscript,
     OutputAudio,
     OutputTranscript,
     StateHint,
     ToolCall,
+    ToolImage,
     ToolsAbandoned,
     ToolsCancelled,
     TurnDone,
@@ -67,6 +69,7 @@ class _StubBackend:
 
 def _shell(**kw) -> tuple[VoiceShell, _StubBackend, AudioSink]:
     backend = _StubBackend()
+    backend.image_types = kw.pop("image_types", frozenset())
     sink = AudioSink(NullPlayback(), mode="stream")
     shell = VoiceShell(
         VoiceConfig(),
@@ -236,6 +239,33 @@ def test_an_image_result_reaches_the_model_as_text_not_base64():
     assert call_id == "c1" and "base64" not in output and len(output) < 200
     assert output.splitlines() == [
         "[image_url not shown: a voice session takes text only]", "(Image file: photo.png)",
+    ]
+    assert not isinstance(output, ImageResult)
+
+
+def test_an_image_result_goes_to_a_model_that_sees_images_beside_its_label():
+    blocks = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+         "_meta": {"path": "photo.png"}},
+        {"type": "text", "text": "(Image file: photo.png)"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+        {"type": "image_url", "image_url": {"url": "data:image/gif;base64,R0lGODlh"}},
+    ]
+
+    async def exec_tool(name, args, turn):
+        return blocks
+
+    async def _case():
+        shell, backend, _ = _shell(exec_tool=exec_tool, image_types=frozenset({"image/png"}))
+        await shell._on_tool_call(ToolCall(call_id="c1", name="read_file", arguments="{}"))
+        return [c[1] for c in backend.calls if c[0] == "result"]
+
+    [(_, output)] = _run(_case())
+    assert isinstance(output, ImageResult)
+    assert output.images == (ToolImage("image/png", b"\x89PNG\r\n\x1a\n"),)
+    # A picture it cannot fetch, or of a type the model does not take, is a note.
+    assert output.splitlines() == [
+        "(Image file: photo.png)", *["[image_url not shown: a voice session takes text only]"] * 2,
     ]
 
 
