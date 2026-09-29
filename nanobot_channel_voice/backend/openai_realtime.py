@@ -308,9 +308,9 @@ class RealtimeBackend(RealtimeTransport):
         rid = self._active_response_id
         if not rid or rid in self._cancelled_responses:
             return
+        self._note_cancelled(rid)  # before the send yields: its deltas are dead already
         with suppress(Exception):
             await self._send(self._cancel_frame(rid))
-        self._note_cancelled(rid)
 
     def _cancel_frame(self, rid: str) -> dict:
         # Named: a cancel delayed by a congested uplink lands on whatever is active THEN,
@@ -433,17 +433,24 @@ class RealtimeBackend(RealtimeTransport):
 
     # ---- wire ---------------------------------------------------------------
 
-    def _connect_args(self) -> tuple[str, dict[str, str]]:
-        url = self._profile.connect_url(self._rt.base_url, self._model)
+    def _live_conversation_id(self) -> str | None:
+        """The resumable conversation (xAI), dropped once the vendor would have."""
         if self._conversation_id:
             idle = time.monotonic() - self._conversation_t
             if idle > self._profile.resumption_ttl_s - _RESUMPTION_MARGIN_S:
                 self._log.info("realtime conversation expired ({:.0f}s idle); starting fresh", idle)
                 self._conversation_id = None
-            else:
-                sep = "&" if "?" in url else "?"
-                url = f"{url}{sep}conversation_id={quote(self._conversation_id, safe='')}"
-                self._log.debug("resuming realtime conversation {}", self._conversation_id)
+        return self._conversation_id
+
+    def _resumes_conversation(self) -> bool:
+        return self._live_conversation_id() is not None
+
+    def _connect_args(self) -> tuple[str, dict[str, str]]:
+        url = self._profile.connect_url(self._rt.base_url, self._model)
+        if conversation_id := self._live_conversation_id():
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}conversation_id={quote(conversation_id, safe='')}"
+            self._log.debug("resuming realtime conversation {}", conversation_id)
         return url, self._profile.auth_headers(self._api_key())
 
     def _hello_payload(self) -> dict:
@@ -607,10 +614,16 @@ class RealtimeBackend(RealtimeTransport):
         elif t == "conversation.item.input_audio_transcription.completed":
             text = evt.get("transcript", "")
             if text:
-                await self._emit(InputTranscript(text))
                 # A transcript lands after its commit, often after the next onset, which then
                 # owns the state: a stop for an older utterance must not act on the new one.
-                item_onset = self._item_onset.get(evt.get("item_id"), self._onsets)
+                known = self._item_onset.get(evt.get("item_id"))
+                item_onset = self._onsets if known is None else known
+                # Placed by the utterance it is for; with no committed item on record, the
+                # last one that ended.
+                spoken = self._end_onset if known is None else known
+                await self._emit(
+                    InputTranscript(text, later_onsets=max(0, self._onsets - spoken))
+                )
                 if (
                     self._stop_match is not None
                     and item_onset >= self._onsets

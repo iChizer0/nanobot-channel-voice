@@ -22,6 +22,7 @@ from nanobot_channel_voice.channel import (
 )
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.context_tool import VoiceContextBridge
+from nanobot_channel_voice.history import SpokenHistory
 from nanobot_channel_voice.streamid import TURN_META
 
 
@@ -95,7 +96,7 @@ class _FakeGateway:
 
 def _instructions(gateway, *, supervisor: bool, has_tools: bool) -> str:
     channel = VoiceChannel(VoiceConfig(), MessageBus(), tool_gateway=gateway)
-    return asyncio.run(channel._instructions_source(supervisor, has_tools)())
+    return asyncio.run(channel._instructions_source(supervisor, has_tools, SpokenHistory())(True))
 
 
 def test_cloud_instructions_carry_the_agent_context_and_a_clock():
@@ -121,6 +122,26 @@ def test_a_failing_or_missing_gateway_keeps_persona_and_rules():
         assert _AGENT_CONTEXT_HEAD not in out
         assert "[time at connect: " in out
         assert out.endswith(f"{_STOP_RULE}\n\n{_NOTICE_RULE}")
+
+
+def test_a_fresh_session_replays_what_was_said_and_a_resumed_one_does_not():
+    """A park, a turn cap or a drop costs the provider the conversation; xAI and Gemini
+    resume theirs, where a replay would say everything twice."""
+    from nanobot_channel_voice.channel import _HISTORY_HEAD
+
+    history = SpokenHistory()
+    history.user_text("My name is Ada.")
+    history.reply_text("Nice to meet you, Ada.")
+    channel = VoiceChannel(VoiceConfig(), MessageBus())
+    source = channel._instructions_source(False, True, history)
+    fresh = asyncio.run(source(True))
+    assert f"{_HISTORY_HEAD}\nUser: My name is Ada.\nYou: Nice to meet you, Ada." in fresh
+    # The replay sits before the contract: the rules close the instructions.
+    assert fresh.index(_HISTORY_HEAD) < fresh.index(_DIRECT_RULES)
+    assert _HISTORY_HEAD not in asyncio.run(source(False))
+    # Nothing said yet: no heading either.
+    empty = channel._instructions_source(False, True, SpokenHistory())
+    assert _HISTORY_HEAD not in asyncio.run(empty(True))
 
 
 # ---- local speakability context ---------------------------------------------
@@ -421,3 +442,18 @@ def test_stacked_notes_share_one_block():
     stamp, *events = block.content.split("\n")
     assert stamp.startswith("[time now: ")
     assert events == ["[voice event: a]", "[voice event: b]"]
+
+
+def test_the_spoken_history_outlives_a_pipeline_rebuild():
+    """A rebuild (new models landing, a restart) must not make the model greet again."""
+    cfg = VoiceConfig.model_validate(
+        {"backend": "qwen", "audio": {"backend": "null"}, "realtime": {"apiKey": "k"}}
+    )
+    channel = VoiceChannel(cfg, MessageBus())
+
+    async def _run():
+        first, *_ = await channel._build_cloud("openai_dialect")
+        second, *_ = await channel._build_cloud("openai_dialect")
+        assert first.history is second.history is channel._history
+
+    asyncio.run(_run())

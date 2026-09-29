@@ -1171,8 +1171,10 @@ def test_a_resumed_session_keeps_the_instructions_it_started_with(monkeypatch):
     async def _run():
         backend, sent, _ = make_backend()
         versions = iter(["v1", "v2", "v3"])
+        fresh_flags: list[bool] = []
 
-        async def source() -> str:
+        async def source(fresh: bool) -> str:
+            fresh_flags.append(fresh)
             return next(versions)
 
         opened = 0
@@ -1198,5 +1200,38 @@ def test_a_resumed_session_keeps_the_instructions_it_started_with(monkeypatch):
         assert texts == ["v1", "v1", "v2"]  # resumed keeps v1; the fresh session reads again
         assert "handle" in setups[1]["sessionResumption"]
         assert setups[2]["sessionResumption"] == {}
+        assert fresh_flags[:2] == [True, True]  # never asked while resuming
+
+    asyncio.run(_run())
+
+
+def test_a_gated_barge_in_is_dead_before_the_onset_reaches_the_shell():
+    """The shell's flush yields: what the cut-off turn sends meanwhile, audio or its
+    transcript, must already be dead, or it plays and reads as a new reply."""
+    cfg = VoiceConfig(backend="gemini", vad={"engine": "silero"}, realtime={"uplink": "vad"})
+
+    async def _run():
+        backend, _, events = make_backend(cfg)
+        await backend._handle_event({"setupComplete": {}})
+        await backend._handle_event(audio_msg(b"\x01"))  # a reply is playing
+        dead_at_onset: list[bool] = []
+
+        async def on_event(e):
+            events.append(e)
+            if isinstance(e, UserSpeechStarted):
+                dead_at_onset.append(backend._dead_audio)
+                # The rx loop runs during the flush: the dead turn's tail arrives.
+                await backend._handle_event({"serverContent": {
+                    "outputTranscription": {"text": "tail"}, "modelTurn": {"parts": [
+                        {"inlineData": {"mimeType": "audio/pcm;rate=24000", "data": b64(b"\x09")}},
+                    ]},
+                }})
+
+        backend._on_event = on_event
+        await backend.begin_activity()
+        assert dead_at_onset == [True]
+        assert not any(isinstance(e, OutputTranscript) for e in events)
+        assert sum(isinstance(e, OutputAudio) for e in events) == 1  # the first reply only
+        await backend.close()
 
     asyncio.run(_run())

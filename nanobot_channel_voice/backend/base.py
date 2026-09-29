@@ -87,10 +87,14 @@ class OutputTranscript:
 
 @dataclass(frozen=True, slots=True)
 class InputTranscript:
-    """Recognized USER speech. OBSERVATIONAL (logging only). ``cloud`` only, and only when
-    ``realtime.inputTranscriptionModel`` is set; ``local`` logs its transcript internally."""
+    """Recognized USER speech. OBSERVATIONAL (logging, the spoken history). ``cloud`` only,
+    and only when ``realtime.inputTranscriptionModel`` is set; ``local`` logs its transcript
+    internally. ``later_onsets``: how many user onsets began after this utterance's, for a
+    transcript that lands after its commit (OpenAI dialects); None when it is transcribed
+    live, as spoken (Gemini)."""
 
     text: str
+    later_onsets: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,8 +186,9 @@ VoiceEvent = (
 
 OnEvent = Callable[[VoiceEvent], Awaitable[None]]
 # A cloud session's instructions: fixed text, or a source resolved again at every connect
-# so a reconnected session carries fresh context.
-Instructions = str | Callable[[], Awaitable[str]] | None
+# so a reconnected session carries fresh context. Its argument says the provider holds no
+# history of this conversation (a fresh session, not a resumed one).
+Instructions = str | Callable[[bool], Awaitable[str]] | None
 
 
 @runtime_checkable

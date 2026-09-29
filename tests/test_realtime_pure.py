@@ -718,7 +718,9 @@ def test_xai_conversation_id_rides_every_reconnect():
         resumed, _ = xai._connect_args()
         assert resumed == fresh + "&conversation_id=conv%2F1"
         # Older than the vendor's cache (minus the margin): forgotten, never sent stale.
+        assert xai._resumes_conversation()  # the provider holds the history: no replay
         xai._conversation_t -= PROFILES["xai"].resumption_ttl_s
+        assert not xai._resumes_conversation()
         assert xai._connect_args()[0] == fresh and xai._conversation_id is None
         await xai.close()
 
@@ -2136,3 +2138,26 @@ def test_the_deadman_during_a_tool_wait_settles_thinking():
         await sink.stop()
 
     asyncio.run(_run())
+
+
+def test_a_late_transcript_says_how_many_onsets_came_after_it():
+    """The spoken history places a transcript by its utterance's onset: one that lands
+    after the next onset began counts it."""
+    async def _case():
+        b, _, events = make_stop_backend()
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "u1"})
+        await b._handle_event({"type": "input_audio_buffer.speech_started"})
+        await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await b._handle_event({"type": "input_audio_buffer.committed", "item_id": "u2"})
+        for item, text in (("u1", "first"), ("u2", "second")):
+            await b._handle_event({
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": item, "transcript": text,
+            })
+        got = [(e.text, e.later_onsets) for e in events if isinstance(e, InputTranscript)]
+        assert got == [("first", 1), ("second", 0)]
+        await b.close()
+
+    asyncio.run(_case())

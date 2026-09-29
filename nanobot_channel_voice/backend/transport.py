@@ -163,6 +163,14 @@ class RealtimeTransport(TurnEventMixin):
         """The first frame after connect (session.update / setup)."""
         raise NotImplementedError
 
+    def _activity_begin_mark(self) -> None:
+        """Before the onset is emitted: the shell's flush yields, and what the reply sends
+        meanwhile must already count as cut off."""
+
+    def _resumes_conversation(self) -> bool:
+        """This connect resumes a conversation the provider still holds."""
+        return False
+
     def _keeps_instructions(self) -> bool:
         """This connect resumes a session that keeps the instructions it started with."""
         return False
@@ -333,6 +341,7 @@ class RealtimeTransport(TurnEventMixin):
             # budget as an un-park, else the frames would go into the void and the
             # deadman would report a fault for a turn the server never saw.
             await self._await_ready("reconnect")
+        self._activity_begin_mark()
         await self._on_speech_started()
         await self._activity_begin_wire()
 
@@ -521,17 +530,24 @@ class RealtimeTransport(TurnEventMixin):
         # (mic gated -> no audio out -> no speech_started to move off SPEAKING).
         await self._set_turn(VoiceState.IDLE)
 
+    async def _refresh_instructions(self, *, fresh: bool) -> None:
+        """Resolve the instruction source for this connect; never raises."""
+        if self._instructions_source is None or (
+            self._instructions is not None and self._keeps_instructions()
+        ):
+            return
+        try:
+            self._instructions = await self._instructions_source(fresh)
+        except Exception:  # noqa: BLE001 - the last instructions beat none
+            self._log.exception("could not refresh the session instructions")
+
     async def _connect_and_run(self) -> None:
         connect = _load_connect()
-        if self._instructions_source is not None and (
-            self._instructions is None or not self._keeps_instructions()
-        ):
-            try:
-                self._instructions = await self._instructions_source()
-            except Exception:  # noqa: BLE001 - the last instructions beat none
-                self._log.exception("could not refresh the session instructions")
         try:
             url, headers = self._connect_args()
+            # Decided with the URL, before any await: a resumption window closing
+            # meanwhile cannot leave a resumed session with a replay, or the reverse.
+            await self._refresh_instructions(fresh=not self._resumes_conversation())
             hello = self._hello_payload()
         except Exception as exc:
             raise _SetupError(f"realtime connect could not be prepared: {exc}") from exc

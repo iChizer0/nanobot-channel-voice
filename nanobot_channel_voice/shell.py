@@ -21,7 +21,9 @@ from loguru import logger
 
 from nanobot_channel_voice.aio import cancel_and_wait
 from nanobot_channel_voice.audio.base import CaptureSource
+from nanobot_channel_voice.audio.pcm import pcm_ms
 from nanobot_channel_voice.config import VoiceConfig
+from nanobot_channel_voice.history import SpokenHistory
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.telemetry import VoiceTracer
 
@@ -72,7 +74,10 @@ class VoiceShell:
         tool_mode: str = "direct",
         metrics: VoiceMetrics | None = None,
         tracer: VoiceTracer | None = None,
+        history: SpokenHistory | None = None,
     ):
+        # Cloud only: what was said, for a session that replaces a lost one.
+        self.history = history
         # Label only; execution latency is bucketed by it (direct vs supervisor).
         self._tool_mode = tool_mode
         self._metrics = metrics if metrics is not None else VoiceMetrics()
@@ -269,9 +274,17 @@ class VoiceShell:
             # flush wakes it into the epoch drop. See VoiceBackend.pace_output_audio.
             if self._pace_audio:
                 await self._sink.wait_backlog_below()
+            if self.history is not None and event.pcm and event.epoch == self._sink.epoch:
+                # A flushed epoch's audio never plays (the sink drops it).
+                self.history.reply_audio(pcm_ms(len(event.pcm), event.rate))
             self._sink.enqueue(event)
         elif isinstance(event, UserSpeechStarted):
+            if self.history is not None:
+                # Before the flush: what the sink still holds went unheard.
+                self.history.user_onset(self._sink.backlog_ms())
             await self._cloud_barge_in()
+            if self.history is not None:
+                self.history.discard_open_reply()
         elif isinstance(event, ToolCall):
             self._spawn_tool_task(event)
         elif isinstance(event, ToolsAbandoned):
@@ -283,9 +296,12 @@ class VoiceShell:
                 if call_id in event.call_ids:
                     task.cancel()  # a delegation /stops its nanobot turn on the way out
         elif isinstance(event, OutputTranscript):
-            pass  # observational; nothing here consumes assistant text
+            if self.history is not None:
+                self.history.reply_text(event.text)
         elif isinstance(event, InputTranscript):
             self._log.debug("user: {}", loggable_text(event.text, self._log_transcripts))
+            if self.history is not None:
+                self.history.user_text(event.text, event.later_onsets)
         elif isinstance(event, ToolStarted):
             self._log.info("tool_started: {}", event.name or "?")
         elif isinstance(event, TurnDone):
@@ -315,6 +331,8 @@ class VoiceShell:
         if state != self._state:
             self._log.info("state {} -> {}", self._state.value, state.value)
             self._state = state
+            if self.history is not None and state is VoiceState.IDLE:
+                self.history.reply_done()
 
     async def _cloud_barge_in(self) -> None:
         # Cloud only. State is already CAPTURING (StateHint precedes UserSpeechStarted);

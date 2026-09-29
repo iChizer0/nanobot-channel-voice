@@ -256,10 +256,12 @@ class GeminiLiveBackend(RealtimeTransport):
 
     # ---- ManualTurnBackend wire (gated uplink) ------------------------------
 
-    async def _activity_begin_wire(self) -> None:
+    def _activity_begin_mark(self) -> None:
         # Whether or not a reply is audible yet: one requested before this onset can still
         # have audio in flight, and it answers what the user is now talking over.
         self._dead_audio = True
+
+    async def _activity_begin_wire(self) -> None:
         await self._send({"realtimeInput": {"activityStart": {}}})
 
     async def _activity_end_wire(self, *, commit: bool) -> None:
@@ -289,9 +291,12 @@ class GeminiLiveBackend(RealtimeTransport):
             self._resume_handle = None
         return self._resume_handle
 
+    def _resumes_conversation(self) -> bool:
+        return self._live_handle() is not None
+
     def _keeps_instructions(self) -> bool:
         # Whether a resumed session takes a changed systemInstruction is undocumented.
-        return self._live_handle() is not None
+        return self._resumes_conversation()
 
     def _hello_payload(self) -> dict:
         self._live_handle()
@@ -384,7 +389,7 @@ class GeminiLiveBackend(RealtimeTransport):
         if status == "IN_PROGRESS":
             self._in_progress = True
         transcript = (sc.get("outputTranscription") or {}).get("text")
-        if transcript and not self._suppress_turn:
+        if transcript and not (self._suppress_turn or self._dead_audio):  # as its audio
             self._progress_t = time.monotonic()
             await self._emit(OutputTranscript(transcript))
         heard = (sc.get("inputTranscription") or {}).get("text")

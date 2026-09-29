@@ -377,3 +377,52 @@ def test_capture_restart_tells_the_backend_about_the_gap():
 
     _run(_case())
     assert gaps == [True, True, True]  # one per bounded restart
+
+
+# ---- spoken history ------------------------------------------------------------
+
+def test_the_shell_feeds_the_spoken_history():
+    """Onsets, transcripts and the reply audio, in the order the backend delivers them;
+    a barge-in keeps only what the sink had played (read before its flush)."""
+    from nanobot_channel_voice.backend.base import UserSpeechStarted
+    from nanobot_channel_voice.history import SpokenHistory
+
+    async def _case():
+        history = SpokenHistory()
+        shell, backend, sink = _shell(history=history)
+        second = b"\x00\x01" * 24000  # 1 s at 24 kHz
+        await shell._on_event(UserSpeechStarted())
+        await shell._on_event(StateHint(VoiceState.THINKING))
+        await shell._on_event(OutputTranscript("It is sunny. "))
+        await shell._on_event(OutputAudio(epoch=sink.epoch, pcm=second, rate=24000))
+        await shell._on_event(InputTranscript("What is the weather?", later_onsets=0))
+        await shell._on_event(OutputTranscript("Tomorrow it rains."))
+        await shell._on_event(OutputAudio(epoch=sink.epoch, pcm=second, rate=24000))
+        # Nothing played (the sink never started): a barge-in now heard none of it.
+        await shell._on_event(UserSpeechStarted())
+        assert history.render() == "User: What is the weather?"
+        assert backend.calls[-1][0] == "barge_in"  # the flush still followed
+        await shell._on_event(InputTranscript("Stop", later_onsets=0))
+        assert history.render() == "User: What is the weather?\nUser: Stop"
+        # Local mode builds no history: nothing to feed.
+        plain, *_ = _shell()
+        assert plain.history is None
+        await plain._on_event(OutputTranscript("x"))
+
+    _run(_case())
+
+
+def test_a_flushed_epochs_audio_is_not_counted_as_heard():
+    from nanobot_channel_voice.backend.base import UserSpeechStarted
+    from nanobot_channel_voice.history import SpokenHistory
+
+    async def _case():
+        history = SpokenHistory()
+        shell, _, sink = _shell(history=history)
+        await shell._on_event(OutputTranscript("Heard. "))
+        await shell._on_event(OutputAudio(epoch=sink.epoch - 1, pcm=b"\x00\x01" * 24000, rate=24000))
+        assert history._reply_audio_ms == 0  # a dead turn's audio: dropped, never heard
+        await shell._on_event(UserSpeechStarted())
+        assert history.render() == "You: Heard."
+
+    _run(_case())

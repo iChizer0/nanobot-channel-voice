@@ -14,6 +14,7 @@ from nanobot_channel_voice.backend import transport
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
     Error,
+    InputTranscript,
     ManualTurnBackend,
     StateHint,
     UserSpeechStarted,
@@ -845,8 +846,10 @@ def test_an_instructions_source_is_resolved_again_at_every_connect(monkeypatch):
     async def _run():
         backend, sent, _ = make_backend()
         versions = iter(["v1", RuntimeError("gateway down"), "v3"])
+        fresh_flags: list[bool] = []
 
-        async def source() -> str:
+        async def source(fresh: bool) -> str:
+            fresh_flags.append(fresh)  # no resumption on this profile: every session is new
             value = next(versions, "v3")
             if isinstance(value, Exception):
                 raise value
@@ -864,5 +867,72 @@ def test_an_instructions_source_is_resolved_again_at_every_connect(monkeypatch):
         await backend.close()
         seen = [p["session"]["instructions"] for p in hellos[:3]]
         assert seen == ["v1", "v1", "v3"]
+        assert all(fresh_flags)
+
+    run(_run())
+
+
+def test_a_cancelled_response_is_dead_before_its_cancel_is_sent():
+    """The send yields: a delta the rx loop handles meanwhile must already drop."""
+    async def _run():
+        backend, _, _ = make_backend(profile="qwen")
+        backend._active_response_id = "r1"
+        seen: list[bool] = []
+
+        async def record(payload):
+            seen.append("r1" in backend._cancelled_responses)
+
+        backend._send = record
+        await backend._cancel_active()
+        assert seen == [True]
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_transcript_with_no_committed_item_is_the_last_ended_utterance():
+    async def _run():
+        backend, _, events = make_backend(profile="openai", config=VoiceConfig())
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend._handle_event({"type": "input_audio_buffer.speech_stopped"})
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend._handle_event({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "never-committed", "transcript": "the first one",
+        })
+        [heard] = [e for e in events if isinstance(e, InputTranscript)]
+        assert heard.later_onsets == 1
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_resumption_window_closing_during_the_source_await_keeps_the_decision(monkeypatch):
+    """Fresh-or-resumed is decided with the connect URL: the replay goes to a fresh
+    session only, however long the instruction source takes."""
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+
+    async def _run():
+        backend, _, _ = make_backend(profile="xai")
+        backend._conversation_id, backend._conversation_t = "conv1", transport.time.monotonic()
+        asked: list[bool] = []
+
+        async def source(fresh: bool) -> str:
+            asked.append(fresh)
+            backend._conversation_t -= PROFILES["xai"].resumption_ttl_s  # expires meanwhile
+            return "instructions"
+
+        urls: list[str] = []
+
+        def connect(url, **_k):
+            urls.append(url)
+            raise OSError("stop here")
+
+        monkeypatch.setattr(transport, "_load_connect", lambda: connect)
+        backend._instructions_source = source
+        with pytest.raises(OSError):
+            await backend._connect_and_run()
+        assert asked == [False] and "conversation_id=conv1" in urls[0]
+        await backend.close()
 
     run(_run())

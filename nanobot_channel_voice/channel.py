@@ -56,6 +56,7 @@ from nanobot_channel_voice.context_tool import (
     tool_created,
     unregister_bridge,
 )
+from nanobot_channel_voice.history import SpokenHistory
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.shell import VoiceShell
 from nanobot_channel_voice.streamid import TURN_META, base_of, unique_token
@@ -86,6 +87,13 @@ _DIRECT_RULES = (
 _AGENT_CONTEXT_HEAD = (
     "You speak for the agent below: its workspace, profile, memory and skills are "
     "yours. Where it asks for formatting, the voice rules win."
+)
+
+# Heads the replay of a lost session (SpokenHistory): the new one starts with no memory of
+# the conversation, and without being told it greets the user again.
+_HISTORY_HEAD = (
+    "The connection to you was renewed mid-conversation. What was said before it, "
+    "oldest first; continue from there without greeting again:"
 )
 
 # Silence-is-the-ack, model-side half: enforcement is backend._consume_stop's
@@ -212,19 +220,23 @@ def _cloud_instructions(
     has_tools: bool,
     agent_context: str | None = None,
     clock: str | None = None,
+    history: str | None = None,
 ) -> str:
     """The realtime session's instructions: persona (taste), the clock, the agent's own
-    context, then the mode's tool rules (contract). ONE derivation, so a
-    ``realtime.persona`` override restyles the voice but never deletes the delegation
-    contract or the filler preamble."""
+    context, what was said before a lost session, then the mode's tool rules (contract).
+    ONE derivation, so a ``realtime.persona`` override restyles the voice but never
+    deletes the delegation contract or the filler preamble."""
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
     context = (
         f"{_AGENT_CONTEXT_HEAD}\n\n{agent_context.strip()}"
         if agent_context and agent_context.strip() else ""
     )
+    replay = f"{_HISTORY_HEAD}\n{history}" if history else ""
     return "\n\n".join(
         part
-        for part in (persona or _DEFAULT_PERSONA, clock, context, rules, _STOP_RULE, _NOTICE_RULE)
+        for part in (
+            persona or _DEFAULT_PERSONA, clock, context, replay, rules, _STOP_RULE, _NOTICE_RULE,
+        )
         if part
     )
 
@@ -492,6 +504,8 @@ class VoiceChannel(BaseChannel):
         self._delegation_lock = asyncio.Lock()
         self._asked_turn: str | None = None  # the model turn of the newest delegation
         self._cloud_stops = 0  # every consumed stop that ended tool work (_on_cloud_abandon)
+        # Cloud: what was said, outliving a pipeline rebuild as it outlives a reconnect.
+        self._history = SpokenHistory()
         # Local mode: killed-turn tokens whose core re-run was /stop-ped (once each).
         self._stopped_reruns: deque[str] = deque(maxlen=16)
         # One per session, shared with backend and shell: segments join on call_id.
@@ -819,6 +833,7 @@ class VoiceChannel(BaseChannel):
                 output_rate=profile.output_rate if profile else gemini_live.OUTPUT_RATE,
             )
         tools, exec_tool = await self._cloud_tools(supported, rt.tool_mode)
+        history = self._history
         shell = VoiceShell(
             self.config,
             capture=capture,
@@ -831,18 +846,22 @@ class VoiceChannel(BaseChannel):
             tool_mode=rt.tool_mode,
             metrics=self._metrics,
             tracer=self._tracer,
+            history=history,
         )
         # Supervisor rules only when the delegated tool is wired; direct rules only when
         # there are tools whose round-trip needs masking.
         supervisor = rt.tool_mode == "supervisor" and exec_tool is not None
-        return shell, self._instructions_source(supervisor, bool(tools)), tools
+        return shell, self._instructions_source(supervisor, bool(tools), history), tools
 
-    def _instructions_source(self, supervisor: bool, has_tools: bool) -> Instructions:
+    def _instructions_source(
+        self, supervisor: bool, has_tools: bool, history: SpokenHistory,
+    ) -> Instructions:
         """The cloud session's instructions, resolved at every connect so a reconnected
-        session reads fresh memory, skills and time."""
+        session reads fresh memory, skills and time, and a fresh one (the provider lost
+        the conversation) what was said before."""
         gw = self._tool_gateway
 
-        async def instructions() -> str:
+        async def instructions(fresh: bool) -> str:
             context = None
             if gw is not None:
                 try:
@@ -856,6 +875,7 @@ class VoiceChannel(BaseChannel):
             text = _cloud_instructions(
                 self.config.realtime.persona, supervisor=supervisor, has_tools=has_tools,
                 agent_context=context, clock=time_note("time at connect"),
+                history=history.render() if fresh else None,
             )
             self.logger.debug("voice: session instructions are {} chars", len(text))
             return text
