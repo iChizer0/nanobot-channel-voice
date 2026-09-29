@@ -1472,6 +1472,128 @@ def test_a_tool_run_after_the_filler_holds_thinking_not_speaking():
     asyncio.run(_run())
 
 
+_FILLER = b"\x00" * (24000 * 2 * 300 // 1000)  # 300 ms at the profile's 24 kHz
+
+
+async def _fast_tool_turn(backend, ev, *, result_before_done: bool = True) -> None:
+    """A filler, its call answered at once (a direct-mode read), the continuation born
+    while the filler still sounds."""
+    await ev({"type": "session.updated"})
+    await ev({"type": "response.created", "response": {"id": "r1"}})
+    await ev({"type": "response.audio.delta", "response_id": "r1", "delta": b64(_FILLER)})
+    await ev({"type": "response.function_call_arguments.done", "response_id": "r1",
+              "call_id": "c1", "name": "read_file", "arguments": "{}"})
+    if result_before_done:
+        await backend.submit_tool_result("c1", "the file")
+    await ev({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+    if not result_before_done:
+        await backend.submit_tool_result("c1", "the file")
+    await ev({"type": "response.created", "response": {"id": "r2"}})
+
+
+def _hints(events) -> list[VoiceState]:
+    return [e.state for e in events if isinstance(e, StateHint)]
+
+
+def _playing_backend(sink: AudioSink):
+    """The shell's part: output audio goes to the sink."""
+    backend, sent, events = _tool_wait_backend(sink)
+
+    async def on_event(e):
+        events.append(e)
+        if isinstance(e, OutputAudio):
+            sink.enqueue(e)
+
+    backend._on_event = on_event
+    return backend, sent, events
+
+
+@pytest.mark.parametrize("result_before_done", [True, False])
+def test_a_continuation_born_under_its_filler_stays_speaking_until_it_played(
+    result_before_done,
+):
+    """THINKING at its birth would open a half-duplex mic onto the rest of the filler,
+    whose echo then cuts it off and cancels the answer (a fast tool: before or after the
+    filler's response.done). The turn goes THINKING once the filler has played."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, _, events = _playing_backend(sink)
+        await _fast_tool_turn(backend, backend._handle_event,
+                              result_before_done=result_before_done)
+        assert sink.backlog_ms() > 0
+        assert backend._turn is VoiceState.SPEAKING
+        await asyncio.wait_for(sink.wait_played(), 2.0)
+        await asyncio.sleep(0.05)
+        # The sink's clock says it played; the device buffer still sounds it for a moment.
+        assert backend._turn is VoiceState.SPEAKING
+        await asyncio.wait_for(backend._drain_task, 2.0)
+        assert sink.backlog_ms() == 0
+        assert _hints(events) == [VoiceState.THINKING, VoiceState.SPEAKING, VoiceState.THINKING]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_continuation_heard_before_its_filler_ends_keeps_the_turn_speaking():
+    """Its audio lands on the same stream right behind the filler, with no THINKING
+    between; and it owns the turn from there: a gap in it before its response.done is not
+    the end of the filler's tail."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, _, events = _playing_backend(sink)
+        ev = backend._handle_event
+        await _fast_tool_turn(backend, ev)
+        await asyncio.wait_for(sink.wait_idle(), 2.0)  # all written, its last lead sounding
+        await asyncio.sleep(0.01)
+        assert sink.backlog_ms() > 0
+        generation = sink.stream_generation
+        hold = backend._drain_task
+        await ev({"type": "response.audio.delta", "response_id": "r2", "delta": b64(_FILLER)})
+        await asyncio.wait_for(sink.wait_idle(), 2.0)
+        assert sink.stream_generation == generation  # no device reopen at the seam
+        await asyncio.wait_for(sink.wait_played(), 2.0)  # all played, the response still live
+        await asyncio.wait({hold}, timeout=0.5)  # a hold that outlived the seam settles here
+        assert backend._turn is VoiceState.SPEAKING
+        assert _hints(events) == [VoiceState.THINKING, VoiceState.SPEAKING]
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_continuation_announced_under_its_filler_is_still_truncated_when_cut():
+    """Its message item lands while the filler plays; the filler then ends before its
+    audio. The stream stayed open, so that item's truncate base holds: a barge-in into the
+    answer still tells the model how much of it was heard."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        await sink.start()
+        backend, sent, _ = _playing_backend(sink)
+        ev = backend._handle_event
+        await _fast_tool_turn(backend, ev)
+        await ev({"type": "response.output_item.added", "response_id": "r2",
+                  "item": {"type": "message", "id": "item-r2"}})
+        await asyncio.wait_for(backend._drain_task, 2.0)
+        assert backend._turn is VoiceState.THINKING
+        await ev({"type": "response.audio.delta", "response_id": "r2", "item_id": "item-r2",
+                  "delta": b64(_FILLER)})
+        await asyncio.sleep(0.1)
+        await backend.barge_in(await sink.flush())
+        truncate = [p for p in sent if p["type"] == "conversation.item.truncate"]
+        assert [p["item_id"] for p in truncate] == ["item-r2"]
+        assert 0 < truncate[0]["audio_end_ms"] <= 300
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
 async def _tool_wait(ev, rid: str = "r1", cid: str = "c1") -> None:
     """A filler, then a dispatched ask_nanobot call, then the response's completion."""
     await ev({"type": "response.created", "response": {"id": rid}})

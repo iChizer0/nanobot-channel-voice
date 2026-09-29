@@ -588,7 +588,13 @@ class RealtimeBackend(RealtimeTransport):
                 self._retry_create = False
             self._last_error = None  # only errors seen inside THIS response may detail it
             self._metrics.turn_thinking()
-            await self._set_turn(VoiceState.THINKING)
+            if self._turn is VoiceState.SPEAKING:
+                # Born while the last response still sounds (a fast tool's continuation under
+                # its filler): THINKING now would open a half-duplex mic onto that audio,
+                # whose echo then cuts it off and cancels this answer.
+                self._start_hold_thinking(end_stream=False)
+            else:
+                await self._set_turn(VoiceState.THINKING)
             self._arm_watchdog()
         elif t == "response.output_item.added":
             await self._on_item_added(evt)
@@ -731,6 +737,7 @@ class RealtimeBackend(RealtimeTransport):
             pcm = base64.b64decode(b64)
         except (ValueError, TypeError):
             return
+        self._cancel_drain()  # audible again: a hold on the last response's tail is moot
         if self._turn is not VoiceState.SPEAKING:
             await self._set_turn(VoiceState.SPEAKING)
         self._progress_t = time.monotonic()  # feed the deadman: the turn is alive

@@ -115,6 +115,8 @@ class RealtimeTransport(TurnEventMixin):
         self._sink = sink
         # Software AEC3 front-end (barge_in="aec" w/o hardware AEC); sink feeds the ref.
         self._aec = aec
+        # What still sounds once the sink's clock says it played: the device buffer, the room.
+        self._playback_tail_s = config.playback_hangover_ms / 1000.0
         # Gated uplink: the gate owns turn boundaries (begin/end_activity), no server VAD
         # runs, and every barge-in is a client-side cancel.
         self._manual = config.realtime.uplink != "server"
@@ -652,27 +654,35 @@ class RealtimeTransport(TurnEventMixin):
         self._cancel_drain()
         self._drain_task = asyncio.create_task(self._drain(VoiceState.IDLE))
 
-    def _start_hold_thinking(self) -> None:
+    def _start_hold_thinking(self, *, end_stream: bool = True) -> None:
         """The turn goes on after the audio (a tool runs, background reasoning): the filler
         drains, then THINKING — not IDLE (the turn is live), not SPEAKING (a half-duplex mic
-        would stay gated for the whole wait, unable to stop or steer a delegation)."""
+        would stay gated for the whole wait, unable to stop or steer a delegation). Not
+        ``end_stream``: a response already on its way plays on the same stream."""
         self._cancel_drain()
-        self._drain_task = asyncio.create_task(self._drain(VoiceState.THINKING))
+        self._drain_task = asyncio.create_task(
+            self._drain(VoiceState.THINKING, end_stream=end_stream)
+        )
 
     def _cancel_drain(self) -> None:
         if self._drain_task is not None and not self._drain_task.done():
             self._drain_task.cancel()
 
-    async def _drain(self, settle: VoiceState) -> None:
+    async def _drain(self, settle: VoiceState, *, end_stream: bool = True) -> None:
         try:
-            await self._sink.drain_stream()
+            if end_stream:
+                await self._sink.drain_stream()
+            else:
+                await self._sink.wait_played()
+                await asyncio.sleep(self._playback_tail_s)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             # A device failure must not skip the transition: the watchdog died at turn
             # end and gated-mic SPEAKING mutes the mic — nothing else recovers.
             self._log.warning("drain failed ({}); forcing {}", exc, settle.value)
-        self._on_drained()
+        if end_stream:  # on a stream left open, what was measured on it still holds
+            self._on_drained()
         if self._turn is VoiceState.CAPTURING:
             # A completion landing after the next onset: the onset owns the state, and
             # the deadman that completion cancelled guards the answer it is still owed.

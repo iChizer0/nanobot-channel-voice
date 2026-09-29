@@ -153,6 +153,30 @@ def test_the_paced_producer_never_trips_the_ceiling():
     asyncio.run(scenario())
 
 
+def test_wait_played_waits_out_the_audio_and_leaves_the_stream_open():
+    """A realtime continuation plays on after the last response's tail: waiting that tail
+    out must not end the stream as drain_stream does, or its audio reopens the device."""
+    async def scenario():
+        ps = _RecordingSink()
+        sink = AudioSink(ps, mode="stream")
+        await sink.start()
+        try:
+            loop = asyncio.get_running_loop()
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(300), rate=RATE))
+            t0 = loop.time()
+            await asyncio.wait_for(sink.wait_played(), 2.0)
+            assert loop.time() - t0 >= 0.25  # heard out, not merely written
+            assert sink.backlog_ms() == 0
+            stream, gen = ps.stream, sink.stream_generation
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(100), rate=RATE))
+            await asyncio.wait_for(sink.wait_idle(), 2.0)
+            assert ps.stream is stream and sink.stream_generation == gen
+        finally:
+            await sink.stop()
+
+    asyncio.run(scenario())
+
+
 # ---- stream position ---------------------------------------------------------
 
 def test_accepted_ms_is_where_audio_enqueued_now_starts():

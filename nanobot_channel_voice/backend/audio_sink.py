@@ -486,6 +486,12 @@ class AudioSink:
         """Block until the queue is empty (blob: playback done; stream: all PCM written)."""
         await self._idle.wait()
 
+    async def wait_played(self) -> None:
+        """Block until the audio accepted so far has played, leaving the stream open for
+        audio still to come (``drain_stream`` ends it). Paused, it waits for the resume."""
+        while (ms := self.backlog_ms()) > 0:
+            await asyncio.sleep(ms / 1000.0)
+
     async def drain_stream(self) -> None:
         """Stream mode: after the queue drains, end the stream and block until the
         buffered audio finishes playing (no-op in blob mode / when closed). The
