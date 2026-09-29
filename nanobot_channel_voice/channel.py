@@ -910,27 +910,13 @@ class VoiceChannel(BaseChannel):
     async def _cloud_tools(self, supported: bool, tool_mode: str):
         """(tool_defs, exec_tool) for the realtime model, or ([], None) persona-only.
 
-        ``supported`` is the profile's tool capability: a provider whose function-call flow
-        isn't the OpenAI exchange (Qwen) stays persona-only even with the gateway wired.
-        ``"direct"`` declares nanobot's N tools, each call a guarded ``execute_tool`` slice
-        the realtime model sequences; ``"supervisor"`` declares ``ask_nanobot``, delegating
-        the whole request so multi-step planning leaves the weak model, and
-        ``cancel_nanobot`` to stop it."""
-        gw = self._tool_gateway
-        if gw is None:
-            # Official core passes none. A toolMode the user SET is inert: say so, or a
-            # supervisor session looks like a plain chatbot that forgot how to delegate.
-            level = (
-                "warning" if "tool_mode" in self.config.realtime.model_fields_set else "info"
-            )
-            getattr(self.logger, level)(
-                "voice: realtime.toolMode='{}' has no effect — this nanobot build passes no "
-                "tool gateway to plugin channels (VoiceChannel.wants_tool_gateway is "
-                "unread), so the session is persona-only: no nanobot tools, no ask_nanobot "
-                "delegation. Use backend='local' for the full agent.",
-                tool_mode,
-            )
-            return [], None
+        ``supported`` is the profile's tool capability: a model that cannot drive the
+        function-call exchange (qwen3-omni) stays persona-only in either mode.
+        ``"supervisor"`` declares ``ask_nanobot``, delegating the whole request over the
+        bus so multi-step planning leaves the weak model, and ``cancel_nanobot`` to stop
+        it: any core runs it. ``"direct"`` declares nanobot's N tools, each call a guarded
+        ``execute_tool`` slice the realtime model sequences, which needs the core's tool
+        gateway."""
         if not supported:
             self.logger.info(
                 "voice: provider '{}' does not support the tool-call seam; persona-only",
@@ -945,6 +931,20 @@ class VoiceChannel(BaseChannel):
             await self._warn_if_unified_session()
             # Not execute_tool: a delegated request is a whole turn, driven over the bus.
             return [_SUPERVISOR_TOOL, _CANCEL_TOOL], self._supervisor_tool
+
+        gw = self._tool_gateway
+        if gw is None:
+            # Official core passes none. The default mode says so quietly; one the user SET
+            # warns, or the session looks like a plain chatbot that forgot its tools.
+            level = (
+                "warning" if "tool_mode" in self.config.realtime.model_fields_set else "info"
+            )
+            getattr(self.logger, level)(
+                "voice: realtime.toolMode='direct' needs a tool gateway, which this nanobot "
+                "build does not pass to plugin channels, so the session is persona-only; "
+                "toolMode='supervisor' reaches nanobot's tools over the bus instead."
+            )
+            return [], None
 
         # Direct mode. The gateway derives the session key from channel/chat_id as the bus
         # does, so cloud tools share the voice session's working dir / memory. The context

@@ -623,51 +623,51 @@ def test_tool_boundary_does_not_latch_first_token():
     asyncio.run(_t())
 
 
-def test_missing_tool_gateway_says_the_tool_mode_is_inert():
-    """No shipped core passes a tool gateway to a plugin channel, so a configured
-    toolMode silently produced a persona-only session: zero tools, no ask_nanobot, and
-    not one log line saying why."""
+def test_supervisor_mode_needs_no_tool_gateway():
+    """ask_nanobot runs a whole turn over the bus, so a core that passes no tool gateway
+    (every official one) still delegates; only direct mode, which executes each tool
+    through the gateway, falls back to persona-only, and says so."""
     from nanobot.bus.queue import MessageBus
 
     from nanobot_channel_voice.config import VoiceConfig
 
-    async def _case():
+    class _Log:
+        def __init__(self):
+            self.infos: list[str] = []
+            self.warned: list[str] = []
+
+        def info(self, msg, *a): self.infos.append(msg.format(*a))
+        def warning(self, msg, *a): self.warned.append(msg.format(*a))
+
+    def channel(realtime: dict) -> VoiceChannel:
         cfg = VoiceConfig.model_validate(
-            {"backend": "openai", "realtime": {"toolMode": "supervisor", "apiKey": "k"}}
+            {"backend": "openai", "realtime": {"apiKey": "k", **realtime}}
         )
-        channel = VoiceChannel(cfg, MessageBus())
-        assert channel._tool_gateway is None  # nothing in core supplies one
-        warned: list[str] = []
+        ch = VoiceChannel(cfg, MessageBus())
+        assert ch._tool_gateway is None  # nothing in official core supplies one
+        ch.logger = _Log()  # type: ignore[assignment]
+        return ch
 
-        infos: list[str] = []
-
-        class _Log:
-            def info(self, msg, *a): infos.append(msg.format(*a))
-            def warning(self, msg, *a): warned.append(msg.format(*a))
-
-        channel.logger = _Log()  # type: ignore[assignment]
-        tools, exec_tool = await channel._cloud_tools(True, "supervisor")
-        assert (tools, exec_tool) == ([], None)
-        assert len(warned) == 1
-        assert "toolMode='supervisor'" in warned[0]
-        assert "persona-only" in warned[0]
-        # The DEFAULT toolMode was never asked for: every cloud start must not warn.
-        quiet = VoiceChannel(
-            VoiceConfig.model_validate({"backend": "openai", "realtime": {"apiKey": "k"}}),
-            MessageBus(),
-        )
-        quiet.logger = _Log()  # type: ignore[assignment]
-        warned.clear()
-        assert await quiet._cloud_tools(True, "direct") == ([], None)
-        assert warned == [] and len(infos) == 1
-
-        # With a gateway wired the mode works and stays quiet.
-        channel._tool_gateway = object()
-        warned.clear()
-        tools, exec_tool = await channel._cloud_tools(True, "supervisor")
+    async def _case():
+        sup = channel({"toolMode": "supervisor"})
+        tools, exec_tool = await sup._cloud_tools(True, "supervisor")
         assert [t.name for t in tools] == ["ask_nanobot", "cancel_nanobot"]
-        assert exec_tool == channel._supervisor_tool  # a fresh bound method each access
-        assert warned == []
+        assert exec_tool == sup._supervisor_tool  # a fresh bound method each access
+        assert sup.logger.warned == []
+
+        # Direct mode the user SET: persona-only, loudly, pointing at supervisor.
+        direct = channel({"toolMode": "direct"})
+        assert await direct._cloud_tools(True, "direct") == ([], None)
+        [warning] = direct.logger.warned
+        assert "persona-only" in warning and "toolMode='supervisor'" in warning
+
+        # The DEFAULT toolMode was never asked for: every cloud start must not warn.
+        quiet = channel({})
+        assert await quiet._cloud_tools(True, "direct") == ([], None)
+        assert quiet.logger.warned == [] and len(quiet.logger.infos) == 1
+
+        # A model that cannot drive tools stays persona-only in either mode.
+        assert await channel({})._cloud_tools(False, "supervisor") == ([], None)
 
     run(_case())
 
