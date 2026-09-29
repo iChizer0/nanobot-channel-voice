@@ -393,6 +393,10 @@ class RealtimeTransport(TurnEventMixin):
         if task is not None:
             await asyncio.wait({task})
 
+    async def unpark(self) -> None:
+        if self._parked and not self._closing:
+            await self._resume()
+
     async def _resume(self) -> None:
         if not self._parked:
             return  # begin_activity's guard; a resume of a live loop would double it

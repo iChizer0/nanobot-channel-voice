@@ -19,6 +19,7 @@ import asyncio
 import math
 import threading
 import time
+from dataclasses import dataclass
 
 from loguru import logger
 
@@ -53,11 +54,25 @@ _WAKE_ECHO_TAIL = 64
 # Strict: the rest of an utterance the endpointer closed early (a pause, Smart Turn) still
 # goes up this long after its commit, unless the model is audible first.
 _CONTINUE_S = 1.5
+# A phrase heard inside speech waits for this much quiet before the listening cue answers
+# it: past the gaps between words, well inside the hangover (the local fast ack's bar).
+# Speech past the phrase first is a same-breath command, which no cue talks over.
+_SUMMON_QUIET_MS = 240
 
 
 def _reply_is_question(text: str) -> bool:
     tail = text.rstrip().rstrip("\"'”’)」』")
     return tail.endswith(("?", "？"))
+
+
+@dataclass
+class _Summon:
+    """A hit inside an open utterance, until what follows the phrase decides."""
+
+    hit_pos: int  # the phrase's end, in endpointer stream coordinates
+    count_from: float  # speech before this is a cut-off reply's tail, not the command
+    active_ms: int  # the utterance's speech-flagged ms when last looked at
+    past_ms: int = 0  # speech since the phrase: the would-be command
 
 
 class GatedUplink:
@@ -150,14 +165,20 @@ class GatedUplink:
         self._phrase_echo_until = 0.0
         self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
         # Cues (earcons.*): what the user hears of a gate the provider never sees. The
-        # receipt plays at a commit and at a summon; the attention cue when the wake window
-        # closes unused. Enqueued straight on the sink at the provider's output rate.
+        # receipt plays at a commit. The listening cue, in the receipt's tone, answers every
+        # summon the moment the phrase is heard, with no toggle: a cloud summon has no spoken
+        # ack, and silence leaves the user waiting on a reply that is not coming. The
+        # attention cue marks the wake window closing. Enqueued straight on the sink at the
+        # provider's output rate.
         cues = config.earcons
         self._cue_rate = output_rate
-        self._receipt = (
+        listening = self._mode == "wake" and wake.window_s > 0  # else a bare phrase grants nothing
+        tone = (
             cue_pcm(cues.path, ding_pcm, output_rate, gain_db=cues.gain_db)[0]
-            if cues.captured else None
+            if cues.captured or listening else None
         )
+        self._receipt = tone if cues.captured else None
+        self._listen_cue = tone if listening else None
         self._lapse_cue = None
         if cues.attention and self._mode == "wake":
             self._lapse_cue = cue_pcm(
@@ -176,19 +197,16 @@ class GatedUplink:
             None if open_mic and self._wake_mode != "strict"
             else config.playback_hangover_ms / 1000.0
         )
-        if self._mode == "wake" and self._receipt is None:
-            self._log.info(
-                "voice: a cloud summon gets no audible receipt (wake.ack needs the local "
-                "TTS); enable earcons.captured for one"
-            )
 
         self._state = VoiceState.IDLE
         self._active = False          # begin_activity sent, end_activity not yet
         self._hit_pos: int | None = None  # phrase END in endpointer stream coordinates
-        # Speech-flagged ms of the open utterance when a hit adopted it: what closes with
-        # less than minUtteranceMs of speech past it was the phrase alone.
-        self._hit_active_ms: int | None = None
+        self._summon: _Summon | None = None
+        self._held_onset = False  # an onset during a cue, waiting for speech to outlast it
         self._min_utterance_ms = config.vad.min_utterance_ms
+        # A reply the phrase cuts off still sounds this long (device buffer and room).
+        self._playback_tail_s = config.playback_hangover_ms / 1000.0
+        self._unpark_task: asyncio.Task | None = None
         self._eou_gen: int | None = None  # COMPLETE verdict awaiting the next frame
         self._consult_task: asyncio.Task | None = None
         self._park_task: asyncio.Task | None = None
@@ -227,12 +245,19 @@ class GatedUplink:
         else:
             pcm, hit, utterance = self._hop(pcm)
         now = time.monotonic()
-        # A hit may adopt the open utterance wholesale (this frame included): then neither
-        # the onset nor the per-frame upload below may send it again.
-        adopted = await self._on_wake_hit(now) if hit else False
+        # A summon may adopt the open utterance wholesale (this frame included): then
+        # neither the onset nor the per-frame upload below may send it again.
+        if hit:
+            adopted = await self._on_wake_hit(now)
+        elif self._summon is not None:
+            adopted = await self._resolve_summon(now)
+        else:
+            adopted = False
         if self._ep.in_speech and not prev_speech:
-            if not self._active:
+            if not self._active and self._summon is None:  # a summon owns its phrase's utterance
                 await self._on_onset(now)
+        elif self._held_onset and not self._active:
+            await self._release_held(now)
         elif self._ep.in_speech and self._active and not adopted:
             await self._upload(pcm)
         if prev_speech and not self._ep.in_speech:
@@ -287,6 +312,10 @@ class GatedUplink:
             if self._wake is not None and not keep_wake:
                 self._wake.reset()
         self._eou_gen = None
+        if self._summon is not None:
+            self._schedule_park()  # its hit held the park off, and nothing will settle now
+        self._summon = None
+        self._held_onset = False
         cancel_task(self._consult_task)
         if self._active:
             self._active = False
@@ -294,9 +323,9 @@ class GatedUplink:
 
     async def close(self) -> None:
         self._closing = True
-        for task in (self._consult_task, self._park_task, self._lapse_task):
+        for task in (self._consult_task, self._park_task, self._lapse_task, self._unpark_task):
             await cancel_and_wait(task)
-        self._consult_task = self._park_task = self._lapse_task = None
+        self._consult_task = self._park_task = self._lapse_task = self._unpark_task = None
         await self._inner.close()
         for engine in (self._vad, self._wake, self._turn):
             release = getattr(engine, "release", None)
@@ -338,7 +367,7 @@ class GatedUplink:
         return now < self._window_until
 
     async def _on_wake_hit(self, now: float) -> bool:
-        """True when the hit adopted the open utterance (buffer uploaded, this frame in)."""
+        """True when this frame's audio went up (a same-breath command adopted)."""
         if now < self._phrase_echo_until:
             self._metrics.count("wake_echo_suppressed")
             self._log.info("wake hit suppressed (own reply speaks the phrase)")
@@ -352,32 +381,85 @@ class GatedUplink:
         # max: never shortens an engaged turn's window (inf until IDLE).
         self._window_until = max(self._window_until, now + self._window_s)
         self._spent = False
-        if self._ep.in_speech:
-            # Same breath ("hey nanobot, what's the weather"): adopt the open utterance
-            # from the phrase end; the endpointer keeps its clock, we keep uploading.
-            buf = self._ep.open_pcm() or b""
-            offset = 0
-            if self._hit_pos is not None:
-                offset = min(len(buf), max(0, self._hit_pos - self._ep.open_pos)) & ~1
-            await self._open_activity(buf[offset:])
-            if self._active:
-                self._hit_active_ms = self._ep.active_ms
-            return self._active
-        if self._state is VoiceState.SPEAKING:
-            # A bare summon over the audible reply: kill it and listen (the local
-            # _wake_kill). While the agent works the query survives, as locally.
+        self._cancel_park()
+        self._unpark()  # the command follows the cue: a parked socket reconnects meanwhile
+        killed = self._state is VoiceState.SPEAKING
+        if killed:
+            # Over the audible reply: cut it now (the local _wake_kill), so the listening cue
+            # plays at once rather than behind it. While the agent works the query
+            # survives, as locally.
             await self._kill_reply()
-        # No receipt here: the command that follows would land inside its echo guard.
-        self._arm_lapse()
+        if not self._ep.in_speech:
+            self._summon = None  # one closing as it lands is answered here, not again
+            self._answer_summon()
+            return False
+        # Inside an open utterance: what follows the phrase decides. Right after a kill,
+        # speech may be the cut-off reply's own tail.
+        self._held_onset = False
+        self._summon = _Summon(
+            hit_pos=self._hit_pos if self._hit_pos is not None else self._ep.pos,
+            count_from=now + self._playback_tail_s if killed else now,
+            active_ms=self._ep.active_ms,
+        )
+        return await self._resolve_summon(now)
+
+    async def _resolve_summon(self, now: float) -> bool:
+        """Speech past the phrase is a same-breath command ("hey nanobot, what's the
+        weather"), adopted from the phrase end, with no cue over the user; a quiet beat
+        first is the bare summon, answered at once. True when this frame's audio went up."""
+        summon = self._summon
+        if self._ep.in_speech:
+            active = self._ep.active_ms
+            if now >= summon.count_from:
+                summon.past_ms += active - summon.active_ms
+            summon.active_ms = active
+            if summon.past_ms >= self._min_utterance_ms:
+                self._summon = None
+                buf = self._ep.open_pcm() or b""
+                offset = min(len(buf), max(0, summon.hit_pos - self._ep.open_pos)) & ~1
+                await self._open_activity(buf[offset:])
+                return self._active
+            if self._ep.silence_run_ms < _SUMMON_QUIET_MS:
+                return False
+            with self._hop_lock:
+                self._ep.reset()  # the phrase's utterance ends here: the command opens its own
+        self._summon = None
+        if self._state is VoiceState.SPEAKING:
+            await self._kill_reply()  # it began while the phrase decided: never cue behind it
+        self._answer_summon()
         return False
+
+    def _answer_summon(self) -> None:
+        """The bare phrase: the listening cue at once, and all of windowS after it for the
+        user to start the command."""
+        self._schedule_park()  # nothing is open: a summon nobody follows parks again
+        end = self._play_cue(self._listen_cue, "earcon_listening")
+        if end is not None:
+            until = end + self._window_s
+            self._grant_until = max(self._grant_until, until)
+            if self._window_until != math.inf:
+                self._window_until = max(self._window_until, until)
+        self._arm_lapse()
+
+    def _unpark(self) -> None:
+        if not self._closing and (self._unpark_task is None or self._unpark_task.done()):
+            self._unpark_task = asyncio.create_task(self._run_unpark())
+
+    async def _run_unpark(self) -> None:
+        try:
+            await self._inner.unpark()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the command's begin_activity retries
+            self._log.debug("reconnect for a summon failed ({}); the command retries", exc)
 
     async def _on_onset(self, now: float) -> None:
         if now < self._cue_until:
-            # Our own cue: forget the utterance it opened, so a real onset after it is
-            # fresh rather than merged into a phantom that never uploaded.
+            # Our own cue may be what opened it: believed only once speech outlasts the cue
+            # (_release_held), so its echo dies unsent and a command begun over the tone
+            # keeps its start.
             self._metrics.count("gate_cue_onsets")
-            with self._hop_lock:
-                self._ep.reset()
+            self._held_onset = True
             return
         if not self._window_open(now):
             self._metrics.count("gate_dropped_onsets")  # a later hit may still adopt it
@@ -392,9 +474,17 @@ class GatedUplink:
             return
         await self._open_activity(self._ep.open_pcm() or b"")
 
+    async def _release_held(self, now: float) -> None:
+        """An onset held over a cue: speech past the cue's end is the user's, judged now
+        with everything since its onset; an utterance closing first was the cue's echo."""
+        if not self._ep.in_speech:
+            self._held_onset = False
+        elif now >= self._cue_until and self._ep.silence_run_ms == 0:
+            self._held_onset = False
+            await self._on_onset(now)
+
     async def _open_activity(self, pcm: bytes) -> None:
         self._cancel_park()
-        self._hit_active_ms = None  # an adoption sets it after; a lost session left it
         self._audible_while_open = False
         try:
             await self._inner.begin_activity()
@@ -427,26 +517,12 @@ class GatedUplink:
         cancel_task(self._consult_task)
         self._eou_gen = None
         if not self._active:
-            return  # never uploaded (window shut / strict-dropped)
+            return  # never uploaded (window shut / strict-dropped / a summon's phrase)
         self._active = False
-        hit_active_ms, self._hit_active_ms = self._hit_active_ms, None
         if utterance is None:
             # Min-length reject: the blip already went up; take it back.
             self._metrics.count("gate_blip_aborted")
             await self._inner.end_activity(commit=False)
-            return
-        if (
-            hit_active_ms is not None
-            and self._ep.closed_active_ms - hit_active_ms < self._min_utterance_ms
-        ):
-            # The phrase alone (the detector fires before the utterance closes, so a bare
-            # summon adopts too): nothing to answer, the window stays open for the
-            # command — the local path publishes nothing either.
-            self._metrics.count("gate_bare_summon")
-            self._log.debug("bare summon: nothing after the phrase; window open")
-            await self._inner.end_activity(commit=False)
-            self._play_cue(self._receipt, "earcon_captured")
-            self._arm_lapse()
             return
         if self._attention == "sentence":
             self._spent = True
@@ -513,9 +589,12 @@ class GatedUplink:
             prev, self._state = self._state, event.state
             if event.state is VoiceState.SPEAKING:
                 # Audible: what follows may be its echo, so the phrase's attention ends here
-                # (a reply the phrase cuts off sends no more: stale audio never plays).
+                # (a reply the phrase cuts off sends no more: stale audio never plays), a
+                # summon still deciding included.
                 self._grant_until = self._continue_until = 0.0
                 self._audible_while_open = True
+                if self._wake_mode == "strict":
+                    self._summon = None
             if (
                 event.state in (VoiceState.THINKING, VoiceState.SPEAKING)
                 and prev in (VoiceState.IDLE, VoiceState.CAPTURING)
@@ -564,15 +643,16 @@ class GatedUplink:
 
     # ---- cues ----------------------------------------------------------------
 
-    def _play_cue(self, pcm: bytes | None, metric: str) -> None:
+    def _play_cue(self, pcm: bytes | None, metric: str) -> float | None:
+        """Enqueue a cue; returns when it stops sounding (None: it did not play)."""
         if pcm is None or self._closing or self._ep.in_speech:
-            return  # never over the user
+            return None  # never over the user
         self._metrics.count(metric)
         self._sink.enqueue(OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._cue_rate))
+        end = time.monotonic() + self._sink.backlog_ms() / 1000.0
         if self._cue_guard_s is not None:
-            self._cue_until = (
-                time.monotonic() + self._sink.backlog_ms() / 1000.0 + self._cue_guard_s
-            )
+            self._cue_until = end + self._cue_guard_s
+        return end
 
     def _arm_lapse(self) -> None:
         """(Re)watch the attention window: a sleeping watcher holds a stale deadline."""

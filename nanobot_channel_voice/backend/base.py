@@ -255,10 +255,15 @@ class ManualTurnBackend(Protocol):
     async def end_activity(self, *, commit: bool = True) -> None:
         """The gate closed the utterance. ``commit``: what speech_stopped did, then hand the
         turn to the model (commit + response.create, or the vendor's activity end). Not
-        ``commit``: the audio was a blip or a bare summon — discard it server-side and settle
-        to IDLE without a response."""
+        ``commit``: the audio was a blip, or the activity only cut a reply off (the wake
+        word over it) — discard it server-side and settle to IDLE without a response."""
 
     async def park(self) -> None:
         """Idle: close the socket, keep the session config; the next ``begin_activity``
         reconnects (with the vendor's resumption where it has one). Idempotent."""
+
+    async def unpark(self) -> None:
+        """A summon was heard and its command is coming: reconnect a parked socket now, so
+        the connect overlaps the user's reply instead of their words. No-op unless parked;
+        raises if the reconnect fails (the next ``begin_activity`` tries again)."""
 

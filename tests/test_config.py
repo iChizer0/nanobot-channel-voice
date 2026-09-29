@@ -714,6 +714,17 @@ def test_earcons_path_validators():
     }})
     assert cfg.earcons.path == "/x/cue.wav"
     assert cfg.earcons.attention_path == "/x/close.wav"
+    # A cloud wake gate's listening cue sounds the clip too, receipt or not; with no window
+    # there is no such cue.
+    woken = {
+        "backend": "openai", "realtime": {"uplink": "wake"}, "vad": {"engine": "silero"},
+        "wake": {"mode": "gate", "phrases": ["hi bot"], "engine": "openwakeword"},
+        "earcons": {"path": "/x/cue.wav"},
+    }
+    assert VoiceConfig.model_validate(woken).earcons.path == "/x/cue.wav"
+    closed = {**woken, "wake": {**woken["wake"], "windowS": 0}}
+    with pytest.raises(ValidationError, match="earcons.captured is not enabled"):
+        VoiceConfig.model_validate(closed)
 
 
 def test_notice_phrases_must_not_contain_stop_phrases():

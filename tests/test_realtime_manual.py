@@ -204,6 +204,27 @@ def test_park_closes_the_loop_and_begin_resumes_it():
     run(_run())
 
 
+def test_unpark_reconnects_ahead_of_the_activity_and_leaves_a_live_socket_alone():
+    """A summon's command is coming: the socket reconnects now, without an activity (no
+    onset reaches the shell), and the activity after it opens on the live session."""
+    async def _run():
+        backend, sent, events = make_backend()
+        connects = _stub_connection(backend)
+        await backend.start(instructions="", tools=[], on_event=backend._on_event)
+        await asyncio.sleep(0)
+        await backend.unpark()  # live: nothing to do
+        assert connects == [1]
+        await backend.park()
+        await backend.unpark()
+        assert not backend._parked and backend._ready.is_set() and connects == [1, 1]
+        assert not any(isinstance(e, UserSpeechStarted) for e in events)
+        await backend.begin_activity()
+        assert connects == [1, 1]  # the command rode the reconnect already made
+        await backend.close()
+
+    run(_run())
+
+
 def test_resume_timeout_raises_so_the_gate_drops_the_utterance(monkeypatch):
     monkeypatch.setattr(transport, "_RESUME_TIMEOUT_S", 0.05)
 

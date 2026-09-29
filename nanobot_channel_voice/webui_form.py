@@ -302,6 +302,9 @@ _AEC_CLOUD = ("webrtc", "hardware")
 # for the phrase before every turn, and its window only times the command after the phrase.
 _WAKE_MODE_HELP_CLOUD = "Gate listens only after the wake phrase. Strict asks for it before every turn and every interruption."
 _WINDOW_HELP_STRICT = "How long after the phrase alone its command may start. 0 asks for both in one breath."
+# After a wake word the receipt's tone answers the phrase, clip included.
+_RECEIPT_HELP_WAKE = "A short rising tone when what you said is taken. The same tone answers the wake word."
+_RECEIPT_CLIP_HELP_WAKE = "Optional. The path of a WAV to play instead of the built-in tone, cut to 600 ms. It answers the wake word too."
 _NOTE_GATE = "Not in use until Send audio is On speech or After wake word."
 _NOTE_WAKE_GATE = "Not in use until Send audio is After wake word."
 _NOTE_SERVE = "The provider transcribes for itself. Serve transcription runs an engine on this device for other clients."
@@ -408,19 +411,28 @@ def build_form(cfg: VoiceConfig, store: Store | None = None) -> dict[str, Any]:
                 field["help"] = _WAKE_MODE_HELP_CLOUD
             elif field["key"] == "wake.windowS" and cfg.wake.mode == "strict":
                 field["help"] = _WINDOW_HELP_STRICT
-        # The gate plays them: the receipt at every sent utterance, the attention cue when
-        # the wake window closes.
+        # The gate plays them: the receipt at every sent utterance, its tone after the wake
+        # word too, the attention cue when the wake window closes.
+        wake_gate = cfg.realtime.uplink == "wake"
+        listening = wake_gate and cfg.wake.window_s > 0  # a phrase alone opens nothing at 0
         sections.append(section(
-            "cues", "Cues", _cue_paths(cfg, attention=cfg.realtime.uplink == "wake"),
+            "cues", "Cues", _cue_paths(cfg, attention=wake_gate, listening=listening),
             note=None if gated else _NOTE_GATE,
         ))
+        if listening:
+            for field in sections[-1]["fields"]:
+                if field["key"] == "earcons.captured":
+                    field["help"] = _RECEIPT_HELP_WAKE
+                elif field["key"] == "earcons.path":
+                    field["help"] = _RECEIPT_CLIP_HELP_WAKE
     sections.append(section("access", "Access", ["allowFrom", "logTranscripts"]))
     return {"sections": sections}
 
 
-def _cue_paths(cfg: VoiceConfig, *, attention: bool) -> list[str]:
+def _cue_paths(cfg: VoiceConfig, *, attention: bool, listening: bool = False) -> list[str]:
+    """``listening``: the receipt's tone answers the wake word, so its clip applies anyway."""
     paths = ["earcons.captured"] + (["earcons.attention"] if attention else []) + ["earcons.gainDb"]
-    if cfg.earcons.captured:
+    if cfg.earcons.captured or listening:
         paths.append("earcons.path")
     if attention and cfg.earcons.attention:
         paths.append("earcons.attentionPath")

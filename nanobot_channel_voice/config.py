@@ -953,14 +953,17 @@ class OpenWakeWordConfig(OnDeviceRuntime):
 class EarconsConfig(_VoiceBase):
     """Non-verbal cues: synthesized struck two-note tones, ~¼ s — no asset, no TTS call, no
     language. Local backend, and a cloud backend under a gated uplink (``realtime.uplink``
-    vad/wake), where ``captured`` plays at every sent utterance and bare summon. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
+    vad/wake), where ``captured`` plays at every sent utterance, and under ``uplink="wake"`` a
+    bare summon hears the same tone (or ``path``) as its listening cue, with no toggle, the
+    moment the phrase is heard. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
     (the publish), ~1-3 s before any spoken feedback. ``attention`` (falling E6→A5) plays when
     the wake attention window closes — at the deadline lapse under ``attention="conversation"``,
     at the reply's settle when the window is already spent (``"sentence"``, ``windowS=0``, or
     strict under a cloud gate, after every answered turn);
     it needs wake gating and stays silent with ``wake.mode="off"``. Verdicts that must stay
     silent do: gated/echo (never reveal liveness to bystanders), consumed stops (silence IS the
-    acknowledgment), bare summons (the wake ack owns those)."""
+    acknowledgment), bare summons (locally the wake ack owns those, on a cloud gate the
+    listening cue)."""
 
     captured: bool = False
     attention: bool = False
@@ -975,18 +978,14 @@ class EarconsConfig(_VoiceBase):
 
     @model_validator(mode="after")
     def _path_needs_a_cue(self) -> EarconsConfig:
-        for path, enabled, name in (
-            (self.path, self.captured, "captured"),
-            (self.attention_path, self.attention, "attention"),
-        ):
+        # ``path`` also sounds a cloud wake gate's listening cue: VoiceConfig checks it.
+        for path in (self.path, self.attention_path):
             if path is not None and not path.strip():
                 raise ValueError(
                     "earcons paths must be file paths (omit for the built-in cues)"
                 )
-            if path and not enabled:
-                raise ValueError(
-                    f"a custom cue file is set but earcons.{name} is not enabled"
-                )
+        if self.attention_path and not self.attention:
+            raise ValueError("a custom cue file is set but earcons.attention is not enabled")
         return self
 
 
@@ -1008,7 +1007,8 @@ class WakeAckConfig(_VoiceBase):
 class WakeConfig(_VoiceBase):
     """Wake-word gate. Local backend: two tiers, as below. Cloud backends: the ACOUSTIC tier
     only, as the ``realtime.uplink="wake"`` gate (no STT there, so no transcript tier, no
-    stripping, no alias learning, and no spoken ack: a cloud summon has no audible receipt).
+    stripping, no alias learning, and no spoken ack: the listening cue answers a cloud summon,
+    see ``EarconsConfig``).
 
     ``mode="gate"``: a cold start needs the wake phrase; once engaged, follow-ups and barge-in
     stay natural for ``windowS`` after each turn. ``mode="strict"`` additionally requires the
@@ -1339,6 +1339,17 @@ class VoiceConfig(_VoiceBase):
                     f"(supported: {', '.join(map(str, supported))}); "
                     "change the rate or the engine"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _receipt_path_has_a_cue(self) -> VoiceConfig:
+        """``earcons.path`` sounds the receipt, and under a cloud wake gate the listening cue
+        that answers every bare summon, receipt or not."""
+        listening = (
+            self.backend != "local" and self.realtime.uplink == "wake" and self.wake.window_s > 0
+        )
+        if self.earcons.path and not (self.earcons.captured or listening):
+            raise ValueError("a custom cue file is set but earcons.captured is not enabled")
         return self
 
     @model_validator(mode="after")

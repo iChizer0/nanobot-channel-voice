@@ -743,6 +743,7 @@ class _FakeCloud:
 
     def __init__(self):
         self.calls: list = []
+        self.cues: list = []  # (metric, room seconds) each cue started at
         self.on_event = None
 
     async def start(self, *, instructions, tools, on_event):
@@ -767,6 +768,9 @@ class _FakeCloud:
 
     async def park(self):
         self.calls.append(("park",))
+
+    async def unpark(self):
+        pass
 
     async def barge_in(self, played_ms):
         pass
@@ -836,6 +840,15 @@ async def _run_gate(mode: str, room: bytes, *, window_s: float, monkeypatch):
 
     clock = _AudioClock()
     monkeypatch.setattr(gated, "time", clock)
+    play = gate._play_cue
+
+    def recorded(pcm, metric):  # when each cue started, in room seconds
+        end = play(pcm, metric)
+        if end is not None:
+            cloud.cues.append((metric, round(clock.now - 1000.0, 2)))
+        return end
+
+    gate._play_cue = recorded
     await gate.start(instructions=None, tools=[], on_event=on_event)
     step = 16000 * 2 * frame_ms // 1000
     try:
@@ -863,7 +876,11 @@ def test_gated_uplink_real_detectors_upload_only_the_summoned_command(monkeypatc
 
     assert m.get("wake_hit") == 1
     assert cloud.commits() == 1  # the summoned command; the bare summon commits nothing
-    assert m.get("gate_bare_summon") == 1  # the hit adopted the phrase's own utterance
+    assert cloud.calls.count(("begin",)) == 1  # nothing of the phrase went up
+    # The listening cue answers the phrase at the first quiet beat after it (the phrase
+    # ends 2.95 s in), well before the command 0.6 s later.
+    [(metric, at)] = cloud.cues
+    assert metric == "earcon_listening" and 2.95 < at < 2.95 + 0.6, cloud.cues
     assert m.get("uplink_utterances", 0) >= 1
     assert m.get("gate_dropped_onsets", 0) >= 1  # the unsummoned repeat
     # Engaged vs wall clock: one command (+ preroll and hangover) out of a ~21 s room.

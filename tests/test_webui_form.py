@@ -331,6 +331,15 @@ def test_behaviour_rows_follow_their_switches():
     assert "wake.attention" not in strict and "wake.windowS" in strict
     assert strict["wake.mode"]["help"].endswith("Strict asks for it before every turn and every interruption.")
     assert strict["wake.windowS"]["help"].startswith("How long after the phrase alone")
+    # after a wake word the receipt's tone answers the phrase: its clip row shows with the
+    # receipt off, and both rows say so
+    assert "earcons.path" in cloud_wake and "earcons.path" not in _fields({"backend": "openai"})
+    closed = _fields({"backend": "openai", "realtime": {"uplink": "wake"}, "vad": {"engine": "silero"},
+                      "wake": {"mode": "gate", "engine": "openwakeword", "phrases": ["hey"],
+                               "windowS": 0}})
+    assert "earcons.path" not in closed  # no window, no listening cue for a clip to sound
+    assert cloud_wake["earcons.captured"]["help"].endswith("The same tone answers the wake word.")
+    assert cloud_wake["earcons.path"]["help"].endswith("It answers the wake word too.")
     local_strict = _fields({"wake": {"mode": "strict", "phrases": ["hey"]}})
     assert cloud_wake["wake.windowS"]["help"] == local_strict["wake.windowS"]["help"]
     assert "wake.attention" in local_strict  # locally it applies
