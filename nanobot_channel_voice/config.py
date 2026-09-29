@@ -764,7 +764,7 @@ class RealtimeConfig(_VoiceBase):
     api_key: str | None = None            # falls back to OPENAI_API_KEY
     voice: str | None = None              # provider voice (e.g. OpenAI cedar/marin, Qwen Tina)
     # Replaces the built-in persona (style/identity) ONLY: the resolved toolMode's tool rules
-    # (filler preamble, supervisor's ask_nanobot contract) are appended by the channel and
+    # (direct's tool contract and filler, supervisor's ask_nanobot contract) are appended and
     # cannot be overridden — they are the wire contract. Say nothing about tools here.
     persona: str | None = None
 

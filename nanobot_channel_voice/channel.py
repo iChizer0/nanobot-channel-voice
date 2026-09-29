@@ -77,9 +77,17 @@ _DEFAULT_PERSONA = (
     "You are a helpful, concise voice assistant. Keep replies short and conversational."
 )
 
-# Direct mode: the filler is what the user hears across a tool round-trip, else the line
-# goes dead. Appended only when tools are declared.
+# Direct mode, appended only when tools are declared: the tool contract (the realtime model
+# runs without nanobot's system prompt, and a "voice assistant" persona talks a small model
+# out of calling tools), then the filler, what the user hears across a tool round-trip.
 _DIRECT_RULES = (
+    "Your tools are how you know and do anything beyond this conversation; speaking "
+    "changes how you word a reply, never what you can do. For a fact you do not already "
+    "know, anything current, the user's files, the web, reminders or messages, or any "
+    "action, you MUST call the matching tool: never guess or answer from your own "
+    "knowledge what a tool can check, and never say you cannot do what a tool does. To "
+    "follow a skill, read its SKILL.md with read_file first. If a tool fails, try another "
+    "way, and say how it ended. "
     "Before a tool call that will keep the user waiting, say a brief neutral filler "
     "in the user's language, such as \"One moment.\" or \"Let me check.\" (never "
     "implying success or failure), then call it with no further speech. Skip the "
