@@ -678,6 +678,15 @@ def test_wake_alias_and_attention_validators():
         VoiceConfig.model_validate(
             {"wake": {**base, "attention": "sentence", "windowS": 0}}
         )
+    with pytest.raises(ValidationError, match="windowS"):
+        VoiceConfig.model_validate(
+            {"wake": {**base, "mode": "strict", "attention": "sentence", "windowS": 0}}
+        )
+    # Only where the attention applies: a cloud backend's strict asks for the phrase before
+    # every turn (the panel hides the row), and a wake mode off runs no attention at all.
+    VoiceConfig.model_validate({"backend": "openai", "wake": {
+        **base, "mode": "strict", "attention": "sentence", "windowS": 0}})
+    VoiceConfig.model_validate({"wake": {"mode": "off", "attention": "sentence", "windowS": 0}})
     # an ack phrase containing an ALIAS causes the same echo-veto lockout
     with pytest.raises(ValidationError, match="contains a wake phrase"):
         VoiceConfig.model_validate({"wake": {

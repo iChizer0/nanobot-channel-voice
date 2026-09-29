@@ -324,6 +324,16 @@ def test_behaviour_rows_follow_their_switches():
     cloud_wake = _fields({"backend": "openai", "realtime": {"uplink": "wake"}, "vad": {"engine": "silero"},
                           "wake": {"mode": "gate", "phrases": ["hey"], "engine": "openwakeword"}})
     assert "wake.attention" in cloud_wake and "wake.ack.enabled" not in cloud_wake and "wake.aliases" not in cloud_wake
+    # strict under a cloud gate asks for the phrase before every turn: no attention policy,
+    # and the window only times the command after a bare phrase
+    strict = _fields({"backend": "openai", "realtime": {"uplink": "wake"}, "vad": {"engine": "silero"},
+                      "wake": {"mode": "strict", "phrases": ["hey"], "engine": "openwakeword"}})
+    assert "wake.attention" not in strict and "wake.windowS" in strict
+    assert strict["wake.mode"]["help"].endswith("Strict asks for it before every turn and every interruption.")
+    assert strict["wake.windowS"]["help"].startswith("How long after the phrase alone")
+    local_strict = _fields({"wake": {"mode": "strict", "phrases": ["hey"]}})
+    assert cloud_wake["wake.windowS"]["help"] == local_strict["wake.windowS"]["help"]
+    assert "wake.attention" in local_strict  # locally it applies
     # no STT in a cloud session: no Transcript tier on its Model row
     assert [c["value"] for c in cloud_wake["wake.openwakeword.weights"]["choices"]] == []
     assert cloud_wake["wake.openwakeword.weights"]["help"] == "The index lists no head, Custom takes one of your own."

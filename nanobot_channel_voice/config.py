@@ -955,7 +955,8 @@ class EarconsConfig(_VoiceBase):
     vad/wake), where ``captured`` plays at every sent utterance and bare summon. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
     (the publish), ~1-3 s before any spoken feedback. ``attention`` (falling E6→A5) plays when
     the wake attention window closes — at the deadline lapse under ``attention="conversation"``,
-    at the reply's settle when the window is already spent (``"sentence"``, or ``windowS=0``);
+    at the reply's settle when the window is already spent (``"sentence"``, ``windowS=0``, or
+    strict under a cloud gate, after every answered turn);
     it needs wake gating and stays silent with ``wake.mode="off"``. Verdicts that must stay
     silent do: gated/echo (never reveal liveness to bystanders), consumed stops (silence IS the
     acknowledgment), bare summons (the wake ack owns those)."""
@@ -1014,15 +1015,21 @@ class WakeConfig(_VoiceBase):
     ``bargeIn.mode="pause"`` pauses it for an utterance's first 2.5 s, or a shorter one until
     its verdict, so the phrase is heard clear of the canceller's double-talk suppression) and
     gates speech while the agent is WORKING once the window is shut — the posture for public
-    rooms, where a hit is the whole barge-in verdict. Detection is two-tier: the transcript
-    prefix (``phrases``, any language the STT covers) always counts, ``engine="openwakeword"``
-    adds an acoustic detector that hears through the bot's own playback. A leading wake phrase
-    is stripped from the published text, repeats included ("小娜小娜" is one summon); an utterance
-    that is ONLY the phrase publishes nothing and just opens the attention window, silently
-    unless ``ack`` speaks. A bare summon while the agent is WORKING never cancels the query.
-    Half-duplex contract: detection trails the phrase and the mic-reopen flush discards audio up
-    to it, so the command belongs AFTER the reply stops (phrase, beat, command) — same-breath
-    content survives only in the open-mic modes; with the ack on, the ack IS the beat."""
+    rooms, where a hit is the whole barge-in verdict. Under a cloud gate
+    (``realtime.uplink="wake"``) strict asks for the phrase before EVERY turn: no transcript
+    there tells the reply's echo from the user, and a follow-up window is where a leaky
+    canceller feeds the model its own voice. A hit grants ``windowS`` to start one utterance,
+    which spends it, as anything the model says does; only its own rest, when a pause closed
+    it early, still goes up for a moment while the model is silent (``attention`` does not
+    apply). Detection is two-tier: the transcript prefix (``phrases``, any language the STT
+    covers) always counts, ``engine="openwakeword"`` adds an acoustic detector that hears
+    through the bot's own playback. A leading wake phrase is stripped from the published text,
+    repeats included ("小娜小娜" is one summon); an utterance that is ONLY the phrase publishes
+    nothing and just opens the attention window, silently unless ``ack`` speaks. A bare summon
+    while the agent is WORKING never cancels the query. Half-duplex contract: detection trails
+    the phrase and the mic-reopen flush discards audio up to it, so the command belongs AFTER
+    the reply stops (phrase, beat, command) — same-breath content survives only in the open-mic
+    modes; with the ack on, the ack IS the beat."""
 
     mode: Literal["off", "gate", "strict"] = "off"
     # The spoken wake phrases, matched at utterance START (hesitation fillers may precede). Also
@@ -1039,7 +1046,8 @@ class WakeConfig(_VoiceBase):
     # What one wake buys. "conversation": attention re-opens for windowS after every turn —
     # natural follow-ups, at the cost of an invisible open window. "sentence": the window opens
     # ONLY on wake evidence and the next published turn SPENDS it; a reply ENDING with a
-    # question re-opens it so the agent's clarifying question gets its answer.
+    # question re-opens it so the agent's clarifying question gets its answer. Strict under a
+    # cloud gate spends every wake with its turn, whatever this says.
     attention: Literal["conversation", "sentence"] = "conversation"
     # Seconds after a wake/turn during which cold starts need no wake phrase; 0 = every cold
     # start needs it. Sized to industry follow-up windows (~8 s) plus slack: re-summoning is
@@ -1059,11 +1067,6 @@ class WakeConfig(_VoiceBase):
             )
         if any(not a.strip() for a in self.aliases):
             raise ValueError("wake.aliases entries must be non-empty")
-        if self.attention == "sentence" and self.window_s <= 0:
-            raise ValueError(
-                'wake.attention="sentence" requires wake.windowS > 0: the window '
-                "IS the grace to start the summoned sentence"
-            )
         return self
 
     @model_validator(mode="after")
@@ -1335,6 +1338,20 @@ class VoiceConfig(_VoiceBase):
                     f"(supported: {', '.join(map(str, supported))}); "
                     "change the rate or the engine"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _sentence_attention_has_a_window(self) -> VoiceConfig:
+        """The window IS the grace to start the summoned sentence. Checked only where the
+        attention applies: a wake mode on, and not a cloud backend's strict, which asks for
+        the phrase before every turn whatever the attention says."""
+        wake = self.wake
+        applies = wake.mode == "gate" or (wake.mode == "strict" and self.backend == "local")
+        if applies and wake.attention == "sentence" and wake.window_s <= 0:
+            raise ValueError(
+                'wake.attention="sentence" requires wake.windowS > 0: the window '
+                "IS the grace to start the summoned sentence"
+            )
         return self
 
     @model_validator(mode="after")

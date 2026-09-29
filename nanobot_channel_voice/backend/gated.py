@@ -50,6 +50,9 @@ _WAKE_ECHO_S = 3.0
 # Transcript deltas are token sized on the OpenAI dialects, so the phrase is looked for
 # in the delta plus this much of the reply before it (longer than any spoken phrase).
 _WAKE_ECHO_TAIL = 64
+# Strict: the rest of an utterance the endpointer closed early (a pause, Smart Turn) still
+# goes up this long after its commit, unless the model is audible first.
+_CONTINUE_S = 1.5
 
 
 def _reply_is_question(text: str) -> bool:
@@ -125,17 +128,24 @@ class GatedUplink:
 
         # Attention. "vad": always open. "wake": opened by a hit, extended while a turn
         # is in flight, re-armed for wake.windowS at IDLE ("conversation") or spent by
-        # the next commit unless the reply asked a question ("sentence").
+        # the next commit unless the reply asked a question ("sentence"); under strict,
+        # never re-armed (the grant below).
         wake = config.wake
         self._wake_mode = wake.mode if self._mode == "wake" else "off"
         self._attention = wake.attention
         self._window_s = wake.window_s
         self._window_until = 0.0 if self._mode == "wake" else math.inf
         self._spent = False
-        # Strict admits an onset over a working turn (THINKING) until this, as locally: a
-        # hit opens it for windowS, a committed utterance re-opens it ("conversation") or
-        # spends it ("sentence"). A reply (SPEAKING) always needs the phrase itself.
-        self._steer_until = 0.0
+        # Strict admits an onset only before this: a hit grants windowS, and the utterance
+        # it admits, or any model audio, spends the grant. With no transcript here to tell
+        # the reply's echo from the user, no follow-up window rides a reply, whatever the
+        # attention. A reply (SPEAKING) always needs the phrase itself.
+        self._grant_until = 0.0
+        # ... and the utterance's own rest until this: its commit opens the grace unless the
+        # model was audible while it was open; model audio ends it (a settle does not: a
+        # model silent over half a sentence is waiting for the rest).
+        self._continue_until = 0.0
+        self._audible_while_open = False
         self._phrase = WakePhrase(list(wake.phrases) + list(wake.aliases))
         self._phrase_echo_until = 0.0
         self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
@@ -159,9 +169,13 @@ class GatedUplink:
         self._lapse_task: asyncio.Task | None = None
         # Without echo cancellation the mic hears a cue: onsets until its end (plus the
         # playback hangover) are the cue, not the user. The canceller removes it (the sink
-        # feeds its reference), as it does the reply.
+        # feeds its reference), as it does the reply; strict trusts none, since the
+        # receipt's echo would pass for the rest of the sentence.
         self._cue_until = 0.0
-        self._cue_guard_s = None if open_mic else config.playback_hangover_ms / 1000.0
+        self._cue_guard_s = (
+            None if open_mic and self._wake_mode != "strict"
+            else config.playback_hangover_ms / 1000.0
+        )
         if self._mode == "wake" and self._receipt is None:
             self._log.info(
                 "voice: a cloud summon gets no audible receipt (wake.ack needs the local "
@@ -332,7 +346,7 @@ class GatedUplink:
         self._metrics.count("wake_hit")
         score = getattr(self._wake, "last_score", None)
         self._log.info("wake hit{}", f" (score={score:.2f})" if score is not None else "")
-        self._steer_until = now + self._window_s
+        self._grant_until = now + self._window_s
         if self._active:
             return False  # the name mid-upload changes nothing else (the window stays inf)
         # max: never shortens an engaged turn's window (inf until IDLE).
@@ -370,10 +384,10 @@ class GatedUplink:
             return
         if self._wake_mode == "strict" and (
             self._state is VoiceState.SPEAKING
-            or (self._state is VoiceState.THINKING and now >= self._steer_until)
+            or now >= max(self._grant_until, self._continue_until)
         ):
-            # Public-room posture: only the phrase interrupts a reply, or steers a working
-            # turn once its window shut; a hit later in this same utterance adopts it.
+            # Every turn starts with the phrase, and only the phrase interrupts a reply;
+            # a hit later in this same utterance adopts it.
             self._metrics.count("gate_dropped_onsets")
             return
         await self._open_activity(self._ep.open_pcm() or b"")
@@ -381,6 +395,7 @@ class GatedUplink:
     async def _open_activity(self, pcm: bytes) -> None:
         self._cancel_park()
         self._hit_active_ms = None  # an adoption sets it after; a lost session left it
+        self._audible_while_open = False
         try:
             await self._inner.begin_activity()
         except asyncio.CancelledError:
@@ -435,9 +450,12 @@ class GatedUplink:
             return
         if self._attention == "sentence":
             self._spent = True
-            self._steer_until = 0.0  # the turn spends the phrase's window
-        else:
-            self._steer_until = time.monotonic() + self._window_s
+        # Strict: the turn spends the phrase's grant, and its rest may follow for a moment
+        # (never past model audio, whose echo that would be).
+        self._grant_until = 0.0
+        self._continue_until = (
+            0.0 if self._audible_while_open else time.monotonic() + _CONTINUE_S
+        )
         await self._inner.end_activity(commit=True)
         self._play_cue(self._receipt, "earcon_captured")  # once it went
 
@@ -493,6 +511,11 @@ class GatedUplink:
     async def _on_inner_event(self, event) -> None:
         if isinstance(event, StateHint):
             prev, self._state = self._state, event.state
+            if event.state is VoiceState.SPEAKING:
+                # Audible: what follows may be its echo, so the phrase's attention ends here
+                # (a reply the phrase cuts off sends no more: stale audio never plays).
+                self._grant_until = self._continue_until = 0.0
+                self._audible_while_open = True
             if (
                 event.state in (VoiceState.THINKING, VoiceState.SPEAKING)
                 and prev in (VoiceState.IDLE, VoiceState.CAPTURING)
@@ -522,7 +545,14 @@ class GatedUplink:
 
     def _on_idle(self, now: float) -> None:
         self._release_duck()
-        if self._mode == "wake":
+        if self._wake_mode == "strict":
+            # An engaged turn hands back what is still granted: the phrase's grant, or the
+            # rest of an utterance the model has not answered aloud (model audio clears
+            # both). A notice's settle opens nothing.
+            if self._window_until == math.inf:
+                self._window_until = max(self._grant_until, self._continue_until)
+                self._arm_lapse()
+        elif self._mode == "wake":
             spent = self._spent and self._attention == "sentence"
             self._spent = False
             if spent and not _reply_is_question(self._reply_tail):

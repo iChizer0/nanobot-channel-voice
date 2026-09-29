@@ -298,6 +298,10 @@ _AEC_HELP_CLOUD = (
     "the `aec` extra, Hardware trusts the device."
 )
 _AEC_CLOUD = ("webrtc", "hardware")
+# A cloud gate has no transcript to tell the reply's echo from the user: strict there asks
+# for the phrase before every turn, and its window only times the command after the phrase.
+_WAKE_MODE_HELP_CLOUD = "Gate listens only after the wake phrase. Strict asks for it before every turn and every interruption."
+_WINDOW_HELP_STRICT = "How long after the phrase alone its command may start. 0 asks for both in one breath."
 _NOTE_GATE = "Not in use until Send audio is On speech or After wake word."
 _NOTE_WAKE_GATE = "Not in use until Send audio is After wake word."
 _NOTE_SERVE = "The provider transcribes for itself. Serve transcription runs an engine on this device for other clients."
@@ -399,6 +403,11 @@ def build_form(cfg: VoiceConfig, store: Store | None = None) -> dict[str, Any]:
             "wake", "Wake word", _wake_paths(cfg) + _wake_extras(cfg, local=False),
             note=None if cfg.realtime.uplink == "wake" else _NOTE_WAKE_GATE,
         ))
+        for field in sections[-1]["fields"]:
+            if field["key"] == "wake.mode":
+                field["help"] = _WAKE_MODE_HELP_CLOUD
+            elif field["key"] == "wake.windowS" and cfg.wake.mode == "strict":
+                field["help"] = _WINDOW_HELP_STRICT
         # The gate plays them: the receipt at every sent utterance, the attention cue when
         # the wake window closes.
         sections.append(section(
@@ -552,11 +561,13 @@ def _listening_paths(cfg: VoiceConfig) -> list[str]:
 
 
 def _wake_extras(cfg: VoiceConfig, *, local: bool) -> list[str]:
-    """What one wake buys, once a mode is on: the attention policy and window everywhere,
-    the spoken ack and the transcript aliases where a local STT and TTS exist."""
+    """What one wake buys, once a mode is on: the attention policy (save strict under a
+    cloud gate, which spends every wake with its turn) and the window, the spoken ack and
+    the transcript aliases where a local STT and TTS exist."""
     if cfg.wake.mode == "off":
         return []
-    paths = ["wake.attention", "wake.windowS"]
+    cloud_strict = not local and cfg.wake.mode == "strict"
+    paths = ["wake.windowS"] if cloud_strict else ["wake.attention", "wake.windowS"]
     if local:
         paths += ["wake.aliases", "wake.ack.enabled"]
         if cfg.wake.ack.enabled:
