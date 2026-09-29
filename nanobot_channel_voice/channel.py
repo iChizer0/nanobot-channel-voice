@@ -103,6 +103,14 @@ _AGENT_CONTEXT_HEAD = (
     "You speak for the agent below: its workspace, profile, memory and skills are "
     "yours. Where it asks for formatting, the voice rules win."
 )
+# Supervisor mode's head for the same context: the model works through ask_nanobot, and a
+# profile saying "I am nanobot" otherwise has it answer a request for nanobot itself.
+_SUPERVISED_CONTEXT_HEAD = (
+    "You are the voice of nanobot, the agent below: speak as it, from its profile and "
+    "memory. The agent itself does the work, reached through ask_nanobot: what the profile "
+    "says about its tools and skills is for the agent, followed by delegating to it. Where "
+    "it asks for formatting, the voice rules win."
+)
 
 # Heads the replay of a lost session (SpokenHistory): the new one starts with no memory of
 # the conversation, and without being told it greets the user again.
@@ -133,10 +141,12 @@ _NOTICE_RULE = (
 _SUPERVISOR_RULES = (
     "Handle greetings, small talk, and clarifying questions yourself. For ANYTHING "
     "that needs a fact you don't already know, an action, a lookup, or multi-step "
-    "work, you MUST delegate: FIRST say a brief neutral filler in the user's "
-    "language, such as \"One moment.\" or \"Let me check.\" (never implying "
-    "success or failure), THEN call "
-    "the ask_nanobot tool with the user's request. When it returns, read the answer "
+    "work, you MUST delegate, whether or not the user names nanobot: FIRST say a brief "
+    "neutral filler in the user's language, such as \"One moment.\" or \"Let me "
+    "check.\" (never implying success or failure), THEN, in the same reply, call the "
+    "ask_nanobot tool with the user's request. Only that call delegates: saying you will "
+    "ask, check or do something does nothing, and nothing is done, found or sent until "
+    "its answer says so. When it returns, read the answer "
     "aloud naturally and concisely as if it were your own, never mention the tool "
     "or that you delegated. If the user tells you to stop or cancel a request that is "
     "still being worked on, call cancel_nanobot and say nothing."
@@ -167,7 +177,8 @@ _SUPERVISOR_TOOL = ToolDef(
     description=(
         "Delegate the user's request to the nanobot agent, which can reason over "
         "multiple steps, use tools, and access memory and files. Call this whenever "
-        "the user wants an action taken or a fact you do not already know. Always "
+        "the user wants an action taken or a fact you do not already know, including when "
+        "they ask nanobot for it. Always "
         "speak a brief neutral filler to the user BEFORE calling this. A new call "
         "replaces one still running: include anything from that request the user "
         "still wants."
@@ -310,9 +321,9 @@ def _cloud_instructions(
     rules = _SUPERVISOR_RULES if supervisor else (_DIRECT_RULES if has_tools else "")
     if supervisor and inspects:
         rules = f"{rules} {_INSPECT_RULE}"
+    head = _SUPERVISED_CONTEXT_HEAD if supervisor else _AGENT_CONTEXT_HEAD
     context = (
-        f"{_AGENT_CONTEXT_HEAD}\n\n{agent_context.strip()}"
-        if agent_context and agent_context.strip() else ""
+        f"{head}\n\n{agent_context.strip()}" if agent_context and agent_context.strip() else ""
     )
     replay = f"{_HISTORY_HEAD}\n{history}" if history else ""
     return "\n\n".join(

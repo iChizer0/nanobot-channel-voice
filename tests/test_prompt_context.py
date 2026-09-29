@@ -13,8 +13,10 @@ from nanobot_channel_voice.channel import (
     _AGENT_CONTEXT_HEAD,
     _DEFAULT_PERSONA,
     _DIRECT_RULES,
+    _INSPECT_RULE,
     _NOTICE_RULE,
     _STOP_RULE,
+    _SUPERVISED_CONTEXT_HEAD,
     _SUPERVISOR_RULES,
     VoiceChannel,
     _cloud_instructions,
@@ -105,6 +107,22 @@ def test_cloud_instructions_carry_the_agent_context_and_a_clock():
     assert _AGENT_CONTEXT_HEAD in out and "Ada's cat is Turing." in out
     assert re.search(r"\[time at connect: \d{4}-\d{2}-\d{2} \(\w+day\) \d{2}:\d{2}", out)
     assert gateway.calls == [{"channel": "voice", "chat_id": "voice:local", "include_skills": True}]
+
+
+def test_a_supervisor_session_is_the_agents_voice_not_the_agent():
+    """The profile says "I am nanobot" and may name tools the model does not hold. Headed as
+    a direct session's, a request for nanobot was answered by the model itself instead of
+    through ask_nanobot."""
+    out = _instructions(_FakeGateway(), supervisor=True, has_tools=True)
+    assert _SUPERVISED_CONTEXT_HEAD in out and "Ada's cat is Turing." in out
+    assert _AGENT_CONTEXT_HEAD not in out
+    assert "ask_nanobot" in _SUPERVISED_CONTEXT_HEAD
+    # Its own reads stay its own: the head leaves them to the inspect rule.
+    reads = _cloud_instructions(None, supervisor=True, has_tools=True, inspects=True,
+                                agent_context="# Memory\n\nAda's cat is Turing.")
+    assert _SUPERVISED_CONTEXT_HEAD in reads and _INSPECT_RULE in reads
+    direct = _instructions(_FakeGateway(), supervisor=False, has_tools=True)
+    assert _AGENT_CONTEXT_HEAD in direct and _SUPERVISED_CONTEXT_HEAD not in direct
 
 
 def test_only_a_direct_session_with_tools_gets_the_skills_index():
