@@ -208,6 +208,40 @@ def test_stop_through_echo_is_consumed():
     assert b._metrics.counters.get("barge_in_stop") == 1
 
 
+def test_a_chinese_stop_run_into_the_leak_is_consumed():
+    """zh twin: a streaming STT runs the stop into our own words with no punctuation,
+    mid-run or at the end; it still kills AND consumes."""
+    for heard in ("今天天气很好停最高气温二十度", "今天天气很好最高气温二十度停"):
+        h = _build()
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._echo.note_spoken("今天天气很好，最高气温二十度。")
+        h.transcript = heard
+        _run(b._on_utterance(_utt(onset_interrupting=True)))
+        assert h.published == [], heard
+        assert h.interrupts == 1, heard
+        assert b._metrics.counters.get("barge_in_stop") == 1, heard
+
+
+def test_a_stop_with_a_polite_word_said_into_the_leak_is_consumed():
+    """The polite word is in our own words too (…てください), so it takes a character of
+    the stop from the cut reading: the whole token still reads as the stop."""
+    for spoken, heard in [
+        ("初めての方は、こちらの手順を確認してください。", "手順を確認して、やめてください"),
+        ("请别担心，我刚才说了，今天会下雨。", "今天会下雨，请别说了"),
+        ("别嫌麻烦，安心出门吧。", "安心出门吧，麻烦安静"),
+    ]:
+        h = _build(bargeIn={"minWords": 2, "stopPhrases": ["やめて", "别说了", "安静"]})
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._echo.note_spoken(spoken)
+        h.transcript = heard
+        _run(b._on_utterance(_utt(onset_interrupting=True)))
+        assert h.published == [], heard
+        assert h.interrupts == 1, heard
+        assert b._metrics.counters.get("barge_in_stop") == 1, heard
+
+
 def test_reply_that_drains_during_stt_is_still_consumed_by_the_onset_latch():
     """The user said stop AT a live reply; the reply finished while STT ran.
     Verdict-time state would launder the stop into a cold turn ("stop what?")."""

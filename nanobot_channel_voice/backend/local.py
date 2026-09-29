@@ -2274,7 +2274,11 @@ class LocalBackend(TurnEventMixin):
             # neither our TTS nor backchannels — one fresh STOP word suffices (the kill switch
             # must survive the leak).
             fresh = self._echo.fresh_words(text) - self._ack_words
-            fresh_seq = self._fresh_seq(text, fresh)
+            # In utterance order (multi-word stop phrases need contiguity, which the SET
+            # destroyed): the fresh tokens whole, and a fused CJK run cut down to what is
+            # not our own. A stop in either reading counts.
+            readings = self._echo.fresh_readings(text, fresh)
+            stop_seq = next((r for r in readings if self._stop_match.pure(r)), None)
             # Strict wake gating applies to the echo-rung overrides too (same predicate as
             # _wake_verdict): otherwise a bystander's "stop" through the leak kills the reply,
             # or a drain-tail mixture steers a shut-window THINKING turn. Wake evidence — a
@@ -2288,11 +2292,7 @@ class LocalBackend(TurnEventMixin):
                     and self._wake_strip_leaky(text)[0]
                 )
             )
-            if (
-                (interrupting or preempted)
-                and not wake_blocked
-                and self._stop_match.pure(fresh_seq)
-            ):
+            if (interrupting or preempted) and not wake_blocked and stop_seq is not None:
                 # The fresh remainder is pure command material: a stop said THROUGH the
                 # leak. Ordered, so multi-word phrases ("shut up") match here too.
                 self._log.info(
@@ -2300,13 +2300,13 @@ class LocalBackend(TurnEventMixin):
                     loggable_text(text, self._cfg.log_transcripts, 60),
                 )
                 await self._consume_stop(
-                    " ".join(fresh_seq), heard,
+                    " ".join(stop_seq), heard,
                     interrupting=interrupting, preempted=preempted,
                 )
                 return _summary("stop")
             if (interrupting or preempted) and not wake_blocked and (
                 len(fresh) >= self._min_fresh_words
-                or self._stop_match.present(fresh_seq)
+                or any(self._stop_match.present(r) for r in readings)
             ):
                 self._metrics.count("barge_in_through_echo")
                 self._log.info(
@@ -3005,13 +3005,6 @@ class LocalBackend(TurnEventMixin):
         Unlike a stop, the phrase sits INSIDE real content, so the whole utterance is the goal."""
         return self._goal_lex is not None and phrase_within(text, self._goal_lex)
 
-    @staticmethod
-    def _fresh_seq(text: str, fresh: set[str]) -> list[str]:
-        """The fresh words in UTTERANCE order: multi-word stop phrases need contiguity, which
-        the fresh SET destroyed. ``fresh`` is the echo filter's UNIT alphabet (CJK bigrams),
-        tokens are the lexicon's — a token is fresh when any of its units is."""
-        return [t for t in tokens_of(text) if units_of(t) & fresh]
-
     def _note_spoken(self, text: str, hold_ms: float) -> None:
         """Words just went out: they must not read back as user speech, and they are
         what ``stallNoticeS`` measures (a wordless earcon is a receipt, not an update)."""
@@ -3024,7 +3017,9 @@ class LocalBackend(TurnEventMixin):
         phrase in the ordered fresh remainder — "hold" under the AEC warmup, None otherwise."""
         stop_early = False
         if len(fresh) < self._min_fresh_words:
-            if not fresh or not self._stop_match.present(self._fresh_seq(text, fresh)):
+            if not fresh or not any(
+                self._stop_match.present(r) for r in self._echo.fresh_readings(text, fresh)
+            ):
                 return None
             stop_early = True
         if self._in_aec_warmup():

@@ -429,6 +429,63 @@ def test_empty_partial_polls_release_a_stale_candidate():
     _run(_case())
 
 
+class _PartialHandle(_FakeSttHandle):
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def partial(self) -> str:
+        return self.text
+
+
+def test_a_partial_of_our_own_chinese_is_no_barge_in():
+    """The streaming path of the self-answer loop: a partial of the reply's own echo,
+    clause marks gone and a character misheard, is acquitted, not an early confirm."""
+    async def _case():
+        vad = _ScriptedVad([True] * 12)
+        h = _build(vad, mode="duck", stt_stream=_FakeSttStream())
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._echo.note_spoken("明天天气很好，最高气温二十度，适合出门散步。")
+        b._engage_duck(suspect=False)
+        b._duck_onset = time.monotonic() - 1.0  # past the 600 ms release floor
+        b._endpointer._in_speech = True
+        b._endpointer._buf = bytearray(_FRAME)
+        b._stt_live = _PartialHandle("明天天器很好最高气温二十度适合出门")
+        for _ in range(7):
+            await b.push_audio(_FRAME)
+        counters = b._metrics.counters
+        assert "barge_in_early_confirm" not in counters and h.interrupts == 0
+        assert counters.get("barge_in_false_resume.partial") == 1
+
+    _run(_case())
+
+
+def test_a_stop_in_a_partial_confirms_early_either_reading():
+    """The streaming kill switch: a stop fused onto our own words (the cut reading), or
+    with a polite word that is ours too (the whole token), confirms the barge-in early."""
+    async def _case(spoken: str, partial: str) -> dict:
+        vad = _ScriptedVad([True] * 12)
+        h = _build(vad, stt_stream=_FakeSttStream(),
+                   bargeIn={"mode": "duck", "stopPhrases": ["停", "やめて"]})
+        b = h.backend
+        b._turn = VoiceState.SPEAKING
+        b._echo.note_spoken(spoken)
+        b._engage_duck(suspect=False)
+        b._duck_onset = time.monotonic() - 1.0
+        b._endpointer._in_speech = True
+        b._endpointer._buf = bytearray(_FRAME)
+        b._stt_live = _PartialHandle(partial)
+        for _ in range(7):
+            await b.push_audio(_FRAME)
+        return b._metrics.counters
+
+    for spoken, partial in [
+        ("明天天气很好，最高气温二十度。", "明天天气很好最高气温二十度停"),
+        ("初めての方は、こちらの手順を確認してください。", "確認して、やめてください"),
+    ]:
+        assert _run(_case(spoken, partial)).get("barge_in_stop_early") == 1, partial
+
+
 # ---- min-filter blips -------------------------------------------------------
 
 def _blip(b, vad, tag: int = 1):

@@ -875,7 +875,8 @@ class BargeInConfig(_VoiceBase):
     # nor ack phrases confirms the interrupt before the endpoint verdict — streaming partials
     # (zipformer) check it live, batch engines at their eager decode. Also the bar a self-echo
     # transcript must clear to still count as an interruption. Counted in the echo filter's
-    # units: words for spaced scripts, character bigrams for CJK (n fresh hanzi ~ n-1 units).
+    # units: words for spaced scripts, character bigrams for CJK (n fresh hanzi ~ n-1 units),
+    # none for a character STT mishears in our own words.
     min_words: int = Field(default=2, ge=1)
     # Duck on SUSPICION: consecutive VAD speech frames (x audio.frameMs) while the bot speaks
     # before the reversible duck engages; deliberately below vad.startFrames because a false dip

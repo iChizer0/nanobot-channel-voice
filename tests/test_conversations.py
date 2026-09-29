@@ -224,6 +224,41 @@ def test_own_reply_words_after_drain_are_dropped_as_echo():
     _run(_case())
 
 
+def test_a_chinese_reply_heard_back_without_punctuation_is_echo():
+    """A streaming STT hears the reply's clauses run together, and gets a character
+    wrong now and then: neither may cut the reply off or reach the agent as a turn."""
+    async def _case():
+        async with EvalConversation() as c:
+            await c.user_says("明天天气怎么样")
+            await c.agent_replies("明天天气很好，最高气温二十度，适合出门散步。" * 8)
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(60)
+            await c.user_says("明天天气很好最高气温二十度适合出门散步")
+            await c.user_says("明天天器很好最高气温二十度适合出门散步")
+            assert c.counter("barge_in_false_resume.echo") == 2
+            assert c.interrupts == 0
+            await c.wait_state(VoiceState.IDLE)  # the reply plays out in full
+            assert c.texts() == ["明天天气怎么样"]
+
+    _run(_case())
+
+
+def test_a_correction_in_the_replys_own_words_still_interrupts():
+    """"Not what I meant", every word of it from the reply: mostly our own words, yet
+    the joins between them were never said, so it is the user's."""
+    async def _case():
+        async with EvalConversation() as c:
+            await c.user_says("周末天气怎么样")
+            await c.agent_replies("这个周末不是晴天，意思是会一直下雨，出门记得带伞。" * 6)
+            await c.wait_state(VoiceState.SPEAKING)
+            await c.wait_played_ms(60)
+            await c.user_says("不是这个意思")
+            assert c.interrupts == 1
+            assert c.texts() == ["周末天气怎么样", "不是这个意思"]
+
+    _run(_case())
+
+
 def test_pause_probe_acquits_leak_and_the_reply_survives():
     async def _case():
         async with EvalConversation(bargeIn={
