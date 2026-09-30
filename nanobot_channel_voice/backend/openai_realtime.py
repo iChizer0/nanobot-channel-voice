@@ -668,7 +668,7 @@ class RealtimeBackend(RealtimeTransport):
             await self._on_item_added(evt)
         elif t in ("response.output_audio_transcript.delta", "response.audio_transcript.delta"):
             self._adopt_response(evt)
-            if self._is_live(evt):
+            if self._is_live(evt) and not (self._manual and self._user_speaking):
                 self._progress_t = time.monotonic()
                 await self._emit(OutputTranscript(evt.get("delta", "")))
         elif t in ("response.output_audio.delta", "response.audio.delta"):
@@ -798,6 +798,8 @@ class RealtimeBackend(RealtimeTransport):
     async def _on_audio_delta(self, evt: dict) -> None:
         if not self._is_live(evt):
             return  # stale-response guard (cancelled/inactive) -> drop
+        if self._manual and self._user_speaking:
+            return  # talked over: the onset's flush yields before its barge-in cancels this
         b64 = evt.get("delta")
         if not b64:
             return

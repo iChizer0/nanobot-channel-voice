@@ -16,6 +16,8 @@ from nanobot_channel_voice.backend.base import (
     Error,
     InputTranscript,
     ManualTurnBackend,
+    OutputAudio,
+    OutputTranscript,
     StateHint,
     UserSpeechStarted,
     VoiceState,
@@ -522,6 +524,42 @@ def make_shell_backend(profile="openai", config: VoiceConfig | None = None):
 
     backend._on_event = on_event
     return backend, sent, events
+
+
+def test_a_reply_chunk_read_while_the_onset_flushes_is_talked_over():
+    """The shell's flush yields before barge_in cancels the reply, and the rx loop may read
+    a chunk meanwhile: it must not play, nor put the turn back in SPEAKING, where a
+    discarded activity never settles and a half-duplex mic stays gated."""
+
+    async def _run():
+        backend, sent, events = make_backend()
+        backend._ready.set()
+
+        async def on_event(e):  # _cloud_barge_in, with a chunk read during its flush
+            events.append(e)
+            if isinstance(e, UserSpeechStarted):
+                played = await backend._sink.flush()
+                await backend._handle_event({"type": "response.output_audio_transcript.delta",
+                                             "response_id": "r1", "delta": "and then"})
+                await backend._handle_event({"type": "response.output_audio.delta",
+                                             "response_id": "r1", "delta": b64(b"\x01\x00")})
+                await backend.barge_in(played)
+
+        backend._on_event = on_event
+        await backend._handle_event({"type": "response.created", "response": {"id": "r1"}})
+        await backend._handle_event({"type": "response.output_audio.delta",
+                                     "response_id": "r1", "delta": b64(b"\x01\x00")})
+        assert backend._turn is VoiceState.SPEAKING
+        events.clear()
+        await backend.begin_activity()  # the wake word over the reply (GatedUplink._kill_reply)
+        await backend.end_activity(commit=False)
+        assert [e.state for e in events if isinstance(e, StateHint)] == [
+            VoiceState.CAPTURING, VoiceState.IDLE,
+        ]
+        assert not [e for e in events if isinstance(e, (OutputAudio, OutputTranscript))]
+        await backend.close()
+
+    run(_run())
 
 
 def test_manual_onset_on_an_unborn_continuation_kills_it_at_birth():
