@@ -952,15 +952,15 @@ class OpenWakeWordConfig(OnDeviceRuntime):
 
 
 class EarconsConfig(_VoiceBase):
-    """Non-verbal cues: synthesized struck two-note tones, ~¼ s — no asset, no TTS call, no
-    language. Local backend, and a cloud backend under a gated uplink (``realtime.uplink``
-    vad/wake), where ``captured`` plays at every sent utterance, and under ``uplink="wake"`` a
-    bare summon hears the same tone (or ``path``) as its listening cue, with no toggle, the
-    moment the phrase is heard. ``captured`` (rising A5→E6) plays at every ACCEPTED turn
-    (the publish), ~1-3 s before any spoken feedback. ``attention`` (falling E6→A5) plays when
-    the wake attention window closes — at the deadline lapse under ``attention="conversation"``,
-    at the reply's settle when the window is already spent (``"sentence"``, ``windowS=0``, or
-    strict under a cloud gate, after every answered turn);
+    """Non-verbal cues: synthesized struck tones, ~¼ s — no asset, no TTS call, no language.
+    Local backend, and a cloud backend under a gated uplink (``realtime.uplink`` vad/wake),
+    where ``captured`` plays at every sent utterance, and under ``uplink="wake"`` a bare
+    summon hears a listening cue of its own (rising C♯6→E6→A6, or ``listeningPath``), with no
+    toggle, the moment the phrase is heard. ``captured`` (rising A5→E6) plays at every
+    ACCEPTED turn (the publish), ~1-3 s before any spoken feedback. ``attention`` (falling
+    E6→A5) plays when the wake attention window closes — at the deadline lapse under
+    ``attention="conversation"``, at the reply's settle when the window is already spent
+    (``"sentence"``, ``windowS=0``, or strict under a cloud gate, after every answered turn);
     it needs wake gating and stays silent with ``wake.mode="off"``. Verdicts that must stay
     silent do: gated/echo (never reveal liveness to bystanders), consumed stops (silence IS the
     acknowledgment), bare summons (locally the wake ack owns those, on a cloud gate the
@@ -973,18 +973,21 @@ class EarconsConfig(_VoiceBase):
     # refuse to load. None => the built-in, as does an unreadable file (loudly).
     path: str | None = None
     attention_path: str | None = None
+    listening_path: str | None = None  # the cloud wake gate's listening cue
     # Level adjust for the cues (built-in or file); boosts saturate at full scale. The built-ins
     # peak ~-15 dBFS.
     gain_db: float = Field(default=0.0, ge=-30.0, le=12.0)
 
     @model_validator(mode="after")
     def _path_needs_a_cue(self) -> EarconsConfig:
-        # ``path`` also sounds a cloud wake gate's listening cue: VoiceConfig checks it.
-        for path in (self.path, self.attention_path):
+        # ``listeningPath`` needs a cloud wake gate: VoiceConfig checks it.
+        for path in (self.path, self.attention_path, self.listening_path):
             if path is not None and not path.strip():
                 raise ValueError(
                     "earcons paths must be file paths (omit for the built-in cues)"
                 )
+        if self.path and not self.captured:
+            raise ValueError("a custom cue file is set but earcons.captured is not enabled")
         if self.attention_path and not self.attention:
             raise ValueError("a custom cue file is set but earcons.attention is not enabled")
         return self
@@ -1343,14 +1346,17 @@ class VoiceConfig(_VoiceBase):
         return self
 
     @model_validator(mode="after")
-    def _receipt_path_has_a_cue(self) -> VoiceConfig:
-        """``earcons.path`` sounds the receipt, and under a cloud wake gate the listening cue
-        that answers every bare summon, receipt or not."""
+    def _listening_path_has_a_cue(self) -> VoiceConfig:
+        """Only a cloud wake gate answers a bare summon with the listening cue, and only with a
+        window for the command it invites."""
         listening = (
             self.backend != "local" and self.realtime.uplink == "wake" and self.wake.window_s > 0
         )
-        if self.earcons.path and not (self.earcons.captured or listening):
-            raise ValueError("a custom cue file is set but earcons.captured is not enabled")
+        if self.earcons.listening_path and not listening:
+            raise ValueError(
+                "earcons.listeningPath is set but nothing plays the listening cue: it answers "
+                "the wake word on a cloud backend with realtime.uplink=\"wake\" and wake.windowS above 0"
+            )
         return self
 
     @model_validator(mode="after")

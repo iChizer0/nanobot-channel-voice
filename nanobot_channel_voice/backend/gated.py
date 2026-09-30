@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from loguru import logger
 
 from nanobot_channel_voice.aio import cancel_and_wait, cancel_task
-from nanobot_channel_voice.audio.pcm import ding_pcm, dong_pcm, resample_pcm
+from nanobot_channel_voice.audio.pcm import ding_pcm, dong_pcm, listen_pcm, resample_pcm
 from nanobot_channel_voice.config import VoiceConfig
 from nanobot_channel_voice.metrics import VoiceMetrics
 from nanobot_channel_voice.vad import Endpointer, resolve_preroll_ms
@@ -165,7 +165,7 @@ class GatedUplink:
         self._phrase_echo_until = 0.0
         self._reply_tail = ""  # the reply's last _WAKE_ECHO_TAIL chars + its latest delta
         # Cues (earcons.*): what the user hears of a gate the provider never sees. The
-        # receipt plays at a commit. The listening cue, in the receipt's tone, answers every
+        # receipt plays at a commit. The listening cue, a tone of its own, answers every
         # summon the moment the phrase is heard, with no toggle: a cloud summon has no spoken
         # ack, and silence leaves the user waiting on a reply that is not coming. The
         # attention cue marks the wake window closing. Enqueued straight on the sink at the
@@ -173,12 +173,14 @@ class GatedUplink:
         cues = config.earcons
         self._cue_rate = output_rate
         listening = self._mode == "wake" and wake.window_s > 0  # else a bare phrase grants nothing
-        tone = (
+        self._receipt = (
             cue_pcm(cues.path, ding_pcm, output_rate, gain_db=cues.gain_db)[0]
-            if cues.captured or listening else None
+            if cues.captured else None
         )
-        self._receipt = tone if cues.captured else None
-        self._listen_cue = tone if listening else None
+        self._listen_cue = (
+            cue_pcm(cues.listening_path, listen_pcm, output_rate, gain_db=cues.gain_db)[0]
+            if listening else None
+        )
         self._lapse_cue = None
         if cues.attention and self._mode == "wake":
             self._lapse_cue = cue_pcm(

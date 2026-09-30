@@ -1540,6 +1540,28 @@ def test_a_bare_summon_gets_the_listening_cue_with_no_toggle():
     asyncio.run(_run())
 
 
+def test_the_listening_cue_has_a_tone_and_a_clip_of_its_own(tmp_path):
+    """The wake word's cue is not the receipt: the receipt's clip leaves it alone, and its
+    own clip replaces it."""
+    from nanobot_channel_voice.audio.pcm import dong_pcm, listen_pcm, pcm_to_wav_bytes
+
+    receipt_clip, listening_clip = tmp_path / "receipt.wav", tmp_path / "go.wav"
+    receipt_clip.write_bytes(pcm_to_wav_bytes(dong_pcm(24000), 24000))
+    listening_clip.write_bytes(pcm_to_wav_bytes(dong_pcm(24000), 24000))
+    woken = {"backend": "openai", "vad_cfg": {"engine": "silero"}, "wake": {
+        "mode": "gate", "phrases": ["hey nanobot"], "windowS": 5, "engine": "openwakeword",
+    }}
+    gate, *_ = build("wake", vad=ScriptVad([]), detector=ScriptWake(set()), **woken,
+                     earcons={"captured": True})
+    assert gate._listen_cue == listen_pcm(24000) and gate._receipt != gate._listen_cue
+    gate, *_ = build("wake", vad=ScriptVad([]), detector=ScriptWake(set()), **woken,
+                     earcons={"captured": True, "path": str(receipt_clip)})
+    assert gate._receipt != gate._listen_cue == listen_pcm(24000)
+    gate, *_ = build("wake", vad=ScriptVad([]), detector=ScriptWake(set()), **woken,
+                     earcons={"listeningPath": str(listening_clip)})
+    assert gate._listen_cue not in (None, listen_pcm(24000)) and gate._receipt is None
+
+
 def test_the_attention_cue_marks_a_window_closing_unused():
     async def _run():
         vad = ScriptVad([True] * 4 + [False] * 5)

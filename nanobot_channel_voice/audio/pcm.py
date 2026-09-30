@@ -228,6 +228,16 @@ def dong_pcm(rate: int, *, peak: float = 0.18) -> bytes:
     return _struck_pcm(rate, ((1318.5, 0.0, 140.0, 45.0), (880.0, 60.0, 170.0, 60.0)), peak)
 
 
+def listen_pcm(rate: int, *, peak: float = 0.18) -> bytes:
+    """The listening cue after the wake word (~240 ms, S16 mono): a quick rising run
+    (C#6 -> E6 -> A6), three notes to the receipt's two and above them, so "go ahead" never
+    sounds like "got it" (``ding_pcm``) or "closed" (``dong_pcm``), and as far from speech."""
+    return _struck_pcm(
+        rate, ((1108.73, 0.0, 90.0, 30.0), (1318.5, 45.0, 90.0, 30.0), (1760.0, 90.0, 150.0, 55.0)),
+        peak,
+    )
+
+
 def _struck_pcm(rate: int, notes: tuple, peak: float) -> bytes:
     mix = [0.0] * max(int(rate * (s + d) / 1000) for _, s, d, _ in notes)
     attack = max(1, int(rate * 0.003))

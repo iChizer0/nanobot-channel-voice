@@ -407,22 +407,36 @@ def test_duck_targets_configured_floor_only_in_range():
     assert sink._duck_floor == 1.0
 
 
-def test_close_cue_is_the_receipt_pair_reversed():
+def _sign_changes(pcm: bytes) -> int:
     import array
 
+    s = array.array("h", pcm)
+    return sum(1 for a, b in zip(s, s[1:]) if (a >= 0) != (b >= 0))
+
+
+def test_close_cue_is_the_receipt_pair_reversed():
     from nanobot_channel_voice.audio.pcm import ding_pcm, dong_pcm
 
     ding, dong = ding_pcm(16000), dong_pcm(16000)
     assert len(ding) == len(dong) and ding != dong
 
-    def sign_changes(pcm: bytes) -> int:
-        s = array.array("h", pcm)
-        return sum(1 for a, b in zip(s, s[1:]) if (a >= 0) != (b >= 0))
-
     # Falling contour: the close cue OPENS on the high note (E6 vs A5), so its
     # first 50 ms oscillates ~1.5x faster than the receipt's.
     head = 16000 * 50 // 1000 * 2
-    assert sign_changes(dong[:head]) > sign_changes(ding[:head]) * 1.2
+    assert _sign_changes(dong[:head]) > _sign_changes(ding[:head]) * 1.2
+
+
+def test_the_listening_cue_is_a_run_of_its_own_above_the_receipt():
+    """The wake word's cue climbs (C#6 to A6) and sits above the receipt at both ends
+    (C#6 over A5, A6 over E6), so neither of the other cues passes for it."""
+    from nanobot_channel_voice.audio.pcm import ding_pcm, dong_pcm, listen_pcm
+
+    listen, ding = listen_pcm(16000), ding_pcm(16000)
+    assert listen not in (ding, dong_pcm(16000))
+    head, tail = 16000 * 40 // 1000 * 2, 16000 * 60 // 1000 * 2
+    assert _sign_changes(listen[:head]) > _sign_changes(ding[:head]) * 1.15
+    assert _sign_changes(listen[-tail:]) > _sign_changes(ding[-tail:]) * 1.2
+    assert _sign_changes(listen[-tail:]) / 60 > _sign_changes(listen[:head]) / 40 * 1.4
 
 
 def test_a_slow_device_open_warns_once():

@@ -714,17 +714,22 @@ def test_earcons_path_validators():
     }})
     assert cfg.earcons.path == "/x/cue.wav"
     assert cfg.earcons.attention_path == "/x/close.wav"
-    # A cloud wake gate's listening cue sounds the clip too, receipt or not; with no window
-    # there is no such cue.
+    # A cloud wake gate's listening cue has a clip of its own, and the receipt's stays the
+    # receipt's; with no window, or locally, nothing plays a listening cue.
     woken = {
         "backend": "openai", "realtime": {"uplink": "wake"}, "vad": {"engine": "silero"},
         "wake": {"mode": "gate", "phrases": ["hi bot"], "engine": "openwakeword"},
-        "earcons": {"path": "/x/cue.wav"},
+        "earcons": {"listeningPath": "/x/listen.wav"},
     }
-    assert VoiceConfig.model_validate(woken).earcons.path == "/x/cue.wav"
-    closed = {**woken, "wake": {**woken["wake"], "windowS": 0}}
+    assert VoiceConfig.model_validate(woken).earcons.listening_path == "/x/listen.wav"
     with pytest.raises(ValidationError, match="earcons.captured is not enabled"):
-        VoiceConfig.model_validate(closed)
+        VoiceConfig.model_validate({**woken, "earcons": {"path": "/x/cue.wav"}})
+    with pytest.raises(ValidationError, match="file path"):
+        VoiceConfig.model_validate({**woken, "earcons": {"listeningPath": " "}})
+    closed = {**woken, "wake": {**woken["wake"], "windowS": 0}}
+    for inert in (closed, {"earcons": {"listeningPath": "/x/listen.wav"}}):
+        with pytest.raises(ValidationError, match="nothing plays the listening cue"):
+            VoiceConfig.model_validate(inert)
 
 
 def test_notice_phrases_must_not_contain_stop_phrases():
