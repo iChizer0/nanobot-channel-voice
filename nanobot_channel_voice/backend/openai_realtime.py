@@ -51,7 +51,7 @@ from .base import (
     TurnDone,
     VoiceState,
 )
-from .common import loggable_text
+from .common import clamp_tool_output, loggable_text
 from .profiles import RealtimeProfile
 from .transport import RealtimeTransport, _load_connect  # noqa: F401 - re-exported
 
@@ -405,21 +405,6 @@ class RealtimeBackend(RealtimeTransport):
         if self._turn is not VoiceState.IDLE:
             await self._set_turn(VoiceState.IDLE)
 
-    def _clamp_tool_output(self, output: str) -> str:
-        """Clamp an oversized tool output to protect the realtime context window; the
-        marker keeps the model aware the tool ran."""
-        limit = self._max_tool_output_chars
-        if limit <= 0 or len(output) <= limit:
-            return output
-        marker = (
-            f"[output truncated: {len(output)} chars exceeds the voice session's "
-            f"{limit}-char tool-result limit; use offset/limit or ask for a specific range]"
-        )
-        if len(marker) >= limit:
-            return marker[:limit]
-        keep = max(0, limit - len(marker) - 1)  # leave one newline separator
-        return output[:keep] + "\n" + marker
-
     async def submit_tool_result(self, call_id: str, output: str) -> None:
         images = getattr(output, "images", ())
         frames: list[bytes] = []
@@ -436,7 +421,7 @@ class RealtimeBackend(RealtimeTransport):
             return
         abandoned = isinstance(output, AbandonedResult)
         receipt = isinstance(output, ReceiptResult)
-        output = self._clamp_tool_output(output)
+        output = clamp_tool_output(output, self._max_tool_output_chars)
         payload = {
             "type": "conversation.item.create",
             "item": {"type": "function_call_output", "call_id": call_id, "output": output},

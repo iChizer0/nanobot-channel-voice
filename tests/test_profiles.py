@@ -66,6 +66,14 @@ def test_qwen_capabilities_gate_tools_per_model_generation():
         assert new["max_tool_output_chars"] == 8000
 
 
+def test_every_provider_bounds_a_tool_result_by_default():
+    """A web page or a file read enters the realtime context whole; a spoken answer needs
+    a fraction of it, and gpt-realtime's whole window is 32k tokens."""
+    for key, profile in PROFILES.items():
+        caps = profile.capabilities_for(profile.default_model)
+        assert caps["max_tool_output_chars"] == 8000, key
+
+
 def test_longest_prefix_wins_for_voice_overrides():
     p = PROFILES["qwen"]
     assert p.default_voice_for("qwen3-omni-flash-realtime") == "Chelsie"

@@ -94,15 +94,18 @@ def test_tooldef_from_nanobot_schema_tolerates_flat_and_nested():
 
 
 def test_clamp_tool_output_marker_semantics():
-    b = rt.RealtimeBackend.__new__(rt.RealtimeBackend)
-    b._max_tool_output_chars = 0
-    assert b._clamp_tool_output("x" * 100_000) == "x" * 100_000  # 0 = unlimited
-    b._max_tool_output_chars = 200
-    assert b._clamp_tool_output("short") == "short"
-    clamped = b._clamp_tool_output("y" * 500)
-    assert len(clamped) <= 200 and "truncated" in clamped
-    b._max_tool_output_chars = 10  # marker itself longer than the cap
-    assert len(b._clamp_tool_output("z" * 500)) == 10
+    from nanobot_channel_voice.backend.common import TOOL_OUTPUT_CHARS, clamp_tool_output
+
+    assert clamp_tool_output("x" * 100_000, 0) == "x" * 100_000  # 0 = unlimited
+    assert clamp_tool_output("short", 200) == "short"
+    clamped = clamp_tool_output("y" * 500, 200)
+    assert len(clamped) == 200 and "500 chars in all, the middle cut" in clamped
+    assert len(clamp_tool_output("z" * 500, 10)) == 10  # marker itself longer than the cap
+    # A failing command's verdict is at its end: the cut keeps the head AND the tail.
+    run = "collected 90 items\n" + "test_x PASSED\n" * 800 + "STDERR:\nboom\n\nExit code: 1"
+    cut = clamp_tool_output(run)
+    assert len(cut) == TOOL_OUTPUT_CHARS
+    assert cut.startswith("collected 90 items") and cut.endswith("boom\n\nExit code: 1")
 
 
 # ---- _handle_event over canned server frames --------------------------------

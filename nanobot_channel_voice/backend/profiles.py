@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, TypeVar
 
+from .common import TOOL_OUTPUT_CHARS
+
 _V = TypeVar("_V")
 
 Dialect = Literal["ga", "beta"]
@@ -70,8 +72,8 @@ class RealtimeProfile:
     # reject them (Qwen-Omni). OFF by default: the GA family keeps full schemas.
     flatten_tool_schema: bool = False
     # Max chars in one function_call_output: the whole output enters the model context, so
-    # large payloads (base64 images) blow the window. 0 = unlimited (provider enforces).
-    max_tool_output_chars: int = 0
+    # large payloads blow the window. 0 = unlimited (provider enforces).
+    max_tool_output_chars: int = TOOL_OUTPUT_CHARS
     image_input: ImageInput = ""
     # Per-model voice overrides: keys match by startswith on the resolved model, longest
     # prefix wins; realtime.voice still overrides the result.
@@ -209,13 +211,8 @@ PROFILES: dict[str, RealtimeProfile] = {
         },
         # qwen3.5 (flash and plus) and qwen3.8 add tool calling and require an explicit
         # response.create after the function_call_output to produce the final answer.
-        # Big outputs push the realtime context over its limit; the server truncates.
         model_capability_overrides={
-            prefix: {
-                "supports_tools": True,
-                "needs_response_create_after_tools": True,
-                "max_tool_output_chars": 8000,
-            }
+            prefix: {"supports_tools": True, "needs_response_create_after_tools": True}
             for prefix in ("qwen3.5-omni-", "qwen3.8-omni-")
         },
         input_rate=16000,   # DashScope Qwen-Omni takes 16k in, streams 24k out

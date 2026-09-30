@@ -324,6 +324,24 @@ def test_a_delegated_answer_interrupts_and_a_read_waits_for_the_filler():
                          {"result": "file contents", "scheduling": "WHEN_IDLE"}]
 
 
+def test_a_long_tool_result_is_cut_to_the_session_limit():
+    """As on the OpenAI dialects: the cut keeps the delegated answer's scheduling."""
+    cfg = VoiceConfig(backend="gemini", realtime={"toolMode": "supervisor"})
+
+    async def after(backend):
+        await backend.submit_tool_result("c1", DelegatedResult("a" * 20_000))
+        await backend.submit_tool_result("c2", "b" * 20_000)
+
+    _, sent, _ = drive([
+        {"toolCall": {"functionCalls": [{"id": "c1", "name": "ask_nanobot", "args": {}},
+                                        {"id": "c2", "name": "read_file", "args": {}}]}},
+    ], config=cfg, after=after)
+    responses = [m["toolResponse"]["functionResponses"][0]["response"] for m in sent]
+    assert [len(r["result"]) for r in responses] == [8000, 8000]
+    assert all("20000 chars in all, the middle cut" in r["result"] for r in responses)
+    assert [r["scheduling"] for r in responses] == ["INTERRUPT", "WHEN_IDLE"]
+
+
 def test_cancelled_tool_result_is_dropped():
     async def after(backend):
         await backend.submit_tool_result("c1", "{}")

@@ -5,6 +5,26 @@ from __future__ import annotations
 
 from .base import OnEvent, StateHint, VoiceState
 
+# One tool result's share of a realtime session's context: the whole output enters it, and
+# a spoken answer needs a fraction of it (nanobot's own text turns cut at 16 000).
+TOOL_OUTPUT_CHARS = 8000
+
+
+def clamp_tool_output(output: str, limit: int = TOOL_OUTPUT_CHARS) -> str:
+    """An oversized tool output cut to ``limit`` chars (0 = unlimited): its head and its
+    tail, where a command's errors and exit code are, around a note of the cut."""
+    if limit <= 0 or len(output) <= limit:
+        return output
+    marker = (
+        f"\n[... {len(output)} chars in all, the middle cut: a voice session keeps {limit} "
+        "of a tool's output; narrow the call for the rest ...]\n"
+    )
+    if len(marker) >= limit:
+        return marker.strip()[:limit]
+    keep = limit - len(marker)
+    head = keep // 2
+    return output[:head] + marker + output[len(output) - (keep - head):]
+
 
 def loggable_text(text: str, enabled: bool, cap: int = 80) -> str:
     """Transcript text for log lines, honoring ``voice.logTranscripts``; off (the default)

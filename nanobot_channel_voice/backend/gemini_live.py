@@ -46,7 +46,7 @@ from .base import (
     TurnDone,
     VoiceState,
 )
-from .common import loggable_text
+from .common import clamp_tool_output, loggable_text
 from .openai_realtime import _normalize_schema
 from .transport import RealtimeTransport
 
@@ -228,6 +228,7 @@ class GeminiLiveBackend(RealtimeTransport):
             else "INTERRUPT" if isinstance(output, DelegatedResult) and not busy
             else "WHEN_IDLE"
         )
+        output = clamp_tool_output(output)  # after the type checks: a cut is a plain str
         try:
             result = json.loads(output)  # a JSON tool result rides as structure
         except (ValueError, TypeError):
