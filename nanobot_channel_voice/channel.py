@@ -78,22 +78,30 @@ _DEFAULT_PERSONA = (
     "You are a helpful, concise voice assistant. Keep replies short and conversational."
 )
 
+# How a tool round sounds, both modes: without it a chain opens every call with a filler
+# and every result with an "OK". No quoted filler either: a model repeats a sample phrase.
+_ANSWER_FIRST = (
+    "Never open what you say with an acknowledgment such as \"OK\" or \"Sure\", in any "
+    "language, and start an answer with the answer itself, not a wait phrase."
+)
+
 # Direct mode, appended only when tools are declared: the tool contract (the realtime model
 # runs without nanobot's system prompt, and a "voice assistant" persona talks a small model
-# out of calling tools), then the filler, what the user hears across a tool round-trip.
+# out of calling tools), then what the user hears across the calls.
 _DIRECT_RULES = (
     "Your tools are how you know and do anything beyond this conversation; speaking "
-    "changes how you word a reply, never what you can do. For a fact you do not already "
-    "know, anything current, the user's files, the web, reminders or messages, or any "
-    "action, you MUST call the matching tool: never guess or answer from your own "
-    "knowledge what a tool can check, and never say you cannot do what a tool does. To "
-    "follow a skill, read its SKILL.md with read_file first. If a tool fails, try another "
-    "way, and say how it ended. "
-    "Before a tool call that will keep the user waiting, say a brief neutral filler "
-    "in the user's language, such as \"One moment.\" or \"Let me check.\" (never "
-    "implying success or failure), then call it with no further speech. Skip the "
-    "filler when you expect the answer immediately. The reply that delivers the "
-    "answer is pure answer: never open it with wait phrases or progress narration."
+    "changes how you word a reply, never what you can do. For anything current, the "
+    "user's files, the web, reminders or messages, any action, or a fact you are not sure "
+    "of, you MUST call the matching tool: never guess, and never say you cannot do what a "
+    "tool does. To follow a skill, first read its SKILL.md at the path listed. If a tool "
+    "fails, try another way (a safety or workspace refusal is final), and say how it "
+    "ended. Never edit the agent's profile or memory files: this conversation does not "
+    "reach its memory, so tell the user that what they ask you to remember lasts only for "
+    "this conversation. When a request needs tools that take a moment, first say one "
+    "short sentence on what you are doing, in the user's language, never implying the "
+    "outcome and worded differently each time; then make every call it needs without "
+    "speaking in between. "
+    + _ANSWER_FIRST
 )
 
 # Heads nanobot's workspace, profile files, memory and (direct mode) skills index: the
@@ -137,19 +145,21 @@ _NOTICE_RULE = (
 )
 
 # Supervisor mode (Responder-Thinker): the realtime model owns the conversational surface
-# and delegates reasoning/tool work to nanobot; the filler masks the round-trip.
+# and delegates reasoning/tool work to nanobot; its sentence before the call masks the wait.
 _SUPERVISOR_RULES = (
     "Handle greetings, small talk, and clarifying questions yourself. For ANYTHING "
     "that needs a fact you don't already know, an action, a lookup, or multi-step "
-    "work, you MUST delegate, whether or not the user names nanobot: FIRST say a brief "
-    "neutral filler in the user's language, such as \"One moment.\" or \"Let me "
-    "check.\" (never implying success or failure), THEN, in the same reply, call the "
-    "ask_nanobot tool with the user's request. Only that call delegates: saying you will "
-    "ask, check or do something does nothing, and nothing is done, found or sent until "
-    "its answer says so. When it returns, read the answer "
-    "aloud naturally and concisely as if it were your own, never mention the tool "
-    "or that you delegated. If the user tells you to stop or cancel a request that is "
-    "still being worked on, call cancel_nanobot and say nothing."
+    "work, you MUST delegate, whether or not the user names nanobot: FIRST, once per "
+    "request, say one short sentence on what you are doing, in the user's language, never "
+    "implying the outcome and worded differently each time, THEN, in the same reply, call "
+    "the ask_nanobot tool with the user's request. Only that call delegates: saying you "
+    "will ask, check or do something does nothing, and nothing is done, found or sent "
+    "until its answer says so. When it returns, say its answer as your own, concisely: "
+    "leave out any line where nanobot only says what it is about to do, and never mention "
+    "the tool or that you delegated. "
+    + _ANSWER_FIRST
+    + " If the user tells you to stop or cancel a request that is still being worked on, "
+    "call cancel_nanobot and say nothing."
 )
 
 # Supervisor mode with a tool gateway: the agent's read-only tools the realtime model calls
@@ -159,9 +169,9 @@ _INSPECT_TOOLS = frozenset({"read_file", "list_dir", "find_files", "my", "list_e
 _INSPECT_RULE = (
     "Checking on nanobot's work is not delegated: to read a file it wrote, see what a "
     "folder holds, or whether its background tasks and commands have finished, call your "
-    "read-only tools yourself and say what you find, with no filler first (they answer at "
-    "once). Anything that changes something, or needs more than a read or two, still goes "
-    "to ask_nanobot."
+    "read-only tools yourself and say what you find, saying nothing before them (they "
+    "answer at once). Anything that changes something, or needs more than a read or two, "
+    "still goes to ask_nanobot."
 )
 _MY_CHECK = (
     "Check nanobot's own runtime state, read-only: with no key an overview of its model "
@@ -178,10 +188,9 @@ _SUPERVISOR_TOOL = ToolDef(
         "Delegate the user's request to the nanobot agent, which can reason over "
         "multiple steps, use tools, and access memory and files. Call this whenever "
         "the user wants an action taken or a fact you do not already know, including when "
-        "they ask nanobot for it. Always "
-        "speak a brief neutral filler to the user BEFORE calling this. A new call "
-        "replaces one still running: include anything from that request the user "
-        "still wants."
+        "they ask nanobot for it. Before the first call for a request, say one short "
+        "sentence to the user on what you are doing. A new call replaces one still running: "
+        "include anything from that request the user still wants."
     ),
     parameters={
         "type": "object",
@@ -1055,8 +1064,8 @@ class VoiceChannel(BaseChannel):
                 try:
                     context = await gw.get_agent_context(
                         channel=self.name, chat_id=self.config.chat_id,
-                        # The skills index only helps a model holding read_file.
-                        include_skills=has_tools and not supervisor,
+                        # The agent's files and skills help only a model holding its tools.
+                        with_tools=has_tools and not supervisor,
                     )
                 except Exception:  # noqa: BLE001 - persona and rules still hold
                     self.logger.exception("voice: could not read the agent context")

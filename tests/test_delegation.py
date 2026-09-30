@@ -697,8 +697,8 @@ class _ReadGateway:
         self.ran.append((name, args, channel, chat_id))
         return f"{name} ran"
 
-    async def get_agent_context(self, *, channel, chat_id, include_skills=True):
-        return f"agent context (skills={include_skills})"
+    async def get_agent_context(self, *, channel, chat_id, with_tools=True):
+        return f"agent context (tools={with_tools})"
 
 
 def test_supervisor_mode_reads_for_itself_through_the_gateway():
@@ -799,7 +799,7 @@ def test_supervisor_instructions_name_the_reads_only_when_it_holds_them():
         ch = VoiceChannel(cfg, MessageBus(), tool_gateway=_ReadGateway())
         text = await ch._instructions_source(True, True, SpokenHistory(), inspects=True)(True)
         assert f"{_SUPERVISOR_RULES} {_INSPECT_RULE}" in text
-        assert "skills=False" in text  # a delegating model reads no skill itself
+        assert "tools=False" in text  # a delegating model follows no skill itself
         plain = await ch._instructions_source(True, True, SpokenHistory())(True)
         assert _SUPERVISOR_RULES in plain and _INSPECT_RULE not in plain
 

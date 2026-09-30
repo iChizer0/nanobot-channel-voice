@@ -69,6 +69,23 @@ def test_direct_rules_survive_a_persona_override():
     assert _SUPERVISOR_RULES not in out
 
 
+def test_the_tool_rules_ask_for_one_sentence_and_the_answer_first():
+    """A filler before every call and an "OK" opening every result were what a tool
+    chain sounded like; a quoted filler is one the model repeats word for word."""
+    for rules in (_DIRECT_RULES, _SUPERVISOR_RULES):
+        assert "One moment" not in rules and "Let me check" not in rules
+        assert "one short sentence" in rules and "worded differently each time" in rules
+        assert 'Never open what you say with an acknowledgment such as "OK"' in rules
+    assert "without speaking in between" in _DIRECT_RULES
+    # Nothing a direct session hears reaches the agent's memory: it neither overwrites the
+    # memory files nor promises to remember.
+    assert "Never edit the agent's profile or memory files" in _DIRECT_RULES
+    assert "lasts only for this conversation" in _DIRECT_RULES
+    assert "once per request" in _SUPERVISOR_RULES
+    # nanobot's own "let me check" lines ride its answer: the model leaves them out.
+    assert "only says what it is about to do" in _SUPERVISOR_RULES
+
+
 def test_agent_context_and_clock_sit_between_persona_and_rules():
     out = _cloud_instructions(
         None, supervisor=False, has_tools=True,
@@ -106,7 +123,7 @@ def test_cloud_instructions_carry_the_agent_context_and_a_clock():
     out = _instructions(gateway, supervisor=False, has_tools=True)
     assert _AGENT_CONTEXT_HEAD in out and "Ada's cat is Turing." in out
     assert re.search(r"\[time at connect: \d{4}-\d{2}-\d{2} \(\w+day\) \d{2}:\d{2}", out)
-    assert gateway.calls == [{"channel": "voice", "chat_id": "voice:local", "include_skills": True}]
+    assert gateway.calls == [{"channel": "voice", "chat_id": "voice:local", "with_tools": True}]
 
 
 def test_a_supervisor_session_is_the_agents_voice_not_the_agent():
@@ -125,12 +142,12 @@ def test_a_supervisor_session_is_the_agents_voice_not_the_agent():
     assert _AGENT_CONTEXT_HEAD in direct and _SUPERVISED_CONTEXT_HEAD not in direct
 
 
-def test_only_a_direct_session_with_tools_gets_the_skills_index():
-    # Supervisor reaches skills through ask_nanobot; a tool-less model cannot read them.
+def test_only_a_direct_session_with_tools_gets_the_agents_files_and_skills():
+    # Supervisor reaches them through ask_nanobot; a tool-less model cannot use them.
     for supervisor, has_tools in ((True, True), (False, False)):
         gateway = _FakeGateway()
         _instructions(gateway, supervisor=supervisor, has_tools=has_tools)
-        assert gateway.calls[0]["include_skills"] is False
+        assert gateway.calls[0]["with_tools"] is False
 
 
 def test_a_failing_or_missing_gateway_keeps_persona_and_rules():
