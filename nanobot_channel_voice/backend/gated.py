@@ -188,6 +188,7 @@ class GatedUplink:
             self._log.info("voice: earcons.attention marks the wake window closing; "
                            "uplink='vad' has none, cue disabled")
         self._lapse_task: asyncio.Task | None = None
+        self._cue_task: asyncio.Task | None = None  # ends the stream a cue plays on
         # Without echo cancellation the mic hears a cue: onsets until its end (plus the
         # playback hangover) are the cue, not the user. The canceller removes it (the sink
         # feeds its reference), as it does the reply; strict trusts none, since the
@@ -327,9 +328,13 @@ class GatedUplink:
 
     async def close(self) -> None:
         self._closing = True
-        for task in (self._consult_task, self._park_task, self._lapse_task, self._unpark_task):
+        for task in (
+            self._consult_task, self._park_task, self._lapse_task, self._unpark_task,
+            self._cue_task,
+        ):
             await cancel_and_wait(task)
         self._consult_task = self._park_task = self._lapse_task = self._unpark_task = None
+        self._cue_task = None
         await self._inner.close()
         for engine in (self._vad, self._wake, self._turn):
             release = getattr(engine, "release", None)
@@ -653,10 +658,25 @@ class GatedUplink:
             return None  # never over the user
         self._metrics.count(metric)
         self._sink.enqueue(OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._cue_rate))
+        cancel_task(self._cue_task)  # one stream end covers every cue queued on it
+        self._cue_task = asyncio.create_task(self._end_cue())
         end = time.monotonic() + self._sink.backlog_ms() / 1000.0
         if self._cue_guard_s is not None:
             self._cue_until = end + self._cue_guard_s
         return end
+
+    async def _end_cue(self) -> None:
+        """End the stream once the cue is written, as a reply's drain does: aplay plays
+        nothing until its buffer fills (~500 ms) or EOF, and an open stream runs dry. A
+        reply queued behind the cue ends the stream itself."""
+        try:
+            await self._sink.wait_idle()
+            if self._state is not VoiceState.SPEAKING:
+                await self._sink.drain_stream()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a cue must never take the session down
+            self._log.warning("cue playback failed ({})", exc)
 
     def _arm_lapse(self) -> None:
         """(Re)watch the attention window: a sleeping watcher holds a stale deadline."""
@@ -667,13 +687,17 @@ class GatedUplink:
 
     async def _lapse_watch(self) -> None:
         """One attention cue per window that closes unused. An engaged turn holds the
-        window open (inf) until its IDLE, which re-arms the watch."""
+        window open (inf) until its IDLE, which re-arms the watch. Never over a reply (a
+        notice's): its settle may reopen the window, which then re-arms it too."""
         while not self._closing:
             delay = self._window_until - time.monotonic()
             if delay == math.inf:
                 return
             if delay > 0:
                 await asyncio.sleep(delay)
+                continue
+            if self._state is VoiceState.SPEAKING:
+                await asyncio.sleep(0.25)
                 continue
             if not self._active:
                 self._play_cue(self._lapse_cue, "earcon_attention")

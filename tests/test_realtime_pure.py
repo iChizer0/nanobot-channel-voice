@@ -345,9 +345,14 @@ def test_a_stream_reopen_under_the_item_skips_the_truncate():
         })
         gen = sink.stream_generation
         assert backend._item_gen == gen and backend._item_base_played > 0
+        _audio_to(sink, backend)
+        chunk = {"type": "response.output_audio.delta", "response_id": "r1",
+                 "delta": b64(b"\x00" * 48000)}
+        await backend._handle_event(chunk)  # the item's first audio, on this stream
+        await sink.wait_idle()
 
         playback.streams[-1].is_dead = True  # device gone; the sink reopens on the next write
-        sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=b"\x00" * 48000, rate=24000))
+        await backend._handle_event(chunk)  # mid-item: only the first audio re-takes the base
         await sink.wait_idle()
         assert sink.stream_generation == gen + 1
 
@@ -358,6 +363,158 @@ def test_a_stream_reopen_under_the_item_skips_the_truncate():
         await sink.stop()
 
     asyncio.run(_run())
+
+
+class _GatedDrain(PlaybackStream):
+    """A device playing its tail out after EOF until released."""
+
+    def __init__(self):
+        self.done = asyncio.Event()
+
+    async def write(self, pcm: bytes) -> None:
+        await asyncio.sleep(0)
+
+    async def drain(self) -> None:
+        await self.done.wait()
+
+    async def kill(self) -> None:
+        self.done.set()
+
+
+class _GatedDrainPlayback(NullPlayback):
+    def __init__(self):
+        self.streams: list[_GatedDrain] = []
+
+    async def open_stream(self, rate: int) -> PlaybackStream:
+        self.streams.append(_GatedDrain())
+        return self.streams[-1]
+
+
+def _audio_to(sink: AudioSink, backend) -> None:
+    async def on_event(e):  # the shell's part
+        if isinstance(e, OutputAudio):
+            sink.enqueue(e)
+
+    backend._on_event = on_event
+
+
+def test_an_item_added_over_an_ending_stream_is_based_on_its_own():
+    """A cue's stream still plays out when the reply's item is added: the item plays on a
+    fresh stream from 0, so that tail is no part of its base."""
+
+    async def _run():
+        playback = _GatedDrainPlayback()
+        sink = AudioSink(playback, mode="stream")
+        backend, sent = make_sending_backend(sink)
+        _audio_to(sink, backend)
+        await publish_stream(sink, ms=230)  # the receipt
+        ending = asyncio.create_task(sink.drain_stream())
+        await asyncio.sleep(0.05)
+        await backend._handle_event(_created("r1"))
+        await backend._handle_event({"type": "response.output_item.added", "response_id": "r1",
+                                     "item": {"type": "message", "id": "item-1"}})
+        assert backend._item_base_played == 0
+        await backend._handle_event({"type": "response.output_audio.delta", "response_id": "r1",
+                                     "delta": b64(b"\x00" * 48000)})
+        await sink.wait_idle()
+        await backend.barge_in(700)
+        truncate = [p for p in sent if p["type"] == "conversation.item.truncate"]
+        assert truncate and truncate[0]["audio_end_ms"] == 700
+        playback.streams[0].done.set()
+        await ending
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def test_a_stream_ended_before_the_items_audio_is_measured_again():
+    """The stream the item was added over ends before its first audio (a cue ended it):
+    the audio plays on a fresh stream, so the base is re-taken there, not left stale."""
+
+    async def _run():
+        sink = AudioSink(NullPlayback(), mode="stream")
+        backend, sent = make_sending_backend(sink)
+        _audio_to(sink, backend)
+        await publish_stream(sink, ms=500)  # the last reply's filler, the stream held open
+        await backend._handle_event(_created("r2"))
+        await backend._handle_event({"type": "response.output_item.added", "response_id": "r2",
+                                     "item": {"type": "message", "id": "item-2"}})
+        await sink.drain_stream()
+        await backend._handle_event({"type": "response.output_audio.delta", "response_id": "r2",
+                                     "delta": b64(b"\x00" * 48000)})
+        await sink.wait_idle()
+        await backend.barge_in(700)
+        truncate = [p for p in sent if p["type"] == "conversation.item.truncate"]
+        assert truncate and truncate[0]["audio_end_ms"] == 700
+        assert not backend._metrics.counters.get("truncate_skipped_stale_stream")
+        await backend.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+def _played_out_then_onset(
+    *, next_item: bool = False, ended: str | None = "drain",
+) -> list[dict]:
+    """r1's item plays out whole on a stream a hold kept open (no _on_drained); a cue's drain,
+    or a reaper, then ends it (``ended``; None leaves it open), and the user starts talking.
+    ``next_item`` adds r2's item over that stream first, with none of its own audio."""
+
+    async def _run():
+        playback = _GatedDrainPlayback()
+        sink = AudioSink(playback, mode="stream")
+        backend, sent = make_sending_backend(sink)
+
+        async def on_event(e):  # the shell's part: play, and flush at the onset
+            if isinstance(e, OutputAudio):
+                sink.enqueue(e)
+            elif isinstance(e, UserSpeechStarted):
+                await backend.barge_in(await sink.flush())
+
+        backend._on_event = on_event
+        await sink.start()
+        await backend._handle_event(_created("r1"))
+        await backend._handle_event({"type": "response.output_item.added", "response_id": "r1",
+                                     "item": {"type": "message", "id": "item-1"}})
+        await backend._handle_event({"type": "response.output_audio.delta", "response_id": "r1",
+                                     "delta": b64(b"\x00" * 38400)})
+        await sink.wait_idle()
+        if next_item:
+            await backend._handle_event({"type": "response.output_item.added",
+                                         "response_id": "r1",
+                                         "item": {"type": "message", "id": "item-2"}})
+        if ended is not None:
+            ending = asyncio.create_task(sink.drain_stream())
+            await asyncio.sleep(0)
+            if ended == "reaper":
+                await cancel_and_wait(ending)  # parked: the reaper plays the tail out
+            playback.streams[0].done.set()
+            await asyncio.sleep(0.01)
+            assert not sink.stream_open
+        await backend._handle_event({"type": "input_audio_buffer.speech_started"})
+        await backend.close()
+        await sink.stop()
+        return [p for p in sent if p["type"] == "conversation.item.truncate"]
+
+    return asyncio.run(_run())
+
+
+@pytest.mark.parametrize("ended", ["drain", "reaper"])
+def test_an_item_that_played_out_whole_is_not_truncated(ended):
+    """Its stream ended by playing out, so played_ms() reads 0: a truncate would wipe audio
+    the user heard in full. Talked over while its stream still plays, it is cut there."""
+    assert _played_out_then_onset(ended=ended) == []
+    [cut] = _played_out_then_onset(ended=None)
+    assert cut["item_id"] == "item-1" and cut["audio_end_ms"] > 0
+
+
+def test_an_item_added_over_a_played_out_stream_is_still_truncated_at_zero():
+    """None of its own audio played: the user heard none of it."""
+    assert _played_out_then_onset(next_item=True) == [{
+        "type": "conversation.item.truncate", "item_id": "item-2", "content_index": 0,
+        "audio_end_ms": 0,
+    }]
 
 
 def test_a_congested_uplink_cannot_stall_a_control_frame(monkeypatch):

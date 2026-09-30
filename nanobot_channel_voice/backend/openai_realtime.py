@@ -237,6 +237,7 @@ class RealtimeBackend(RealtimeTransport):
         self._item_gen = -1
         # Sink overflow drops since the base was taken: credited backlog that never played.
         self._item_dropped_ms = 0.0
+        self._item_audio_id: str | None = None  # the item whose audio began (base re-taken)
         # Never carry a dead session's fault into the next one's failure detail.
         self._last_error = None
         # call_ids THIS session announced: a result finishing after a reconnect must drop
@@ -722,6 +723,14 @@ class RealtimeBackend(RealtimeTransport):
         # utterance, not a consumed stop.
         self._stop_suppress_until = 0.0
         self._onsets += 1
+        if (
+            self._audio_item_id is not None
+            and self._item_audio_id == self._audio_item_id
+            and not self._sink.stream_open
+        ):
+            # Its audio played out, and nothing plays now (a cue's drain or a hold's reaper
+            # ended the stream without _on_drained): heard whole, while played_ms() reads 0.
+            self._audio_item_id = None
         await super()._on_speech_started()
 
     def _on_speech_stopped(self) -> None:
@@ -765,19 +774,7 @@ class RealtimeBackend(RealtimeTransport):
         rid = evt.get("response_id") or self._active_response_id
         if item.get("type") == "message":
             self._audio_item_id = item.get("id")
-            # Truncate baseline: where this item's audio STARTS. played + backlog, not
-            # played alone, or an item added over a buffered tail over-counts audio_end_ms
-            # past the item's real length (GA rejects that); backlog over-counts, so
-            # audio_end under-counts — the safe way.
-            # The stream this item's audio will play on; the sink opens it lazily, so
-            # stream_generation here can name one that is already dying.
-            self._item_gen = self._sink.next_generation
-            heard = (
-                self._sink.played_ms() if self._item_gen == self._sink.stream_generation
-                else 0  # a fresh stream restarts played_ms(), so the base restarts too
-            )
-            self._item_base_played = heard + self._sink.backlog_ms()
-            self._item_dropped_ms = self._sink.dropped_ms
+            self._anchor_item()
         elif item.get("type") == "function_call":
             cid = item.get("call_id")
             name = item.get("name", "")
@@ -794,6 +791,15 @@ class RealtimeBackend(RealtimeTransport):
                 self._fn_names[cid] = name
                 self._fn_args.setdefault(cid, "")
             await self._emit(ToolStarted(name or None, call_id=cid))
+
+    def _anchor_item(self) -> None:
+        """Truncate baseline: where the item's audio STARTS on the stream it will play on,
+        not what was heard so far, or an item added over a buffered tail over-counts
+        audio_end_ms past its real length (GA rejects that). The sink opens streams lazily,
+        so stream_generation here can name one that is already dying."""
+        self._item_gen = self._sink.next_generation
+        self._item_base_played = self._sink.accepted_ms()
+        self._item_dropped_ms = self._sink.dropped_ms
 
     async def _on_audio_delta(self, evt: dict) -> None:
         if not self._is_live(evt):
@@ -813,6 +819,10 @@ class RealtimeBackend(RealtimeTransport):
         self._progress_t = time.monotonic()  # feed the deadman: the turn is alive
         # TTFA, latched to the turn's first frame at ENQUEUE: device playout is excluded.
         self._metrics.turn_first_audio()
+        if self._audio_item_id is not None and self._item_audio_id != self._audio_item_id:
+            # The item's first audio: a stream may have ended since its add (a cue's).
+            self._item_audio_id = self._audio_item_id
+            self._anchor_item()
         await self._emit(OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._profile.output_rate))
 
     async def _on_fn_done(self, evt: dict) -> None:

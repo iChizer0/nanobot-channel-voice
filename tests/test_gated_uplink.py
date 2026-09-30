@@ -11,6 +11,7 @@ import math
 
 import pytest
 
+from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
@@ -132,12 +133,12 @@ def _recorder():
 
 
 def build(mode="vad", *, vad, detector=None, uplink_rate=RATE, open_mic=False, vad_cfg=None,
-          **cfg):
+          device=None, **cfg):
     config = VoiceConfig(
         realtime={"uplink": mode, "idleParkS": 0}, vad={**VAD_CFG, **(vad_cfg or {})}, **cfg,
     )
     inner = FakeInner()
-    sink = AudioSink(NullPlayback(), mode="stream")
+    sink = AudioSink(device or NullPlayback(), mode="stream")
     gate = GatedUplink(
         inner, config=config, sink=sink, vad=vad, wake_detector=detector,
         capture_rate=RATE, uplink_rate=uplink_rate, open_mic=open_mic,
@@ -1626,6 +1627,141 @@ def test_strict_cues_attention_as_the_answered_turn_settles():
         await asyncio.sleep(0.02)
         assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1
         await gate.close()
+
+    asyncio.run(_run())
+
+
+class AplayDevice(PlaybackSink):
+    """aplay's stream defaults: nothing sounds until it holds a full buffer (500 ms), or
+    until EOF plays out what it holds (for ``drain_s``)."""
+
+    def __init__(self, drain_s: float = 0.0):
+        self.streams: list[_AplayStream] = []
+        self.drain_s = drain_s
+
+    async def play_wav(self, wav_bytes):
+        return True
+
+    async def abort(self):
+        pass
+
+    async def open_stream(self, rate):
+        self.streams.append(stream := _AplayStream(rate, self.drain_s))
+        return stream
+
+    def sounded(self) -> list[bytes]:
+        return [s.held for s in self.streams if s.ended or len(s.held) >= s.rate]
+
+
+class _AplayStream(PlaybackStream):
+    def __init__(self, rate, drain_s):
+        self.rate = rate  # 500 ms of S16 mono is `rate` bytes
+        self.drain_s = drain_s
+        self.held = b""
+        self.ended = False
+
+    async def write(self, pcm):
+        self.held += pcm
+        await asyncio.sleep(0)
+
+    async def drain(self):
+        self.ended = True
+        await asyncio.sleep(self.drain_s)
+
+    async def kill(self):
+        pass
+
+
+def test_every_cue_sounds_when_it_plays():
+    """A cue ends its stream: left open, aplay held the listening cue and the attention cue
+    silent (both together are under its buffer) until later audio pushed them out."""
+    async def _run():
+        vad = ScriptVad([True] * 5 + [False] * 5)
+        device = AplayDevice()
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}, back_bytes=FRAME), device=device,
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 0.5},
+            earcons={"attention": True},
+        )
+        await gate._sink.start()
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 10)
+        await asyncio.sleep(0.3)
+        assert device.sounded() == [gate._listen_cue]
+        await asyncio.sleep(0.8)
+        assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1
+        assert device.sounded() == [gate._listen_cue, gate._lapse_cue]
+        await gate.close()
+        await gate._sink.stop()
+
+    asyncio.run(_run())
+
+
+def _playing(sink):
+    """The shell's part: model audio goes to the sink."""
+    async def on_event(e):
+        if isinstance(e, OutputAudio):
+            sink.enqueue(e)
+
+    return on_event
+
+
+def test_a_reply_behind_the_receipt_ends_its_own_stream():
+    """Audio queued behind a cue is a reply's: its drain ends the stream, not the cue."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5)
+        device = AplayDevice()
+        gate, inner, _, _ = build(vad=vad, device=device, earcons={"captured": True})
+        sink = gate._sink
+        await sink.start()
+        await gate.start(instructions=None, tools=[], on_event=_playing(sink))
+        await feed(gate, 9)
+        assert gate._metrics.snapshot()["counters"]["earcon_captured"] == 1
+        await asyncio.sleep(0)  # the receipt is being written when the answer starts
+        await inner.emit(StateHint(VoiceState.SPEAKING))
+        reply = b"\x01\x00" * 2400  # the first 100 ms of the answer
+        await inner.emit(OutputAudio(epoch=sink.epoch, pcm=reply, rate=24000))
+        await asyncio.sleep(0.3)
+        assert len(device.streams) == 1 and not device.streams[0].ended
+        await sink.drain_stream()  # the reply's own end
+        assert device.sounded() == [gate._receipt + reply]
+        await gate.close()
+        await sink.stop()
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("mode", ["gate", "strict"])
+def test_the_attention_cue_waits_out_a_reply(mode):
+    """The window lapses while a notice's reply plays: no cue over it (queued there, it also
+    landed on a stream nobody ended). Its settle reopens a gate window, whose close cues
+    once; under strict it reopens nothing, and the cue follows the settle."""
+    async def _run():
+        device = AplayDevice()
+        gate, inner, _, _ = build(
+            "wake", vad=ScriptVad([]), detector=ScriptWake(set()), device=device,
+            wake={"mode": mode, "phrases": ["hey nanobot"], "windowS": 0.3},
+            earcons={"attention": True},
+        )
+        sink = gate._sink
+        await sink.start()
+        await gate.start(instructions=None, tools=[], on_event=_playing(sink))
+        await inner.emit(StateHint(VoiceState.SPEAKING))
+        await inner.emit(OutputAudio(epoch=sink.epoch, pcm=b"\x01\x00" * 14400, rate=24000))
+        gate._window_until = 0.0  # the window lapses mid-reply
+        gate._arm_lapse()
+        await asyncio.sleep(0.4)
+        assert "earcon_attention" not in gate._metrics.snapshot()["counters"]
+        await sink.drain_stream()
+        await inner.emit(StateHint(VoiceState.IDLE))
+        await asyncio.sleep(0.1 if mode == "gate" else 0.4)
+        cued = gate._metrics.snapshot()["counters"].get("earcon_attention", 0)
+        assert cued == (0 if mode == "gate" else 1)
+        await asyncio.sleep(0.5)
+        assert gate._metrics.snapshot()["counters"]["earcon_attention"] == 1
+        assert device.sounded()[-1] == gate._lapse_cue
+        await gate.close()
+        await sink.stop()
 
     asyncio.run(_run())
 
