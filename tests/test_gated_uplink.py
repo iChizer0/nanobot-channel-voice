@@ -245,22 +245,22 @@ def test_wake_mode_uploads_nothing_until_the_phrase():
 
 
 def test_same_breath_command_uploads_from_the_phrase_end():
-    """Speech past the phrase (minUtteranceMs of it) is the command: adopted from the phrase
-    end once it is, and no cue talks over the user."""
+    """Speech outlasting the phrase's own tail (600 ms past the hit) is the command: adopted
+    from the phrase end once it is, and no cue talks over the user."""
     async def _run():
         # Speech from frame 0; the hit lands on frame 4 with the phrase ending one
         # frame back (= the start of frame 4) => the upload starts at frame 4.
-        vad = ScriptVad([True] * 8 + [False] * 5)
+        vad = ScriptVad([True] * 38 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({5}, back_bytes=FRAME),
             wake={"mode": "gate", "phrases": ["hey nanobot"]},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        frames = await feed(gate, 13)
+        frames = await feed(gate, 43)
         assert inner.calls[0] == ("begin",)
         first = inner.calls[1][1]
-        assert first == b"".join(frames[4:7])  # adopted at 40 ms past the phrase end
-        assert inner.pushed() == b"".join(frames[4:12])  # then frame by frame to the close
+        assert first == b"".join(frames[4:35])  # adopted 600 ms past the phrase end
+        assert inner.pushed() == b"".join(frames[4:42])  # then frame by frame to the close
         assert inner.calls[-1] == ("end", True)
         counters = gate._metrics.snapshot()["counters"]
         assert counters["wake_hit"] == 1 and "earcon_listening" not in counters
@@ -352,14 +352,14 @@ def test_strict_spends_the_grant_with_the_turn_it_admitted(monkeypatch, attentio
 
     async def _run():
         # A same-breath summoned command (hit on its second frame), then a follow-up.
-        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15,
                   "attention": attention},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 11)
+        await feed(gate, 37)
         assert inner.calls[-1] == ("end", True)
         await inner.emit(StateHint(VoiceState.THINKING))
         if settle != "working":
@@ -368,7 +368,7 @@ def test_strict_spends_the_grant_with_the_turn_it_admitted(monkeypatch, attentio
             await inner.emit(StateHint(VoiceState.IDLE))
         inner.calls.clear()
         clock.t = 1002.0  # well inside the hit's windowS
-        await feed(gate, 9, start=11)  # a follow-up without the phrase
+        await feed(gate, 9, start=37)  # a follow-up without the phrase
         assert inner.kinds() == []
         await gate.close()
 
@@ -381,18 +381,18 @@ def test_strict_takes_the_rest_of_a_sentence_closed_early(answered):
     before any reply is audible, goes up without the phrase, whether or not the provider
     has started on the first part."""
     async def _run():
-        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 11)
+        await feed(gate, 37)
         assert inner.calls[-1] == ("end", True)
         if answered:
             await inner.emit(StateHint(VoiceState.THINKING))  # silent so far
         inner.calls.clear()
-        await feed(gate, 9, start=11)
+        await feed(gate, 9, start=37)
         assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
         await gate.close()
 
@@ -411,20 +411,20 @@ def test_strict_takes_no_rest_once_the_reply_is_audible_or_the_grace_passed(
     monkeypatch.setattr(gated, "time", clock)
 
     async def _run():
-        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 11)
+        await feed(gate, 37)
         if after == "audible":
             await inner.emit(StateHint(VoiceState.SPEAKING))
         await inner.emit(StateHint(VoiceState.THINKING))
         if after == "late":
             clock.t += gated._CONTINUE_S
         inner.calls.clear()
-        await feed(gate, 9, start=11)
+        await feed(gate, 9, start=37)
         assert inner.kinds() == []
         await gate.close()
 
@@ -441,18 +441,18 @@ def test_strict_a_silent_settle_keeps_the_rest_of_the_sentence(monkeypatch, rest
     monkeypatch.setattr(gated, "time", clock)
 
     async def _run():
-        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 11)  # committed at 1000
+        await feed(gate, 37)  # committed at 1000
         await inner.emit(StateHint(VoiceState.THINKING))
         await inner.emit(StateHint(VoiceState.IDLE))  # no audio
         inner.calls.clear()
         clock.t = rest_at
-        await feed(gate, 9, start=11)
+        await feed(gate, 9, start=37)
         assert (inner.kinds()[:1] == ["begin"]) is admitted
         await gate.close()
 
@@ -463,19 +463,19 @@ def test_strict_takes_no_rest_after_model_audio_during_the_utterance():
     """Model audio while the summoned utterance was still open (a notice, a late reply):
     past its commit what follows may be that audio's echo, so no grace opens."""
     async def _run():
-        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 4)  # the summoned utterance is open
+        await feed(gate, 33)  # the summoned utterance is open, adopted
         await inner.emit(StateHint(VoiceState.SPEAKING))
         await inner.emit(StateHint(VoiceState.THINKING))
-        await feed(gate, 7, start=4)
+        await feed(gate, 4, start=33)
         assert inner.calls[-1] == ("end", True)
         inner.calls.clear()
-        await feed(gate, 9, start=11)
+        await feed(gate, 9, start=37)
         assert inner.kinds() == []
         await gate.close()
 
@@ -486,18 +486,18 @@ def test_strict_takes_the_receipts_echo_for_the_cue_even_with_an_open_mic():
     """Strict trusts no canceller: an onset while the receipt plays (plus the playback
     hangover) is the cue's echo, not the rest of the sentence."""
     async def _run():
-        vad = ScriptVad([True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}), open_mic=True,
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
             earcons={"captured": True},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 11)
+        await feed(gate, 37)
         counters = gate._metrics.snapshot()["counters"]
         assert inner.calls[-1] == ("end", True) and counters["earcon_captured"] == 1
         inner.calls.clear()
-        await feed(gate, 9, start=11)  # inside the receipt's guard
+        await feed(gate, 9, start=37)  # inside the receipt's guard
         assert inner.kinds() == []
         assert gate._metrics.snapshot()["counters"]["gate_cue_onsets"] >= 1
         await gate.close()
@@ -560,7 +560,7 @@ def test_strict_with_no_window_takes_only_a_same_breath_command(same_breath):
     """windowS=0: a bare phrase grants nothing, so the command rides the phrase's breath,
     and no cue promises attention the gate does not grant."""
     async def _run():
-        flags = [True] * 6 + [False] * 5 if same_breath else [False] * 3 + [True] * 4 + [False] * 5
+        flags = [True] * 32 + [False] * 5 if same_breath else [False] * 3 + [True] * 4 + [False] * 5
         gate, inner, _, on_event = build(
             "wake", vad=ScriptVad(flags), detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 0},
@@ -859,7 +859,7 @@ def test_window_shuts_after_window_s_and_at_zero():
 def test_sentence_attention_is_spent_unless_the_reply_asks():
     async def _run():
         def make(reply: str):
-            vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+            vad = ScriptVad([True] * 32 + [False] * 5 + [True] * 4 + [False] * 5)
             gate, inner, _, on_event = build(
                 "wake", vad=vad, detector=ScriptWake({2}),
                 wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15,
@@ -870,14 +870,14 @@ def test_sentence_attention_is_spent_unless_the_reply_asks():
         for reply, expect_second in (("It is sunny.", False), ("Which city?", True)):
             gate, inner, on_event, reply = make(reply)
             await gate.start(instructions=None, tools=[], on_event=on_event)
-            await feed(gate, 9)  # hit + first sentence
+            await feed(gate, 37)  # hit + first sentence
             assert inner.calls[-1] == ("end", True)
             await inner.emit(StateHint(VoiceState.THINKING))
             await inner.emit(OutputTranscript(reply))
             await inner.emit(StateHint(VoiceState.SPEAKING))
             await inner.emit(StateHint(VoiceState.IDLE))
             inner.calls.clear()
-            await feed(gate, 9, start=9)  # a follow-up without the phrase
+            await feed(gate, 9, start=37)  # a follow-up without the phrase
             assert (inner.kinds() != []) is expect_second, reply
             await gate.close()
 
@@ -1065,16 +1065,16 @@ def test_a_session_lost_under_an_adopted_command_leaves_nothing_behind():
     the next plain command is judged on its own speech, and committed."""
 
     async def _run():
-        vad = ScriptVad([True] * 8 + [False] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 38 + [False] * 5 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({5}, back_bytes=FRAME),
             wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 7)  # adopted once 40 ms of it outlasted the phrase, still open
+        await feed(gate, 36)  # adopted once 600 ms of it outlasted the phrase, still open
         assert gate._active and gate._summon is None
         await inner.emit(StateHint(VoiceState.IDLE))  # the session died under it
-        await feed(gate, 15, start=7)  # it closes unsent; then a short plain command
+        await feed(gate, 16, start=36)  # it closes unsent; then a short plain command
         assert inner.calls[-1] == ("end", True)
         assert "earcon_listening" not in gate._metrics.snapshot()["counters"]
         await gate.close()
@@ -1303,15 +1303,15 @@ def test_a_hit_on_the_onset_frame_leaves_the_phrase_on_the_device():
     utterance, so the onset does not upload it, and one activity carries only what
     follows the phrase."""
     async def _run():
-        vad = ScriptVad([True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        frames = await feed(gate, 9)
+        frames = await feed(gate, 37)
         assert inner.kinds().count("begin") == 1 and inner.calls[-1] == ("end", True)
-        assert inner.pushed() == b"".join(frames[2:8])  # the phrase (0-1) never went up
+        assert inner.pushed() == b"".join(frames[2:36])  # the phrase (0-1) never went up
         await gate.close()
 
     asyncio.run(_run())
@@ -1502,7 +1502,7 @@ def test_model_audio_ends_a_strict_summon_still_deciding(mode, adopted):
     """The phrase, and the agent's answer lands before the user goes on: under strict that
     audio ends the summon, so its echo is no command; gate mode barges in as ever."""
     async def _run():
-        vad = ScriptVad([True] * 5 + [True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 5 + [True] * 30 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({5}), open_mic=True,
             wake={"mode": mode, "phrases": ["hey nanobot"], "windowS": 15},
@@ -1511,7 +1511,7 @@ def test_model_audio_ends_a_strict_summon_still_deciding(mode, adopted):
         await feed(gate, 5)  # the phrase, the hit at its end: deciding
         assert gate._summon is not None
         await inner.emit(StateHint(VoiceState.SPEAKING))  # a tool's answer starts
-        await feed(gate, 9, start=5)  # speech that may be its echo
+        await feed(gate, 35, start=5)  # speech that may be its echo
         assert (inner.kinds()[:1] == ["begin"]) is adopted
         assert "earcon_listening" not in gate._metrics.snapshot()["counters"]
         await gate.close()
@@ -1634,14 +1634,14 @@ def test_the_listening_cue_has_a_tone_and_a_clip_of_its_own(tmp_path):
 
 def test_the_attention_cue_marks_a_window_closing_unused():
     async def _run():
-        vad = ScriptVad([True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 0.05},
             earcons={"attention": True},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 9)  # hit + sentence: engaged, the window holds
+        await feed(gate, 37)  # hit + sentence: engaged, the window holds
         assert inner.calls[-1] == ("end", True)
         await asyncio.sleep(0.1)
         assert "earcon_attention" not in gate._metrics.snapshot()["counters"]
@@ -1681,7 +1681,7 @@ def test_the_attention_cue_closes_a_summon_nobody_follows():
 
 def test_a_spent_sentence_window_cues_at_the_settle():
     async def _run():
-        vad = ScriptVad([True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15,
@@ -1689,7 +1689,7 @@ def test_a_spent_sentence_window_cues_at_the_settle():
             earcons={"attention": True},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 9)
+        await feed(gate, 37)
         await inner.emit(StateHint(VoiceState.THINKING))
         await inner.emit(OutputTranscript("It is sunny."))
         await inner.emit(StateHint(VoiceState.IDLE))
@@ -1703,14 +1703,14 @@ def test_a_spent_sentence_window_cues_at_the_settle():
 def test_strict_cues_attention_as_the_answered_turn_settles():
     """The answered turn spent the grant, a question included: the cue marks the close."""
     async def _run():
-        vad = ScriptVad([True] * 4 + [False] * 5)
+        vad = ScriptVad([True] * 32 + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({2}),
             wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
             earcons={"attention": True},
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
-        await feed(gate, 9)
+        await feed(gate, 37)
         assert inner.calls[-1] == ("end", True)
         await inner.emit(StateHint(VoiceState.THINKING))
         await inner.emit(OutputTranscript("Which city?"))
@@ -1861,3 +1861,48 @@ def test_the_attention_cue_waits_out_a_reply(mode):
 def test_vad_uplink_has_no_attention_cue():
     gate, *_ = build(vad=ScriptVad([]), earcons={"attention": True})
     assert gate._lapse_cue is None
+
+
+# ---- the phrase's own tail after the hit ---------------------------------------
+
+
+def test_speech_inside_the_phrase_tail_allowance_is_still_the_phrase():
+    """openWakeWord fires before the last syllable ends (up to ~480 ms measured): speech
+    that long past the hit is the phrase's own tail. The summon stays bare: cued, and
+    nothing goes up."""
+    async def _run():
+        from nanobot_channel_voice.backend import gated
+
+        tail = gated._SUMMON_TAIL_MS // FRAME_MS - 1  # just inside the allowance
+        vad = ScriptVad([True] * 5 + [True] * tail + [False] * 20)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 5 + tail + 20)
+        assert inner.calls == []
+        assert gate._metrics.snapshot()["counters"]["earcon_listening"] == 1
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_speech_past_the_tail_allowance_is_a_same_breath_command():
+    async def _run():
+        from nanobot_channel_voice.backend import gated
+
+        past = gated._SUMMON_TAIL_MS // FRAME_MS
+        vad = ScriptVad([True] * 5 + [True] * past + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        frames = await feed(gate, 5 + past + 5)
+        assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
+        assert inner.calls[1][1].startswith(frames[5])  # from the phrase end
+        assert "earcon_listening" not in gate._metrics.snapshot()["counters"]
+        await gate.close()
+
+    asyncio.run(_run())

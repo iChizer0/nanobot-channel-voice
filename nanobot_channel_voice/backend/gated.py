@@ -57,6 +57,9 @@ _CONTINUE_S = 1.5
 # it: past the gaps between words, well inside the hangover (the local fast ack's bar).
 # Speech past the phrase first is a same-breath command, which no cue talks over.
 _SUMMON_QUIET_MS = 240
+# The detector fires inside the phrase, up to this long before its last syllable ends
+# (measured 480 ms): speech this long past the hit is still the phrase, not a command.
+_SUMMON_TAIL_MS = 600
 
 
 def _reply_is_question(text: str) -> bool:
@@ -409,16 +412,17 @@ class GatedUplink:
         return await self._resolve_summon(now)
 
     async def _resolve_summon(self, now: float) -> bool:
-        """Speech past the phrase is a same-breath command ("hey nanobot, what's the
-        weather"), adopted from the phrase end, with no cue over the user; a quiet beat
-        first is the bare summon, answered at once. True when this frame's audio went up."""
+        """Speech outlasting the phrase's own tail is a same-breath command ("hey nanobot,
+        what's the weather"), adopted from the phrase end, with no cue over the user; a
+        quiet beat first is the bare summon, answered at once. True when this frame's audio
+        went up."""
         summon = self._summon
         if self._ep.in_speech:
             active = self._ep.active_ms
             if now >= summon.count_from:
                 summon.past_ms += active - summon.active_ms
             summon.active_ms = active
-            if summon.past_ms >= self._min_utterance_ms:
+            if summon.past_ms >= max(self._min_utterance_ms, _SUMMON_TAIL_MS):
                 self._summon = None
                 buf = self._ep.open_pcm() or b""
                 offset = min(len(buf), max(0, summon.hit_pos - self._ep.open_pos)) & ~1
