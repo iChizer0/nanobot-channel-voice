@@ -56,6 +56,8 @@ _RESUME_TIMEOUT_S = 5.0
 # Healthy session: resets the backoff budget, so an endpoint that recycles long sessions
 # (Qwen turn caps, Gemini's ~10-min socket) never reaches "reconnect exhausted".
 _HEALTHY_SESSION_S = 30.0
+# A held utterance goes up in frames this big (~1 s at 16 kHz): one JSON frame each.
+_UTTERANCE_CHUNK_B = 32_000
 
 
 def _load_connect():
@@ -383,6 +385,26 @@ class RealtimeTransport(TurnEventMixin):
                 VoiceState.THINKING if self._waiting_on_tools() else VoiceState.IDLE
             )
 
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set() and not self._closing
+
+    async def push_utterance(self, pcm: bytes) -> bool:
+        """An utterance the gate held while the session was away: sent whole and in order
+        behind the live frames queued before it. The live queue drops its oldest frames to
+        stay real time, which would cut the head off a backlog. False: the session is gone
+        and nothing of it went up."""
+        if self._closing or not self._ready.is_set():
+            return False
+        await self._flush_uplink()
+        for off in range(0, len(pcm), _UTTERANCE_CHUNK_B):
+            if not self._ready.is_set():
+                return False
+            await self._send(self._audio_frame(pcm[off:off + _UTTERANCE_CHUNK_B]))
+            if self._user_speaking and self._turn is VoiceState.CAPTURING:
+                self._progress_t = time.monotonic()
+        return self._ready.is_set()
+
     async def park(self) -> None:
         if self._parked or self._closing:
             return
@@ -644,6 +666,8 @@ class RealtimeTransport(TurnEventMixin):
             await asyncio.wait_for(ws.send(json.dumps(obj)), _SEND_TIMEOUT_S)
         except TimeoutError:
             self._warn_backpressure()
+        except Exception as exc:  # noqa: BLE001 - a closed socket: the rx loop reconnects
+            self._log.debug("control frame lost ({}): {}", self._event_name(obj), exc)
 
     def _warn_backpressure(self) -> None:
         if not self._warn_throttle.ready():

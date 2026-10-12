@@ -281,6 +281,18 @@ class ManualTurnBackend(Protocol):
         ``commit``: the audio was a blip, or the activity only cut a reply off (the wake
         word over it) — discard it server-side and settle to IDLE without a response."""
 
+    @property
+    def ready(self) -> bool:
+        """A session is up and configured, so an activity opened now reaches the wire at
+        once. False while parked or reconnecting: the gate then holds the utterance."""
+        return False
+
+    async def push_utterance(self, pcm: bytes) -> bool:
+        """An utterance the gate held until the session was back: send it whole, in order
+        and without loss, between its ``begin_activity`` and ``end_activity``. False when
+        the session fell away and nothing of it went up."""
+        return False
+
     async def park(self) -> None:
         """Idle: close the socket, keep the session config; the next ``begin_activity``
         reconnects (with the vendor's resumption where it has one). Idempotent."""

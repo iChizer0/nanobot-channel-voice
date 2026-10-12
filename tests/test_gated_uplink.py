@@ -70,6 +70,15 @@ class FakeInner:
         self.live = False  # begin emits UserSpeechStarted when a reply is live
         self.waiting = False  # a tool call owes its answer: a discard settles THINKING
         self.unparked = 0
+        # The session: clear = away (parked, reconnecting). A begin then waits for it,
+        # as the transport's resume budget does, and fails past resume_s.
+        self.session = asyncio.Event()
+        self.session.set()
+        self.resume_s = 0.2
+
+    @property
+    def ready(self) -> bool:
+        return self.session.is_set()
 
     async def start(self, *, instructions, tools, on_event):
         self.on_event = on_event
@@ -77,9 +86,18 @@ class FakeInner:
     async def push_audio(self, pcm):
         self.calls.append(("push", pcm))
 
+    async def push_utterance(self, pcm):
+        self.calls.append(("push_whole", pcm))
+        return self.ready
+
     async def begin_activity(self):
         if self.fail_begin:
             raise RuntimeError("no socket")
+        if not self.ready:
+            try:
+                await asyncio.wait_for(self.session.wait(), self.resume_s)
+            except TimeoutError:
+                raise RuntimeError("realtime session did not resume") from None
         self.calls.append(("begin",))
         await self.on_event(StateHint(VoiceState.CAPTURING))
         if self.live:
@@ -114,7 +132,7 @@ class FakeInner:
         await self.on_event(event)
 
     def pushed(self) -> bytes:
-        return b"".join(pcm for kind, pcm in ((c[0], c[1]) for c in self.calls if c[0] == "push"))
+        return b"".join(c[1] for c in self.calls if c[0] in ("push", "push_whole"))
 
     def kinds(self) -> list[str]:
         return [c[0] for c in self.calls]
@@ -1863,6 +1881,171 @@ def test_vad_uplink_has_no_attention_cue():
     assert gate._lapse_cue is None
 
 
+# ---- the session away: utterances held, capture never waiting ------------------
+
+
+def test_an_utterance_begun_with_the_session_away_goes_up_whole_once_it_is_back():
+    """Parked or reconnecting, the inner is not ready: the utterance is held on the device
+    and goes up as one activity once the session is back, nothing of it lost."""
+    async def _run():
+        vad = ScriptVad([True] * 6 + [False] * 5 + [False] * 3)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()  # parked
+        frames = await feed(gate, 14)
+        assert inner.calls == [] and gate._held and gate._hold_from is None
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["gate_held"] == 1 and "uplink_utterances" not in counters
+        inner.session.set()  # back
+        await asyncio.sleep(0.05)
+        assert inner.calls == [("begin",), ("push_whole", b"".join(frames[:11])), ("end", True)]
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["uplink_utterances"] == 1 and counters["earcon_captured"] == 1
+        assert not gate._holding() and gate._window_until == math.inf  # engaged
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_capture_never_waits_for_the_session():
+    """The resume is awaited off the frame path: a frame pushed while the session is away
+    returns at once (the shell's capture loop stalled behind it before, and the device
+    buffer then burst into the drop-oldest uplink queue)."""
+    async def _run():
+        vad = ScriptVad([True] * 6 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 1.0
+        loop = asyncio.get_running_loop()
+        worst = 0.0
+        for i in range(11):
+            t0 = loop.time()
+            await gate.push_audio(frame(i))
+            worst = max(worst, loop.time() - t0)
+        assert worst < 0.05
+        assert inner.calls == [] and gate._held
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_held_utterance_the_session_never_comes_back_for_is_dropped(clock):
+    """Past the resume budget, twice, the utterance is dropped with a warning, and what it
+    engaged settles: the window re-arms and the idle park too."""
+    async def _run():
+        vad = ScriptVad([False] * 2 + [True] * 6 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        gate._idle_park_s = 0.05
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 0.02
+        await feed(gate, 2)  # the bare phrase: cued, the socket asked back
+        clock.t += TONE_S
+        await feed(gate, 11, start=2)  # the command, held
+        assert gate._held and inner.calls == []
+        await asyncio.sleep(0.1)
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["gate_activity_failed"] == 1 and "uplink_utterances" not in counters
+        assert not gate._holding() and gate._window_until != math.inf
+        await asyncio.sleep(0.1)
+        assert ("park",) in inner.calls and "begin" not in inner.kinds()
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_held_utterances_go_up_in_order_one_activity_each():
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        frames = await feed(gate, 18)
+        assert len(gate._held) == 2 and inner.calls == []
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert inner.kinds() == ["begin", "push_whole", "end", "begin", "push_whole", "end"]
+        assert inner.calls[1][1] == b"".join(frames[:9])
+        assert inner.calls[4][1].endswith(b"".join(frames[9:18]))
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_an_utterance_begun_while_a_held_one_goes_up_is_held_behind_it():
+    """One activity at a time: speech during a held utterance's upload queues behind it
+    rather than streaming into its activity."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 9)  # the first, held
+        release = asyncio.Event()
+
+        async def slow_push(pcm):
+            inner.calls.append(("push_whole", pcm))
+            await release.wait()
+
+        inner.push_utterance = slow_push
+        inner.session.set()
+        await asyncio.sleep(0.02)  # the worker is inside push_utterance
+        assert inner.kinds() == ["begin", "push_whole"] and gate._active
+        await feed(gate, 9, start=9)  # the second, while the first goes up
+        assert inner.kinds() == ["begin", "push_whole"] and len(gate._held) == 1
+        release.set()
+        await asyncio.sleep(0.02)
+        assert inner.kinds() == ["begin", "push_whole", "end", "begin", "push_whole", "end"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_capture_gap_drops_the_held_open_utterance_but_not_those_already_whole():
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 4)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 13)  # one whole, one open
+        assert len(gate._held) == 1 and gate._hold_from is not None
+        await gate.on_capture_gap()
+        assert len(gate._held) == 1 and gate._hold_from is None
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert inner.kinds() == ["begin", "push_whole", "end"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_held_same_breath_command_goes_up_from_the_phrase_end():
+    async def _run():
+        from nanobot_channel_voice.backend import gated
+
+        past = gated._SUMMON_TAIL_MS // FRAME_MS
+        vad = ScriptVad([True] * 5 + [True] * past + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        frames = await feed(gate, 5 + past + 5)
+        assert inner.calls == [] and len(gate._held) == 1
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert inner.kinds() == ["begin", "push_whole", "end"]
+        assert inner.calls[1][1] == b"".join(frames[5:])  # the phrase (0-4) never goes up
+        await gate.close()
+
+    asyncio.run(_run())
+
+
 # ---- the phrase's own tail after the hit ---------------------------------------
 
 
@@ -1903,6 +2086,255 @@ def test_speech_past_the_tail_allowance_is_a_same_breath_command():
         assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
         assert inner.calls[1][1].startswith(frames[5])  # from the phrase end
         assert "earcon_listening" not in gate._metrics.snapshot()["counters"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_held_utterance_the_session_falls_away_under_gets_no_receipt():
+    """IDLE under the worker's activity is a lost session: the utterance went with it,
+    counted, and no receipt claims it was heard."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 9)
+
+        async def push_and_lose(pcm):
+            inner.calls.append(("push_whole", pcm))
+            await inner.on_event(StateHint(VoiceState.IDLE))  # the adapter's session loss
+
+        inner.push_utterance = push_and_lose
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["gate_activity_lost"] == 1 and "earcon_captured" not in counters
+        assert inner.kinds() == ["begin", "push_whole", "end"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_the_phrase_over_a_held_utterance_going_up_is_answered_and_the_command_queued(clock):
+    """The worker's activity is not the user's open utterance: a summon then is cued as
+    ever, and its command queues behind the upload rather than being swallowed."""
+    async def _run():
+        from nanobot_channel_voice.backend import gated
+
+        past = gated._SUMMON_TAIL_MS // FRAME_MS
+        vad = ScriptVad([True] * 5 + [True] * past + [False] * 5 + [False] + [True] * 4 + [False] * 5)
+        detector = ScriptWake({5})
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=detector,
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 5 + past + 5)  # a same-breath command, held
+        release = asyncio.Event()
+
+        async def slow_push(pcm):
+            inner.calls.append(("push_whole", pcm))
+            await release.wait()
+
+        inner.push_utterance = slow_push
+        inner.session.set()
+        await asyncio.sleep(0.02)  # going up
+        assert inner.kinds() == ["begin", "push_whole"]
+        detector.hits.add(detector.n + 1)
+        await feed(gate, 1, start=5 + past + 5)  # the phrase again, nothing else said
+        assert gate._metrics.snapshot()["counters"]["earcon_listening"] == 1
+        clock.t += TONE_S
+        await feed(gate, 9, start=5 + past + 6)  # the command after the cue: queued
+        assert len(gate._held) == 1 and inner.kinds() == ["begin", "push_whole"]
+        release.set()
+        await asyncio.sleep(0.02)
+        assert inner.kinds() == ["begin", "push_whole", "end", "begin", "push_whole", "end"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_dead_socket_under_a_held_upload_loses_only_that_utterance():
+    """The worker survives an inner that raises mid-upload: the utterance is counted lost,
+    the ones queued behind it still go up, and nothing is left holding."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 18)
+        assert len(gate._held) == 2
+        pushes = 0
+
+        async def flaky_push(pcm):
+            nonlocal pushes
+            pushes += 1
+            inner.calls.append(("push_whole", pcm))
+            if pushes == 1:
+                raise RuntimeError("socket closed")
+            return True
+
+        inner.push_utterance = flaky_push
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert inner.kinds() == ["begin", "push_whole", "begin", "push_whole", "end"]
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["gate_activity_lost"] == 1 and counters["uplink_utterances"] == 1
+        assert not gate._holding() and not gate._active
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_session_lost_as_a_held_activity_opens_is_counted_not_captured():
+    """The session dies inside begin_activity (after its CAPTURING, before the audio): the
+    inner's push sends nothing. No receipt, no utterance counted, one loss counted."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 9)
+        begin = inner.begin_activity
+
+        async def begin_and_lose():
+            await begin()
+            inner.session.clear()  # _on_session_lost: ready off, IDLE
+            await inner.on_event(StateHint(VoiceState.IDLE))
+
+        inner.begin_activity = begin_and_lose
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["gate_activity_lost"] == 1
+        assert "uplink_utterances" not in counters and "earcon_captured" not in counters
+        assert inner.calls[-1] == ("end", False)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_held_utterance_still_open_when_the_session_returns_streams_on():
+    """Back mid-sentence: the activity opens then, with everything since the onset, and the
+    rest streams live. Nothing waits for the close, so a notice or a reply cannot gate the
+    mic under the user."""
+    async def _run():
+        vad = ScriptVad([True] * 10 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        frames = await feed(gate, 4)
+        assert inner.calls == [] and gate._hold_from is not None
+        inner.session.set()
+        frames += await feed(gate, 11, start=4)
+        assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
+        assert inner.calls[1] == ("push", b"".join(frames[:5]))  # since the onset
+        assert inner.pushed() == b"".join(frames[:14])
+        counters = gate._metrics.snapshot()["counters"]
+        assert counters["gate_held"] == 1 and counters["uplink_utterances"] == 1
+        assert not gate._held and gate._hold_from is None
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_an_open_utterance_streams_on_once_the_queue_ahead_of_it_went_up():
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 12 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        frames = await feed(gate, 12)  # one whole, the second open
+        assert len(gate._held) == 1 and gate._hold_from is not None
+        inner.session.set()
+        for i in range(12, 26):  # frames keep coming while the worker sends the first
+            frames += await feed(gate, 1, start=i)
+            await asyncio.sleep(0.005)
+        kinds = inner.kinds()
+        assert kinds[:3] == ["begin", "push_whole", "end"]  # the first, whole
+        assert kinds[3] == "begin" and kinds[-1] == "end"  # the second, live from there
+        assert inner.calls[-1] == ("end", True)
+        assert inner.calls[4][1].startswith(frames[9])  # its onset frames, held meanwhile
+        assert gate._metrics.snapshot()["counters"]["uplink_utterances"] == 2
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_dropped_held_command_keeps_the_strict_grant(clock):
+    """Attention is spent when an utterance goes up, not when it is held: the command the
+    session never took still has the phrase's grant, so saying it again needs no phrase."""
+    async def _run():
+        vad = ScriptVad([False] * 2 + [True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 0.02
+        await feed(gate, 2)  # the bare phrase: cued, granted
+        clock.t += TONE_S
+        await feed(gate, 11, start=2)  # the command, held
+        await asyncio.sleep(0.1)  # dropped
+        assert gate._metrics.snapshot()["counters"]["gate_activity_failed"] == 1
+        inner.session.set()
+        clock.t += 3.0  # past any continuation grace, inside the phrase's windowS
+        await feed(gate, 9, start=13)  # said again, without the phrase
+        assert inner.calls[-1] == ("end", True)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_held_turn_owns_the_window_even_after_a_loss_before_it(clock):
+    async def _run():
+        vad = ScriptVad([False] + [True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({1}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 1)  # the bare phrase: cued
+        clock.t += TONE_S
+        await feed(gate, 18, start=1)
+        assert gate._holding() and len(gate._held) == 1  # the first is in the worker's hands
+        seen: list[float] = []
+        pushes = 0
+
+        async def push(pcm):
+            nonlocal pushes
+            pushes += 1
+            inner.calls.append(("push_whole", pcm))
+            if pushes == 1:
+                await inner.on_event(StateHint(VoiceState.IDLE))  # lost under the first
+                return False
+            seen.append(gate._window_until)
+            return True
+
+        inner.push_utterance = push
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert seen == [math.inf]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_the_backlog_keeps_the_newest_held_utterances():
+    async def _run():
+        vad = ScriptVad(([True] * 4 + [False] * 5) * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 5.0
+        frames = await feed(gate, 45)
+        assert len(gate._held) == 4
+        assert gate._metrics.snapshot()["counters"]["gate_held_dropped"] == 1
+        assert gate._held[-1].endswith(b"".join(frames[36:45]))
         await gate.close()
 
     asyncio.run(_run())

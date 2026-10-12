@@ -740,6 +740,7 @@ class _FakeCloud:
     """A ManualTurnBackend that answers every committed turn at once."""
 
     pace_output_audio = False
+    ready = True
 
     def __init__(self):
         self.calls: list = []
@@ -751,6 +752,10 @@ class _FakeCloud:
 
     async def push_audio(self, pcm):
         self.calls.append(("push", pcm))
+
+    async def push_utterance(self, pcm):
+        self.calls.append(("push", pcm))
+        return True
 
     async def begin_activity(self):
         from nanobot_channel_voice.backend.base import StateHint, VoiceState

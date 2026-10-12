@@ -1200,3 +1200,79 @@ def test_a_frame_keeps_a_photo_upright_and_transparency_white():
     photo.save(out, "JPEG", exif=exif)
     frame = Image.open(io.BytesIO(_jpeg_frame(ToolImage("image/jpeg", out.getvalue()))))
     assert frame.size == (20, 40)
+
+
+def test_push_utterance_goes_out_whole_in_order_behind_the_live_frames():
+    """A held utterance never takes the drop-oldest live path: it goes through the
+    control-frame sender in chunks, after the live frames queued before it."""
+
+    async def _run():
+        backend, sent, _ = make_backend()
+        backend._ready.set()
+        order: list = []
+
+        async def drain_one():
+            pcm = await backend._send_q.get()
+            order.append(("live", pcm))
+            backend._send_q.task_done()
+
+        async def record(payload):
+            order.append(("whole", base64.b64decode(payload["audio"])))
+
+        backend._send = record
+        await backend.push_audio(b"\x01\x02")
+        drainer = asyncio.create_task(drain_one())
+        pcm = bytes(range(256)) * 300  # three chunks
+        await backend.push_utterance(pcm)
+        await drainer
+        assert order[0] == ("live", b"\x01\x02")
+        assert [kind for kind, _ in order[1:]] == ["whole"] * 3
+        assert b"".join(part for _, part in order[1:]) == pcm
+        await backend.close()
+
+    run(_run())
+
+
+def test_ready_follows_the_session():
+    async def _run():
+        backend, _, _ = make_backend()
+        assert backend.ready is False
+        backend._ready.set()
+        assert backend.ready is True
+        await backend.park()
+        assert backend.ready is False and backend._parked
+        await backend.close()
+
+    run(_run())
+
+
+def test_push_utterance_reports_a_session_gone():
+    async def _run():
+        backend, sent, _ = make_backend()
+        assert await backend.push_utterance(b"\x00" * 100) is False
+        backend._ready.set()
+        assert await backend.push_utterance(b"\x00" * 100) is True
+        assert [p["type"] for p in sent] == ["input_audio_buffer.append"]
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_control_frame_on_a_dead_socket_is_dropped_not_raised():
+    """websockets raises on send once the socket closed; the rx loop reconnects, and a
+    caller's bookkeeping (a held upload's worker) must not die on it."""
+
+    class DeadWs:
+        async def send(self, raw):
+            raise ConnectionError("no close frame received or sent")
+
+    async def _run():
+        backend = rt.RealtimeBackend(
+            _manual_config(), sink=AudioSink(NullPlayback(), mode="stream"),
+            profile=PROFILES["openai"],
+        )
+        backend._ws = DeadWs()
+        await backend._send({"type": "input_audio_buffer.commit"})  # no raise
+        await backend.close()
+
+    run(_run())

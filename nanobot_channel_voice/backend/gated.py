@@ -18,6 +18,7 @@ import asyncio
 import math
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from loguru import logger
@@ -60,6 +61,11 @@ _SUMMON_QUIET_MS = 240
 # The detector fires inside the phrase, up to this long before its last syllable ends
 # (measured 480 ms): speech this long past the hit is still the phrase, not a command.
 _SUMMON_TAIL_MS = 600
+# A held utterance asks the session back this many times (each the transport's resume
+# budget) before it is dropped; past this many waiting, the oldest goes (a long outage
+# must not replay a monologue).
+_HOLD_ATTEMPTS = 2
+_HOLD_MAX = 4
 
 
 def _reply_is_question(text: str) -> bool:
@@ -94,7 +100,7 @@ class GatedUplink:
         output_rate: int = 24000,  # the cue rate: every supported provider streams 24 kHz
         metrics: VoiceMetrics | None = None,
     ):
-        for name in ("begin_activity", "end_activity", "park"):
+        for name in ("begin_activity", "end_activity", "park", "push_utterance", "ready"):
             if not hasattr(inner, name):
                 raise RuntimeError(
                     f"backend {type(inner).__name__} cannot run under a gated uplink "
@@ -200,6 +206,12 @@ class GatedUplink:
 
         self._state = VoiceState.IDLE
         self._active = False          # begin_activity sent, end_activity not yet
+        self._streaming = False       # ... and the open utterance goes up frame by frame
+        # The session away (parked, reconnecting): the open utterance is held, to stream on
+        # from this position once it is back, or go up whole, queued behind earlier ones.
+        self._hold_from: int | None = None
+        self._held: deque[bytes] = deque(maxlen=_HOLD_MAX)
+        self._hold_task: asyncio.Task | None = None
         self._hit_pos: int | None = None  # phrase END in endpointer stream coordinates
         self._summon: _Summon | None = None
         self._held_onset = False  # an onset during a cue, waiting for speech to outlast it
@@ -254,11 +266,13 @@ class GatedUplink:
         else:
             adopted = False
         if self._ep.in_speech and not prev_speech:
-            if not self._active and self._summon is None:  # a summon owns its phrase's utterance
+            if not self._streaming and self._summon is None:  # a summon owns its phrase's utterance
                 await self._on_onset(now)
-        elif self._held_onset and not self._active:
+        elif self._held_onset and not self._streaming:
             await self._release_held(now)
-        elif self._ep.in_speech and self._active and not adopted:
+        elif self._hold_from is not None and self._ep.in_speech and self._can_stream():
+            await self._open_live(self._hold_from)  # the session is back: on from here
+        elif self._ep.in_speech and self._streaming and not adopted:
             await self._upload(pcm)
         if prev_speech and not self._ep.in_speech:
             await self._on_close(utterance)
@@ -270,7 +284,7 @@ class GatedUplink:
         flush discards this audio, so the command belongs after the reply stops."""
         if self._closing or not pcm:
             return
-        if self._active or self._ep.in_speech:
+        if self._streaming or self._ep.in_speech:
             # The mic gated under an open utterance (a reply started while the user
             # spoke): frame-counted, it would never close, then commit garbage at the
             # reopen. This tap keeps feeding the wake detector without a gap, so its
@@ -298,8 +312,26 @@ class GatedUplink:
 
     @property
     def at_rest(self) -> bool:
-        """Idle on both sides of the gate: no open activity here, nothing waiting inside."""
-        return self._state is VoiceState.IDLE and not self._active and self._inner.at_rest
+        """Idle on both sides of the gate: no open or held activity here, nothing waiting
+        inside."""
+        return (
+            self._state is VoiceState.IDLE and not self._active and not self._holding()
+            and self._inner.at_rest
+        )
+
+    def _holding(self) -> bool:
+        """An utterance waits for the session: open and held, queued, or going up whole."""
+        return (
+            self._hold_from is not None or bool(self._held)
+            or (self._hold_task is not None and not self._hold_task.done())
+        )
+
+    def _can_stream(self) -> bool:
+        """The open utterance may go up live: the session is here and nothing waits ahead."""
+        return (
+            self._inner.ready and not self._held
+            and (self._hold_task is None or self._hold_task.done())
+        )
 
     async def announce(self, text: str) -> None:
         # The inner resumes a parked socket for it; the IDLE after its reply re-arms the park.
@@ -316,24 +348,28 @@ class GatedUplink:
             if self._wake is not None and not keep_wake:
                 self._wake.reset()
         self._eou_gen = None
-        if self._summon is not None:
-            self._schedule_park()  # its hit held the park off, and nothing will settle now
+        if self._summon is not None or self._hold_from is not None:
+            self._schedule_park()  # the hit held the park off, and nothing will settle now
         self._summon = None
         self._held_onset = False
+        if self._hold_from is not None:
+            self._hold_from = None  # held utterances already whole still go up
+            self._settle_held()
         cancel_task(self._consult_task)
-        if self._active:
-            self._active = False
+        if self._streaming:
+            self._active = self._streaming = False
             await self._inner.end_activity(commit=False)
 
     async def close(self) -> None:
         self._closing = True
         for task in (
             self._consult_task, self._park_task, self._lapse_task, self._unpark_task,
-            self._cue_task,
+            self._cue_task, self._hold_task,
         ):
             await cancel_and_wait(task)
         self._consult_task = self._park_task = self._lapse_task = self._unpark_task = None
-        self._cue_task = None
+        self._cue_task = self._hold_task = None
+        self._held.clear()
         await self._inner.close()
         for engine in (self._vad, self._wake, self._turn):
             release = getattr(engine, "release", None)
@@ -384,8 +420,8 @@ class GatedUplink:
         score = getattr(self._wake, "last_score", None)
         self._log.info("wake hit{}", f" (score={score:.2f})" if score is not None else "")
         self._grant_until = now + self._window_s
-        if self._active:
-            return False  # the name mid-upload changes nothing else (the window stays inf)
+        if self._streaming or self._hold_from is not None:
+            return False  # the name mid-utterance changes nothing else (the window stays inf)
         # max: never shortens an engaged turn's window (inf until IDLE).
         self._window_until = max(self._window_until, now + self._window_s)
         self._spent = False
@@ -424,10 +460,8 @@ class GatedUplink:
             summon.active_ms = active
             if summon.past_ms >= max(self._min_utterance_ms, _SUMMON_TAIL_MS):
                 self._summon = None
-                buf = self._ep.open_pcm() or b""
-                offset = min(len(buf), max(0, summon.hit_pos - self._ep.open_pos)) & ~1
-                await self._open_activity(buf[offset:])
-                return self._active
+                await self._open_activity(summon.hit_pos)
+                return self._streaming
             if self._ep.silence_run_ms < _SUMMON_QUIET_MS:
                 return False
             with self._hop_lock:
@@ -481,7 +515,7 @@ class GatedUplink:
             # a hit later in this same utterance adopts it.
             self._metrics.count("gate_dropped_onsets")
             return
-        await self._open_activity(self._ep.open_pcm() or b"")
+        await self._open_activity(self._ep.open_pos)
 
     async def _release_held(self, now: float) -> None:
         """An onset held over a cue: speech past the cue's notes is the user's, judged now
@@ -492,24 +526,45 @@ class GatedUplink:
             self._held_onset = False
             await self._on_onset(now)
 
-    async def _open_activity(self, pcm: bytes) -> None:
+    async def _open_activity(self, start_pos: int) -> None:
+        """Open the activity for the open utterance, uploading it from stream position
+        ``start_pos``: live, or held until the session is back (never waiting for it
+        here, where capture would wait too)."""
         self._cancel_park()
         self._audible_while_open = False
+        self._window_until = math.inf  # engaged: the turn owns attention until IDLE
+        if not self._can_stream():
+            if self._hold_from is None:
+                self._metrics.count("gate_held")
+                self._log.info("session away: holding the utterance until it is back")
+            self._hold_from = start_pos
+            self._unpark()
+            return
+        await self._open_live(start_pos)
+
+    async def _open_live(self, start_pos: int) -> None:
+        """The activity for the open utterance, streaming from ``start_pos`` on."""
+        self._hold_from = None
         try:
             await self._inner.begin_activity()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - parked and could not resume
+        except Exception as exc:  # noqa: BLE001 - lost between the check and the wire
             self._metrics.count("gate_activity_failed")
             self._log.warning("uplink could not open an activity ({}); utterance dropped", exc)
-            self._schedule_park()  # no turn will settle IDLE to re-arm it
+            self._settle_held()
             return
-        self._active = True
-        self._window_until = math.inf  # engaged: the turn owns attention until IDLE
+        self._active = self._streaming = True
         self._release_duck()  # the shell's flush restored gain; keep our bookkeeping true
         self._metrics.count("uplink_utterances")
+        pcm = self._open_slice(start_pos)
         if pcm:
             await self._upload(pcm)
+
+    def _open_slice(self, start_pos: int) -> bytes:
+        """The open utterance from stream position ``start_pos`` on."""
+        buf = self._ep.open_pcm() or b""
+        return buf[min(len(buf), max(0, start_pos - self._ep.open_pos)) & ~1:]
 
     async def _upload(self, pcm: bytes) -> None:
         self._metrics.count("uplink_ms", len(pcm) * 1000 // (2 * self._capture_rate))
@@ -525,14 +580,23 @@ class GatedUplink:
     async def _on_close(self, utterance: bytes | None) -> None:
         cancel_task(self._consult_task)
         self._eou_gen = None
-        if not self._active:
+        if self._hold_from is not None:
+            self._close_held(utterance)
+            return
+        if not self._streaming:
             return  # never uploaded (window shut / strict-dropped / a summon's phrase)
-        self._active = False
+        self._active = self._streaming = False
         if utterance is None:
             # Min-length reject: the blip already went up; take it back.
             self._metrics.count("gate_blip_aborted")
             await self._inner.end_activity(commit=False)
             return
+        self._spend_attention()
+        await self._inner.end_activity(commit=True)
+        self._play_cue(self._receipt, "earcon_captured")  # once it went
+
+    def _spend_attention(self) -> None:
+        """An utterance of the user's goes up: what that spends of the attention."""
         if self._attention == "sentence":
             self._spent = True
         # Strict: the turn spends the phrase's grant, and its rest may follow for a moment
@@ -541,8 +605,88 @@ class GatedUplink:
         self._continue_until = (
             0.0 if self._audible_while_open else time.monotonic() + _CONTINUE_S
         )
-        await self._inner.end_activity(commit=True)
-        self._play_cue(self._receipt, "earcon_captured")  # once it went
+
+    def _close_held(self, utterance: bytes | None) -> None:
+        """The held utterance closed: whole now, it queues for the session (a blip
+        queues nothing, and nothing else will settle what it engaged)."""
+        start, self._hold_from = self._hold_from, None
+        if utterance is None:
+            self._settle_held()
+            return
+        off = min(len(utterance), max(0, start - self._ep.closed_open_pos)) & ~1
+        if len(self._held) == self._held.maxlen:
+            self._metrics.count("gate_held_dropped")  # the oldest goes, below
+            self._log.warning("session still away: the oldest held utterance is dropped")
+        self._held.append(utterance[off:])
+        if self._hold_task is None or self._hold_task.done():
+            self._hold_task = asyncio.create_task(self._send_held())
+
+    async def _send_held(self) -> None:
+        """Held utterances go up in order, one activity each, once the session is back;
+        one it never comes back for is dropped. Then an utterance still open streams on."""
+        while self._held and not self._closing:
+            pcm = self._held.popleft()
+            try:
+                await self._send_one(pcm)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a dead socket: the rest still go
+                self._active = False
+                self._metrics.count("gate_activity_lost")
+                self._log.warning("a held utterance was lost ({})", exc)
+        self._hold_task = None  # done: what follows must not count this task as holding
+        if self._hold_from is not None and self._ep.in_speech and self._can_stream():
+            await self._open_live(self._hold_from)
+        elif not self._active and self._state is VoiceState.IDLE:
+            self._settle_held()  # the last one was dropped: nothing else settles it
+
+    async def _send_one(self, pcm: bytes) -> None:
+        why = None
+        for _ in range(_HOLD_ATTEMPTS):
+            try:
+                await self._inner.begin_activity()
+                why = None
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the resume budget, once more
+                why = exc
+        if why is not None:
+            self._metrics.count("gate_activity_failed")
+            self._log.warning(
+                "uplink could not open an activity ({}); held utterance dropped", why,
+            )
+            return
+        self._active = True
+        self._window_until = math.inf  # this turn owns attention until its IDLE
+        self._release_duck()
+        ms = len(pcm) * 1000 // (2 * self._capture_rate)
+        if self._uplink_rate != self._capture_rate:
+            pcm = resample_pcm(pcm, self._capture_rate, self._uplink_rate)
+        sent = await self._inner.push_utterance(pcm)
+        # Not sent, or IDLE landed under it (_on_inner_event): the session fell away.
+        lost = not sent or not self._active
+        counted = not self._active  # _on_inner_event counted a loss under an open activity
+        self._active = False
+        await self._inner.end_activity(commit=not lost)
+        if lost:
+            if not counted:
+                self._metrics.count("gate_activity_lost")
+            return
+        self._spend_attention()
+        self._metrics.count("uplink_utterances")
+        self._metrics.count("uplink_ms", ms)
+        self._play_cue(self._receipt, "earcon_captured")
+
+    def _settle_held(self) -> None:
+        """What a held utterance engaged, with no turn to settle it: back to the attention a
+        settle gives, and the idle park."""
+        if self._holding() or self._active or self._state is not VoiceState.IDLE:
+            return
+        if self._window_until == math.inf:
+            self._on_idle(time.monotonic())
+        else:
+            self._schedule_park()
 
     async def _kill_reply(self) -> None:
         """Cancel the live reply and settle with the window open (THINKING while a tool
@@ -613,7 +757,7 @@ class GatedUplink:
                 if self._active:
                     # Only a lost session settles IDLE under an open activity (our own
                     # aborts clear the flag first): the utterance dies with it.
-                    self._active = False
+                    self._active = self._streaming = False
                     self._metrics.count("gate_activity_lost")
                 self._on_idle(time.monotonic())
         elif isinstance(event, OutputTranscript):
@@ -723,7 +867,10 @@ class GatedUplink:
 
     async def _park_after_idle(self) -> None:
         await asyncio.sleep(self._idle_park_s)
-        if self._state is VoiceState.IDLE and not self._active and not self._closing:
+        if (
+            self._state is VoiceState.IDLE and not self._active and not self._holding()
+            and not self._closing
+        ):
             await self._inner.park()
 
 
