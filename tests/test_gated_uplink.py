@@ -1,4 +1,4 @@
-"""GatedUplink: what leaves the device, and when, per DESIGN-cloud-uplink-gate.md §8.
+"""GatedUplink: what leaves the device, and when.
 
 A scripted VAD and wake detector drive the gate over synthetic frames; a fake inner
 backend records the call sequence and plays the adapter's state hints back.
@@ -13,6 +13,7 @@ import pytest
 
 from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
+from nanobot_channel_voice.audio.pcm import ring_ms
 from nanobot_channel_voice.backend.audio_sink import AudioSink
 from nanobot_channel_voice.backend.base import (
     OutputAudio,
@@ -1203,6 +1204,73 @@ def test_an_onset_after_the_cue_is_the_user():
     asyncio.run(_run())
 
 
+def test_cues_go_out_unpaced():
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        assert inner.calls[-1] == ("end", True)
+        assert gate._sink._queue.get_nowait().paced is False  # the receipt, written whole
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_the_cue_guard_spans_the_cues_body_not_its_ring(clock):
+    """The quiet ring is too faint to open an onset, so it holds none: the guard runs the
+    body plus the playback hangover, sparing a short answer begun over the tone."""
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        assert inner.calls[-1] == ("end", True)  # the commit plays the receipt
+        cue_s = len(gate._receipt) / 2 / 24000
+        ring_s = ring_ms(gate._receipt, 24000) / 1000
+        assert ring_s > 0.1
+        assert gate._cue_until == pytest.approx(1000.0 + cue_s - ring_s + gate._cue_guard_s, abs=1e-3)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_custom_cue_is_guarded_to_its_end(clock, tmp_path):
+    """A custom clip's quiet tail may be speech, whose echo passes for the user's: only a
+    built-in tone's ring is left out of the guard."""
+    from nanobot_channel_voice.audio.pcm import ding_pcm, pcm_to_wav_bytes
+
+    clip = tmp_path / "receipt.wav"
+    clip.write_bytes(pcm_to_wav_bytes(ding_pcm(24000), 24000))
+
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6)
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True, "path": str(clip)})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        assert inner.calls[-1] == ("end", True)
+        cue_s = len(gate._receipt) / 2 / 24000
+        assert gate._cue_until == pytest.approx(1000.0 + cue_s + gate._cue_guard_s, abs=1e-3)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_cue_file_that_fails_to_load_is_guarded_as_the_tone_it_falls_back_to(clock, tmp_path):
+    async def _run():
+        vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6)
+        missing = str(tmp_path / "missing.wav")
+        gate, inner, _, on_event = build(vad=vad, earcons={"captured": True, "path": missing})
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 14)
+        cue_s = len(gate._receipt) / 2 / 24000
+        ring_s = ring_ms(gate._receipt, 24000) / 1000
+        assert gate._cue_until == pytest.approx(1000.0 + cue_s - ring_s + gate._cue_guard_s, abs=1e-3)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
 def test_echo_cancellation_needs_no_cue_guard():
     async def _run():
         vad = ScriptVad([False] * 3 + [True] * 5 + [False] * 6 + [True] * 3)
@@ -1279,7 +1347,8 @@ def test_a_summon_is_cued_at_the_first_quiet_beat_not_at_the_close(clock):
 
 
 def test_the_window_runs_window_s_from_the_cues_end(clock):
-    """The user needs the cue to know the device listens: windowS starts when it ends."""
+    """The user needs the cue to know the device listens: windowS starts when it ends,
+    its quiet ring aside."""
     async def _run():
         vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(
@@ -1288,8 +1357,9 @@ def test_the_window_runs_window_s_from_the_cues_end(clock):
         )
         await gate.start(instructions=None, tools=[], on_event=on_event)
         await feed(gate, 2)  # the bare phrase at 1000
-        cue_s = len(gate._listen_cue) / (2 * 24000)
-        assert gate._window_until == pytest.approx(1000.0 + cue_s + 2)
+        cue_s = (len(gate._listen_cue) / 2 / 24000) - ring_ms(gate._listen_cue, 24000) / 1000
+        assert 0.15 < cue_s < 0.25  # the run and the top note's strike, not its ring
+        assert gate._window_until == pytest.approx(1000.0 + cue_s + 2, abs=1e-3)
         clock.t = 1000.0 + 2 + cue_s / 2  # past windowS from the hit, not from the cue
         await feed(gate, 10, start=2)
         assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)

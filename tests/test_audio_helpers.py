@@ -439,6 +439,34 @@ def test_the_listening_cue_is_a_run_of_its_own_above_the_receipt():
     assert _sign_changes(listen[-tail:]) / 60 > _sign_changes(listen[:head]) / 40 * 1.4
 
 
+@pytest.mark.parametrize("name", ["ding_pcm", "dong_pcm", "listen_pcm"])
+def test_the_built_in_cues_ring_out(name):
+    """A struck tone cut while still ringing reads as chopped: each cue decays to well
+    under its loudest moment and lands on zero, keeping a short body."""
+    from nanobot_channel_voice.audio import pcm
+
+    np = pytest.importorskip("numpy")
+    x = np.frombuffer(getattr(pcm, name)(24000), dtype="<i2").astype(np.float64)
+    win = 24000 * 5 // 1000
+    rms = np.sqrt((x[: len(x) // win * win].reshape(-1, win) ** 2).mean(axis=1))
+    assert 20 * np.log10(rms[-1] / rms.max()) < -50
+    assert x[-1] == 0
+    body_ms = len(x) / 24 - pcm.ring_ms(x.astype("<i2").tobytes(), 24000)
+    assert 150 < body_ms < 250
+
+
+def test_ring_ms_measures_the_tail_under_the_peak(monkeypatch):
+    from nanobot_channel_voice.audio import pcm
+
+    loud, faint = b"\x00\x40" * 160, b"\x00\x01" * 80  # 10 ms at 16k, then 5 ms at -36 dB
+    assert pcm.ring_ms(loud + faint, 16000) == pytest.approx(5.0)
+    assert pcm.ring_ms(loud, 16000) == 0.0
+    assert pcm.ring_ms(b"", 16000) == pcm.ring_ms(b"\x00\x00" * 50, 16000) == 0.0
+    monkeypatch.setattr(pcm, "_np", None)
+    assert pcm.ring_ms(loud + faint, 16000) == pytest.approx(5.0)
+    assert pcm.ring_ms(b"\x00\x00" * 50, 16000) == 0.0
+
+
 def test_a_slow_device_open_warns_once():
     from loguru import logger as loguru_logger
 

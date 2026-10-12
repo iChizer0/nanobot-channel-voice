@@ -68,6 +68,9 @@ class OutputAudio:
     wav: bytes | None = None
     pcm: bytes | None = None
     rate: int = 0
+    # False: written whole past the write-ahead cap. A cue: aplay starts at a full buffer
+    # or EOF, so pacing would only delay its start.
+    paced: bool = True
 
 
 @dataclass(frozen=True, slots=True)

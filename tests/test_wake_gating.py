@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 from eval_harness import _FRAME, EvalConversation
 
+from nanobot_channel_voice.audio.base import PlaybackStream
+from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.backend.base import VoiceState
 from nanobot_channel_voice.backend.local import _WAKE_ACK_FALLBACK, _WAKE_ATTACH_S, LocalBackend
 from nanobot_channel_voice.echo_reject import SelfEchoFilter
@@ -1505,6 +1507,32 @@ def test_second_summon_closing_over_the_playing_ack_lets_it_finish():
     _run(_case())
 
 
+class _PlayoutStream(PlaybackStream):
+    """Drains as a device plays, in real time, and a kill ends it: a cue written whole
+    still sounds for its length, as on aplay."""
+
+    def __init__(self, rate: int):
+        self._rate, self._end, self._killed = rate, 0.0, asyncio.Event()
+
+    async def write(self, pcm: bytes) -> None:
+        self._end = max(self._end, time.monotonic()) + len(pcm) / (2 * self._rate)
+        await asyncio.sleep(0)
+
+    async def drain(self) -> None:
+        try:
+            await asyncio.wait_for(self._killed.wait(), max(0.0, self._end - time.monotonic()))
+        except TimeoutError:
+            pass
+
+    async def kill(self) -> None:
+        self._killed.set()
+
+
+class _PlayoutDevice(NullPlayback):
+    async def open_stream(self, rate: int) -> PlaybackStream:
+        return _PlayoutStream(rate)
+
+
 def test_summon_during_the_attention_cue_flushes_it_and_acks():
     """The close cue plays with the ack's IDLE base but is no answer to a summon: a hit
     over it must flush the cue and ack (the cue's own docstring), not be read as "an
@@ -1517,6 +1545,7 @@ def test_summon_during_the_attention_cue_flushes_it_and_acks():
             **_wake("gate", windowS=0.3, ack={"enabled": True, "phrases": ["i am here"]}),
         ) as conv:
             b = conv.backend
+            conv.sink._sink = _PlayoutDevice()  # the cue is written whole: only playout holds it
             await conv.user_says("hey nanobot what time is it")
             await conv.agent_replies("It is noon.")
             await conv.wait_state(VoiceState.IDLE)
@@ -2512,6 +2541,95 @@ def test_gate_thinking_cold_window_stays_free():
             await conv.user_says("hey nanobot tell me a story")
             await conv.user_says("actually make it short")
             assert conv.texts()[-1] == "actually make it short"
+
+    _run(_case())
+
+
+def test_earcons_go_out_whole_while_spoken_clips_stay_paced():
+    """A cue gains nothing from the write-ahead pacing and starts late by it (aplay waits
+    for a full buffer or EOF); an ack or a reply is speech the duck must still reach."""
+
+    async def _case():
+        async with EvalConversation(
+            playbackHangoverMs=1, earcons={"captured": True, "attention": True},
+            **_wake("gate", windowS=0.3, ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            b = conv.backend
+            seen = []
+            enqueue = conv.sink.enqueue
+            conv.sink.enqueue = lambda audio: (seen.append(audio), enqueue(audio))[1]
+            await conv.user_says("hey nanobot")  # the ack
+            await _until(lambda: len(seen) == 1)
+            await conv.wait_state(VoiceState.IDLE)
+            await conv.user_says("what time is it")  # the receipt
+            await _until(lambda: len(seen) == 2)
+            await conv.agent_replies("It is noon.")
+            await conv.wait_state(VoiceState.IDLE)
+            await _until(lambda: conv.counter("earcon_attention") == 1)  # the window closes
+            await _until(lambda: seen[-1].pcm == b._attention_audio)
+            assert seen[0].paced and not seen[1].paced and not seen[-1].paced
+            assert all(audio.paced for audio in seen[2:-1])  # the reply
+
+    _run(_case())
+
+
+def test_a_clip_tail_never_takes_the_state_back_from_a_publish():
+    """A publish landing during a clip's half-duplex tail guard owns the state: the clip may
+    not set its base over the new turn."""
+
+    async def _case():
+        async with EvalConversation(aec="auto", playbackHangoverMs=300) as conv:
+            b = conv.backend
+            clip = asyncio.create_task(
+                b._canned_playback(b._sink.epoch, b"\x00\x40" * 800, VoiceState.IDLE)
+            )
+            await _until(lambda: b._turn is VoiceState.SPEAKING and not b._sink.busy)
+            await asyncio.sleep(0.05)  # inside the tail guard
+            await b._set_turn(VoiceState.THINKING)  # a publish took the state
+            await clip
+            assert b._turn is VoiceState.THINKING
+
+    _run(_case())
+
+
+def test_a_quieter_earcon_keeps_its_ring():
+    """Canned clips are edge-trimmed against an absolute floor; a tone turned down by gainDb
+    would lose its ring to it and end chopped."""
+    from nanobot_channel_voice.audio.pcm import ding_pcm
+    from nanobot_channel_voice.backend.audio_sink import scale_pcm
+
+    async def _case():
+        async with EvalConversation(earcons={"captured": True, "gainDb": -18}) as conv:
+            rate = conv.backend._tts.output_rate
+            assert conv.backend._earcon_audio == scale_pcm(ding_pcm(rate), 10 ** (-18 / 20))
+
+    _run(_case())
+
+
+def test_a_tones_ring_counts_toward_the_half_duplex_tail_guard(monkeypatch):
+    """The muted mic reopens as early as before the tone grew its ring: the ring counts
+    toward the guard for device latency and reverb."""
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def spy(delay, *args, **kwargs):
+        slept.append(delay)
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", spy)
+
+    async def _case():
+        async with EvalConversation(
+            aec="auto", playbackHangoverMs=777, earcons={"captured": True}
+        ) as conv:
+            b = conv.backend
+            ring = b._cue_rings[b._earcon_audio]
+            assert 0.1 < ring < 0.2
+            await conv.user_says("what time is it")
+            await _until(lambda: VoiceState.SPEAKING in conv.states)  # the ding
+            await conv.wait_state(VoiceState.THINKING)
+            assert any(abs(d - (0.777 - ring)) < 1e-9 for d in slept)
+            assert 0.777 not in slept
 
     _run(_case())
 

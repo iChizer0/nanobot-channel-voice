@@ -9,6 +9,7 @@ import time
 
 from eval_harness import _FRAME, EvalConversation
 
+from nanobot_channel_voice.audio.pcm import pcm_ms
 from nanobot_channel_voice.backend import local as local_mod
 from nanobot_channel_voice.backend.base import NOTICE_BACKLOG, VoiceState
 
@@ -348,8 +349,8 @@ def test_steer_over_a_status_line_keeps_the_run_working():
             )
             await b.on_stream_end(resuming=True)          # more tools follow
             await c.wait_state(VoiceState.SPEAKING)
-            # The 230 ms captured ding sounds first; only then are reply words heard.
-            await c.wait_played_ms(350)
+            # The captured ding sounds first; only then are reply words heard.
+            await c.wait_played_ms(pcm_ms(len(b._earcon_audio), b._tts.output_rate) + 120)
             quiet_since = b._cur_turn.last_activity = time.monotonic() - 100.0
             dings = c.counter("earcon_captured")  # the opening turn dinged too
             await c.user_says("use the italian place on maple street")

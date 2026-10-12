@@ -113,6 +113,24 @@ def test_a_tap_registered_mid_piece_tightens_the_very_next_block():
     assert sum(sizes) == len(_pcm(480))
 
 
+def test_an_unpaced_cue_is_written_whole_at_once():
+    """aplay starts at a full buffer or at EOF, so a cue paced past the lead starts late by
+    the pacing: unpaced, all of it is written before the first wait."""
+    async def written_after(paced: bool) -> float:
+        sink = AudioSink(_RecordingSink(), mode="stream")
+        await sink.start()
+        try:
+            t0 = asyncio.get_running_loop().time()
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(400), rate=RATE, paced=paced))
+            await asyncio.wait_for(sink.wait_idle(), 5.0)
+            return asyncio.get_running_loop().time() - t0
+        finally:
+            await sink.stop()
+
+    assert asyncio.run(written_after(paced=True)) > 0.12  # 400 ms past a 240 ms lead
+    assert asyncio.run(written_after(paced=False)) < 0.08
+
+
 # ---- backlog ceiling ---------------------------------------------------------
 
 def test_enqueue_drops_the_oldest_once_the_backlog_passes_the_cap():

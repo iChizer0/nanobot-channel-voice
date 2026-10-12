@@ -35,7 +35,7 @@ _STREAM_LEAD_MS = 240.0
 # reaction time.
 _DUCK_STREAM_LEAD_MS = 120.0
 _GAIN_BLOCK_MS = 20  # envelope granularity (one gain step per block)
-# A ~250 ms cue is audibly late behind an open this slow; below it, nobody notices.
+# A ~⅓ s cue is audibly late behind an open this slow; below it, nobody notices.
 _SLOW_OPEN_MS = 80.0
 # Producer-side backlog ceiling: playback is real time while blob-mode synthesis is
 # not, so an uncapped queue holds a whole reply's audio. Far above the JIT runway.
@@ -520,7 +520,7 @@ class AudioSink:
 
     def _note_open_cost(self, open_ms: float) -> None:
         """A drain EOFs the stream, so every segment reopens the device; the shorter the
-        segment the more of it this is (a ~250 ms earcon most of all)."""
+        segment the more of it this is (a ~⅓ s earcon most of all)."""
         if open_ms < _SLOW_OPEN_MS or self._warned_slow_open:
             return
         self._warned_slow_open = True
@@ -558,7 +558,7 @@ class AudioSink:
                 if item.wav is not None:
                     await self._sink.play_wav(item.wav)
                 elif item.pcm is not None:
-                    await self._stream_write(item.pcm, item.rate, item.epoch)
+                    await self._stream_write(item.pcm, item.rate, item.epoch, paced=item.paced)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - never let one item kill the worker
@@ -584,7 +584,9 @@ class AudioSink:
         ms = _GAIN_BLOCK_MS if shaped else self._lead_ms() / 4.0
         return max(2, int(rate * ms / 1000.0) * 2)
 
-    async def _stream_write(self, pcm: bytes, rate: int, epoch: int) -> None:
+    async def _stream_write(
+        self, pcm: bytes, rate: int, epoch: int, *, paced: bool = True
+    ) -> None:
         stream = self._stream
         if stream is not None and (stream is self._draining or stream in self._parked):
             # EOF'd (or parked in a reaper): no more writes. Open fresh; flush kills both.
@@ -652,7 +654,7 @@ class AudioSink:
             # stays within the cap: the device ring is sized for the cap, not cap + block.
             block_b = self._block_bytes(rate)
             block_s = min(block_b, len(pcm) - off) / (2 * rate)
-            if lead_s > lead_cap_s - block_s:
+            if paced and lead_s > lead_cap_s - block_s:
                 await asyncio.sleep(lead_s - (lead_cap_s - block_s))
             if epoch != self._epoch or self._stream is not stream:
                 return  # flushed while pacing: the rest of this chunk is dead

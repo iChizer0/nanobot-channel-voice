@@ -4,8 +4,7 @@ A decorator :class:`VoiceBackend` wrapping a :class:`ManualTurnBackend`. The she
 backend; the inner adapter sees only what the on-device detectors admit: per utterance,
 the endpointer's pre-roll + speech + hangover (``"vad"``), and only inside an attention
 window the acoustic wake word opened (``"wake"``). Everything else never leaves the box —
-which on every vendor but OpenAI is what the listening bill is made of
-(``DESIGN-cloud-uplink-gate.md``).
+which on every vendor but OpenAI is what the listening bill is made of.
 
 Frame path (one hop per capture frame, off the loop when a detector is neural):
 AEC -> wake detector -> Endpointer (+ Smart Turn early close). The gate does NOT own
@@ -172,26 +171,21 @@ class GatedUplink:
         # provider's output rate.
         cues = config.earcons
         self._cue_rate = output_rate
+        self._cue_rings: dict[bytes, float] = {}  # a built-in tone's ring, past its body
         listening = self._mode == "wake" and wake.window_s > 0  # else a bare phrase grants nothing
-        self._receipt = (
-            cue_pcm(cues.path, ding_pcm, output_rate, gain_db=cues.gain_db)[0]
-            if cues.captured else None
-        )
+        self._receipt = self._cue(cues.path, ding_pcm, cues.gain_db) if cues.captured else None
         self._listen_cue = (
-            cue_pcm(cues.listening_path, listen_pcm, output_rate, gain_db=cues.gain_db)[0]
-            if listening else None
+            self._cue(cues.listening_path, listen_pcm, cues.gain_db) if listening else None
         )
         self._lapse_cue = None
         if cues.attention and self._mode == "wake":
-            self._lapse_cue = cue_pcm(
-                cues.attention_path, dong_pcm, output_rate, gain_db=cues.gain_db
-            )[0]
+            self._lapse_cue = self._cue(cues.attention_path, dong_pcm, cues.gain_db)
         elif cues.attention:
             self._log.info("voice: earcons.attention marks the wake window closing; "
                            "uplink='vad' has none, cue disabled")
         self._lapse_task: asyncio.Task | None = None
         self._cue_task: asyncio.Task | None = None  # ends the stream a cue plays on
-        # Without echo cancellation the mic hears a cue: onsets until its end (plus the
+        # Without echo cancellation the mic hears a cue: onsets until its notes end (plus the
         # playback hangover) are the cue, not the user. The canceller removes it (the sink
         # feeds its reference), as it does the reply; strict trusts none, since the
         # receipt's echo would pass for the rest of the sentence.
@@ -486,7 +480,7 @@ class GatedUplink:
         await self._open_activity(self._ep.open_pcm() or b"")
 
     async def _release_held(self, now: float) -> None:
-        """An onset held over a cue: speech past the cue's end is the user's, judged now
+        """An onset held over a cue: speech past the cue's notes is the user's, judged now
         with everything since its onset; an utterance closing first was the cue's echo."""
         if not self._ep.in_speech:
             self._held_onset = False
@@ -654,15 +648,24 @@ class GatedUplink:
 
     # ---- cues ----------------------------------------------------------------
 
+    def _cue(self, path: str | None, synth, gain_db: float) -> bytes:
+        cue = cue_pcm(path, synth, self._cue_rate, gain_db=gain_db)
+        if cue.ring_s:
+            self._cue_rings[cue.pcm] = cue.ring_s
+        return cue.pcm
+
     def _play_cue(self, pcm: bytes | None, metric: str) -> float | None:
-        """Enqueue a cue; returns when it stops sounding (None: it did not play)."""
+        """Enqueue a cue; returns when it stops sounding, a built-in tone's ring aside (None:
+        it did not play)."""
         if pcm is None or self._closing or self._ep.in_speech:
             return None  # never over the user
         self._metrics.count(metric)
-        self._sink.enqueue(OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._cue_rate))
+        self._sink.enqueue(
+            OutputAudio(epoch=self._sink.epoch, pcm=pcm, rate=self._cue_rate, paced=False)
+        )
         cancel_task(self._cue_task)  # one stream end covers every cue queued on it
         self._cue_task = asyncio.create_task(self._end_cue())
-        end = time.monotonic() + self._sink.backlog_ms() / 1000.0
+        end = time.monotonic() + self._sink.backlog_ms() / 1000.0 - self._cue_rings.get(pcm, 0.0)
         if self._cue_guard_s is not None:
             self._cue_until = end + self._cue_guard_s
         return end

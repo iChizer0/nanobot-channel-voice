@@ -952,7 +952,7 @@ class OpenWakeWordConfig(OnDeviceRuntime):
 
 
 class EarconsConfig(_VoiceBase):
-    """Non-verbal cues: synthesized struck tones, ~¼ s — no asset, no TTS call, no language.
+    """Non-verbal cues: synthesized struck tones, ~⅓ s — no asset, no TTS call, no language.
     Local backend, and a cloud backend under a gated uplink (``realtime.uplink`` vad/wake),
     where ``captured`` plays at every sent utterance, and under ``uplink="wake"`` a bare
     summon hears a listening cue of its own (rising C♯6→E6→A6, or ``listeningPath``), with no
@@ -1194,7 +1194,8 @@ class VoiceConfig(_VoiceBase):
     goal: GoalConfig = Field(default_factory=GoalConfig)
     wake: WakeConfig = Field(default_factory=WakeConfig)
 
-    # Tail after playback drains before re-listening (local only; the cloud drain has no hangover).
+    # Tail after playback drains before re-listening; a cloud gate also guards a cue's onsets and
+    # a cut reply's tail for this long.
     playback_hangover_ms: int = Field(default=250, ge=0)
 
     # Stalled-agent deadman (local; cloud analog: realtime.turnTimeoutS) on two clocks — "the

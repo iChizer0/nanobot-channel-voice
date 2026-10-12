@@ -978,6 +978,7 @@ class LocalBackend(TurnEventMixin):
         # Phrase -> audio, session-scoped: prewarm_canned() fills it (probe_ok only), else lazily.
         self._fillers: dict[str, bytes] = {}
         # Notification cues (earcons.*), built at init. None = off, or an unbuildable cue.
+        self._cue_rings: dict[bytes, float] = {}  # a built-in tone's ring, past its body
         self._earcon_audio: bytes | None = None
         self._earcon_task: asyncio.Task | None = None
         self._attention_audio: bytes | None = None
@@ -3639,9 +3640,11 @@ class LocalBackend(TurnEventMixin):
             return  # a watcher armed during teardown waits forever on a cancelled TTS worker
         self._drain_task = asyncio.create_task(self._drain_watch(self._sink.epoch))
 
-    def _audio_event(self, epoch: int, audio: bytes) -> OutputAudio:
+    def _audio_event(self, epoch: int, audio: bytes, *, paced: bool = True) -> OutputAudio:
         if self._pcm_out:
-            return OutputAudio(epoch=epoch, pcm=audio, rate=self._tts.output_rate)
+            return OutputAudio(
+                epoch=epoch, pcm=audio, rate=self._tts.output_rate, paced=paced
+            )
         return OutputAudio(epoch=epoch, wav=audio)
 
     def _audio_ms(self, audio: bytes) -> float:
@@ -3686,13 +3689,20 @@ class LocalBackend(TurnEventMixin):
         self._canned_ack = False
 
     def _build_earcon(self, path: str | None, synth) -> bytes | None:
-        """One cue, shaped once at init (see :func:`cue_pcm`)."""
-        pcm, rate = cue_pcm(
+        """One cue, shaped once at init (see :func:`cue_pcm`). Never edge-trimmed again: an
+        absolute silence floor would cut a quieter tone's ring short."""
+        cue = cue_pcm(
             path, synth, self._tts.output_rate if self._pcm_out else 16000,
             keep_file_rate=not self._pcm_out, gain_db=self._cfg.earcons.gain_db,
         )
-        audio = pcm if self._pcm_out else pcm_to_wav_bytes(pcm, rate)
-        return self._prep_canned(audio)
+        if self._pcm_out:
+            audio = cue.pcm
+        else:  # blob playback bakes the static duck, as _prep_canned does
+            pcm = scale_pcm(cue.pcm, self._duck_gain) if self._duck_gain < 1.0 else cue.pcm
+            audio = pcm_to_wav_bytes(pcm, cue.rate)
+        if cue.ring_s:
+            self._cue_rings[audio] = cue.ring_s
+        return audio
 
     def _arm_earcon(self) -> None:
         if self._earcon_audio is None or self._closing:
@@ -3702,7 +3712,7 @@ class LocalBackend(TurnEventMixin):
 
     async def _play_earcon(self, epoch: int) -> None:
         """The "captured" receipt cue: canned THINKING audio like a filler, but wordless
-        (nothing transcribable, so no echo note) and ~¼ s. Skipped once the user resumed
+        (nothing transcribable, so no echo note) and ~⅓ s. Skipped once the user resumed
         speaking."""
         try:
             if (
@@ -3713,7 +3723,7 @@ class LocalBackend(TurnEventMixin):
             ):
                 return
             self._metrics.count("earcon_captured")
-            await self._canned_playback(epoch, self._earcon_audio, VoiceState.THINKING)
+            await self._canned_playback(epoch, self._earcon_audio, VoiceState.THINKING, cue=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a cue must never wedge the turn
@@ -3768,7 +3778,7 @@ class LocalBackend(TurnEventMixin):
         self._metrics.count("earcon_attention")
         self._log.info("attention window closed")
         try:
-            await self._canned_playback(epoch, self._attention_audio, VoiceState.IDLE)
+            await self._canned_playback(epoch, self._attention_audio, VoiceState.IDLE, cue=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a cue must never wedge the session
@@ -3912,26 +3922,31 @@ class LocalBackend(TurnEventMixin):
             self._log.warning("stall notice failed ({})", exc)
 
     async def _canned_playback(
-        self, epoch: int, audio: bytes, base: VoiceState, *, ack: bool = False
+        self, epoch: int, audio: bytes, base: VoiceState, *, ack: bool = False,
+        cue: bool = False,
     ) -> None:
         """The canned-audio dance every ack/filler/cue shares: SPEAKING -> emit -> settle ->
         half-duplex tail guard (device latency/reverb must not re-trigger the VAD) -> ``base``.
         Owns the base/nonce bracket (the nonce keeps a successor clip's base past this exit).
         A flush mid-dance takes the state; a failure past the flip restores ``base`` here,
-        or a half-duplex mic gated on a dead SPEAKING never reopens."""
+        or a half-duplex mic gated on a dead SPEAKING never reopens. A ``cue`` goes out whole."""
         nonce = object()
         self._canned_base, self._canned_nonce, self._canned_ack = base, nonce, ack
         try:
             await self._set_turn(VoiceState.SPEAKING)
-            await self._emit(self._audio_event(epoch, audio))
+            await self._emit(self._audio_event(epoch, audio, paced=not cue))
             if not await self._settle(epoch):
                 return
             if self._turn is VoiceState.SPEAKING:
                 if not self._full_duplex:
-                    await asyncio.sleep(self._cfg.playback_hangover_ms / 1000)
+                    # A built-in tone's ring already played out as part of the guard.
+                    ring = self._cue_rings.get(audio, 0.0) if cue else 0.0
+                    await asyncio.sleep(max(0.0, self._cfg.playback_hangover_ms / 1000 - ring))
                     if self._closing or epoch != self._sink.epoch:
                         return
-                await self._set_turn(base)
+                # Past the sleep a publish, or a clip after this one, may own the state.
+                if self._turn is VoiceState.SPEAKING and self._canned_nonce is nonce:
+                    await self._set_turn(base)
         except asyncio.CancelledError:
             raise
         except Exception:

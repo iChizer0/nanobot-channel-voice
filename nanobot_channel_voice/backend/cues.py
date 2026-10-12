@@ -5,16 +5,25 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from loguru import logger
 
-from nanobot_channel_voice.audio.pcm import fade_tail_pcm, pcm_ms, resample_pcm, wav_pcm
+from nanobot_channel_voice.audio.pcm import fade_tail_pcm, pcm_ms, resample_pcm, ring_ms, wav_pcm
 
 from .audio_sink import scale_pcm, trim_lead_silence, trim_tail_silence
 
 # Past this a cue is a jingle: it gates the half-duplex mic and delays what queues behind it.
 CUE_MAX_MS = 600
 _CUE_MAX_FILE_B = 2_000_000  # refuse absurd files unread: ~10 s of 48 k stereo already
+
+
+class Cue(NamedTuple):
+    pcm: bytes  # S16 mono
+    rate: int
+    # A built-in tone's ring past its body: too faint to open an onset, so it needs no
+    # guard of its own. 0.0 for a custom clip, whose tail may be speech.
+    ring_s: float
 
 
 def cue_pcm(
@@ -24,12 +33,10 @@ def cue_pcm(
     *,
     keep_file_rate: bool = False,
     gain_db: float = 0.0,
-) -> tuple[bytes, int]:
-    """One cue as S16 mono ``(pcm, rate)``. A custom WAV wins, resampled to ``rate`` unless
-    ``keep_file_rate`` (blob playback follows the header); an unusable file degrades loudly
-    to ``synth``'s built-in at ``rate``. Edge-trim runs BEFORE the length cap (a padded
-    export must not spend the budget on silence while the cut eats the sound); a real cut
-    fades."""
+) -> Cue:
+    """One cue. A custom WAV wins, resampled to ``rate`` unless ``keep_file_rate`` (blob
+    playback follows the header); an unusable file degrades loudly to ``synth``'s built-in.
+    Edge-trim runs BEFORE the length cap, so padding spends no budget; a real cut fades."""
     pcm, out_rate = b"", rate
     if path:
         try:
@@ -57,11 +64,13 @@ def cue_pcm(
         except Exception as exc:  # noqa: BLE001 - degrade loudly, never mute
             logger.warning("voice: earcon file '{}' unusable ({}); using the built-in", path, exc)
             pcm, out_rate = b"", rate
+    ring_s = 0.0
     if not pcm:
         pcm = synth(rate)
+        ring_s = ring_ms(pcm, rate) / 1000.0
     if gain_db:
         pcm = scale_pcm(pcm, 10.0 ** (gain_db / 20.0))
-    return pcm, out_rate
+    return Cue(pcm, out_rate, ring_s)
 
 
-__all__ = ["CUE_MAX_MS", "cue_pcm"]
+__all__ = ["CUE_MAX_MS", "Cue", "cue_pcm"]

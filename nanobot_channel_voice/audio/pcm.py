@@ -215,40 +215,72 @@ def fade_tail_pcm(pcm: bytes, rate: int, *, ms: float = 10.0) -> bytes:
     return samples.tobytes()
 
 
+def ring_ms(pcm: bytes, rate: int, *, depth_db: float = 20.0) -> float:
+    """Length of the trailing ring of S16_LE mono: the ms after the last sample within
+    ``depth_db`` of the peak, a struck tone's decay or a clip's quiet tail. 0.0 for
+    empty or silent input."""
+    n = len(pcm) // 2
+    if n == 0 or rate <= 0:
+        return 0.0
+    if _np is not None:
+        a = _np.abs(_np.frombuffer(pcm[: n * 2], dtype="<i2").astype(_np.int32))
+        floor = a.max() * 10.0 ** (-depth_db / 20.0)
+        if floor <= 0:
+            return 0.0
+        last = int(_np.flatnonzero(a >= floor)[-1])
+    else:
+        samples = array.array("h", pcm[: n * 2])
+        floor = max(abs(v) for v in samples) * 10.0 ** (-depth_db / 20.0)
+        if floor <= 0:
+            return 0.0
+        last = next(i for i in range(n - 1, -1, -1) if abs(samples[i]) >= floor)
+    return (n - 1 - last) / rate * 1000.0
+
+
 def ding_pcm(rate: int, *, peak: float = 0.18) -> bytes:
-    """The "captured" receipt cue (~230 ms, S16 mono): a STRUCK rising fifth (A5 -> E6),
+    """The "captured" receipt cue (~340 ms, S16 mono): a STRUCK rising fifth (A5 -> E6),
     measured least speech-like of the audition set; ``peak`` ~-15 dBFS sits under
     speech."""
-    return _struck_pcm(rate, ((880.0, 0.0, 140.0, 45.0), (1318.5, 60.0, 170.0, 60.0)), peak)
+    return _struck_pcm(rate, ((880.0, 0.0, 140.0, 45.0), (1318.5, 60.0, 280.0, 60.0)), peak)
 
 
 def dong_pcm(rate: int, *, peak: float = 0.18) -> bytes:
     """The attention-close cue: ``ding_pcm``'s pair reversed (E6 -> A5) so the contour
     falls and the long ring lands on the LOW note."""
-    return _struck_pcm(rate, ((1318.5, 0.0, 140.0, 45.0), (880.0, 60.0, 170.0, 60.0)), peak)
+    return _struck_pcm(rate, ((1318.5, 0.0, 140.0, 45.0), (880.0, 60.0, 280.0, 60.0)), peak)
 
 
 def listen_pcm(rate: int, *, peak: float = 0.18) -> bytes:
-    """The listening cue after the wake word (~240 ms, S16 mono): a quick rising run
+    """The listening cue after the wake word (~350 ms, S16 mono): a quick rising run
     (C#6 -> E6 -> A6), three notes to the receipt's two and above them, so "go ahead" never
     sounds like "got it" (``ding_pcm``) or "closed" (``dong_pcm``), and as far from speech."""
     return _struck_pcm(
-        rate, ((1108.73, 0.0, 90.0, 30.0), (1318.5, 45.0, 90.0, 30.0), (1760.0, 90.0, 150.0, 55.0)),
+        rate, ((1108.73, 0.0, 90.0, 30.0), (1318.5, 45.0, 90.0, 30.0), (1760.0, 90.0, 260.0, 55.0)),
         peak,
     )
 
 
+# Every note eases out over its last this-many ms: a ring stopped dead reads as chopped.
+_RELEASE_MS = 20.0
+
+
 def _struck_pcm(rate: int, notes: tuple, peak: float) -> bytes:
+    """Struck notes ``(freq, start_ms, dur_ms, tau_ms)``: a last note's ``dur_ms`` lets
+    its decay reach ~-40 dB, the earlier ones are damped under the next."""
     mix = [0.0] * max(int(rate * (s + d) / 1000) for _, s, d, _ in notes)
     attack = max(1, int(rate * 0.003))
+    release = max(1, int(rate * _RELEASE_MS / 1000))
     for freq, start_ms, dur_ms, tau_ms in notes:
         off = int(rate * start_ms / 1000)
         tau = rate * tau_ms / 1000.0
         w = 2 * math.pi * freq / rate
-        for i in range(int(rate * dur_ms / 1000)):
+        n = int(rate * dur_ms / 1000)
+        for i in range(n):
             env = (0.5 - 0.5 * math.cos(math.pi * min(i, attack) / attack)) * math.exp(
                 -max(0, i - attack) / tau
             )
+            if n - i < release:
+                env *= 0.5 - 0.5 * math.cos(math.pi * (n - i) / release)
             mix[off + i] += env * (
                 math.sin(w * i)
                 + 0.30 * math.sin(2 * w * i)
