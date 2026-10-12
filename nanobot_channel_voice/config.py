@@ -946,7 +946,12 @@ class OpenWakeWordConfig(OnDeviceRuntime):
     # Package sidecar (meta.json) from the weights store: advisory checks that the head's
     # declared phrase is in wake.phrases (a mismatch breaks stripping) and .rknn matches target.
     meta_path: str | None = None
-    threshold: float = Field(default=0.5, ge=0.0, le=1.0)  # sigmoid score at/above => hit
+    # Sigmoid score at/above => hit. A phrase sharing most of its sounds with the wake phrase
+    # scores as high as the phrase itself: the head and the phrase decide those, not this.
+    threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Consecutive 80 ms decisions at/above the threshold before a hit: a lone spike is noise,
+    # the phrase holds the score for 5-10.
+    patience: int = Field(default=2, ge=1)
     # Minimum spacing between hits: the phrase echoing in a hard room must not double-fire.
     refractory_s: float = Field(default=2.0, ge=0.0)
 

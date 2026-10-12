@@ -216,6 +216,7 @@ def _detector(**kw):
     kw.setdefault("model_path", "head.onnx")
     kw.setdefault("sample_rate", 16000)
     kw.setdefault("refractory_s", 0.0)
+    kw.setdefault("patience", 1)
     return OpenWakeWord(**kw)
 
 
@@ -808,3 +809,20 @@ def test_a_phrase_configured_in_a_compatibility_form_matches_itself():
     wake = WakePhrase(["ｎａｎｏｂｏｔ"])
     assert wake.strip("ｎａｎｏｂｏｔ weather")[0] == "ｎａｎｏｂｏｔ"  # display stays as written
     assert wake.strip("nanobot weather")[0] == "ｎａｎｏｂｏｔ"
+
+
+def test_patience_needs_consecutive_chunks_at_the_threshold(fakes):
+    """A lone chunk at the threshold is not the phrase, which holds the score for 5-10;
+    a run of ``patience`` is, once per run."""
+    det = _detector(threshold=0.5, patience=2)
+    fakes["head.onnx"].probs = [0.9, 0.2, 0.9, 0.9, 0.9, 0.2, 0.9, 0.9]
+    assert [det.push(_CHUNK) for _ in range(8)] == [
+        False, False, False, True, False, False, False, True,
+    ]
+
+
+def test_the_shipped_wake_defaults_are_patient():
+    from nanobot_channel_voice.config import OpenWakeWordConfig
+
+    cfg = OpenWakeWordConfig()
+    assert cfg.threshold == 0.6 and cfg.patience == 2

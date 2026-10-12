@@ -163,7 +163,7 @@ def test_setup_validator_reports_plugin_schema_errors():
     assert keys[keys.index("wake.mode"):keys.index("wake.attention")] == ["wake.mode", "wake.openwakeword.weights", "wake.phrases"]
     payload = manifest._validate({"enabled": True, "importJson": {"wake": {"mode": "gate", "engine": "openwakeword", "openwakeword": {"threshold": 7}}}}, ctx)
     fields = {f["key"]: f for s in payload["form"]["sections"] for f in s["fields"]}
-    assert fields["wake.openwakeword.threshold"]["value"] == 0.5  # the refused leaf at its default, the rest kept
+    assert fields["wake.openwakeword.threshold"]["value"] == 0.6  # the refused leaf at its default, the rest kept
     ids, _ = shape({"enabled": True, "legacyKey": 1, "importJson": {"backend": "openai"}})
     assert ids == ["general", "provider", "audio", "stt", "vad", "wake", "cues", "access"]  # an old config's stray key, backend switched
     ids, _ = shape({"stt": {"whisper": {"bogus": 1}}, "importJson": {"backend": "gemini", "realtime": {"uplink": "vad"}}})

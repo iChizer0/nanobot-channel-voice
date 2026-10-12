@@ -537,7 +537,7 @@ The turn model is an on-device engine like any other: the extension picks the ru
 Detection is two-tier; both feed the same gate:
 
 - **Transcript tier** (`phrases`, zero models): the phrase as a transcript prefix, in any language the STT can spell; stripped from the published turn. When the STT *mis-spells* an out-of-vocabulary name, three layers catch it in falling trust: `aliases` pins extra spellings, warmup calibration learns them automatically (`learnAliases` - the channel speaks each phrase with the session TTS, decodes it with the session STT, and registers the mis-renders; on-device STT only, logged loudly), and a phonetic consonant-skeleton match strips remaining latin near-misses - strip-only, from utterances that already passed on real evidence, so it can never open the gate or unlock strict.
-- **Acoustic tier** (`engine: "openwakeword"`): an openWakeWord ONNX head (~3.7 MB, one decision per 80 ms, `[ondevice]` extra) that hears through the bot's own playback, so a mid-reply hit is a high-precision interrupt. It reports where the phrase *ended* and that audio is cut from what STT decodes. Required whenever the STT cannot spell the phrase.
+- **Acoustic tier** (`engine: "openwakeword"`): an openWakeWord ONNX head (~3.7 MB, one decision per 80 ms, `[ondevice]` extra) that hears through the bot's own playback, so a mid-reply hit is a high-precision interrupt. It reports where the phrase *ended* and that audio is cut from what STT decodes. Required whenever the STT cannot spell the phrase. `openwakeword.threshold` (default 0.6) and `patience` (default 2: consecutive 80 ms decisions at the threshold) trade false accepts for sensitivity; neither helps against a phrase that shares most of its sounds with the wake phrase ("hey, my crops" for *hey mycroft*), which scores as high as the phrase itself - the phrase and the head decide those.
 
 In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays hot over the muted mic and a hit is the *only* barge-in: with the transcript tier alone the wake word can start a turn between replies but never interrupt one, and startup warns about that pairing. The contract is *phrase, beat, command* - the mic-reopen discards ~100-350 ms after the phrase, so a same-breath command can lose its first word (open-mic modes capture it cleanly). A reply that literally *speaks* a wake phrase never wakes the bot through its own leak.
 
@@ -567,7 +567,7 @@ In **half-duplex** (no AEC, mic muted during replies) the acoustic tier stays ho
           "melPath": "model/mel.onnx",
           "embeddingPath": "model/embedding.onnx",
           "modelPath": "model/hey_jarvis_v0.1.onnx",
-          "threshold": 0.5
+          "threshold": 0.7
         }
       }
     }

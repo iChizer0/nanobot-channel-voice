@@ -85,8 +85,9 @@ class OpenWakeWord(WakeDetector):
         model_path: str,
         mel_filters_path: str | None = None,
         sample_rate: int,
-        threshold: float = 0.5,
+        threshold: float = 0.6,
         refractory_s: float = 2.0,
+        patience: int = 2,
         core_mask: str = "auto",
         target: str | None = None,
         device_id: str | None = None,
@@ -139,6 +140,7 @@ class OpenWakeWord(WakeDetector):
             )
             self._threshold = threshold
             self._refractory_s = refractory_s
+            self._patience = max(1, patience)
             self._fail_throttle = Throttle(_FAIL_LOG_EVERY_S)
             self._log = logger.bind(component="wake-oww")
             self._head_width = 0  # flattened head output size, proven by the prime run
@@ -157,6 +159,7 @@ class OpenWakeWord(WakeDetector):
             sample_rate=sample_rate,
             threshold=cfg.threshold,
             refractory_s=cfg.refractory_s,
+            patience=cfg.patience,
             core_mask=cfg.core_mask,
             target=cfg.resolved_target,
             device_id=cfg.device_id,
@@ -186,6 +189,7 @@ class OpenWakeWord(WakeDetector):
         # model's output distribution and score arbitrarily on some heads.
         self._embs = self._embs_prime.copy()
         self._armed = True          # re-armed by a sub-threshold score
+        self._run = 0               # consecutive chunks at/above the threshold
         self._last_hit = float("-inf")
         self.last_score = None
 
@@ -252,16 +256,20 @@ class OpenWakeWord(WakeDetector):
             return False
 
     def _debounce(self, score: float, now: float | None = None) -> bool:
-        """Threshold + re-arm hysteresis + refractory: one hit per crossing, no
-        retriggers while the score rides high, and a floor on hit spacing (a room echo
-        must not double-fire)."""
+        """Threshold + patience + re-arm hysteresis + refractory: one hit per run of
+        ``patience`` chunks at/above the threshold (a lone spike is not the phrase), no
+        retriggers while the score rides high, and a floor on hit spacing (room echo)."""
         t = time.monotonic() if now is None else now
         if score >= self._threshold:
+            self._run += 1
+            if self._run < self._patience:
+                return False
             hit = self._armed and (t - self._last_hit) >= self._refractory_s
             self._armed = False
             if hit:
                 self._last_hit = t
             return hit
+        self._run = 0
         self._armed = True
         return False
 
