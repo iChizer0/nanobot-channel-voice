@@ -56,7 +56,8 @@ _RESUME_TIMEOUT_S = 5.0
 # Healthy session: resets the backoff budget, so an endpoint that recycles long sessions
 # (Qwen turn caps, Gemini's ~10-min socket) never reaches "reconnect exhausted".
 _HEALTHY_SESSION_S = 30.0
-# A held utterance goes up in frames this big (~1 s at 16 kHz): one JSON frame each.
+# A held utterance goes up in frames this big (~1 s at 16 kHz): one JSON frame each, far
+# under any documented cap (OpenAI: 15 MiB an append; Gemini documents none).
 _UTTERANCE_CHUNK_B = 32_000
 
 
