@@ -319,8 +319,8 @@ def test_bare_summon_over_a_reply_kills_it_and_opens_the_window(clock):
 
 
 def test_a_bare_summon_while_the_agent_works_keeps_the_query_and_admits_the_command(clock):
-    """Over THINKING (a delegation's wait) the bare phrase cancels nothing, as locally; in
-    strict mode it opens the window that lets the command after it through."""
+    """Over THINKING (a delegation's wait) the bare phrase cancels nothing, unlike locally:
+    the work is the model's to drop. In strict mode it opens the window for the command."""
     async def _run():
         vad = ScriptVad([False] * 3 + [True] * 4 + [False] * 5)
         gate, inner, _, on_event = build(

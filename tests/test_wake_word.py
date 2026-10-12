@@ -671,8 +671,8 @@ def test_ack_pool_follows_the_tts_not_the_called_name():
 
 
 def test_a_bare_summon_answers_in_the_called_names_language():
-    """The verdict hands the called name on, to the ack at rest and to the reassure over
-    a working turn: with a mixed ack list, each answers in that name's language."""
+    """The verdict hands the called name on to the ack, at rest or after stopping a working
+    turn: with a mixed ack list, each answers in that name's language."""
     import asyncio
 
     from eval_harness import EvalConversation

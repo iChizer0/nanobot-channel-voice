@@ -391,8 +391,8 @@ class GatedUplink:
         killed = self._state is VoiceState.SPEAKING
         if killed:
             # Over the audible reply: cut it now (the local _wake_kill), so the listening cue
-            # plays at once rather than behind it. While the agent works the query
-            # survives, as locally.
+            # plays at once rather than behind it. A tool call in flight is the model's to
+            # drop: the command that follows reaches it.
             await self._kill_reply()
         if not self._ep.in_speech:
             self._summon = None  # one closing as it lands is answered here, not again

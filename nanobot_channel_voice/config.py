@@ -1030,11 +1030,12 @@ class WakeConfig(_VoiceBase):
     covers) always counts, ``engine="openwakeword"`` adds an acoustic detector that hears
     through the bot's own playback. A leading wake phrase is stripped from the published text,
     repeats included ("小娜小娜" is one summon); an utterance that is ONLY the phrase publishes
-    nothing and just opens the attention window, silently unless ``ack`` speaks. A bare summon
-    while the agent is WORKING never cancels the query. Half-duplex contract: detection trails
-    the phrase and the mic-reopen flush discards audio up to it, so the command belongs AFTER
-    the reply stops (phrase, beat, command) — same-breath content survives only in the open-mic
-    modes; with the ack on, the ack IS the beat."""
+    nothing and just opens the attention window, silently unless ``ack`` speaks. Locally the
+    phrase takes the floor while the agent is WORKING too: it stops the run, and a command
+    after it replaces the query; speech without it steers the run instead. Half-duplex
+    contract: detection trails the phrase and the mic-reopen flush discards audio up to it, so
+    the command belongs AFTER the reply stops (phrase, beat, command) — same-breath content
+    survives only in the open-mic modes; with the ack on, the ack IS the beat."""
 
     mode: Literal["off", "gate", "strict"] = "off"
     # The spoken wake phrases, matched at utterance START (hesitation fillers may precede). Also

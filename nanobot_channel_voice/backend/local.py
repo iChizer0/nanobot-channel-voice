@@ -295,23 +295,22 @@ def _steer_marker(heard: str | None) -> str | None:
     )
 
 
-def _wake_note(heard: str | None) -> str:
+def _wake_note(heard: str | None, *, working: bool = False) -> str:
     """The pending note a wake-word kill leaves for the NEXT publish (the wake
-    itself publishes nothing) — same contract as a consumed stop's note."""
+    itself publishes nothing) — same contract as a consumed stop's note. ``working``:
+    the kill stopped a run at work, no reply playing."""
+    cut = "stopped your work" if working else "cut your reply short"
     if heard:
         return (
-            "[voice event: the user cut your reply short with the wake word; "
+            f"[voice event: the user {cut} with the wake word; "
             f'they heard up to: "{_heard_tail(heard)}"; do not resume it unless asked]'
         )
-    if heard == "":
+    if heard == "" and not working:
         return (
             "[voice event: the user cut your reply short with the wake word "
             "before hearing it; do not resume it unless asked]"
         )
-    return (
-        "[voice event: the user cut your reply short with the wake word; "
-        "do not resume it unless asked]"
-    )
+    return f"[voice event: the user {cut} with the wake word; do not resume it unless asked]"
 
 
 def _stop_note(stop_text: str, heard: str | None) -> str:
@@ -826,8 +825,8 @@ class LocalBackend(TurnEventMixin):
         # Wake-word gate: "gate" requires the phrase to START a conversation from cold (window
         # shut); "strict" additionally to barge into a live reply (while SPEAKING, non-wake
         # speech never confirms and ducks only as pause mode's wake probe — hit-or-ignore) and
-        # to steer a shut-window THINKING turn. Two tiers feed one claim: the acoustic detector
-        # (hop) and the transcript prefix.
+        # to reach a shut-window THINKING turn, which the phrase then stops. Two tiers feed one
+        # claim: the acoustic detector (hop) and the transcript prefix.
         wake_phrase = (
             WakePhrase(self._wake_entries()) if config.wake.mode != "off" else None
         )
@@ -911,6 +910,8 @@ class LocalBackend(TurnEventMixin):
         self._last_kill = float("-inf")
         # A consumed stop's heard-up-to note, appended to the NEXT publish.
         self._pending_note: str | None = None
+        # A hushed status line's note: rides the steer that cut it, dropped if a kill follows.
+        self._steer_note: str | None = None
         # Early-RELEASE flag (reason string), the acquittal twin of _early_confirm: set by
         # the frame hop or the eager callback, consumed on the loop (duck mode only).
         self._early_release: str | None = None
@@ -1198,16 +1199,15 @@ class LocalBackend(TurnEventMixin):
                     # Over a live reply mid-utterance: confirm without the min-words bar.
                     self._early_confirm = True
                     self._wake_confirm = True
-                elif base is VoiceState.SPEAKING:
+                elif base is VoiceState.THINKING and self._endpointer.in_speech:
+                    # Working, with nothing of the reply to cut: the verdict stops the run
+                    # for the phrase or a command, never for a backchannel, echo or blip.
+                    pass
+                elif base in (VoiceState.SPEAKING, VoiceState.THINKING):
                     # No utterance to bind the confirm to (the bare phrase, or a residual the
                     # VAD missed): kill directly and settle, and the follow-up publishes cold
                     # inside the window the hit just opened.
                     await self._wake_kill()
-                elif base is VoiceState.THINKING:
-                    # Summoned while the agent works: the query must survive. An open utterance
-                    # rides its claim to the verdict; the bare phrase answers now.
-                    if not self._endpointer.in_speech:
-                        self._reassure()
                 else:
                     # Cold summon: probe for the fast ack (the verdict ack pays hangover + STT).
                     self._arm_fast_ack()
@@ -1522,16 +1522,19 @@ class LocalBackend(TurnEventMixin):
         return quietest_split(pcm[:hit], self._cfg.audio.sample_rate)
 
     async def _wake_kill(self) -> None:
-        """Kill the live reply on wake evidence and settle to IDLE; the follow-up
-        (if any) publishes cold inside the window the hit just opened."""
+        """Kill the live reply or working run on wake evidence and settle to IDLE; the
+        follow-up (if any) publishes cold inside the window the hit just opened."""
+        working = self._base_turn() is VoiceState.THINKING
+        audible = self._turn is VoiceState.SPEAKING
         killed, heard = await self._kill_live_reply(
             interrupting=True, preempted=False, heard=None
         )
         if killed:
             self._last_kill = time.monotonic()
-            self._pending_note = _wake_note(heard)
+            self._pending_note = _wake_note(heard, working=working)
             self._metrics.count("wake_kill")
-            self._observe_wake_kill()
+            if audible:
+                self._observe_wake_kill()
         self._clear_duck()
         if self._turn is not VoiceState.IDLE:
             await self._set_turn(VoiceState.IDLE)
@@ -1695,10 +1698,10 @@ class LocalBackend(TurnEventMixin):
         cancel_task(self._ack_task)
         self._ack_task = asyncio.create_task(self._wake_ack(self._sink.epoch, matched))
 
-    def _reassure(self, matched: str | None = None, *, metric: str = "wake_reassure") -> bool:
-        """Answer a re-summon or a steer during THINKING without touching the query. Prologue
-        script first (an IDLE-style ack would invite a fresh command), else the wake ack; rides
-        the prologue task slot. False = neither is configured, so the caller owes a receipt."""
+    def _reassure(self) -> bool:
+        """Answer a steer during THINKING without touching the query. Prologue script first
+        (an IDLE-style ack would invite a fresh command), else the wake ack; rides the
+        prologue task slot. False = neither is configured, so the caller owes a receipt."""
         if self._canned_base is VoiceState.THINKING:
             return True  # a clip already speaks for the wait; cancelling it strands SPEAKING
         prologue = bool(self._cfg.prologue.enabled and self._prologue_phrases)
@@ -1709,13 +1712,13 @@ class LocalBackend(TurnEventMixin):
             or not self._wake_ack_list
         ):
             return False
-        self._metrics.count(metric)  # counted only when something is armed
+        self._metrics.count("midturn_reassure")  # counted only when something is armed
         if prologue:
             self._arm_prologue(initial_ms=0)
             return True
         self._cancel_prologue()
         self._cur_turn.prologue_task = asyncio.create_task(
-            self._wake_ack(self._sink.epoch, matched, base=VoiceState.THINKING)
+            self._wake_ack(self._sink.epoch, None, base=VoiceState.THINKING)
         )
         return True
 
@@ -1771,8 +1774,7 @@ class LocalBackend(TurnEventMixin):
                     # Recency-guarded like wake_kill_ms: text-tier matches carry no stamp.
                     self._metrics.observe("wake_ack_ms", dt * 1000.0)
             self._log.info(
-                "wake {} ('{}')",
-                "ack" if base is VoiceState.IDLE else "reassure", text,
+                "{} ('{}')", "wake ack" if base is VoiceState.IDLE else "steer reassure", text,
             )
             self._note_spoken(text, self._sink.backlog_ms() + self._audio_ms(audio))
             await self._canned_playback(epoch, audio, base, ack=True)
@@ -1817,14 +1819,6 @@ class LocalBackend(TurnEventMixin):
             "wake hit over gated mic{}",
             f" (score={score:.2f})" if score is not None else "",
         )
-        if self._canned_base is VoiceState.THINKING:
-            # Summon over the FILLER: the query must survive. Flush the clip and stay THINKING
-            # — the cut is the earcon, and another clip would re-gate the reopened mic.
-            self._cancel_prologue()
-            await self._sink.flush()
-            if self._turn is VoiceState.SPEAKING:
-                await self._set_turn(VoiceState.THINKING)
-            return
         await self._wake_kill()
 
     def _take_confirm_latches(self) -> tuple[bool, str | None]:
@@ -2330,6 +2324,7 @@ class LocalBackend(TurnEventMixin):
         # attempt over a live reply — is dropped WHOLE (content spoken at a gated device must
         # not reach the agent). Above the stop rung on purpose: a bystander's "stop" is
         # bystander speech, while the engaged user's arrives in-window or wake-prefixed.
+        gate = "pass"
         if self._wake_mode != "off":
             gate, text, wake_name = self._wake_verdict(pending, text)
             if gate == "gated":
@@ -2342,10 +2337,10 @@ class LocalBackend(TurnEventMixin):
                 elif self._turn is VoiceState.CAPTURING:
                     await self._set_turn(VoiceState.IDLE)
                 return _summary("gated")
-            if gate == "wake":
+            if gate in ("wake", "fuzzy"):
                 await self._bare_wake(
                     pending, interrupting=interrupting, preempted=preempted, heard=heard,
-                    matched=wake_name,
+                    matched=wake_name, named=gate == "wake",
                 )
                 return _summary("wake")
 
@@ -2387,6 +2382,7 @@ class LocalBackend(TurnEventMixin):
             interrupting
             and not preempted
             and not goal
+            and gate != "named"  # the name takes the floor: the command replaces the run
             and not self._cur_turn.dead
             and verdict_state in (VoiceState.THINKING, VoiceState.SPEAKING)
             and (
@@ -2440,6 +2436,9 @@ class LocalBackend(TurnEventMixin):
             if self._pending_note is not None:
                 notes.append(self._pending_note)
                 self._pending_note = None
+            if self._steer_note is not None:
+                notes.append(self._steer_note)
+                self._steer_note = None
             inject_token = unique_token()
             # Fresh token (the context bridge keys notes by it), but owned by the RUNNING
             # turn: a later barge-in must kill this publish too.
@@ -2450,7 +2449,7 @@ class LocalBackend(TurnEventMixin):
             if canned:
                 # The cut clip is the receipt; its script resumes mid-way, not on the same phrase.
                 self._arm_prologue(initial_ms=self._cfg.prologue.interval_ms, start_step=1)
-            elif not self._reassure(metric="midturn_reassure"):
+            elif not self._reassure():
                 # Nothing to say: the ding is the receipt. Last, as a prologue arm sweeps earcons.
                 self._arm_earcon()
             return _summary("inject")
@@ -2458,6 +2457,7 @@ class LocalBackend(TurnEventMixin):
         killed, heard = await self._kill_live_reply(
             interrupting=interrupting, preempted=preempted, heard=heard
         )
+        self._steer_note = None  # a new turn: what was heard of the line rides a kill's marker
         # After a preempted turn the sink can still be ducked from a candidate raised during the
         # STT window, with nothing else to clear it until the NEXT turn drains.
         self._clear_duck()
@@ -2506,11 +2506,11 @@ class LocalBackend(TurnEventMixin):
 
     async def _bare_wake(
         self, pending: _PendingUtterance, *, interrupting: bool, preempted: bool,
-        heard: str | None, matched: str | None = None,
+        heard: str | None, matched: str | None = None, named: bool = True,
     ) -> None:
-        """The bare wake phrase (either tier): attention, not content. Kill a live reply and
+        """The bare wake phrase: attention, not content. Kill a live reply or working run and
         publish nothing; the kill leaves a consumed stop's grace and note. ``matched`` = the
-        phrase the transcript tier saw (ack routing), None = acoustic."""
+        phrase the transcript tier saw (ack routing); ``named`` False = the mangle tier only."""
         self._metrics.count("wake_only")
         if self._adaptive is not None:
             self._adaptive.drop_anchor()
@@ -2525,23 +2525,19 @@ class LocalBackend(TurnEventMixin):
             if self._canned_base is not VoiceState.IDLE and self._turn is VoiceState.CAPTURING:
                 await self._set_turn(VoiceState.IDLE)
             return
-        if not preempted and pending.onset_interrupting and not pending.onset_speaking:
-            # Summoned during THINKING ("are you there?"): never kill the query. A reply that
-            # arrived meanwhile IS the answer, a playing filler already speaks, otherwise
-            # reassure. No kill -> no note, no settle.
+        # Preempted = an audible reply was cut at the hit; else the verdict's own kill.
+        working = not preempted and self._base_turn() is VoiceState.THINKING
+        if working and not named:
             self._clear_duck()
-            if self._turn is VoiceState.THINKING:
-                self._reassure(matched)
-            elif self._turn in (VoiceState.IDLE, VoiceState.CAPTURING):
-                self._arm_wake_ack(matched)
             return
+        audible = self._turn is VoiceState.SPEAKING
         killed, heard = await self._kill_live_reply(
             interrupting=interrupting, preempted=preempted, heard=heard
         )
         if killed:
             self._last_kill = time.monotonic()
-            self._pending_note = _wake_note(heard)
-            if not preempted:  # a preempted kill was observed at confirm
+            self._pending_note = _wake_note(heard, working=working)
+            if audible and not preempted:  # a preempted kill was observed at confirm
                 self._observe_wake_kill()
         self._clear_duck()
         if self._turn is not VoiceState.IDLE:
@@ -2615,8 +2611,8 @@ class LocalBackend(TurnEventMixin):
         self._duck_suspect = False
         heard = self._take_heard(played)
         marker = _steer_marker(heard)
-        if marker is not None and self._pending_note is None:
-            self._pending_note = marker  # rides the steer's own publish
+        if marker is not None and self._steer_note is None:
+            self._steer_note = marker
         if heard:
             # The turn lives on, so its ledger does: a later kill must account for these words.
             self._heard_prefix = heard
@@ -2732,9 +2728,9 @@ class LocalBackend(TurnEventMixin):
     def _wake_verdict(
         self, pending: _PendingUtterance, text: str
     ) -> tuple[str, str, str | None]:
-        """Judge one utterance against the wake gate. Returns ``(decision, text, matched)``:
-        ``"pass"`` (leading phrase stripped), ``"wake"`` (bare phrase, attention only) or
-        ``"gated"``; ``matched`` = the phrase that fired (None = acoustic), routing the ack."""
+        """Judge one utterance against the wake gate: ``(decision, text, matched)``. Content
+        with or without wake evidence is ``named``/``pass`` (phrase stripped), a bare phrase
+        ``wake``, or ``fuzzy`` when only the mangle tier heard it; else ``gated``."""
         matched, stripped = (
             self._wake_strip_leaky(text)
             if self._wake_phrase is not None else (None, text)
@@ -2748,7 +2744,7 @@ class LocalBackend(TurnEventMixin):
                 if again is None or (rest and rest[0] in "'’-"):
                     break
                 stripped = rest
-        woke = pending.wake_hit or matched is not None
+        woke = named = pending.wake_hit or matched is not None
         window_open = pending.onset_window_open
         required = (
             # Strict gates audible barge-in always, and THINKING continuations once the window
@@ -2772,8 +2768,8 @@ class LocalBackend(TurnEventMixin):
         if woke:
             self._touch_wake()
         if matched is not None and not tokens_of(stripped):
-            return "wake", "", matched
-        return "pass", stripped if matched is not None else text, matched
+            return "wake" if named else "fuzzy", "", matched
+        return "named" if named else "pass", stripped if matched is not None else text, matched
 
     def _in_aec_warmup(self) -> bool:
         """AEC3 still converging (too little reference audio accepted): hold the

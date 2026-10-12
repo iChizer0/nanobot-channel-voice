@@ -1299,9 +1299,9 @@ def test_clitic_bound_repeat_stays_content():
     _run(_case())
 
 
-def test_resummon_during_thinking_keeps_the_query():
-    """The "are you there?" check while the agent works: pre-fix it /stopped
-    the in-flight turn and manufactured a false cut-short note."""
+def test_resummon_during_thinking_stops_the_run_and_listens():
+    """The name takes the floor while the agent works, as over a reply: the bare phrase
+    /stops the run and acks, and the next publish says the WORK was stopped."""
 
     async def _case():
         async with EvalConversation(
@@ -1310,22 +1310,25 @@ def test_resummon_during_thinking_keeps_the_query():
         ) as conv:
             await conv.user_says("hey nanobot what's the weather")
             assert conv.texts() == ["what's the weather"]
-            await conv.user_says("hey nanobot")  # anxious re-summon, THINKING
-            assert conv.interrupts == 0
+            await conv.user_says("hey nanobot")  # THINKING: the run is at work
+            assert conv.interrupts == 1
             assert conv.counter("wake_only") == 1
-            assert conv.counter("wake_reassure") == 1
-            await _until(lambda: VoiceState.SPEAKING in conv.states)  # the clip
-            await conv.wait_state(VoiceState.THINKING)  # back beneath it
-            await conv.agent_replies("here is the weather")
+            await _until(lambda: conv.counter("wake_ack") == 1)
             await conv.wait_state(VoiceState.IDLE)
-            await conv.user_says("thanks")
-            assert conv.texts()[-1] == "thanks"
-            assert conv.notes()[-1] == ()  # no false "cut your reply" note
+            await conv.user_says("what time is it")
+            assert conv.texts()[-1] == "what time is it"
+            assert conv.notes()[-1] == (
+                "[voice event: the user stopped your work with the wake word; "
+                "do not resume it unless asked]",
+            )
 
     _run(_case())
 
 
-def test_resummon_during_thinking_prefers_the_prologue_filler():
+def test_resummon_during_thinking_acks_instead_of_filling():
+    """The stopped run waits for nothing: the summon answers with the ack that invites a
+    command, never a filler saying the work goes on."""
+
     async def _case():
         async with EvalConversation(
             playbackHangoverMs=1,
@@ -1334,30 +1337,31 @@ def test_resummon_during_thinking_prefers_the_prologue_filler():
         ) as conv:
             await conv.user_says("hey nanobot what's the weather")
             await conv.user_says("hey nanobot")
-            assert conv.interrupts == 0
-            await _until(lambda: conv.counter("prologue_filler") == 1)
+            assert conv.interrupts == 1
+            await _until(lambda: conv.counter("wake_ack") == 1)
             await asyncio.sleep(0.05)
-            assert conv.counter("wake_ack") == 0  # the filler IS the reassure
+            assert conv.counter("prologue_filler") == 0
 
     _run(_case())
 
 
-def test_resummon_during_thinking_without_canned_audio_is_silent_but_safe():
+def test_resummon_during_thinking_without_an_ack_stops_silently():
     async def _case():
         async with EvalConversation(**_wake("gate")) as conv:
             await conv.user_says("hey nanobot what's the weather")
             await conv.user_says("hey nanobot")
-            assert conv.interrupts == 0
+            assert conv.interrupts == 1
             assert conv.counter("wake_only") == 1
-            assert conv.counter("wake_reassure") == 0  # nothing spoke: nothing counted
             assert VoiceState.SPEAKING not in conv.states  # nothing to say
-            await conv.agent_replies("here is the weather")  # query survived
             await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())
 
 
-def test_acoustic_resummon_during_thinking_keeps_the_query():
+def test_acoustic_resummon_during_thinking_stops_the_run_at_the_verdict():
+    """Nothing audible to cut while working: the hit rides to the verdict, which stops the
+    run for the bare phrase. A kill at the hit would be orphaned by a backchannel or blip."""
+
     async def _case():
         det = _ScriptDetector()
         async with EvalConversation(
@@ -1368,17 +1372,24 @@ def test_acoustic_resummon_during_thinking_keeps_the_query():
             conv._stt.append("")
             conv.vad.flag = True
             await _push_frames(conv, 10, fire_at=4, det=det)
+            assert conv.interrupts == 0  # claimed, not killed
+            assert conv.counter("barge_in_early_confirm") == 0
             await _close_utterance(conv)
-            assert conv.interrupts == 0
+            assert conv.interrupts == 1
             assert conv.counter("wake_only") == 1
-            assert conv.counter("wake_reassure") == 1
-            await conv.agent_replies("here is the weather")
+            await _until(lambda: conv.counter("wake_ack") == 1)
             await conv.wait_state(VoiceState.IDLE)
+            assert "wake_kill_ms" not in conv.backend._metrics._latency  # no audio was cut
+            await conv.user_says("what time is it")
+            assert conv.notes()[-1] == (
+                "[voice event: the user stopped your work with the wake word; "
+                "do not resume it unless asked]",
+            )
 
     _run(_case())
 
 
-def test_resummon_during_playing_filler_lets_it_finish():
+def test_resummon_over_the_playing_filler_stops_the_run():
     async def _case():
         async with EvalConversation(
             playbackHangoverMs=1,
@@ -1388,18 +1399,122 @@ def test_resummon_during_playing_filler_lets_it_finish():
             await conv.user_says("hey nanobot what's the weather")
             await conv.wait_state(VoiceState.SPEAKING)  # the filler, ~2.4 s
             await conv.user_says("hey nanobot")  # over the playing filler
-            assert conv.interrupts == 0
+            assert conv.interrupts == 1
             assert conv.counter("wake_only") == 1
-            assert conv.counter("wake_reassure") == 0  # the filler speaks
             assert conv.counter("prologue_filler") == 1
+            await _until(lambda: conv.counter("wake_ack") == 1)
+            await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())
 
 
-def test_acoustic_hit_over_the_playing_filler_keeps_the_wait_alive():
-    """Hop-side hit with no utterance open while a THINKING-base clip plays: the clip IS
-    the reassure. Re-arming the prologue cancelled the playing clip's task: SPEAKING stood
-    unowned, and the next utterance /stop-ped the query it was meant to keep."""
+def test_acoustic_hit_inside_speech_over_the_filler_stops_the_run_at_the_verdict():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            prologue={"enabled": True, "afterMs": 0, "phrases": ["y" * 400]},
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.wait_state(VoiceState.SPEAKING)  # the filler, ~2.4 s
+            conv._stt.append("")
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=6, det=det)
+            assert conv.interrupts == 0
+            await _close_utterance(conv)
+            assert conv.interrupts == 1
+            assert conv.counter("wake_only") == 1
+            assert "wake_kill_ms" in b._metrics._latency  # the filler was cut
+            await _until(lambda: conv.counter("wake_ack") == 1)
+            await conv.wait_state(VoiceState.IDLE)
+            assert b._canned_base is None
+            await conv.user_says("what time is it")
+            assert conv.notes()[-1] == (
+                "[voice event: the user stopped your work with the wake word; "
+                "do not resume it unless asked]",
+            )
+
+    _run(_case())
+
+
+def test_a_hit_with_no_utterance_open_stops_a_working_run_at_once():
+    """No verdict will follow a phrase the VAD missed, so the hit decides: stop, settle and
+    ack. Nothing audible was cut, so no wake_kill_ms sample."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(
+            wake_detector=det, playbackHangoverMs=1,
+            **_wake("gate", ack={"enabled": True, "phrases": ["i am here"]}),
+        ) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot what's the weather")
+            det.fire = True
+            await b.push_audio(_FRAME)
+            assert conv.interrupts == 1
+            assert conv.counter("wake_kill") == 1
+            assert "wake_kill_ms" not in b._metrics._latency
+            await _until(lambda: conv.counter("wake_ack") == 1)
+            await conv.wait_state(VoiceState.IDLE)
+
+    _run(_case())
+
+
+def test_a_backchannel_after_the_name_keeps_the_working_run():
+    """The name then "ok" is no command: the run survives on both tiers, and nothing is
+    published (a kill at the hit would have left it dead and silent)."""
+
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            conv._stt.append("ok")  # the acoustic tier trims the name off the transcript
+            conv.vad.flag = True
+            await _push_frames(conv, 10, fire_at=4, det=det)
+            await _close_utterance(conv)
+            await conv.user_says("hey nanobot ok")  # the transcript tier
+            assert conv.interrupts == 0
+            assert conv.counter("barge_in_backchannel") == 2
+            assert conv.backend._turn is VoiceState.THINKING
+            assert conv.texts() == ["what's the weather"]
+
+    _run(_case())
+
+
+def test_a_blip_carrying_the_name_keeps_the_working_run():
+    async def _case():
+        det = _ScriptDetector()
+        async with EvalConversation(wake_detector=det, **_wake("gate")) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            conv.vad.flag = True
+            await _push_frames(conv, 4, fire_at=3, det=det)  # opens, then too short to keep
+            await _close_utterance(conv)
+            assert conv.interrupts == 0
+            assert conv.backend._turn is VoiceState.THINKING
+
+    _run(_case())
+
+
+def test_a_mangled_name_alone_does_not_stop_a_working_run():
+    """The mangle tier only strips (it opens no gate): a bare mangle stops no work, as a
+    mangle before a command steers rather than stops."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot what's the weather")
+            await conv.user_says("he nine obt")
+            assert conv.counter("wake_fuzzy_strip") == 1
+            assert conv.interrupts == 0
+            assert conv.backend._turn is VoiceState.THINKING
+
+    _run(_case())
+
+
+def test_acoustic_hit_over_the_playing_filler_stops_the_run():
+    """Hop-side hit with no utterance open while a THINKING-base clip plays: clip and run
+    stop, and the turn settles to IDLE, never leaving SPEAKING unowned."""
 
     async def _case():
         det = _ScriptDetector()
@@ -1414,15 +1529,16 @@ def test_acoustic_hit_over_the_playing_filler_keeps_the_wait_alive():
             assert b._canned_base is VoiceState.THINKING
             det.fire = True
             await b.push_audio(_FRAME)  # the bare phrase; VAD saw nothing
-            assert b._canned_base is VoiceState.THINKING  # the clip plays on
-            assert conv.counter("wake_reassure") == 0
-            await conv.wait_state(VoiceState.THINKING)  # settled beneath it
-            assert conv.interrupts == 0
-            await conv.agent_replies("here is the weather")  # the query survived
+            assert conv.interrupts == 1
+            assert conv.counter("wake_kill") == 1
+            await _until(lambda: conv.counter("wake_ack") == 1)
             await conv.wait_state(VoiceState.IDLE)
             await conv.user_says("thanks")
-            assert conv.interrupts == 0
-            assert conv.notes()[-1] == ()
+            assert conv.interrupts == 1
+            assert conv.notes()[-1] == (
+                "[voice event: the user stopped your work with the wake word; "
+                "do not resume it unless asked]",
+            )
 
     _run(_case())
 
@@ -1568,7 +1684,7 @@ def test_summon_during_the_attention_cue_flushes_it_and_acks():
     _run(_case())
 
 
-def test_half_duplex_tap_over_filler_keeps_the_query():
+def test_half_duplex_tap_over_filler_stops_the_run():
     async def _case():
         det = _ScriptDetector()
         async with EvalConversation(
@@ -1580,10 +1696,9 @@ def test_half_duplex_tap_over_filler_keeps_the_query():
             await conv.wait_state(VoiceState.SPEAKING)  # the filler gates the mic
             det.fire = True
             await conv.backend.push_gated_audio(_FRAME)
-            assert conv.backend._turn is VoiceState.THINKING  # flushed, not killed
-            assert conv.interrupts == 0
-            assert conv.counter("wake_kill") == 0
-            await conv.agent_replies("here is the weather")
+            assert conv.interrupts == 1
+            assert conv.counter("wake_kill") == 1
+            await _until(lambda: conv.counter("wake_ack") == 1)
             await conv.wait_state(VoiceState.IDLE)
 
     _run(_case())
@@ -2522,13 +2637,59 @@ def test_strict_thinking_cold_window_gates_bystanders():
     _run(_case())
 
 
-def test_strict_thinking_cold_window_wake_steers():
+def test_strict_thinking_cold_window_wake_replaces_the_run():
     async def _case():
         async with EvalConversation(**_wake("strict", attention="sentence")) as conv:
             await conv.user_says("hey nanobot tell me a story")
             await conv.user_says("hey nanobot make it a joke instead")
             assert conv.texts()[-1] == "make it a joke instead"
-            assert conv.interrupts == 0  # injected into the live run, not killed
+            assert conv.interrupts == 1  # /stop, then the command as a fresh turn
+            assert conv.notes()[-1] == (
+                "[voice event: you were interrupted before your reply was heard]",
+            )
+
+    _run(_case())
+
+
+def test_named_speech_during_thinking_replaces_the_run_unnamed_steers():
+    """While the agent works, speech without the name is injected into the live run; with
+    the name it /stops the run and publishes as a fresh turn."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            await conv.user_says("hey nanobot tell me a story")
+            await conv.user_says("actually make it short")
+            assert conv.interrupts == 0
+            assert conv.counter("midturn_injection") == 1
+            await conv.user_says("hey nanobot make it a joke instead")
+            assert conv.interrupts == 1
+            assert conv.counter("midturn_injection") == 1
+            assert conv.texts()[-1] == "make it a joke instead"
+
+    _run(_case())
+
+
+def test_named_speech_over_a_status_line_stops_the_run():
+    """Words over the pre-tool status line steer the run; after the name (here the transcript
+    tier) they stop it, as an acoustic hit over the line does."""
+
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot book me a table at eight")
+            await b.on_delta(
+                "The booking site rejected that request when I tried it a moment ago. "
+                "I am going to try a completely different way of getting that table."
+            )
+            await b.on_stream_end(resuming=True)  # more tools follow
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(100)
+            await conv.user_says("hey nanobot never mind, play some jazz")
+            assert conv.interrupts == 1
+            assert conv.counter("midturn_injection") == 0
+            assert conv.texts()[-1] == "never mind, play some jazz"
+            [note] = conv.notes()[-1]
+            assert note.startswith("[voice event: you were interrupted mid-reply")
 
     _run(_case())
 
@@ -2541,6 +2702,44 @@ def test_gate_thinking_cold_window_stays_free():
             await conv.user_says("hey nanobot tell me a story")
             await conv.user_says("actually make it short")
             assert conv.texts()[-1] == "actually make it short"
+
+    _run(_case())
+
+
+def test_a_named_command_after_a_hush_carries_one_note():
+    """A streaming partial can hush the status line before the verdict hears the name: the
+    kill that follows leaves only its interrupt marker, never the hush's steer note too."""
+
+    class _PartialStt:
+        streaming = True
+
+        def stream_start(self):
+            text = "hey nanobot never mind play some jazz"
+            return SimpleNamespace(
+                accept=lambda frame: None, partial=lambda: text, finish=lambda: text
+            )
+
+    async def _case():
+        async with EvalConversation(**_wake("gate")) as conv:
+            b = conv.backend
+            await conv.user_says("hey nanobot book me a table at eight")
+            b._stt_stream = _PartialStt()
+            b._threaded_hop = True
+            await b.on_delta(
+                "The booking site rejected that request when I tried it a moment ago. "
+                "I am going to try a completely different way of getting that table."
+            )
+            await b.on_stream_end(resuming=True)  # a status line: tools follow
+            await conv.wait_state(VoiceState.SPEAKING)
+            await conv.wait_played_ms(100)
+            conv.vad.flag = True
+            await _push_frames(conv, 30)
+            assert conv.counter("midturn_hush") == 1  # the partial cut the line first
+            await _close_utterance(conv)
+            assert conv.interrupts == 1
+            assert conv.texts()[-1] == "never mind play some jazz"
+            [note] = conv.notes()[-1]
+            assert note.startswith("[voice event: you were interrupted mid-reply")
 
     _run(_case())
 
