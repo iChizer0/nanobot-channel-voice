@@ -23,13 +23,16 @@ from nanobot_channel_voice.backend.base import (
     VoiceState,
 )
 from nanobot_channel_voice.backend.gated import GatedUplink
-from nanobot_channel_voice.config import VoiceConfig
+from nanobot_channel_voice.config import OpenWakeWordConfig, VoiceConfig
 from nanobot_channel_voice.vad.base import Vad
 from nanobot_channel_voice.wake.base import WakeDetector
 
 RATE = 16000
 FRAME_MS = 20
 FRAME = RATE * 2 * FRAME_MS // 1000  # 640 bytes
+# Speech past a hit that outlasts the phrase's own tail (wake.openwakeword.tailMs) is a
+# same-breath command.
+TAIL_FRAMES = OpenWakeWordConfig().tail_ms // FRAME_MS
 
 
 def frame(i: int) -> bytes:
@@ -2025,9 +2028,7 @@ def test_a_capture_gap_drops_the_held_open_utterance_but_not_those_already_whole
 
 def test_a_held_same_breath_command_goes_up_from_the_phrase_end():
     async def _run():
-        from nanobot_channel_voice.backend import gated
-
-        past = gated._SUMMON_TAIL_MS // FRAME_MS
+        past = TAIL_FRAMES
         vad = ScriptVad([True] * 5 + [True] * past + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({5}),
@@ -2054,9 +2055,7 @@ def test_speech_inside_the_phrase_tail_allowance_is_still_the_phrase():
     that long past the hit is the phrase's own tail. The summon stays bare: cued, and
     nothing goes up."""
     async def _run():
-        from nanobot_channel_voice.backend import gated
-
-        tail = gated._SUMMON_TAIL_MS // FRAME_MS - 1  # just inside the allowance
+        tail = TAIL_FRAMES - 1  # just inside the allowance
         vad = ScriptVad([True] * 5 + [True] * tail + [False] * 20)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({5}),
@@ -2073,9 +2072,7 @@ def test_speech_inside_the_phrase_tail_allowance_is_still_the_phrase():
 
 def test_speech_past_the_tail_allowance_is_a_same_breath_command():
     async def _run():
-        from nanobot_channel_voice.backend import gated
-
-        past = gated._SUMMON_TAIL_MS // FRAME_MS
+        past = TAIL_FRAMES
         vad = ScriptVad([True] * 5 + [True] * past + [False] * 5)
         gate, inner, _, on_event = build(
             "wake", vad=vad, detector=ScriptWake({5}),
@@ -2086,6 +2083,46 @@ def test_speech_past_the_tail_allowance_is_a_same_breath_command():
         assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
         assert inner.calls[1][1].startswith(frames[5])  # from the phrase end
         assert "earcon_listening" not in gate._metrics.snapshot()["counters"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_the_tail_allowance_follows_the_head():
+    """A head that fires at the phrase's end needs less allowance, or a short command said
+    in the same breath passes for the tail: wake.openwakeword.tailMs sets it."""
+    async def _run():
+        past = 200 // FRAME_MS  # a short command: inside the default allowance
+        vad = ScriptVad([True] * 5 + [True] * past + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15,
+                  "openwakeword": {"tailMs": 200}},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        frames = await feed(gate, 5 + past + 5)
+        assert inner.calls[0] == ("begin",) and inner.calls[-1] == ("end", True)
+        assert inner.calls[1][1].startswith(frames[5])  # adopted from the phrase end
+        assert "earcon_listening" not in gate._metrics.snapshot()["counters"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_no_speech_past_the_phrase_is_never_a_command():
+    """With no allowance at all (tailMs 0 under a zero minUtteranceMs), the hit frame alone
+    is still the phrase: the summon is bare, cued, and nothing goes up."""
+    async def _run():
+        vad = ScriptVad([True] * 5 + [False] * 20)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}), vad_cfg={"min_utterance_ms": 0},
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15,
+                  "openwakeword": {"tailMs": 0}},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 25)
+        assert inner.calls == []
+        assert gate._metrics.snapshot()["counters"]["earcon_listening"] == 1
         await gate.close()
 
     asyncio.run(_run())
@@ -2120,9 +2157,7 @@ def test_the_phrase_over_a_held_utterance_going_up_is_answered_and_the_command_q
     """The worker's activity is not the user's open utterance: a summon then is cued as
     ever, and its command queues behind the upload rather than being swallowed."""
     async def _run():
-        from nanobot_channel_voice.backend import gated
-
-        past = gated._SUMMON_TAIL_MS // FRAME_MS
+        past = TAIL_FRAMES
         vad = ScriptVad([True] * 5 + [True] * past + [False] * 5 + [False] + [True] * 4 + [False] * 5)
         detector = ScriptWake({5})
         gate, inner, _, on_event = build(

@@ -58,9 +58,6 @@ _CONTINUE_S = 1.5
 # it: past the gaps between words, well inside the hangover (the local fast ack's bar).
 # Speech past the phrase first is a same-breath command, which no cue talks over.
 _SUMMON_QUIET_MS = 240
-# The detector fires inside the phrase, up to this long before its last syllable ends
-# (measured 480 ms): speech this long past the hit is still the phrase, not a command.
-_SUMMON_TAIL_MS = 600
 # A held utterance asks the session back this many times (each the transport's resume
 # budget) before it is dropped; past this many waiting, the oldest goes (a long outage
 # must not replay a monologue).
@@ -216,6 +213,7 @@ class GatedUplink:
         self._summon: _Summon | None = None
         self._held_onset = False  # an onset during a cue, waiting for speech to outlast it
         self._min_utterance_ms = config.vad.min_utterance_ms
+        self._summon_tail_ms = wake.openwakeword.tail_ms  # the phrase runs on past the hit
         # A reply the phrase cuts off still sounds this long (device buffer and room).
         self._playback_tail_s = config.playback_hangover_ms / 1000.0
         self._unpark_task: asyncio.Task | None = None
@@ -458,7 +456,7 @@ class GatedUplink:
             if now >= summon.count_from:
                 summon.past_ms += active - summon.active_ms
             summon.active_ms = active
-            if summon.past_ms >= max(self._min_utterance_ms, _SUMMON_TAIL_MS):
+            if summon.past_ms and summon.past_ms >= max(self._min_utterance_ms, self._summon_tail_ms):
                 self._summon = None
                 await self._open_activity(summon.hit_pos)
                 return self._streaming

@@ -954,6 +954,10 @@ class OpenWakeWordConfig(OnDeviceRuntime):
     patience: int = Field(default=2, ge=1)
     # Minimum spacing between hits: the phrase echoing in a hard room must not double-fire.
     refractory_s: float = Field(default=2.0, ge=0.0)
+    # Cloud wake gate: speech this long past a hit (never under vad.minUtteranceMs) is still
+    # the phrase's own tail, since the head fires inside the phrase, the shipped heads up to
+    # 480 ms before its last syllable ends; speech outlasting it is a same-breath command.
+    tail_ms: int = Field(default=600, ge=0)
 
 
 class EarconsConfig(_VoiceBase):
