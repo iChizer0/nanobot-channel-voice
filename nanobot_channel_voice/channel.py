@@ -15,6 +15,7 @@ import threading
 import time
 from collections import deque
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -570,6 +571,19 @@ def _release_late(fut: asyncio.Future) -> None:
         _release(fut.result())
 
 
+def _persist_tokenizer_cache() -> None:
+    """tiktoken keeps its encoding in the temp dir, which a reboot may clear: point it at a
+    cache dir of ours unless the operator chose one, so the fetch happens once per install."""
+    if os.environ.get("TIKTOKEN_CACHE_DIR"):
+        return
+    with suppress(OSError, RuntimeError):  # no home, or one we cannot write: tiktoken's default
+        base = os.environ.get("XDG_CACHE_HOME")
+        cache = Path(base).expanduser() if base else Path.home() / ".cache"
+        cache = cache / "nanobot-voice" / "tiktoken"
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ["TIKTOKEN_CACHE_DIR"] = str(cache)
+
+
 class VoiceChannel(BaseChannel):
     name = "voice"
     display_name = "Voice"
@@ -604,6 +618,7 @@ class VoiceChannel(BaseChannel):
         self._voice_context: list[RuntimeContextBlock] = []
         self._context_bridge: VoiceContextBridge | None = None
         self._warmup_task: asyncio.Task | None = None
+        self._tokenizer_thread: threading.Thread | None = None
         self._metrics_task: asyncio.Task | None = None  # debug.metricsIntervalS reporter
         # Supervisor mode only: the in-flight ask_nanobot delegation the bus glue collects.
         # One slot — a bus reply can't be correlated to a concurrent delegation, so the lock
@@ -709,6 +724,7 @@ class VoiceChannel(BaseChannel):
         server = None
         started = False
         missed: dict[str, Any] = {}
+        self._start_tokenizer_warmup()
         try:
             kind = backend_kind(self.config.backend)
             if kind in ("openai_dialect", "gemini"):
@@ -1336,6 +1352,28 @@ class VoiceChannel(BaseChannel):
         await server.start()
         self._stt_server = server  # published only once actually bound
         return server
+
+    def _start_tokenizer_warmup(self) -> None:
+        """The core's token estimate loads tiktoken's cl100k_base on first use, fetching it
+        (1.7 MB, no timeout) on the event loop, where playback freezes for it: fetched on a
+        thread at start instead, into a cache that outlives the temp dir."""
+        _persist_tokenizer_cache()  # the environment is set here, on the loop, never from a thread
+        if self._tokenizer_thread is not None and self._tokenizer_thread.is_alive():
+            return  # a rebuild while the first fetch still runs
+        self._tokenizer_thread = threading.Thread(
+            target=self._warm_tokenizer, name="voice-tokenizer", daemon=True,
+        )
+        self._tokenizer_thread.start()
+
+    def _warm_tokenizer(self) -> None:
+        try:
+            import tiktoken
+        except ImportError:
+            return  # a core without it fetches nothing
+        try:
+            tiktoken.get_encoding("cl100k_base")
+        except Exception as exc:  # noqa: BLE001 - offline: the core's own call fetches later
+            self.logger.debug("tokenizer warm-up failed ({}); a turn may fetch it", exc)
 
     async def _warmup(self) -> None:
         """Warm each on-device adapter once, then (``perf.calibrate``) measure the WARM

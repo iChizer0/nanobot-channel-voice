@@ -12,6 +12,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def no_tokenizer_fetch(monkeypatch):
+    """A started channel fetches the core's tokenizer on a thread: not from a test."""
+    from nanobot_channel_voice.channel import VoiceChannel
+
+    monkeypatch.setattr(VoiceChannel, "_start_tokenizer_warmup", lambda self: None)
+
+
+@pytest.fixture(autouse=True)
 def store(tmp_path, monkeypatch):
     """The store this test writes and reads; its path is the fixture's value."""
     import nanobot.config.loader as loader
