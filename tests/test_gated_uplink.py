@@ -2324,6 +2324,66 @@ def test_a_dropped_held_command_keeps_the_strict_grant(clock):
     asyncio.run(_run())
 
 
+def test_strict_a_held_command_lost_under_its_upload_keeps_the_grant(clock):
+    """The loss's IDLE settles the window from the grant the command spent as it closed:
+    handed back, the grant opens it again, so saying the command again needs no phrase."""
+    async def _run():
+        vad = ScriptVad([False] * 2 + [True] * 6 + [False] * 5 + [True] * 4 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 2)  # the bare phrase: cued, granted
+        clock.t += TONE_S
+        await feed(gate, 11, start=2)  # the command, held
+        push = inner.push_utterance
+
+        async def push_and_lose(pcm):
+            inner.calls.append(("push_whole", pcm))
+            inner.session.clear()
+            await inner.on_event(StateHint(VoiceState.IDLE))
+            return False
+
+        inner.push_utterance = push_and_lose
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert gate._metrics.snapshot()["counters"]["gate_activity_lost"] == 1
+        inner.push_utterance = push
+        inner.session.set()
+        clock.t += 3.0  # past the rest's grace, inside the phrase's windowS
+        await feed(gate, 9, start=13)  # said again, without the phrase
+        assert inner.calls[-1] == ("end", True)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_dropped_held_command_keeps_the_sentence_window(clock):
+    """Sentence attention: the command the session never took spent nothing, so the window
+    re-arms at the settle instead of closing, and saying it again needs no phrase."""
+    async def _run():
+        vad = ScriptVad([False] * 2 + [True] * 6 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "gate", "attention": "sentence", "phrases": ["hey nanobot"],
+                  "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 0.02
+        await feed(gate, 2)  # the bare phrase: cued
+        clock.t += TONE_S
+        await feed(gate, 11, start=2)  # the command, held
+        await asyncio.sleep(0.1)  # dropped
+        assert gate._metrics.snapshot()["counters"]["gate_activity_failed"] == 1
+        assert gate._window_until > clock.t and not gate._spent
+        await gate.close()
+
+    asyncio.run(_run())
+
+
 def test_a_held_turn_owns_the_window_even_after_a_loss_before_it(clock):
     async def _run():
         vad = ScriptVad([False] + [True] * 4 + [False] * 5 + [True] * 4 + [False] * 5)
@@ -2369,7 +2429,170 @@ def test_the_backlog_keeps_the_newest_held_utterances():
         frames = await feed(gate, 45)
         assert len(gate._held) == 4
         assert gate._metrics.snapshot()["counters"]["gate_held_dropped"] == 1
-        assert gate._held[-1].endswith(b"".join(frames[36:45]))
+        assert gate._held[-1][0].endswith(b"".join(frames[36:45]))
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+
+def test_an_open_held_utterance_closing_as_the_queue_ahead_empties_still_goes_up():
+    """The frame path streams an open held utterance on, never the worker: a close landing
+    while that begin yields (the shell flushes playback) would find no activity to end,
+    and the stale one would take the next utterance unchecked."""
+    async def _run():
+        vad = ScriptVad([True] * 4 + [False] * 5 + [True] * 8 + [False] * 5)
+        gate, inner, _, on_event = build(vad=vad)
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 5.0
+        await feed(gate, 13)  # one whole, the second open
+        begin, begun = inner.begin_activity, 0
+
+        async def yielding_begin():
+            nonlocal begun
+            begun += 1
+            if begun == 2:
+                await asyncio.sleep(0.05)  # the shell's barge-in flush
+            await begin()
+
+        inner.begin_activity = yielding_begin
+        inner.session.set()
+        await asyncio.sleep(0.02)  # the first went up
+        await feed(gate, 9, start=13)  # the second closes
+        await asyncio.sleep(0.1)
+        assert inner.kinds().count("begin") == 2 and inner.calls[-1] == ("end", True)
+        assert not gate._streaming and not gate._active
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_strict_a_held_command_spends_the_grant_as_it_closes(clock):
+    """As a live commit does: speech past the command's rest needs the phrase again, even
+    before the session is back to take the command."""
+    async def _run():
+        vad = ScriptVad(
+            [False] * 2 + [True] * 6 + [False] * 5 + [False] * 2 + [True] * 6 + [False] * 5
+        )
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({2}),
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 5.0
+        await feed(gate, 2)  # the phrase: cued, granted
+        clock.t += TONE_S
+        await feed(gate, 11, start=2)  # the command, held
+        clock.t += 2.0  # past the rest's grace
+        await feed(gate, 13, start=13)  # other speech, no phrase
+        assert gate._metrics.snapshot()["counters"]["gate_dropped_onsets"] == 1
+        inner.session.set()
+        await asyncio.sleep(0.05)
+        assert inner.kinds() == ["begin", "push_whole", "end"]
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_strict_the_phrase_said_while_a_command_is_held_grants_the_next(clock):
+    """The held command spent its own grant: the phrase said again before the session is
+    back grants the command after it, however late the first goes up."""
+    async def _run():
+        vad = ScriptVad(
+            [False] * 2 + [True] * 6 + [False] * 5 + [False] + [True] * 6 + [False] * 5
+        )
+        detector = ScriptWake({2})
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=detector,
+            wake={"mode": "strict", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        inner.resume_s = 5.0
+        await feed(gate, 2)  # the phrase: cued
+        clock.t += TONE_S
+        await feed(gate, 11, start=2)  # the command, held
+        detector.hits.add(detector.n + 1)
+        await feed(gate, 1, start=13)  # the phrase again: cued
+        clock.t += TONE_S
+        inner.session.set()
+        await asyncio.sleep(0.05)  # the first command goes up
+        await inner.on_event(StateHint(VoiceState.THINKING))  # the model works, silent
+        clock.t += 2.0
+        await feed(gate, 11, start=14)  # the next command
+        assert inner.kinds().count("begin") == 2 and inner.calls[-1] == ("end", True)
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_held_utterance_streamed_on_owns_the_window_until_its_turn_settles(clock):
+    """An IDLE while it was held (the session lost under an earlier upload) re-armed the
+    window; going live takes it back, so a long wait after the commit keeps it open."""
+    async def _run():
+        vad = ScriptVad([False] + [True] * 4 + [False] * 5 + [True] * 20 + [False] * 5)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({1}),
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        inner.session.clear()
+        await feed(gate, 1)  # the bare phrase: cued
+        clock.t += TONE_S
+
+        async def push_and_lose(pcm):  # the session falls away under the first upload
+            inner.calls.append(("push_whole", pcm))
+            inner.session.clear()
+            await inner.on_event(StateHint(VoiceState.IDLE))
+            return False
+
+        inner.push_utterance = push_and_lose
+        await feed(gate, 13, start=1)  # one whole, the second open: both held
+        inner.session.set()
+        await asyncio.sleep(0.02)
+        assert gate._hold_from is not None and gate._window_until != math.inf
+        inner.session.set()  # back while the second is still open
+        await feed(gate, 21, start=14)  # it goes live and closes
+        assert inner.calls[-1] == ("end", True) and gate._window_until == math.inf
+        await gate.close()
+
+    asyncio.run(_run())
+
+
+def test_a_session_lost_as_an_utterance_opens_leaves_the_window_to_lapse(clock):
+    """The session falls away while the begin yields (the shell's flush): the utterance is
+    lost with it, no receipt claims it, and the window the loss re-armed still lapses, so
+    speech an hour on without the phrase goes nowhere."""
+    async def _run():
+        vad = ScriptVad(
+            [False] + [True] * 4 + [False] * 5 + [False] * 5 + [True] * 4 + [False] * 5
+        )
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({1}), earcons={"captured": True},
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 1)  # the bare phrase: cued
+        clock.t += TONE_S
+        begin = inner.begin_activity
+
+        async def begin_and_lose():
+            await begin()
+            inner.session.clear()  # _on_session_lost: ready off, IDLE
+            await inner.on_event(StateHint(VoiceState.IDLE))
+
+        inner.begin_activity = begin_and_lose
+        await feed(gate, 14, start=1)  # the command
+        counters = gate._metrics.snapshot()["counters"]
+        assert inner.kinds() == ["begin"] and counters["gate_activity_lost"] == 1
+        assert "earcon_captured" not in counters and gate._window_until != math.inf
+        inner.begin_activity = begin
+        inner.session.set()
+        clock.t += 3600.0
+        await feed(gate, 9, start=15)  # someone talking, no phrase
+        assert inner.kinds() == ["begin"]
         await gate.close()
 
     asyncio.run(_run())

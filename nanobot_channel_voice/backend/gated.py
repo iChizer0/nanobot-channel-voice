@@ -205,9 +205,10 @@ class GatedUplink:
         self._active = False          # begin_activity sent, end_activity not yet
         self._streaming = False       # ... and the open utterance goes up frame by frame
         # The session away (parked, reconnecting): the open utterance is held, to stream on
-        # from this position once it is back, or go up whole, queued behind earlier ones.
+        # from this position once it is back, or go up whole, queued behind earlier ones
+        # with the strict grant it spent (handed back if it never goes up).
         self._hold_from: int | None = None
-        self._held: deque[bytes] = deque(maxlen=_HOLD_MAX)
+        self._held: deque[tuple[bytes, float]] = deque(maxlen=_HOLD_MAX)
         self._hold_task: asyncio.Task | None = None
         self._hit_pos: int | None = None  # phrase END in endpointer stream coordinates
         self._summon: _Summon | None = None
@@ -543,6 +544,7 @@ class GatedUplink:
     async def _open_live(self, start_pos: int) -> None:
         """The activity for the open utterance, streaming from ``start_pos`` on."""
         self._hold_from = None
+        self._window_until = math.inf  # engaged, though an IDLE while it was held re-armed it
         try:
             await self._inner.begin_activity()
         except asyncio.CancelledError:
@@ -550,6 +552,10 @@ class GatedUplink:
         except Exception as exc:  # noqa: BLE001 - lost between the check and the wire
             self._metrics.count("gate_activity_failed")
             self._log.warning("uplink could not open an activity ({}); utterance dropped", exc)
+            self._settle_held()
+            return
+        if not self._inner.ready:  # the session fell away while it opened: lost with it
+            self._metrics.count("gate_activity_lost")
             self._settle_held()
             return
         self._active = self._streaming = True
@@ -594,7 +600,8 @@ class GatedUplink:
         self._play_cue(self._receipt, "earcon_captured")  # once it went
 
     def _spend_attention(self) -> None:
-        """An utterance of the user's goes up: what that spends of the attention."""
+        """An utterance of the user's is taken, live or held whole for the session: what
+        that spends of the attention."""
         if self._attention == "sentence":
             self._spent = True
         # Strict: the turn spends the phrase's grant, and its rest may follow for a moment
@@ -605,8 +612,9 @@ class GatedUplink:
         )
 
     def _close_held(self, utterance: bytes | None) -> None:
-        """The held utterance closed: whole now, it queues for the session (a blip
-        queues nothing, and nothing else will settle what it engaged)."""
+        """The held utterance closed: whole now, it queues for the session and spends the
+        attention as a commit does, so speech without the phrase is not admitted behind it
+        (a blip queues nothing, and nothing else will settle what it engaged)."""
         start, self._hold_from = self._hold_from, None
         if utterance is None:
             self._settle_held()
@@ -615,30 +623,38 @@ class GatedUplink:
         if len(self._held) == self._held.maxlen:
             self._metrics.count("gate_held_dropped")  # the oldest goes, below
             self._log.warning("session still away: the oldest held utterance is dropped")
-        self._held.append(utterance[off:])
+        self._held.append((utterance[off:], self._grant_until))
+        self._spend_attention()
         if self._hold_task is None or self._hold_task.done():
             self._hold_task = asyncio.create_task(self._send_held())
 
     async def _send_held(self) -> None:
-        """Held utterances go up in order, one activity each, once the session is back;
-        one it never comes back for is dropped. Then an utterance still open streams on."""
+        """Held utterances go up in order, one activity each, once the session is back; one
+        it never comes back for is dropped, with the attention it spent handed back. An
+        utterance still open goes live from the frame path, serialized with its close."""
         while self._held and not self._closing:
-            pcm = self._held.popleft()
+            pcm, grant = self._held.popleft()
             try:
-                await self._send_one(pcm)
+                sent = await self._send_one(pcm)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - a dead socket: the rest still go
-                self._active = False
+                sent = self._active = False
                 self._metrics.count("gate_activity_lost")
                 self._log.warning("a held utterance was lost ({})", exc)
+            if not sent:
+                # It spent nothing: the attention comes back (the sentence's too, unless one
+                # still waiting spent it), and with nothing else waiting the settle re-arms
+                # the window from it.
+                self._grant_until = max(self._grant_until, grant)
+                self._spent = self._spent and bool(self._held)
+                if self._hold_from is None and not self._held:
+                    self._window_until = math.inf
         self._hold_task = None  # done: what follows must not count this task as holding
-        if self._hold_from is not None and self._ep.in_speech and self._can_stream():
-            await self._open_live(self._hold_from)
-        elif not self._active and self._state is VoiceState.IDLE:
+        if not self._active and self._state is VoiceState.IDLE:
             self._settle_held()  # the last one was dropped: nothing else settles it
 
-    async def _send_one(self, pcm: bytes) -> None:
+    async def _send_one(self, pcm: bytes) -> bool:
         why = None
         for _ in range(_HOLD_ATTEMPTS):
             try:
@@ -654,7 +670,7 @@ class GatedUplink:
             self._log.warning(
                 "uplink could not open an activity ({}); held utterance dropped", why,
             )
-            return
+            return False
         self._active = True
         self._window_until = math.inf  # this turn owns attention until its IDLE
         self._release_duck()
@@ -670,11 +686,11 @@ class GatedUplink:
         if lost:
             if not counted:
                 self._metrics.count("gate_activity_lost")
-            return
-        self._spend_attention()
+            return False
         self._metrics.count("uplink_utterances")
         self._metrics.count("uplink_ms", ms)
         self._play_cue(self._receipt, "earcon_captured")
+        return True
 
     def _settle_held(self) -> None:
         """What a held utterance engaged, with no turn to settle it: back to the attention a
