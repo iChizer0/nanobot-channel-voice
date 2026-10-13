@@ -13,6 +13,12 @@ def frame_bytes(sample_rate: int, frame_ms: int) -> int:
     return (sample_rate * frame_ms // 1000) * 2
 
 
+# How far ahead of the wall clock the stream-mode sink writes: what the device holds while
+# the event loop is busy (an agent turn's tool, a model load), so a ring shallower than
+# this underruns at the first long callback. A barge-in kill drops it with the stream.
+STREAM_LEAD_MS = 1000
+
+
 class CaptureSource(abc.ABC):
     @abc.abstractmethod
     async def start(self) -> None: ...

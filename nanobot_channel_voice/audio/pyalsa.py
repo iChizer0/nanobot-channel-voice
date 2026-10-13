@@ -18,6 +18,7 @@ from loguru import logger
 
 from nanobot_channel_voice.aio import Throttle, put_drop_oldest
 from nanobot_channel_voice.audio.base import (
+    STREAM_LEAD_MS,
     CaptureSource,
     PlaybackSink,
     PlaybackStream,
@@ -27,9 +28,10 @@ from nanobot_channel_voice.audio.base import (
 # WAV sample width (bytes) -> ALSA format name, resolved by getattr at use time.
 _WIDTH_TO_FORMAT = {1: "PCM_FORMAT_U8", 2: "PCM_FORMAT_S16_LE", 4: "PCM_FORMAT_S32_LE"}
 
-# The sink writes this far ahead of the wall clock; a ring shallower than the
-# write-ahead underruns on any hiccup between blocks (libasound's default is 4 periods).
-_PLAYBACK_LEAD_MS = 240
+# The ring holds the sink's write-ahead (libasound's default is 4 periods: 80 ms at a
+# 20 ms period, gone at the first hiccup). Asked as "near": a device that cannot hold this
+# much gives what it can, and the sink's writes then block for the rest.
+_PLAYBACK_LEAD_MS = STREAM_LEAD_MS
 
 # Capture held while the pump stalls (a gated uplink's un-park blocks it up to 5 s), as
 # the arecord path's pipe and reader do; drop-oldest past it bounds latency.
@@ -193,6 +195,7 @@ class PyAlsaPlayback(PlaybackSink):
     def __init__(self, device: str):
         self._device = device
         self._abort = False
+        self._ring_warned = False
         self._current = None   # blob-mode PCM, owned by _play_blocking
         self._lock = threading.Lock()
         self._log = logger.bind(component="pyalsa-playback")
@@ -274,7 +277,7 @@ class PyAlsaPlayback(PlaybackSink):
         import alsaaudio
 
         periodsize = max(64, rate // 50)  # ~20 ms
-        return alsaaudio.PCM(
+        pcm = alsaaudio.PCM(
             type=alsaaudio.PCM_PLAYBACK,
             mode=alsaaudio.PCM_NORMAL,
             device=self._device,
@@ -284,6 +287,19 @@ class PyAlsaPlayback(PlaybackSink):
             periodsize=periodsize,
             periods=_playback_periods(rate, periodsize),
         )
+        if not self._ring_warned:
+            # Granted "near": a device holding less than the write-ahead has that much less
+            # cover for a busy loop, and the sink's writes block for the rest.
+            with suppress(Exception):  # info() is newer than the oldest supported binding
+                ring_ms = pcm.info()["buffer_size"] * 1000 / rate
+                if ring_ms < _PLAYBACK_LEAD_MS * 0.9:
+                    self._ring_warned = True
+                    self._log.warning(
+                        "playback device holds {:.0f} ms, under the {} ms the sink writes ahead; "
+                        "a busy moment on the gateway runs it dry that much sooner", ring_ms,
+                        _PLAYBACK_LEAD_MS,
+                    )
+        return pcm
 
     # ---- lifecycle ----------------------------------------------------------
 

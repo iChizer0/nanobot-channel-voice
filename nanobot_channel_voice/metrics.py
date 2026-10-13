@@ -282,6 +282,8 @@ class VoiceMetrics:
                 parts.append(f"{key.removeprefix('tool_')}={c[key]}")
         for key in sorted(k for k in c if k.startswith("tool_dropped.")):
             parts.append(f"{key.removeprefix('tool_')}={c[key]}")
+        if c.get("playback_stall_ms"):
+            parts.append(f"playback_stall_ms={c['playback_stall_ms']}")
         for key in ("ttfa_ms", "think_ms"):
             s = self._latency.get(key)
             if s is not None and len(s):

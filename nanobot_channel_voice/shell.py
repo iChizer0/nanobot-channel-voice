@@ -211,6 +211,9 @@ class VoiceShell:
                 self._log.warning("shell teardown step {} failed: {}",
                                   getattr(step, "__qualname__", step), exc)
         # The session's only readout, where the sample set is final.
+        stalled = getattr(self._sink, "dry_stall_ms", 0.0)
+        if isinstance(stalled, (int, float)) and stalled > 0:
+            self._metrics.count("playback_stall_ms", int(stalled))
         if self._metrics.has_data:
             self._log.info("voice session metrics: {}", self._metrics.summary_line())
 

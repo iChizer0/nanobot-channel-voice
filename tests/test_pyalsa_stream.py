@@ -179,7 +179,7 @@ def _stub_alsaaudio():
 
 def test_playback_ring_covers_the_sinks_write_ahead():
     """libasound defaults to 4 periods: at a ~20 ms period that is an 80 ms ring, a
-    third of the write-ahead the sink paces to, so any hiccup between blocks underruns."""
+    twelfth of the write-ahead the sink paces to, so any hiccup between blocks underruns."""
     from nanobot_channel_voice.audio.pyalsa import _PLAYBACK_LEAD_MS, PyAlsaPlayback
 
     async def _case():
@@ -189,7 +189,7 @@ def test_playback_ring_covers_the_sinks_write_ahead():
 
     opened = asyncio.run(_case())
     assert opened["periodsize"] == 480  # 20 ms
-    assert opened["periods"] == 12
+    assert opened["periods"] == 50  # 1000 ms of 20 ms periods
     assert opened["periodsize"] * opened["periods"] / 24000 * 1000 >= _PLAYBACK_LEAD_MS
 
 

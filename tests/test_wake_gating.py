@@ -2745,8 +2745,9 @@ def test_a_named_command_after_a_hush_carries_one_note():
 
 
 def test_earcons_go_out_whole_while_spoken_clips_stay_paced():
-    """A cue gains nothing from the write-ahead pacing and starts late by it (aplay waits
-    for a full buffer or EOF); an ack or a reply is speech the duck must still reach."""
+    """A cue is written whole, since pacing could only hold its start back (aplay plays
+    nothing until its buffer fills or EOF); an ack or a reply is speech the duck must still
+    reach."""
 
     async def _case():
         async with EvalConversation(

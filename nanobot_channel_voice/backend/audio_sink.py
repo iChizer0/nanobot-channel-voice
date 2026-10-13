@@ -19,7 +19,8 @@ from typing import Literal
 
 from loguru import logger
 
-from nanobot_channel_voice.audio.base import PlaybackSink, PlaybackStream
+from nanobot_channel_voice.aio import Throttle
+from nanobot_channel_voice.audio.base import STREAM_LEAD_MS, PlaybackSink, PlaybackStream
 from nanobot_channel_voice.audio.pcm import pcm_ms, pcm_to_wav_bytes, wav_duration_ms
 
 from .base import OutputAudio
@@ -28,12 +29,17 @@ from .base import OutputAudio
 # slow so the level doesn't pump on VAD flicker.
 _DUCK_ATTACK_MS = 30.0
 _DUCK_RELEASE_MS = 250.0
-# Write-ahead of the wall clock: bounds both gain-change latency and barge-in discard.
-_STREAM_LEAD_MS = 240.0
+# Write-ahead of the wall clock: the device's cushion against a busy event loop, which
+# the writer shares with the agent's turn. A barge-in flush kills the stream, device
+# buffer included, so this costs no discard latency.
+_STREAM_LEAD_MS = float(STREAM_LEAD_MS)
 # Tighter lead when a duck floor (or pause) is configured: the lead IS the duck's
 # audible latency (written audio keeps its baked gain); trades underrun headroom for
 # reaction time.
 _DUCK_STREAM_LEAD_MS = 120.0
+# The device played silence with audio already in hand: the writer was held off its clock
+# (a busy loop). Counted whole; warned about once it adds up to this on one stream.
+_DRY_WARN_MS = 200.0
 _GAIN_BLOCK_MS = 20  # envelope granularity (one gain step per block)
 # A ~⅓ s cue is audibly late behind an open this slow; below it, nobody notices.
 _SLOW_OPEN_MS = 80.0
@@ -138,7 +144,9 @@ class AudioSink:
     def __init__(self, sink: PlaybackSink, *, mode: Literal["blob", "stream"] = "blob"):
         self._sink = sink
         self._mode = mode
-        self._queue: asyncio.Queue[OutputAudio] = asyncio.Queue()
+        # Each item with when it was queued: a dry spell is the writer's only if the audio
+        # was already waiting when the device ran out.
+        self._queue: asyncio.Queue[tuple[OutputAudio, float]] = asyncio.Queue()
         self._epoch = 0
         self._worker: asyncio.Task | None = None
         self._idle = asyncio.Event()
@@ -156,6 +164,11 @@ class AudioSink:
         self._inflight_b = 0  # bytes of the item being written that are already written
         self._dropped_ms = 0.0  # audio the overflow guard discarded this session
         self._overflow_warned = False
+        # Silence the device played while audio waited: the session's total, and the run
+        # on this stream since the last warning.
+        self._dry_stall_ms = 0.0
+        self._dry_run_ms = 0.0
+        self._dry_throttle = Throttle()
         # Set whenever _queued_ms shrinks (item played, flush): wakes wait_backlog_below.
         self._space = asyncio.Event()
         self._space.set()
@@ -413,14 +426,14 @@ class AudioSink:
         if audio.epoch == self._epoch:
             # Credit only at the live epoch: a flush zeroes the counter (see _run).
             self._queued_ms += self._item_ms(audio)
-        self._queue.put_nowait(audio)
+        self._queue.put_nowait((audio, time.monotonic()))
 
     def _drop_overflow(self) -> None:
         """Bound the queue for producers that never park (see pace_output_audio): past the
         cap the OLDEST queued item goes, trading one skip for unbounded growth."""
         dropped = 0.0
         while self._queued_ms > UNPACED_BACKLOG_MS and not self._queue.empty():
-            item = self._queue.get_nowait()
+            item, _ = self._queue.get_nowait()
             self._queue.task_done()
             if item.epoch == self._epoch:
                 item_ms = self._item_ms(item)
@@ -442,6 +455,22 @@ class AudioSink:
     def dropped_ms(self) -> float:
         """Audio the overflow guard discarded, cumulative."""
         return self._dropped_ms
+
+    @property
+    def dry_stall_ms(self) -> float:
+        """Silence played while audio was waiting: the writer was held off its clock."""
+        return self._dry_stall_ms
+
+    def _note_dry(self, dry_ms: float) -> None:
+        self._dry_stall_ms += dry_ms
+        self._dry_run_ms += dry_ms
+        if self._dry_run_ms >= _DRY_WARN_MS and self._dry_throttle.ready():
+            self._log.warning(
+                "playback ran dry for {:.0f} ms with audio waiting ({:.0f} ms this session): "
+                "the event loop was busy too long to feed the device (an agent turn's tool, "
+                "a model load)", self._dry_run_ms, self._dry_stall_ms,
+            )
+            self._dry_run_ms = 0.0
 
     async def wait_backlog_below(self, cap_ms: float = MAX_BACKLOG_MS) -> None:
         """Producer-side backpressure: block until the queued backlog is under
@@ -551,14 +580,16 @@ class AudioSink:
 
     async def _run(self) -> None:
         while True:
-            item = await self._queue.get()
+            item, queued_at = await self._queue.get()
             try:
                 if item.epoch != self._epoch:  # pre-play guard on the CARRIED epoch
                     continue
                 if item.wav is not None:
                     await self._sink.play_wav(item.wav)
                 elif item.pcm is not None:
-                    await self._stream_write(item.pcm, item.rate, item.epoch, paced=item.paced)
+                    await self._stream_write(
+                        item.pcm, item.rate, item.epoch, paced=item.paced, queued_at=queued_at,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - never let one item kill the worker
@@ -585,8 +616,11 @@ class AudioSink:
         return max(2, int(rate * ms / 1000.0) * 2)
 
     async def _stream_write(
-        self, pcm: bytes, rate: int, epoch: int, *, paced: bool = True
+        self, pcm: bytes, rate: int, epoch: int, *, paced: bool = True,
+        queued_at: float | None = None,
     ) -> None:
+        if queued_at is None:
+            queued_at = time.monotonic()  # not queued ahead: a dry spell now is not ours
         stream = self._stream
         if stream is not None and (stream is self._draining or stream in self._parked):
             # EOF'd (or parked in a reaper): no more writes. Open fresh; flush kills both.
@@ -630,6 +664,7 @@ class AudioSink:
                 # that predates the stream and pushes its clock past now.
                 self._paused_at = self._stream_open_t
             self._bytes = 0
+            self._dry_run_ms = 0.0
             self._gain = self._gain_target  # a fresh stream never inherits a mid-ramp duck
             self._generation += 1  # played_ms() restarts: tell span consumers
         # Blocks paced to _lead_ms() ahead of the wall clock, envelope per block: pacing is
@@ -642,11 +677,17 @@ class AudioSink:
                 # Stall between blocks; pause(False) or flush() re-opens the gate, so
                 # this cannot wedge.
                 await self._pause_gate.wait()
+                if epoch != self._epoch or self._stream is not stream:
+                    return  # a flush opened it: the stream is dead, its clock unspliced
             now = time.monotonic()
             lead_s = self._bytes / (2 * rate) - (now - self._stream_open_t)
             if lead_s < 0.0:
                 # Starved: re-anchor to the RESUMED playback, else pacing buffers
-                # gap+lead ahead (late duck) and AEC stamps run early.
+                # gap+lead ahead (late duck) and AEC stamps run early. Ours when this piece
+                # was in hand, or queued before the device ran out (nothing written yet:
+                # the device has no clock to be late against).
+                if self._bytes and (off > 0 or now - queued_at > -lead_s):
+                    self._note_dry(-lead_s * 1000.0)
                 self._stream_open_t = now - self._bytes / (2 * rate)
                 lead_s = 0.0
             # Re-chosen per block: a tap or duck floor registered mid-piece must tighten

@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from contextlib import suppress
 
+from nanobot_channel_voice.audio.base import PlaybackStream
 from nanobot_channel_voice.audio.null import NullPlayback
 from nanobot_channel_voice.audio.pcm import pcm_to_wav_bytes
 from nanobot_channel_voice.backend.audio_sink import AudioSink
@@ -57,6 +59,34 @@ class _FlagVad(Vad):
 _VOICED = b"\x00\x40"
 
 
+class _PlayoutStream(PlaybackStream):
+    """A device: what is written plays out in real time, and drain() waits for it."""
+
+    def __init__(self, rate: int):
+        self._rate = rate
+        self._opened = time.monotonic()
+        self._bytes = 0
+        self._killed = asyncio.Event()
+
+    async def write(self, pcm: bytes) -> None:
+        self._bytes += len(pcm)
+        await asyncio.sleep(0)
+
+    async def drain(self) -> None:
+        left = self._bytes / (2 * self._rate) - (time.monotonic() - self._opened)
+        if left > 0:
+            with suppress(asyncio.TimeoutError, TimeoutError):
+                await asyncio.wait_for(self._killed.wait(), timeout=left)
+
+    async def kill(self) -> None:
+        self._killed.set()
+
+
+class _PlayoutPlayback(NullPlayback):
+    async def open_stream(self, rate: int) -> PlaybackStream:
+        return _PlayoutStream(rate)
+
+
 class _ScriptTts(TtsAdapter):
     """Audio whose duration tracks the text, so played_ms maps into words."""
 
@@ -86,7 +116,7 @@ class EvalConversation:
             **cfg_over,
         })
         self.vad = _FlagVad()
-        self.sink = AudioSink(NullPlayback(), mode="stream")
+        self.sink = AudioSink(_PlayoutPlayback(), mode="stream")
         self.published: list[tuple[str, str, tuple[str, ...]]] = []
         self.interrupts = 0
         self.states: list[VoiceState] = []

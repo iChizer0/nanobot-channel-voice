@@ -1232,7 +1232,7 @@ def test_cues_go_out_unpaced():
         await gate.start(instructions=None, tools=[], on_event=on_event)
         await feed(gate, 14)
         assert inner.calls[-1] == ("end", True)
-        assert gate._sink._queue.get_nowait().paced is False  # the receipt, written whole
+        assert gate._sink._queue.get_nowait()[0].paced is False  # the receipt, written whole
         await gate.close()
 
     asyncio.run(_run())

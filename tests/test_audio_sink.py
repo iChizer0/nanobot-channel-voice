@@ -121,14 +121,103 @@ def test_an_unpaced_cue_is_written_whole_at_once():
         await sink.start()
         try:
             t0 = asyncio.get_running_loop().time()
-            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(400), rate=RATE, paced=paced))
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(1200), rate=RATE, paced=paced))
             await asyncio.wait_for(sink.wait_idle(), 5.0)
             return asyncio.get_running_loop().time() - t0
         finally:
             await sink.stop()
 
-    assert asyncio.run(written_after(paced=True)) > 0.12  # 400 ms past a 240 ms lead
+    assert asyncio.run(written_after(paced=True)) > 0.12  # 1200 ms past a 1000 ms lead
     assert asyncio.run(written_after(paced=False)) < 0.08
+
+
+# ---- dry spells --------------------------------------------------------------
+
+def test_a_writer_held_off_its_clock_counts_a_stall():
+    """A callback blocking the loop between two blocks: the device ran dry with the rest of
+    the piece in hand, so the silence is the writer's (a busy loop), not the source's."""
+    import time
+
+    async def scenario():
+        sink = AudioSink(_RecordingSink(on_write=lambda: time.sleep(0.5)), mode="stream")
+        await sink.start()
+        try:
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(1200), rate=RATE))
+            await asyncio.wait_for(sink.wait_idle(), 5.0)
+            return sink.dry_stall_ms
+        finally:
+            await sink.stop()
+
+    stall = asyncio.run(scenario())
+    assert 200 <= stall <= 400  # 500 ms blocked, a quarter-lead block already at the device
+
+
+def test_audio_that_arrives_after_the_device_ran_dry_is_not_a_stall():
+    """Nothing was queued when the device ran out: the source was late, or the gap was
+    meant (a hold on an open stream). Not the writer's, so not counted."""
+    async def scenario():
+        sink = AudioSink(_RecordingSink(), mode="stream")
+        await sink.start()
+        try:
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(100), rate=RATE))
+            await asyncio.wait_for(sink.wait_idle(), 5.0)
+            await asyncio.sleep(0.4)  # played out 300 ms ago
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(100), rate=RATE))
+            await asyncio.wait_for(sink.wait_idle(), 5.0)
+            return sink.dry_stall_ms
+        finally:
+            await sink.stop()
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_a_flush_waking_a_paused_writer_counts_no_stall():
+    """Pause mode: the writer parks on the gate, the verdict kills the stream, and the
+    flush opens the gate on a dead stream whose clock covers the pause."""
+    async def scenario():
+        sink = AudioSink(_RecordingSink(), mode="stream")
+        sink.configure_pause(True)
+        await sink.start()
+        try:
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(3000), rate=RATE))
+            await asyncio.sleep(0.2)
+            sink.pause(True)
+            await asyncio.sleep(0.5)  # the verdict takes this long
+            await sink.flush()
+            await asyncio.sleep(0.05)
+            return sink.dry_stall_ms
+        finally:
+            await sink.stop()
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_a_writer_that_cannot_keep_the_lead_counts_what_adds_up():
+    """Shaped playback writes 20 ms blocks; a write that costs more than a block drains the
+    lead and then runs a few ms dry per block. Each is below anything a floor would keep,
+    together they are the stutter, so every one counts."""
+    class _SlowStream(_RecordingStream):
+        async def write(self, pcm: bytes) -> None:
+            await super().write(pcm)
+            await asyncio.sleep(0.025)  # an executor hop on a loaded box
+
+    class _SlowSink(_RecordingSink):
+        async def open_stream(self, rate: int):
+            self.stream = _SlowStream()
+            return self.stream
+
+    async def scenario():
+        sink = AudioSink(_SlowSink(), mode="stream")
+        sink.configure_duck(0.25)
+        await sink.start()
+        try:
+            sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=_pcm(1200), rate=RATE))
+            await asyncio.wait_for(sink.wait_idle(), 10.0)
+            return sink.dry_stall_ms
+        finally:
+            await sink.stop()
+
+    assert asyncio.run(scenario()) > 100
 
 
 # ---- backlog ceiling ---------------------------------------------------------
@@ -147,7 +236,7 @@ def test_enqueue_drops_the_oldest_once_the_backlog_passes_the_cap():
     assert sink.dropped_ms >= UNPACED_BACKLOG_MS / 3
     assert sink.backlog_ms() <= UNPACED_BACKLOG_MS + item_ms
     # Survivors are the NEWEST run, in order: the tail of the reply, not its head.
-    kept = [sink._queue.get_nowait() for _ in range(sink._queue.qsize())]
+    kept = [sink._queue.get_nowait()[0] for _ in range(sink._queue.qsize())]
     assert [len(a.pcm) for a in kept] == sorted(len(a.pcm) for a in kept)
     assert len(kept[0].pcm) > len(_pcm(item_ms))  # item 0 was dropped
 

@@ -294,6 +294,7 @@ def test_truncate_base_restarts_with_a_fresh_stream():
         sink.enqueue(OutputAudio(epoch=sink.epoch, pcm=b"\x00" * 48000, rate=24000))
         await sink.wait_idle()
         assert playback.opened == 2
+        await asyncio.sleep(0.05)  # 50 ms of turn 2 heard before the cut
 
         await backend.barge_in(await sink.flush())
         truncates = [p for p in sent if p["type"] == "conversation.item.truncate"]
@@ -495,6 +496,7 @@ def _played_out_then_onset(
             playback.streams[0].done.set()
             await asyncio.sleep(0.01)
             assert not sink.stream_open
+        await asyncio.sleep(0.05)  # a stream still playing has been heard this long
         await backend._handle_event({"type": "input_audio_buffer.speech_started"})
         await backend.close()
         await sink.stop()
