@@ -289,8 +289,8 @@ class ManualTurnBackend(Protocol):
 
     async def push_utterance(self, pcm: bytes) -> bool:
         """An utterance the gate held until the session was back: send it whole, in order
-        and without loss, between its ``begin_activity`` and ``end_activity``. False when
-        the session fell away and nothing of it went up."""
+        and without loss, between its ``begin_activity`` and ``end_activity``. False (or an
+        error from the socket) when the session fell away: nothing of it counts as sent."""
         return False
 
     async def park(self) -> None:

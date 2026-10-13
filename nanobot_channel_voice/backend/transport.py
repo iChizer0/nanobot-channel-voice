@@ -73,6 +73,13 @@ def _load_connect():
     return connect
 
 
+def _closed(exc: BaseException) -> bool:
+    """websockets' error for a send on a socket that closed (lazy: the realtime extra)."""
+    from websockets.exceptions import ConnectionClosed
+
+    return isinstance(exc, ConnectionClosed)
+
+
 class _SetupError(RuntimeError):
     """Our own connect could not be prepared (a key, a URL, a tool schema): config, not
     network — never walked up the reconnect ladder."""
@@ -656,10 +663,9 @@ class RealtimeTransport(TurnEventMixin):
                 self._send_q.task_done()
 
     async def _send(self, obj: dict) -> None:
-        """One control frame, waited on for at most _SEND_TIMEOUT_S. websockets hands the
-        whole frame to the transport synchronously before its only await (drain), so a
-        timeout means "committed, uplink congested", never "lost": callers' bookkeeping
-        runs. No lock: frames are written whole, so concurrent sends cannot interleave."""
+        """One frame, waited on for at most _SEND_TIMEOUT_S (past it, left to a congested
+        uplink: callers' bookkeeping runs). A closed socket raises and marks the session
+        gone at once. No lock: websockets writes a frame whole, so sends cannot interleave."""
         ws = self._ws
         if ws is None:
             return
@@ -667,8 +673,10 @@ class RealtimeTransport(TurnEventMixin):
             await asyncio.wait_for(ws.send(json.dumps(obj)), _SEND_TIMEOUT_S)
         except TimeoutError:
             self._warn_backpressure()
-        except Exception as exc:  # noqa: BLE001 - a closed socket: the rx loop reconnects
-            self._log.debug("control frame lost ({}): {}", self._event_name(obj), exc)
+        except Exception as exc:
+            if self._ws is ws and _closed(exc):
+                self._ready.clear()  # the next begin waits for the reconnect, not on this socket
+            raise
 
     def _warn_backpressure(self) -> None:
         if not self._warn_throttle.ready():

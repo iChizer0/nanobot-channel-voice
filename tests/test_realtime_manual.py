@@ -1258,21 +1258,106 @@ def test_push_utterance_reports_a_session_gone():
     run(_run())
 
 
-def test_a_control_frame_on_a_dead_socket_is_dropped_not_raised():
-    """websockets raises on send once the socket closed; the rx loop reconnects, and a
-    caller's bookkeeping (a held upload's worker) must not die on it."""
+class _DeadWs:
+    """websockets once the socket died, before the rx loop noticed: every send raises."""
 
-    class DeadWs:
-        async def send(self, raw):
-            raise ConnectionError("no close frame received or sent")
+    def __init__(self):
+        self.attempts = 0
+
+    async def send(self, raw):
+        from websockets.exceptions import ConnectionClosedError
+
+        self.attempts += 1
+        raise ConnectionClosedError(None, None)
+
+    async def close(self):
+        pass
+
+
+def test_a_held_upload_on_a_dead_socket_fails_and_the_session_is_gone_at_once():
+    """The rx loop notices a dead socket a moment after a send does: the upload must not
+    pass for sent meanwhile, and what is begun next waits for the reconnect."""
+    from websockets.exceptions import ConnectionClosed
 
     async def _run():
         backend = rt.RealtimeBackend(
             _manual_config(), sink=AudioSink(NullPlayback(), mode="stream"),
             profile=PROFILES["openai"],
         )
-        backend._ws = DeadWs()
-        await backend._send({"type": "input_audio_buffer.commit"})  # no raise
+        backend._ws = _DeadWs()
+        backend._ready.set()
+        with pytest.raises(ConnectionClosed):
+            await backend.push_utterance(b"\x00" * 100)
+        assert backend.ready is False
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_send_on_a_replaced_socket_leaves_the_new_session_alone():
+    """A send that began on the old socket fails after a reconnect swapped it: the new
+    session stays ready."""
+    from websockets.exceptions import ConnectionClosed
+
+    class SwappedWs(_DeadWs):
+        async def send(self, raw):
+            backend._ws = object()  # the reconnect landed during the send
+            await super().send(raw)
+
+    backend = rt.RealtimeBackend(
+        _manual_config(), sink=AudioSink(NullPlayback(), mode="stream"),
+        profile=PROFILES["openai"],
+    )
+
+    async def _run():
+        backend._ws = SwappedWs()
+        backend._ready.set()
+        with pytest.raises(ConnectionClosed):
+            await backend._send({"type": "input_audio_buffer.commit"})
+        assert backend.ready is True
+        backend._ws = None
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_frame_that_will_not_serialize_leaves_the_session_up():
+    """Only websockets' closed-socket error means the session is gone: any other failure
+    raises without making a healthy session wait for a reconnect that never comes."""
+
+    class Ws:
+        async def send(self, raw):
+            pass
+
+    async def _run():
+        backend = rt.RealtimeBackend(
+            _manual_config(), sink=AudioSink(NullPlayback(), mode="stream"),
+            profile=PROFILES["openai"],
+        )
+        backend._ws = Ws()
+        backend._ready.set()
+        with pytest.raises(TypeError):
+            await backend._send({"type": "x", "payload": object()})
+        assert backend.ready is True
+        backend._ws = None
+        await backend.close()
+
+    run(_run())
+
+
+def test_a_notice_that_cannot_go_out_waits_for_the_next_session():
+    async def _run():
+        backend = rt.RealtimeBackend(
+            _manual_config(), sink=AudioSink(NullPlayback(), mode="stream"),
+            profile=PROFILES["openai"],
+        )
+        ws = backend._ws = _DeadWs()
+        backend._ready.set()
+        await backend.announce("Dinner is ready.")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert ws.attempts == 1 and list(backend._notices) == ["Dinner is ready."]
+        assert "notice_voiced" not in backend.metrics.snapshot()["counters"]
         await backend.close()
 
     run(_run())
