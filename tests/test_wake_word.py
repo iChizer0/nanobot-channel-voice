@@ -826,3 +826,31 @@ def test_the_shipped_wake_defaults_are_patient():
 
     cfg = OpenWakeWordConfig()
     assert cfg.threshold == 0.6 and cfg.patience == 2
+    assert cfg.tail_ms == 480  # the phrase's own speech past the decision: <= ~400 ms
+
+
+def test_a_hit_under_patience_keeps_the_phrase_end_at_the_runs_first_chunk(fakes):
+    """The decision lands ``patience`` chunks into the run; the phrase end stays where its
+    first chunk ended, so patience does not move the cut 80 ms later with the decision."""
+    det = _detector(threshold=0.5, patience=2)
+    fakes["head.onnx"].probs = [0.9, 0.9]
+    assert det.push(_CHUNK) is False
+    assert det.push(_CHUNK + b"\x01\x00" * 400) is True
+    assert det.last_hit_back_bytes == 2 * (400 + 1280)
+
+
+def test_a_reset_forgets_the_run(fakes):
+    """A capture gap mid-run: what came before it is not the phrase's first half."""
+    det = _detector(threshold=0.5, patience=2)
+    fakes["head.onnx"].probs = [0.9, 0.9]
+    assert det.push(_CHUNK) is False
+    det.reset()
+    assert det.push(_CHUNK) is False
+
+
+def test_the_configured_patience_reaches_the_detector(fakes):
+    cfg = _wake_cfg(openwakeword={
+        "melPath": "mel.onnx", "embeddingPath": "emb.onnx", "modelPath": "head.onnx",
+        "patience": 3,
+    })
+    assert make_wake_detector(cfg, 16000, 20)._patience == 3

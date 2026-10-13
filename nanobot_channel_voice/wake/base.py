@@ -14,9 +14,9 @@ class WakeDetector:
     # Most recent classifier score (0..1); None before the first decision.
     last_score: float | None = None
 
-    # After push() returns True: bytes between the hit's decision point and the end of
-    # the frame just pushed; the backend subtracts it from its stream position to locate
-    # the phrase END. 0 = hit at the frame boundary.
+    # After push() returns True: bytes between where the detector places the phrase END
+    # (a run of decisions: its first) and the end of the frame just pushed; the backend
+    # subtracts it from its stream position. 0 = at the frame boundary.
     last_hit_back_bytes: int = 0
 
     def push(self, frame: bytes) -> bool:

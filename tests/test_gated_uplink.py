@@ -266,7 +266,7 @@ def test_wake_mode_uploads_nothing_until_the_phrase():
 
 
 def test_same_breath_command_uploads_from_the_phrase_end():
-    """Speech outlasting the phrase's own tail (600 ms past the hit) is the command: adopted
+    """Speech outlasting the phrase's own tail (tailMs past the hit) is the command: adopted
     from the phrase end once it is, and no cue talks over the user."""
     async def _run():
         # Speech from frame 0; the hit lands on frame 4 with the phrase ending one
@@ -280,7 +280,7 @@ def test_same_breath_command_uploads_from_the_phrase_end():
         frames = await feed(gate, 43)
         assert inner.calls[0] == ("begin",)
         first = inner.calls[1][1]
-        assert first == b"".join(frames[4:35])  # adopted 600 ms past the phrase end
+        assert first == b"".join(frames[4:5 + TAIL_FRAMES])  # adopted tailMs past the end
         assert inner.pushed() == b"".join(frames[4:42])  # then frame by frame to the close
         assert inner.calls[-1] == ("end", True)
         counters = gate._metrics.snapshot()["counters"]
@@ -2051,9 +2051,9 @@ def test_a_held_same_breath_command_goes_up_from_the_phrase_end():
 
 
 def test_speech_inside_the_phrase_tail_allowance_is_still_the_phrase():
-    """openWakeWord fires before the last syllable ends (up to ~480 ms measured): speech
-    that long past the hit is the phrase's own tail. The summon stays bare: cued, and
-    nothing goes up."""
+    """openWakeWord decides before the last syllable ends (up to ~400 ms measured at the
+    default patience): speech that long past the hit is the phrase's own tail. The summon
+    stays bare: cued, and nothing goes up."""
     async def _run():
         tail = TAIL_FRAMES - 1  # just inside the allowance
         vad = ScriptVad([True] * 5 + [True] * tail + [False] * 20)
@@ -2434,6 +2434,26 @@ def test_the_backlog_keeps_the_newest_held_utterances():
 
     asyncio.run(_run())
 
+
+@pytest.mark.parametrize("past_ms, adopted", [(600, False), (800, True)])
+def test_the_tail_allowance_never_drops_under_min_utterance(past_ms, adopted):
+    """A tailMs under vad.minUtteranceMs is floored at it: speech past the hit is a command
+    only once it would make an utterance."""
+    async def _run():
+        past = past_ms // FRAME_MS
+        vad = ScriptVad([True] * 5 + [True] * past + [False] * 20)
+        gate, inner, _, on_event = build(
+            "wake", vad=vad, detector=ScriptWake({5}), vad_cfg={"min_utterance_ms": 800},
+            wake={"mode": "gate", "phrases": ["hey nanobot"], "windowS": 15,
+                  "openwakeword": {"tailMs": 200}},
+        )
+        await gate.start(instructions=None, tools=[], on_event=on_event)
+        await feed(gate, 5 + past + 20)
+        assert ("begin" in inner.kinds()) is adopted
+        assert ("earcon_listening" in gate._metrics.snapshot()["counters"]) is not adopted
+        await gate.close()
+
+    asyncio.run(_run())
 
 
 def test_an_open_held_utterance_closing_as_the_queue_ahead_empties_still_goes_up():

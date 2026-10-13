@@ -515,6 +515,7 @@ def _dump_session_header(config: VoiceConfig, frame_ms: int) -> dict:
         }
         if config.wake.engine == "openwakeword":
             header["wake"]["threshold"] = config.wake.openwakeword.threshold
+            header["wake"]["patience"] = config.wake.openwakeword.patience
     with suppress(Exception):  # uninstalled source tree: only the version is lost
         header["version"] = _dist_version("nanobot-channel-voice")
     return header

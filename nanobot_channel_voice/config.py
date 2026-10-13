@@ -950,14 +950,16 @@ class OpenWakeWordConfig(OnDeviceRuntime):
     # scores as high as the phrase itself: the head and the phrase decide those, not this.
     threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     # Consecutive 80 ms decisions at/above the threshold before a hit: a lone spike is noise,
-    # the phrase holds the score for 5-10.
+    # the phrase mostly holds the score for 5-10. A fast or faint phrase that clears it once
+    # is missed (1 keeps those), and the hit lands 80 ms later per extra decision.
     patience: int = Field(default=2, ge=1)
     # Minimum spacing between hits: the phrase echoing in a hard room must not double-fire.
     refractory_s: float = Field(default=2.0, ge=0.0)
     # Cloud wake gate: speech this long past a hit (never under vad.minUtteranceMs) is still
-    # the phrase's own tail, since the head fires inside the phrase, the shipped heads up to
-    # 480 ms before its last syllable ends; speech outlasting it is a same-breath command.
-    tail_ms: int = Field(default=600, ge=0)
+    # the phrase's own tail, since the head decides inside the phrase, the reference head up
+    # to ~400 ms before its last syllable ends at the default patience; speech outlasting it
+    # is a same-breath command.
+    tail_ms: int = Field(default=480, ge=0)
 
 
 class EarconsConfig(_VoiceBase):
