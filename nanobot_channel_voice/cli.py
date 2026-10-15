@@ -1,13 +1,16 @@
-"""``nanobot-voice``: manage on-device model weights, export the effective config.
+"""``nanobot-voice``: manage on-device model weights, export the effective config, score
+recordings with the wake word.
 
 Thin argparse front-end over :mod:`.weights`. ``config`` is the export counterpart of
 the WebUI "Import Json" box: the effective ``channels.voice`` section as canonical JSON.
+``wake-eval`` runs the configured acoustic wake detector over WAV files, as the channel runs it.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -251,6 +254,114 @@ def _fmt_mb(n: int) -> str:
     return f"{n / 1e6:,.1f} MB"
 
 
+_EVAL_CHUNK_B = 2560  # 80 ms at 16 kHz: one openWakeWord decision per push
+
+
+def _wake_detector(args: argparse.Namespace) -> tuple[Any, Any, str | None]:
+    """The configured acoustic wake detector, built as the channel builds it, with the
+    threshold/patience flags in place of the config's; the block it runs on; and a note
+    when this config would run no detector at all."""
+    from pydantic import ValidationError
+
+    from nanobot_channel_voice.backend.profiles import backend_kind
+    from nanobot_channel_voice.config import VoiceConfig
+    from nanobot_channel_voice.engines import describe_build_error, missing_fields
+    from nanobot_channel_voice.sync import voice_section
+    from nanobot_channel_voice.wake import ENGINES
+    from nanobot_channel_voice.wake.openwakeword import OpenWakeWord
+
+    if args.threshold is not None and not 0.0 <= args.threshold <= 1.0:
+        raise w.WeightsError("--threshold is a score: 0 to 1")
+    if args.patience is not None and args.patience < 1:
+        raise w.WeightsError("--patience is a count of decisions in a row: 1 or more")
+    try:
+        cfg = VoiceConfig.model_validate(voice_section(_config_path(args)))
+    except ValidationError as exc:
+        raise w.WeightsError(f"channels.voice does not validate: {exc}") from None
+    wake = cfg.wake
+    if wake.engine != "openwakeword":
+        raise w.WeightsError("wake.engine is not 'openwakeword': no acoustic wake word to evaluate")
+    if args.models_dir:  # the store the weights resolve from, as the channel resolves it
+        os.environ["NANOBOT_VOICE_MODELS_DIR"] = str(Path(args.models_dir).expanduser())
+    wake = w.apply_weights(wake, "openwakeword")
+    missing = missing_fields(wake, ENGINES["openwakeword"])
+    if missing:
+        raise w.WeightsError(
+            "wake." + ", wake.".join(missing) + " unset: name the wake package "
+            "(wake.openwakeword.weights) and fetch it (nanobot-voice sync)"
+        )
+    flags = (("threshold", args.threshold), ("patience", args.patience))
+    update = {k: v for k, v in flags if v is not None}
+    oww = wake.openwakeword.model_copy(update=update) if update else wake.openwakeword
+    local = backend_kind(cfg.backend) == "local"
+    idle = (
+        "wake.mode is off" if wake.mode == "off"
+        else f"realtime.uplink is {cfg.realtime.uplink}" if not local and cfg.realtime.uplink != "wake"
+        else None
+    )
+    note = f"this config runs no acoustic wake word ({idle}); scored anyway" if idle else None
+    # The local pipeline runs the detector at the capture rate; a cloud gate captures at 16 kHz.
+    rate = cfg.audio.sample_rate if local else 16000
+    try:
+        return OpenWakeWord.from_config(oww, rate), oww, note
+    except Exception as exc:  # noqa: BLE001 - deps / models, said as the channel says them
+        raise w.WeightsError(f"wake detector unavailable: {describe_build_error(exc)}") from None
+
+
+def _wav_pcm16k(name: str) -> bytes:
+    """A recording's samples as S16LE mono at 16 kHz: a 16-bit WAV at any rate, stereo
+    downmixed. Read whole first, so a header's placeholder size cannot ask for more."""
+    from nanobot_channel_voice.audio.pcm import resample_pcm, wav_pcm
+
+    try:
+        pcm, rate = wav_pcm(Path(name).read_bytes())
+    except OSError as exc:
+        raise w.WeightsError(f"cannot read {name}: {exc}") from None
+    if not rate:
+        raise w.WeightsError(f"{name}: not a 16-bit PCM WAV")
+    return pcm if rate == 16000 else resample_pcm(pcm, rate, 16000)
+
+
+def _wake_eval(args: argparse.Namespace) -> int:
+    """Score recordings chunk by chunk through the configured detector: the peak, the
+    longest run at the threshold and the hits, as the channel would have seen them."""
+    pcms = [(name, _wav_pcm16k(name)) for name in args.wav]  # before the models load
+    det, oww, note = _wake_detector(args)
+    if note:
+        print(f"note: {note}", file=sys.stderr)
+    try:
+        for name, pcm in pcms:
+            chunks = len(pcm) // _EVAL_CHUNK_B
+            if not chunks:
+                print(f"{name}: shorter than one 80 ms chunk")
+                continue
+            det.reset()
+            hits: list[float] = []
+            best, best_at = -1.0, 0.0
+            for i in range(chunks):
+                end = (i + 1) * 0.08  # the chunk's end, on the recording's clock
+                det.last_score = None  # a chunk whose scoring failed prints as nan, not stale
+                hit = det.push(pcm[i * _EVAL_CHUNK_B:(i + 1) * _EVAL_CHUNK_B], now=end)
+                score = det.last_score if det.last_score is not None else float("nan")
+                if math.isfinite(score) and score > best:
+                    best, best_at = score, end
+                if hit:  # the phrase's end as the channel places it, not the deciding chunk's
+                    hits.append(end - det.last_hit_back_bytes / (2 * 16000))
+                if args.all:
+                    print(f"  {end:6.2f} s  {score:.3f}{'  HIT' if hit else ''}")
+            peak, run = det.take_stats()
+            print(
+                f"{name}: {chunks} chunks, peak {peak:.2f}"
+                + (f" at {best_at:.2f} s" if peak > 0.0 else "")
+                + f", longest run {run} at/above {oww.threshold:.2f}, {len(hits)} hit(s)"
+                + (", phrase end at " + ", ".join(f"{t:.2f} s" for t in hits) if hits else "")
+                + f" (patience {oww.patience})"
+            )
+    finally:
+        det.release()
+    return 0
+
+
 def _list(args: argparse.Namespace, index: dict[str, Any], root: Path) -> int:
     have = w.installed(root)
     keys = sorted({k for k, e in index.items() if not e.get("deprecated")} | set(have))
@@ -314,7 +425,8 @@ def _prune(args: argparse.Namespace, root: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="nanobot-voice",
-        description="Fetch, list, sync, and prune on-device model weights for nanobot-channel-voice.",
+        description="Fetch, list, sync and prune on-device model weights for nanobot-channel-voice; "
+        "export its effective config; score recordings with its wake word.",
     )
     parser.add_argument(
         "--index",
@@ -372,11 +484,25 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--full", action="store_true", help="include every default, not just configured keys")
     p.add_argument("--secrets", action="store_true", help="keep apiKey values (full local backup)")
 
+    p = sub.add_parser(
+        "wake-eval",
+        help="score WAV recordings with the configured acoustic wake word, one decision per "
+        "80 ms: the peak, the longest run at the threshold and the hits, to set "
+        "wake.openwakeword.threshold/patience from what the phrase scores on this device",
+    )
+    p.add_argument("wav", nargs="+", metavar="WAV", help="16-bit mono recording, any rate")
+    p.add_argument("--config", metavar="FILE", help="nanobot config (default: ~/.nanobot/config.json)")
+    p.add_argument("--threshold", type=float, metavar="X", help="score against X instead of the config's threshold")
+    p.add_argument("--patience", type=int, metavar="N", help="N decisions in a row instead of the config's patience")
+    p.add_argument("--all", action="store_true", help="print every chunk's score, not only the summary")
+
     args = parser.parse_args(argv)
     root = Path(args.models_dir).expanduser() if args.models_dir else w.store_root()
     try:
         if args.cmd == "config":
             return _config(args)  # needs no weights index
+        if args.cmd == "wake-eval":
+            return _wake_eval(args)  # the store as the channel resolves it, no index
         if args.cmd == "prune":
             return _prune(args, root)
         sources = args.index or _configured_index(_config_path(args), required=args.cmd == "sync")
