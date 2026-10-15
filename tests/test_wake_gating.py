@@ -2975,3 +2975,38 @@ def test_half_duplex_without_an_acoustic_tier_warns_that_wake_cannot_interrupt()
     seen.clear()
     _run(_case(aec="auto", **_wake("off")))  # no wake word to lose
     assert not any("cannot interrupt a reply" in m for m in seen)
+
+
+def test_a_closed_utterance_reports_the_wake_scores():
+    from loguru import logger
+
+    class _StatsDetector(_ScriptDetector):
+        def __init__(self):
+            super().__init__()
+            # Before the onset, a reply's residue through the tap; then the utterance's own.
+            self.stats = [(0.9, 5), (0.42, 1)]
+
+        def take_stats(self):
+            return self.stats.pop(0) if self.stats else (0.0, 0)
+
+    async def _case():
+        det = _StatsDetector()
+        seen: list[str] = []
+        sink = logger.add(lambda m: seen.append(m.record["message"]), level="INFO")
+        try:
+            async with EvalConversation(
+                wake_detector=det, debug={"wakeScores": True}, **_wake("gate"),
+            ) as conv:
+                await conv.user_says("hey nanobot tell me a story")
+                assert det.stats == []  # taken at the onset (dropped) and at the close (reported)
+                assert conv.backend._metrics._latency["wake_peak_pct"].summary()["max"] == 42.0
+        finally:
+            logger.remove(sink)
+        assert [m for m in seen if m.startswith("wake scores")] == [
+            "wake scores between utterances: peak 0.90, longest run 5 chunk(s) at/above 0.60 "
+            "(patience 2)",
+            "wake scores over the utterance: peak 0.42, longest run 1 chunk(s) at/above 0.60 "
+            "(patience 2)",
+        ]
+
+    _run(_case())

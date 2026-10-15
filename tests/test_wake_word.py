@@ -854,3 +854,58 @@ def test_the_configured_patience_reaches_the_detector(fakes):
         "patience": 3,
     })
     assert make_wake_detector(cfg, 16000, 20)._patience == 3
+
+
+def test_a_non_finite_score_warns_once_and_scores_nothing(fakes):
+    from loguru import logger
+
+    seen: list[str] = []
+    sink = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    try:
+        det = _detector(threshold=0.5)
+        fakes["head.onnx"].probs = [float("nan")] * 5 + [float("inf"), 0.9]
+        assert not _push_chunks(det, 6)  # the runtime gone bad: no hit (inf included), no raise
+        assert det.last_score == float("inf")
+        assert det.take_stats() == (0.0, 0)
+        assert len([m for m in seen if "wake detector degraded" in m]) == 1  # throttled
+        assert _push_chunks(det, 1)  # the runtime recovers: the phrase fires again
+    finally:
+        logger.remove(sink)
+
+
+def test_a_non_finite_score_and_a_raise_are_each_said(fakes):
+    from loguru import logger
+
+    seen: list[str] = []
+    sink = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    try:
+        det = _detector()
+        fakes["head.onnx"].probs = [float("nan")]
+        assert not _push_chunks(det, 1)
+        fakes["head.onnx"].run = None  # type: ignore[assignment] - the runtime now raises
+        assert not _push_chunks(det, 1)
+        assert len([m for m in seen if "wake detector degraded" in m]) == 1
+        assert len([m for m in seen if "wake detector failed" in m]) == 1  # its own throttle
+    finally:
+        logger.remove(sink)
+
+
+def test_take_stats_reports_the_peak_and_the_longest_run(fakes):
+    det = _detector(threshold=0.6, patience=3)
+    fakes["head.onnx"].probs = [0.25, 0.75, 0.875, 0.25, 0.9375]
+    assert not _push_chunks(det, 5)  # no run reaches the patience
+    assert det.take_stats() == (0.9375, 2)
+    assert det.take_stats() == (0.0, 0)  # taken
+    fakes["head.onnx"].probs = [0.875]
+    _push_chunks(det, 1)
+    det.reset()  # a capture gap: what was scored across it is dropped with the stream
+    assert det.take_stats() == (0.0, 0)
+
+
+def test_push_takes_the_audio_clock_for_the_refractory(fakes):
+    det = _detector(refractory_s=2.0)
+    fakes["head.onnx"].probs = [0.9, 0.0, 0.9, 0.0, 0.9, 0.0, 0.9]
+    times = (0.0, 0.08, 0.16, 0.24, 3.0, 3.08, 5.5)
+    assert [det.push(_CHUNK, now=t) for t in times] == [
+        True, False, False, False, True, False, True,
+    ]

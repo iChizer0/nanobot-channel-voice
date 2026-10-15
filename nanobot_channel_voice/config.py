@@ -856,6 +856,9 @@ class DebugConfig(_VoiceBase):
     # Log the metrics snapshot (latency percentiles + counters, one JSON line) every N seconds;
     # None = session-end summary only. Floored at 1 s: each snapshot sorts the rings on the loop.
     metrics_interval_s: float | None = Field(default=None, ge=1.0)
+    # Log what the acoustic wake detector made of every utterance the VAD closed (peak score,
+    # longest run at the threshold): whether the phrase scores, and how far from the knobs.
+    wake_scores: bool = False
 
 
 class BargeInConfig(_VoiceBase):

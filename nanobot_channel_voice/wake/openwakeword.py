@@ -12,6 +12,7 @@ livekit-wakeword heads share the backbone contract. 16 kHz only; one decision pe
 
 from __future__ import annotations
 
+import math
 import time
 from contextlib import ExitStack
 
@@ -142,6 +143,7 @@ class OpenWakeWord(WakeDetector):
             self._refractory_s = refractory_s
             self._patience = max(1, patience)
             self._fail_throttle = Throttle(_FAIL_LOG_EVERY_S)
+            self._score_throttle = Throttle(_FAIL_LOG_EVERY_S)  # its own: a raise says more
             self._log = logger.bind(component="wake-oww")
             self._head_width = 0  # flattened head output size, proven by the prime run
             self._embs_prime = np.zeros((self._head_window, _EMB_DIM), dtype=np.float32)
@@ -192,6 +194,14 @@ class OpenWakeWord(WakeDetector):
         self._run = 0               # consecutive chunks at/above the threshold
         self._last_hit = float("-inf")
         self.last_score = None
+        self.peak = 0.0             # since take_stats(): the highest score ...
+        self.longest_run = 0        # ... and the longest run at/above the threshold
+
+    def take_stats(self) -> tuple[float, int]:
+        """The highest score and the longest run at/above the threshold since the last call:
+        what the phrase made of the threshold and the patience."""
+        stats, self.peak, self.longest_run = (self.peak, self.longest_run), 0.0, 0
+        return stats
 
     def _prime_and_validate(self) -> None:
         """One noise pass through the whole pipeline: proves all three models' I/O
@@ -233,7 +243,9 @@ class OpenWakeWord(WakeDetector):
         self._embs_prime = self._embs.copy()
         self.reset()  # the probe must not leave its own streaming state behind
 
-    def push(self, frame: bytes) -> bool:
+    def push(self, frame: bytes, now: float | None = None) -> bool:
+        """``now``: the audio clock for offline scoring, whose refractory would otherwise
+        run on the wall clock."""
         try:
             samples = np.frombuffer(frame, dtype="<i2").astype(np.float32)
             # Upstream contract: raw int16-VALUED floats, not normalized.
@@ -243,7 +255,18 @@ class OpenWakeWord(WakeDetector):
                 chunk, self._pending = self._pending[:_CHUNK], self._pending[_CHUNK:]
                 score = self._score_chunk(chunk)
                 self.last_score = score
-                if self._debounce(score):
+                if math.isfinite(score):
+                    self.peak = max(self.peak, score)
+                else:
+                    # A runtime gone bad (an NPU context): NaN passes no threshold, inf
+                    # every one. A quiet chunk instead, and said, or the deafness is silent.
+                    if self._score_throttle.ready():
+                        self._log.warning(
+                            "wake detector degraded: the model runtime returned a non-finite "
+                            "score; the phrase cannot score until it recovers (throttled)"
+                        )
+                    score = 0.0
+                if self._debounce(score, now):
                     hit = True
                     # Place the phrase end where the run's first chunk at the threshold
                     # ended, as with no patience: its later chunks and all still pending follow.
@@ -265,6 +288,7 @@ class OpenWakeWord(WakeDetector):
         t = time.monotonic() if now is None else now
         if score >= self._threshold:
             self._run += 1
+            self.longest_run = max(self.longest_run, self._run)
             if self._run < self._patience:
                 return False
             hit = self._armed and (t - self._last_hit) >= self._refractory_s

@@ -2616,3 +2616,44 @@ def test_a_session_lost_as_an_utterance_opens_leaves_the_window_to_lapse(clock):
         await gate.close()
 
     asyncio.run(_run())
+
+
+def test_a_closed_utterance_reports_the_wake_scores():
+    from loguru import logger
+
+    class _StatsWake(ScriptWake):
+        def __init__(self):
+            super().__init__(set())
+            # Before the onset, a reply's residue through the tap; then the utterance's own.
+            self.stats = [(0.9, 5), (0.42, 1)]
+
+        def take_stats(self):
+            return self.stats.pop(0) if self.stats else (0.0, 0)
+
+    async def _run(knob: bool) -> list[str]:
+        seen: list[str] = []
+        sink = logger.add(lambda m: seen.append(m.record["message"]), level="INFO")
+        try:
+            vad = ScriptVad([True] * 3 + [False] * 6)
+            det = _StatsWake()
+            gate, _inner, _, on_event = build(
+                "wake", vad=vad, detector=det, debug={"wakeScores": knob},
+                wake={"mode": "gate", "phrases": ["hey nanobot"]},
+            )
+            await gate.start(instructions=None, tools=[], on_event=on_event)
+            await feed(gate, 12)
+            assert det.stats == []  # taken at the onset and at the close
+            assert gate._metrics._latency["wake_peak_pct"].summary() == {
+                "n": 1, "p50": 42.0, "p90": None, "p99": None, "max": 42.0,  # the utterance's only
+            }
+            return [m for m in seen if m.startswith("wake scores")]
+        finally:
+            logger.remove(sink)
+
+    assert asyncio.run(_run(True)) == [
+        "wake scores between utterances: peak 0.90, longest run 5 chunk(s) at/above 0.60 "
+        "(patience 2)",
+        "wake scores over the utterance: peak 0.42, longest run 1 chunk(s) at/above 0.60 "
+        "(patience 2)",
+    ]
+    assert asyncio.run(_run(False)) == []

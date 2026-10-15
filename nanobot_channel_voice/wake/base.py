@@ -26,5 +26,11 @@ class WakeDetector:
     def reset(self) -> None:
         """Drop streaming state (capture gap: the audio is discontinuous)."""
 
+    def take_stats(self) -> tuple[float, int] | None:
+        """The highest score and the longest run at the threshold since the last call, then
+        both start over; None from a detector that keeps no such count."""
+        return None
+
     def release(self) -> None:
         """Release model resources (ORT session / NPU context). Idempotent."""
+

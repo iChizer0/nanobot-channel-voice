@@ -3,6 +3,14 @@ cannot drift."""
 
 from __future__ import annotations
 
+import threading
+
+from loguru import logger
+
+from nanobot_channel_voice.config import VoiceConfig
+from nanobot_channel_voice.metrics import VoiceMetrics
+from nanobot_channel_voice.wake.base import WakeDetector
+
 from .base import OnEvent, StateHint, VoiceState
 
 # One tool result's share of a realtime session's context: the whole output enters it, and
@@ -53,3 +61,46 @@ class TurnEventMixin:
             return
         self._turn = state
         await self._emit(StateHint(state))
+
+
+class WakeScores:
+    """A wake detector's readout: its peak and longest run at the threshold since last taken,
+    at an utterance's onset (what a reply's tail or a dropped utterance scored) and at its
+    close (the session's peaks in the metrics); logged under debug.wakeScores."""
+
+    def __init__(
+        self, detector: WakeDetector | None, lock: threading.Lock, metrics: VoiceMetrics,
+        config: VoiceConfig,
+    ) -> None:
+        self._detector = detector
+        self._lock = lock
+        self._metrics = metrics
+        self._enabled = config.debug.wake_scores
+        self._knobs = (config.wake.openwakeword.threshold, config.wake.openwakeword.patience)
+        self._log = logger.bind(component="voice")
+
+    def _take(self) -> tuple[float, int] | None:
+        if self._detector is None:
+            return None
+        with self._lock:  # the hop is idle between frames; insurance
+            return self._detector.take_stats()
+
+    def onset(self) -> None:
+        self._note("between utterances", metric=False)
+
+    def close(self) -> None:
+        self._note("over the utterance", metric=True)
+
+    def _note(self, what: str, *, metric: bool) -> None:
+        stats = self._take()
+        if stats is None:
+            return
+        peak, run = stats
+        if metric:  # in percent: the ring's one-decimal quantiles keep the resolution
+            self._metrics.observe("wake_peak_pct", peak * 100.0)
+        if self._enabled:
+            self._log.info(
+                "wake scores {}: peak {:.2f}, longest run {} chunk(s) at/above {:.2f} "
+                "(patience {})",
+                what, peak, run, *self._knobs,
+            )

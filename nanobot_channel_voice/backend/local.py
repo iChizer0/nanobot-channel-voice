@@ -63,7 +63,7 @@ from nanobot_channel_voice.wake.phrase import FuzzyWake, WakePhrase
 
 from .audio_sink import AudioSink, scale_pcm, trim_lead_silence, trim_tail_silence
 from .base import NOTICE_BACKLOG, OnEvent, OutputAudio, ToolDef, VoiceState
-from .common import TurnEventMixin, loggable_text
+from .common import TurnEventMixin, WakeScores, loggable_text
 from .cues import cue_pcm
 
 TranscribeFn = Callable[[bytes], Awaitable[str]]
@@ -836,6 +836,7 @@ class LocalBackend(TurnEventMixin):
         fuzzy = FuzzyWake(config.wake.phrases) if config.wake.mode != "off" else None
         self._wake_fuzzy = fuzzy if fuzzy else None
         self._wake_detector = wake_detector
+        self._wake_scores = WakeScores(wake_detector, self._hop_lock, self._metrics, config)
         wake_mode = config.wake.mode
         if wake_mode != "off" and self._wake_phrase is None and wake_detector is None:
             # Zero working tiers would gate every utterance FOREVER: a healthy-looking but
@@ -1164,6 +1165,10 @@ class LocalBackend(TurnEventMixin):
             utterance = self._push_with_model_close(pcm)  # light path: loop-side, no lock
             compute_ms = (time.monotonic() - t0) * 1000.0
         self._track_hop_cost(t0, compute_ms)
+        if self._endpointer.in_speech and not prev_speech:
+            self._wake_scores.onset()
+        elif prev_speech and not self._endpointer.in_speech:
+            self._wake_scores.close()
         if self._wake_mode != "off" and self._wake_hit_at > self._wake_seen_at:
             # A hop-side wake hit (acoustic, or a strict-mode text match). The loop is the
             # single confirm authority: the hop only latches, so the echo/warmup suppressions

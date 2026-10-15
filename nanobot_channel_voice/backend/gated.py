@@ -43,6 +43,7 @@ from .base import (
     ToolDef,
     VoiceState,
 )
+from .common import WakeScores
 from .cues import cue_pcm
 
 # Own reply said the phrase: veto acoustic hits for this long past the transcript delta,
@@ -215,6 +216,7 @@ class GatedUplink:
         self._held_onset = False  # an onset during a cue, waiting for speech to outlast it
         self._min_utterance_ms = config.vad.min_utterance_ms
         self._summon_tail_ms = wake.openwakeword.tail_ms  # the phrase runs on past the hit
+        self._wake_scores = WakeScores(self._wake, self._hop_lock, self._metrics, config)
         # A reply the phrase cuts off still sounds this long (device buffer and room).
         self._playback_tail_s = config.playback_hangover_ms / 1000.0
         self._unpark_task: asyncio.Task | None = None
@@ -265,6 +267,7 @@ class GatedUplink:
         else:
             adopted = False
         if self._ep.in_speech and not prev_speech:
+            self._wake_scores.onset()
             if not self._streaming and self._summon is None:  # a summon owns its phrase's utterance
                 await self._on_onset(now)
         elif self._held_onset and not self._streaming:
@@ -274,6 +277,7 @@ class GatedUplink:
         elif self._ep.in_speech and self._streaming and not adopted:
             await self._upload(pcm)
         if prev_speech and not self._ep.in_speech:
+            self._wake_scores.close()
             await self._on_close(utterance)
         self._duck_step()
 
